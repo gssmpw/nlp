@@ -1,0 +1,276 @@
+\section{Algorithm}
+\label{sec:algorithm}
+\begin{algorithm2e}[h]
+\small
+\caption{Candidate Clustering}
+\label{algo:clustering}
+\SetKwInOut{input}{Input}
+\SetKwInOut{output}{Output}
+\SetKwProg{Def}{Def}{:}{}
+
+\input{Target task $D$, Model Zoo $\mathcal{M}_{ve}$ and $\mathcal{M}_{llm}$, clustering threshold $t_{ve}$ and $t_{llm}$}
+\output{Candidate clusters $C_{vlm}$}
+
+\Def{CandidateClustering($\mathcal{M}_{ve}, \mathcal{M}_{llm}$)}{
+    \textcolor{blue}{\CommentSty{/* Vision Encoder Clustering*/}}\\
+    % Initialize distance matrix $Dist_{ve}$ for vision encoders\\
+    \For{$M_{A}, M_{B} \in \mathcal{M}_{ve}$}{
+        $dist_{A,B} = 1 - CKA(\mathcal{D}, M_{A}, M_{B})$\\
+        $Dist_{ve}[M_{A}][M_{B}] = Dist_{ve}[M_{B}][M_{A}] = dist_{A,B}$\\
+    }
+    $\mathcal{C}_{ve} = Clustering(Dist_{ve}, t_{ve})$\\
+    \textcolor{blue}{\CommentSty{/* Candidate Clustering*/}}\\
+    \For{$C_{A} \in \mathcal{C}_{ve}$}{
+        % \textcolor{blue}{\CommentSty{/* Update dataset with embeddings */}}\\
+        $M_{medoid} = PickMedoidModel(C_{A})$\\
+        % $D_{tmp} = M_{medoid}(\mathcal{D}_{val, img}) \cup \mathcal{D}_{val, text}$\;
+        % Initialize distance matrix $Dist_{llm}$ for LLMs\\
+        \textcolor{blue}{\CommentSty{/* LLM Clustering */}}\\
+        \For{$M_{A}, M_{B} \in \mathcal{M}_{llm}$}{
+            $dist_{A,B} = 1 - CKA(M_{medoid}(\mathcal{D}), M_{A}, M_{B})$\\
+            $Dist_{llm}[M_{A}][M_{B}] = Dist_{llm}[M_{B}][M_{A}] = dist_{A,B}$\\
+        }
+        $\mathcal{C}_{llm} = Clustering(Dist_{llm}, t_{llm})$\\
+        % \For{$C_{B} \in \mathcal{C}_{ve}$}{
+        $\mathcal{C}_{vlm}.append(C_{A} \times \mathcal{C}_{llm})$\\
+        % }
+    }
+    Return $\mathcal{C}_{vlm}$
+}
+\end{algorithm2e}
+
+Detailed two-step clustering algorithm for candidate clustering as described in \Cref{sec:clustering}. We adopt the MinibatchCKA for computation efficiency, which is introduced in \cite{nguyen2020wide} and later used in \cite{raghu2021vision}. In LLM clustering,  we use the last hidden state from LLM as the sentence representation for CKA computation since it produces the best clustering performance. We leverage the hierarchical clustering from \texttt{scipy.cluster.hierarchy} library in SciPy~\cite{2020SciPy-NMeth}. It is possible to adopt other clustering methods. Overall, this approach significantly reduces the number of candidate to explore.
+
+\section{Implementation}
+
+\begin{lstlisting}[language=Python, caption={Mordal interface}, label={lst:mordal}, float=h]
+import mordal
+
+def search_with_mordal(model_zoo, alignment_data, target_task_data):
+    model = mordal.query_for_model(
+        data=alignment_data, # LLaVA-1.5-Mixture
+        task=target_task_data, # GQA
+        pretrained_ve_zoo=model_zoo['ve'],
+        pretrained_llm_zoo=model_zoo['llm'],
+        vlm_kwargs={ 
+            'projector': 'MLP', 'freeze_ve': True, 'freeze_llm': False,
+        },
+        mordal_kwargs={
+            'clustering': {'t_ve': 0.7, 't_llm': 0.8}, 
+            'exploration': {'top_k_inter': 3, 'top_k_intra': 3},
+            'early_stopping': {'R': 0.125, 'b': 0.03, 'eta': 2}
+            'scaling_prediction': {'R': 0.125, 'u': 2, 'delta': 0.01}
+        }
+    )
+\end{lstlisting}
+
+This section describes Mordal's implementation details and configurations to ensure efficient and scalable pretrained model selection. We highlight key design choices that optimize resource utilization without compromising performance. As shown in code snippet \cref{lst:mordal}, to submit a job, users need to provide the alignment data and data for the target task. Users are also allowed to submit a list of available pretrained models. In \texttt{vlm\_kwargs}, users may specify the projector's architecture and whether to free pretrained components. In \texttt{mordal\_kwargs},  
+
+When unfree pretrained components, instead of performing expensive full finetuning, we uses Low-Rank Adaptation (LoRA) \cite{hu2021lora} implemented by Parameter-Efficient Fine-Tuning (PEFT)~\cite{peft} and manage LoRA configurations for each pretrained model. LoRA injects task-specific adaptations into the pretrained model by learning low-rank updates for certain layers while keeping the core parameters frozen. This significantly reduces computational and memory overhead, making finetuning feasible under resource-constrained settings. We incorporate Flash Attention~\cite{dao2023flashattention} for scalable attention computation, which is a memory-efficient implementation of scaled dot-product attention that avoids redundant operations and reduces memory overhead. All models are trained with torch bfloat16 precision, which balances computational efficiency and numerical stability. Mordal also automatically allocates idle GPU resources to candidates that are not converged to speed up the exploration process. 
+
+
+% For the vision encoder, we utilize pretrained models from the HuggingFace and TIMM (PyTorch Image Models) library \textcolor{red}{ref}. TIMM provides state-of-the-art implementations of various vision architectures, enabling us to easily integrate robust visual encoders into our system. These models are initialized with pretrained weights to speed up convergence and improve performance on downstream tasks.
+
+% centered kernel alignment
+% \paragraph{Scaling Law.} Scaling prediction does not start from scratch, as the previous two-stage exploration already produces checkpoints for different iterations. Since the scaling prediction starts from sample ratio $R$, choosing appropriate $s_{inter}$ and $s_{intra}$ values are important. A smaller $R$ will likely make the scaling prediction miss the log-linear relationship, while a large $R$ wastes significantly more resources. 
+
+
+\section{Additional Experiments}
+\label{sec:additional_eval}
+
+\begin{table}[h]
+\centering
+% \large
+\begin{tabular}{cc}
+    \toprule
+    Vision Encoders & LLMs \\
+    \midrule
+    CLIP-ViT-L/14@336~\cite{radford2021learning} & Vicuna-1.5-7B~\cite{vicuna2023} \\
+    SigLIP-so400m-patch14@384~\cite{zhai2023sigmoid} & Llama-2-7B~\cite{touvron2023llama2}\\
+    DFN-CLIP-ViT-H/14@378~\cite{fangdata}  & Llama-3-8B~\cite{dubey2024llama} \\
+    InternViT-300M/14@448~\cite{chen2024internvl}   & Mistral-v0.2-7B~\cite{jiang2023mistral}\\
+    DINOv2-ViT-L/14@518~\cite{oquab2023dinov2} & Qwen2-7B~\cite{yang2024qwen2technicalreport}\\
+    EVA-CLIP-02-ViT-L/14@336~\cite{sun2023eva} &  Phi-3-Small-7B~\cite{abdin2024phi}\\
+    ConvNeXt-L/14@256~\cite{ilharco_gabriel_2021_5143773} & Gemma-1.1-7B~\cite{team2024gemma} \\
+\bottomrule
+\end{tabular}
+\caption{List of vision encoders and LLMs in experiments.
+\label{table:model_zoo}}
+\end{table}%
+
+
+% (CLIP~\cite{radford2021learning}, SigLIP~\cite{zhai2023sigmoid}, DFN-CLIP~\cite{fangdata}, InternViT~\cite{chen2024internvl}) 
+% LLaMA \cite{touvron2023llama}, Vicuna \cite{vicuna2023} and Mistral \cite{jiang2023mistral}.
+
+\paragraph{Model zoo and training settings.} We evaluate seven vision encoders and seven language models as shown in \Cref{table:model_zoo}. Most models are available on \textit{HuggingFace} \cite{huggingface_models_website} while EVA-CLIP and ConvNeXt are supported by \textit{timm} library \cite{rw2019timm}. For ConvNeXt, we interpolate the output embeddings to 16x16 patches following Cambrian-1 \cite{tong2024cambrian}. 
+To make a fair comparison with LLaVA-1.5-7B equivalent structure, we train an MLP projector and finetune pretrained LLM with LoRA. The default training setting uses Adam optimizer with minibatch size 4 and initial learning rate 1e-4. We use the linear schedule to decrease the learning rate linearly from the initial value. 
+
+\paragraph{Mordal hyperparameter settings.}  For pretrained model clustering, the threshold for vision encoder and LLMs are set to $t_{ve}=0.7$ and $t_{llm}=0.8$, respectively. And the warmup round for the feature projector is 10. When performing an efficient evaluation, we set both $topk_{inter}$ and $topk_{intra}$ to 3, which means that the Top-3 clusters will be selected in inter-cluster evaluation and Top-3 candidates will be selected in intra-cluster evaluation with the early stopping mechanism. We use $\eta=2$ as the default reduction factor, which is consistent with typical SHA settings. We further set $p=3$ and $\delta=5e-5$ by default for scaling prediction. We will discuss the effect of hyperparameters in \Cref{sec:sensitivity}. 
+
+\subsection{Evaluation Time Breakdown}
+
+
+\begin{figure}[!h]
+\centering
+% \vspace{-10px}
+% \subfloat[GQA]{
+% \centering
+\includegraphics[width=0.65\textwidth]{fig/eval/bar_breakdown.pdf}
+% }
+% \subfloat[ChartQA]{
+% \centering
+% \includegraphics[width=0.23\textwidth]{fig/eval/ablation_acc.pdf}
+% }
+\caption{Total evaluation time breakdown for Mordal on six datasets.}
+\label{fig:time_breakdown}
+% \vspace{-10px}
+\end{figure}
+
+As shown in \Cref{table:eval_perf}, When evaluating Mordal on different tasks, the total evaluation time required is different. To investigate the differences in time consumption, we analyze the breakdown time for each component of Mordal and present the result in \ref{fig:time_breakdown}. As expected, the early stopping stage consists of most of the evaluation time, and the prediction only takes a small part of time. This is because the scaling prediction is only performed for the candidates left after early stopping. The time varies depending on when the model is converged and scaling is observed. The time for inter-cluster and intra-cluster early stopping depends on the number of clusters, controlled by $t_{ve}$ and $t_{llm}$. The cluster is generally less obvious for difficult tasks (e.g., ChartQA and DocVQA), leading to many clusters with only one candidate. As fewer candidates are eliminated, the total evaluation time increases.     
+
+
+
+\subsection{Sensitivity Analysis}
+
+
+\begin{table}[h]
+\centering
+% \large
+\begin{tabular}{cc|ccc}
+\toprule 
+Category
+& Config
+% & \multicolumn{3}{c}{\textbf{ScienceQA}}
+% & \multicolumn{3}{c}{\textbf{ChartQA}}
+% \\
+&  Time & Top-1 Score & $\tau$   
+\\
+\hline
+Mordal & Default & 483 & 66.4 & 0.81
+\\
+\hline
+ Candidate
+  & $t_{ve}=0.5$ & 446 & 66.4 & 0.52  \\
+\cline{2-5} 
+  Clustering & $t_{ve}=0.9$ & 1041 & 66.4 & \textbf{0.86}  \\
+\hline
+
+Inter-Cluster & $topk_{inter}=2$ & 417 & 66.4 & 0.73 \\
+\cline{2-5}
+Evaluation & $topk_{inter}=4$ & 564 & 66.4 & 0.83  \\
+\hline
+
+ % \multirow{2}{*} \newline } \\
+Intra-Cluster & $topk_{intra}=2$ & \textbf{451} & \textbf{66.4} & 0.81  \\
+\cline{2-5}
+Evaluation & $topk_{intra}=4$ & 522 & 66.4 & 0.81  \\
+\hline
+
+Prediction & $p=4$ & 501 & 66.4 & 0.81 \\
+\bottomrule
+\end{tabular}
+\caption{Summary of sensitivity analysis for GQA.\label{table:sensitivity} 
+% \textcolor{red}{match previous design section.}
+}
+\end{table}%
+
+\label{sec:sensitivity}
+Sensitivity analysis explores how key hyperparameters affect Mordal's performance and efficiency, focusing on clustering thresholds $t_{ve}$ and $t_{llm}$, exploration parameters $s_{inter}$ and $s_{intra}$, and scaling prediction $p$. Careful tuning of these parameters ensures efficient operation without compromising Mordal's ability to select top-performing models. Generally, Mordal is robust and consistently identifies the best-performing model across most hyperparameter settings.
+
+% Clustering thresholds influence the balance between diversity and computational cost, while exploration parameters determine the trade-off between search speed and model quality. The scaling prediction parameter primarily affects search time with little impact on performance.  
+
+\paragraph{Effect of clustering hyperparameters.} The clustering threshold $t_{ve}$ and $t_{llm}$ significantly affects Mordal's performance and efficiency. As shown in \Cref{table:sensitivity}, a smaller threshold $t_{ve}=0.5$ creates fewer, larger clusters based on the LLM's general characteristics, which will lower the $\tau$ value by missing finer distinctions and discarding strong candidates with other LLM backend. On the other hand, a larger threshold $t_{ve}=0.9$ results in more, smaller clusters, capturing subtle differences and improving the $\tau$ value but increasing the number of candidates to evaluate during scaling prediction, leading to longer searching time. Balancing the threshold is crucial to ensure diverse clusters while keeping the computational cost reasonable.
+
+\paragraph{Effect of inter- and intra-cluster hyperparameters.} Based on \Cref{table:sensitivity}, inter-cluster exploration generally has a greater impact on Mordal's performance than intra-cluster exploration. A smaller $topk_{inter}$ reduces the number of clusters evaluated, speeding up the search but lowering the $\tau$ value by excluding promising clusters aggressively. A larger $topk_{inter}$ explores more clusters, increasing search time but improving the $\tau$ value by retaining diverse clusters. Intra-cluster early stopping affects candidate selection within clusters, with smaller $topk_{intra}$ focusing on fewer candidates and larger $topk_{intra}$ exploring more candidates for scaling prediction. However, its influence is smaller, as clusters already limit diversity. Properly balancing these $topk_{inter}$ and $topk_{intra}$ ensures efficient exploration and strong performance.
+
+\paragraph{Effect of scaling prediction hyperparameters.} The scaling prediction parameter $p$ has minimal impact on Mordal's overall performance but affects search time. Increasing $p$ beyond appropriate values adds to the computational cost without improving results. In practice, $p=3$ is sufficient for constructing the linear regression model used in scaling prediction.
+
+
+
+% \subsection{Performance Results on Smaller Models }
+
+% \begingroup
+% \renewcommand{\arraystretch}{1.2}
+% \begin{table*}[h]
+% \centering
+% \caption{Summary of improvements. Training Time (h), Top-1 Model Quality (\%) and Kendall $\tau$ results for different datasets. Mordal significantly reduces the amount of training needed (i.e., GPU Saving) while achieving a comparable Top-1 Model Quality. Kendall $\tau$ represents the differences of top-performing models compared with the grid search baseline and \textit{larger $\tau$ is better}.}
+% \label{table:eval_perf_small}
+% \scriptsize
+% \begin{tabular}{ccc|c||ccc|ccc}
+
+% \toprule 
+% \multirow{2}{*}{Task}
+% & \multirow{2}{*}{Dataset} 
+% & \multirow{2}{*}{Size}
+% & \multirow{2}{*}{LLaVA-1.5}
+% & \multicolumn{3}{c|}{\textbf{Grid Search}}
+% % & \multicolumn{3}{c|}{\textbf{ASHA \textcolor{red}{delete column}}}
+% & \multicolumn{3}{c}{\textbf{Mordal (ours)}}
+% \\
+% &   & &  & Time & Top-1 Score & Model Name & Time & Top-1 Score & $\tau$ 
+% \\
+
+% \hline
+%  \multirow{2}{*}{Visual QA} 
+%     & GQA       & 12,578    & 61.5  & 1472  & 62.4   & SigLIP-LLaMA3.2 & 217 & 62.4  & x \\
+% \cline{2-10}
+%     & VizWiz    & 4,319     & 54.4  & 1472  & 43.1   & SigLIP-LLaMA3.2 & 209 & 43.1 & x \\
+% \hline
+
+%  \multirow{2}{*}{Doc QA} 
+%     & ChartQA   & 2,500     & 18.2  & 1472  & x  & x & x & x  & x \\
+% \cline{2-10}
+%     & DocVQA    & 5,349     & 27.6  & 1472  & x  & x & x & x  & x \\
+% \hline
+
+%  \multirow{2}{*}{Knowledge} 
+%     & ScienceQA     & 2,017     & 70.4  & 1472  & x  & x & x & x  & x \\
+% \cline{2-10}
+%     & AI2D          & 3,088     & 54.8  & 1472  & x  & x & x & x  & x \\
+% \bottomrule
+% \end{tabular}
+% \end{table*}%
+% \endgroup
+
+% \Cref{table:vlm_evaluation} provides a detailed comparison of Mordal and grid search across six datasets, highlighting the substantial reductions in total training time achieved by Mordal. Across all datasets, Mordal identifies the best VLM candidates much faster than grid search. For instance, on VizWiz, Mordal completes the search in just 469 training hours, compared to the exhaustive 5439 hours required by grid search. Notably, the total training time for grid search remains constant across all six tasks, as the same alignment dataset is used. Overall, Mordal achieves impressive speedups of \textit{8.9x-11.6x} over grid search.
+
+\section{Discussion}
+While Mordal demonstrates promising results in efficiently selecting pretrained models fo VLM with small vision encoders and 7B LLMs under a single-request, certain limitations must be addressed to extend its utility and effectiveness. Below, we discuss two key areas for improvement: scaling to different model sizes and optimizing across similar user requests.
+
+\begin{figure}[h]
+    \centering
+    \subfloat[Frozen pretrained modules]{
+    \centering
+    \includegraphics[width=0.25\textwidth]{fig/general/instruction_tuning_frozen.pdf}
+    \label{fig:it-frozen}
+    }
+    % \hfill
+    \subfloat[Updatable pretrained modules]{
+    \centering
+    \includegraphics[width=0.25\textwidth]{fig/general/instruction_tuning_finetune.pdf}
+    \label{fig:it-unfrozen}
+    }
+    \caption{Alternative alignment approaches for VLM instruction tunning.}
+    \label{fig:instruction_tuning}
+\end{figure}
+
+\paragraph{VLM alignment.} 
+One must go through an \emph{alignment} process to ensure that the individual components of the VLM are well integrated before using it. 
+Developers integrate pretrained LLMs and visual encoders, training the projector from scratch using visual alignment datasets like VQA \cite{antol2015vqa} . 
+During the alignment process, pretrained components may remain frozen 
+% (\Cref{fig:it-frozen}) 
+or be further finetuned during alignment training \cite{liu2023improved}. 
+% (\Cref{fig:it-unfrozen}). 
+% The projector and pretrained modules may or may not be trained in separate stages \cite{karamcheti2024prismatic}. 
+Recently, some proprietary models have employed end-to-end training without using any pretrained models \cite{bai2023qwen}, but it is not common due to the excessive training cost. While Mordal addresses pretrained model selection in a popular VLM setting, it would be interesting to investigate its effectiveness under other VLM structures with and without pretrained components.
+
+\paragraph{Extend to smaller and larger models.} Mordal's design and evaluation have focused on small size (i.e., 7B) pretrained models, making it efficient and practical for scenarios with limited computational resources. However, extending Mordal to handle smaller (e.g., 1B) and larger models (e.g., 70B) introduces new challenges. For example, the computational overhead associated with larger models significantly increases, requiring more memory and longer processing times for alignment and evaluation. Mordal's current optimization strategies may not scale effectively under these conditions, necessitating further refinement to manage resource demands. Additionally, the similarity measurements and observational scaling law used to speed up evaluation could become less effective with smaller or larger models due to shifts in their feature spaces, potentially reducing the accuracy of candidate selection. To address these challenges, future iterations of Mordal must incorporate distributed computing frameworks and advanced resource allocation techniques. Adjustments to representation similarity metrics and scaling law formulations will also be essential to maintain the framework's robustness as models vary in size and complexity.
+
+\paragraph{Similar requests among users.} Mordal's current implementation is designed to optimize pretrained model selection for a single request at a time, which limits its efficiency in handling multiple similar tasks submitted by users. This approach overlooks opportunities to reduce redundant computations when user requests share overlapping requirements, leading to inefficient use of computational resources. By evaluating a shared set of model candidates for grouped tasks, Mordal could eliminate redundant computations and improve throughput. For example, implementing a caching mechanism to store and reuse results for previously evaluated models and tasks could further enhance resource efficiency. Addressing these limitations would enable Mordal to support multi-user environments and dynamic workloads more effectively.
+
+
+\section{Related Work}
+\paragraph{Model selection.} Previous model selection methods typically assume that all models share identical architectures, differing only in their pretraining datasets \cite{tran2019transferability}. Recent research focuses on similarity-based approaches, which involve finetuning a model on a target dataset and then measuring feature similarity between the finetuned model and candidate models to predict their finetuning performance \cite{vu2020exploring}. Other methods have introduced training-free approaches to assess the transferability of pretrained features to target tasks without requiring additional finetuning \cite{you2021logme}. Some of these methods estimate model suitability based on intrinsic feature properties, while others frame model selection as a rank or recommendation problem \cite{vu2020exploring}. However, these techniques are primarily designed for classification and regression tasks, making them unsuitable for open-world text generation\cite{bao2019plato}. LLM-based selection~\cite{lin2024selecting} methods also fail to work in VLM since the pretrained models are not aligned with each other. Given the rapidly increasing number of open-source VLMs, there is an urgent need to develop methods specifically tailored for VLM pretrained model selection.
+
+
+% \paragraph{Scaling law.} The relationship between model performance and variables such as model size or pretraining data size has been extensively studied, with these scaling laws often applied to optimize the allocation of computational resources for pretraining LLMs \cite{kaplan2020scaling,hoffmann2022training}. Recently, more granular scaling laws have been proposed, such as those addressing data-constrained and hyperparameter scaling \cite{bi2024deepseek}. In the context of finetuning LLMs, Hernandez \cite{hernandez2021scaling} examined the scaling effects of transfer learning compared to pretraining, while concurrent work \cite{zhang2024scaling} highlighted inconsistencies in model size scaling between pretraining and finetuning. Additionally, recent research \cite{lin2024selecting} identified a "pre-power" phase in finetuning under low-data conditions, emphasizing the need for a transition phase bridging the random-guess initialization and the power-law performance region observed in from-scratch training. In contrast, Mordal's observational scaling law focuses on VLM alignment, simplifying this transition by representing the alignment data size with a single term. This intuitive rectification is supported by robust empirical validation.

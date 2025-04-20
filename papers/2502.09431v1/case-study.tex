@@ -1,0 +1,87 @@
+\section{A Case Study: P\MakeLowercase{ostgre}SQL}
+\label{sec:CaseStudy}
+\noindent PostgreSQL is an open source object-relational database system. It is fully atomicity, consistency, isolation, durability (ACID) 
+compliant and runs on all major operating systems including Linux \cite{momjian2001postgresql}. In this section, we study the 
+storage engine (SE) of PostgreSQL and apply necessary changes to make it NVM-aware. We first describe the read-write architecture 
+of PostgreSQL and then explain our modifications.
+
+
+
+\subsection{Read-Write Architecture of PostgreSQL}
+
+Fig.~\ref{Fig3a} shows the original PostgreSQL architecture from the perspective of read and write file operations. 
+The left column in the figure shows the operations performed by different software layers of PostgreSQL, while the right column 
+shows the corresponding data movement activities. Note that in Fig.~\ref{Fig3a} we assume the disk has already been replaced 
+by NVM hardware with PMFS as the file system. However, the same behavior would be expected using a regular disk and a traditional 
+FS, since PostgreSQL heavily relies on file I/O for read and write operations and the file I/O APIs in PMFS are the same as those 
+in a traditional FS.
+
+The PostgreSQL server calls the services of the  \textit{Buffer Layer} which is responsible for maintaining an 
+internal buffer cache. The buffer cache is used to keep a copy of the requested page which is read from the 
+storage. Copies are kept in the cache as long as they are needed. If there is no free
+slot available for a newly requested page then a replacement policy is used to select a victim. 
+The victim is evicted from the buffer cache and if it is 
+a dirty page, then it is also flushed back to the permanent storage.
+
+Upon receiving a new request to read a page from storage, the \textit{Buffer Layer} finds a free buffer cache slot 
+and gets a pointer to it. The free buffer slot and corresponding pointer are shown in Fig.~\ref{Fig3a} as \textit{Pg Buffer} and \textit{PgBufPtr}, respectively. The \textit{Buffer Layer} then passes the pointer to the \textit{File Layer}. Eventually, the \textit{File Layer} of PostgreSQL invokes the file read and write system calls implemented by the 
+underlying FS. 
+
+For a read operation, PMFS copies the data block from NVM to a kernel buffer and then the kernel copies the requested 
+data block to an internal buffer slot pointed by \textit{PgBufPtr}. In the same way, two copies are made for write operation but in the opposite direction.
+
+Hence, the SE of original PostgreSQL incurs two copy operations for each miss in the internal buffer cache. This is 
+likely to become a big overhead for databases running queries on large datasets. However, since PMFS can map the entire NVM address space into the kernel's virtual address space~\cite{dulloor2014system}, the copy overhead can be avoided by making modifications in the SE. We apply these modifications in two incremental steps as described in 
+the following subsections.
+
+\subsection{SE1: Using Memory Mapped I/O}
+In the first step towards leveraging the features of NVM, we replace the \textit{File Layer} of PostgreSQL by a 
+new layer named \textit{MemMapped Layer}. As shown in Fig. \ref{Fig3b}, this layer still receives a pointer 
+to a free buffer slot from the \textit{Buffer Layer}, but instead of using the file I/O interface, it uses the memory 
+mapped I/O interface of PMFS. We term this storage engine \textit{SE1}.
+
+\noindent\textbf{Read Operation:} When accessing a file for a read operation, we first open the file using the \verb+open()+ 
+system call, same as in original PostgreSQL. Additionally, we create a mapping of the file using \verb+mmap()+. 
+Since we are using PMFS, \verb+mmap()+ returns a pointer to the mapping of the file stored in NVM. The implementation of \verb+mmap()+ by PMFS provides the application with direct access to mapped pages of files residing in NVM.
+
+As a result, we do not need to make an intermediate copy of the requested page from NVM into kernel buffers. We can 
+directly copy the requested page into internal buffers of PostgreSQL by using an implicit \verb+memcpy()+ as shown in Fig. \ref{Fig3b}. When all requested operations on a given file are completed and it is not needed anymore, 
+the file can be closed. Upon closing a file, we delete the mapping of the file by calling the \verb+munmap()+ function. 
+
+\noindent\textbf{Write Operation:} The same approach as in the read operation is used for writing data into a file. The file to be modified is first opened and a mapping is created using \verb+mmap()+. The data to be written into the file is copied 
+directly from internal buffers of PostgreSQL into NVM using \verb+memcpy()+.
+
+An SE with the above-mentioned modifications does not create an intermediate copy of the data in kernel buffers. Hence 
+we reduce the overhead to one copy operation for each miss in the internal buffer cache of PostgreSQL. 
+
+\subsection{SE2: Direct Access to Mapped Files}
+In the second step of modifications to the SE, we replace the \textit{MemMapped Layer} of SE1 by 
+the \textit{PtrRedirection Layer} as shown in Fig.~\ref{Fig3c}. Unlike the \textit{MemMapped Layer}, 
+the \textit{PtrRedirection Layer} in SE2 receives the pointer to \textit{PgBufPtr} (i.e \textit{P2PgBufPtr}), which itself points to a free slot of the buffer cache. In other words, \textit{PtrRedirection Layer} receives a pointer to a pointer from the \textit{Buffer Layer}.
+
+\noindent\textbf{Read Operation:} When accessing a file for a read operation, we first open the file using \verb+open()+ system call, same as in original PostgreSQL and SE1. Additionally, we also create a mapping of the file using \verb+mmap()+. Originally \textit{PgBufPtr} points to a free slot in the 
+internal buffer cache. Since \verb+mmap()+ makes the NVM mapped address space visible to the calling process, the \textit{PtrRedirection Layer} simply redirects the \textit{PgBufPtr} to point to the corresponding address of the file residing in NVM. Pointer redirection in case of a read operation is shown by a black dashed arrow with the ``Read'' label in Fig.~\ref{Fig3c}.
+
+As a result of pointer redirection and the visibility of the NVM address space enabled by PMFS, we incur no copy 
+overhead for read operations. This can represent a significant improvement since read operations are predominant in queries that operate on large datasets.
+
+\noindent\textbf{Write Operation:} PMFS provides direct write access for files residing in NVM. 
+However, it does not manage the data consistency in memory mapped operations and leaves the responsibility 
+to the application \cite{dulloor2014system} - i.e., PostgreSQL.
+
+
+PostgreSQL is an ACID compliant DBMS which uses 
+multi-version concurrency control (MVCC) \cite{neumann2015fast}
+%MultiVersion Concurrency Control (MVCC) 
+to maintain data consistency.
+Under MVCC, concurrent executing transactions see a snapshot of the data at a particular instant in time, 
+regardless of the current state of the underlying data. This provides data consistency and transaction isolation \cite{PostgreSQLDocBook}. 
+
+To keep the consistency model of PostgreSQL unaltered and functionally correct,
+SE2 performs two actions before modifying the 
+actual content of the page and marking it as dirty. First, if the page is residing in NVM, it copies the page back from NVM into the 
+corresponding slot of the internal buffer cache, i.e. \textit{Pg-Buffer}. Second, it undoes the redirection of \textit{PgBufPtr} such that it 
+again points to the corresponding slot in the buffer cache and not to the NVM mapped file. This is shown by a black dashed arrow with 
+the ``Write'' label in Fig.~\ref{Fig3c}. This way, SE2 ensures that each transaction (or query) updates only its local copy of the page.
+
+In other words, SE1 and SE2 always use the internal PostgreSQL  buffers for write operations, avoiding writes directly into  database files residing in NVM disk. As a result,  data consistency model of PostgreSQL is not violated and transactions are protected from viewing inconsistent data. In summary, SE1 and SE2 operate in the same way as far as write operation is concerned. However, for read operations, SE1 reduces overhead for each miss in internal buffer cache from two copy operations in original PostgreSQL storage engine to one. On the other hand, SE2 reduces this overhead to zero copy operations.

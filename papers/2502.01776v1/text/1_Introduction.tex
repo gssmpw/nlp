@@ -1,0 +1,95 @@
+
+% Introduction
+% 1. DiT is popular, and 3D-DiT video generation is growing more and more popular. SOTAs are 3D-DiT models.
+%   a) There is growing demand for high-quality video generation (animation, simulation, content creation, e.g.)
+%   b) Close-sourced model: Sora, Kling; Open-sourced model: Open-Sora, CogVideo, Hunyuan.
+% 2. The DiT is extremely attention-bounded
+%   a) Mention it takes 5-10 minutes to generate a 13 frames video on A100 GPU
+%   b) DiT video generation is attention-bottlenecked. For CogvideoX 5B v1.5, The total frame number is 11, but the token per frame is 4080. The mlp is linear to context length, but the attention is quadratic to context length
+%   c) We add a figure (attention proportion grows as the sequence length grows)
+% 3. 3D-DiT attention is really sparse, previous work was focused on cache-based attention reuse 
+%   a) Copy from FasterCache: Among the recently proposed solutions, cache-based acceleration has emerged as one of the most widely adopted approaches. This approach speeds up the sampling process by reusing intermediate features across timesteps, thereby reducing redundant computations and significantly improving computational efficiency.
+%   b) Cache-based acceleration relies on the embedding similarity between the timesteps and (conditional and unconditional outputs) which is not reliable.
+%   c) The speedup is limited because the frequent recomputation
+% 4. Few research was working on the attention's sparsity itself. 
+%   a) For LLM, there are plenty of sparse attention (H2O, MInference, ...)
+% 5. In this work, we find there are mainly two sparse pattern for 3D-DiT attention, intra-frame and inter-frame correlation
+% 6. We use an online sampling-based method to select the best sparse attention pattern for each attention head at different diffusion step.
+%   a) We sample some queries randomly (less than 1%)
+%   b) We compute the full attention on the sampled queries and also compute the sparse patterns for the sampled queries.
+%   c) We compute the mse between the full attention output and the sparse attention output over the sampled queries to determine the best sparse pattern
+%   d) We compute the sparse pattern over all queries
+% 7. Contributions
+%       a) 3x speedup attention with no accuracy loss
+%       b) we are the first to detailedly explore these patterns
+%       c) observations: quantization errors across heads and layers
+
+
+\begin{figure}[h!]
+    \centering
+    \includegraphics[width=0.95\linewidth]{figure/svg-teaser-3-compressed.pdf}
+    \caption{\textbf{\sys{} accelerates video generation while maintaining high quality}. On CogVideoX-v1.5-I2V and Hunyuan-T2V, our method achieves a $2.28\times$ and $2.33\times$ speedup with high PSNR. In contrast, MInference \citep{jiang2024minference} fails to maintain pixel fidelity (significant blurring in the first example) and temporal coherence (inconsistencies in the tree trunk in the second example).}
+    \label{fig:teaser}
+\end{figure}
+
+
+
+\section{Introduction}\label{sec:introduction}
+
+
+Diffusion Transformers (DiTs)~\citep{peebles2023scalable} have recently emerged as a transformative paradigm for generative tasks, achieving state-of-the-art results in image generation. This success has been naturally carried over to video generation, with models adapting from a spatial 2D attention to a spatiotemporal \attn{}~\cite{arnab2021vivit,yang2024cogvideox,kong2024hunyuanvideo}, resulting in high-fidelity and temporally consistent outputs.
+Close-sourced models such as Sora and Kling, and open-sourced models including CogVideo~\citep{hongcogvideo} and HunyuanVideo~\citep{kong2024hunyuanvideo}, have showcased impressive capabilities in applications ranging from animation~\cite{guoanimatediff} to physical world simulation~\citep{liu2023world}. 
+
+\begin{figure}[t]
+    \centering
+    \begin{minipage}[t]{\linewidth}
+        \includegraphics[width=\linewidth]{figure/AttentionPortionBarChart2.pdf}
+        \caption{\textbf{Attention dominates the computation in video diffusion models.} For CogVideoX-v1 and -v1.5 with $17$k and $45$k context length, attention takes $51$\% and $73$\% of the latency, respectively. For HunyuanVideo with $120$k context length, attention can take over $80$\% amount of the runtime latency.}
+        \label{fig:intro-op-breakdown}
+    \end{minipage}
+\end{figure}
+
+Despite significant advances in generating high-quality videos, the deployment of video generation models remains challenging due to their substantial computation usage. For instance, HunyuanVideo requires almost an hour on an NVIDIA A100 GPU to generate only a $5$-second video, where the \attn{} accounts for more than $80$\% of end-to-end runtime (Figure~\ref{fig:intro-op-breakdown}). Moreover, due to the \textit{quadratic computational complexity} with respect to the context length~\cite{dao2022flashattentionfastmemoryefficientexact}, the attention can be much more dominant as the resolution and number of frames increase, as shown in Figure~\ref{fig:intro-op-breakdown}. 
+
+% To demonstrate this, we showcase the runtime breakdown of different operations involved in video generation with different context lengths. As shown in Figure~\ref{fig:intro-op-breakdown}, attention takes more than $50$\% runtime, limiting the end-to-end generation efficiency.
+
+
+Fortunately, attention in transformers is well-known for its sparsity, offering a great opportunity to reduce redundant computation. For example, in large language models (LLMs),  a small portion of the tokens can dominate the attention output~\cite{zhang2023h2oheavyhitteroracleefficient, xiao2024efficientstreaminglanguagemodels, tang2024questqueryawaresparsityefficient}. Therefore, the computation can be dramatically reduced by only computing the attention among such important tokens, while still maintaining generation accuracy. However, existing methods cannot be directly applied to DiTs (as shown in Table~\ref{table:accuracy_efficiency_benchmark}), as video data has fundamentally different sparsity patterns from text data.
+
+\begin{figure*}[ht]
+    \centering
+    \includegraphics[width=\textwidth]{figure/PatternVisualization4_cropped2.pdf} 
+        \captionof{figure}{We observe two types of attention maps with distinct sparse patterns: \textit{spatial map (b)} and \textit{temporal map (d)}. Based on the attention map, we classify all attention heads into \textit{\SpatialHead{} (a)} and \textit{\TemporalHead{} (c)}, which contribute to the spatial and temporal consistency of generated videos respectively. As visualized in (e), \spatialhead{} primarily focuses on all tokens within the same frame (painted as red). In contrast, \temporalhead{} attends to tokens at the same position across all frames (painted as green).
+        }
+        \label{fig:spatial-temporal-illustration} 
+\end{figure*}
+
+
+Our key observation is that attention heads in DiTs exhibit inherent sparsity in two categories: \textit{\SpatialHead{}} and \textit{\TemporalHead{}}, based on their distinct sparsity patterns. As shown in Figure~\ref{fig:spatial-temporal-illustration}, \spatialhead{} mainly focuses on tokens that reside within the same frame, which determines the spatial structures of generated videos. In contrast, \temporalhead{} attends to tokens at the same spatial location across all frames, contributing to the temporal consistency. Therefore, the computation for both types of heads can be greatly reduced by only calculating the attended tokens.
+
+
+Despite the theoretical speedup, leveraging sparsity for end-to-end acceleration is still challenging. Firstly, sparsity patterns are highly dynamic across different denoising steps and input prompts. It necessitates an online method to identify sparsity patterns without incurring overhead. Secondly, some sparsity patterns are unfriendly to hardware accelerators. For example, \temporalhead{} computes over noncontiguous data that cannot be fed to GPU's tensor cores, resulting in significant efficiency degradations~\cite{ye2023sparsetircomposableabstractionssparse}.
+
+To tackle these challenges, we propose Sparse VideoGen (\sys{}), a training-free framework that accelerates video DiTs with the following novel designs: (1) To efficiently identify the best sparsity pattern for each attention head, \sys{} introduces an \onlinesample{} with minimal overhead ($\sim$3\%). It randomly samples 1\% tokens from each attention head and processes sampled tokens with full attention computation and two distinct sparse attentions (\spatialhead{} and \temporalhead{}). Finally, the sparse pattern with a lower error compared to the full attention is selected for each head. (2) To improve hardware efficiency, \sys{} proposes a novel \reorder{}, which reorders the noncontiguous sparsity pattern of \temporalhead{} into a compact and hardware-friendly sparsity pattern.
+
+We prototype \sys{} with customized kernel implementation by Triton~\cite{Tillet2019TritonAI} and FlashInfer~\cite{ye2025flashinferefficientcustomizableattention} and evaluate \sys{}'s accuracy and efficiency on representative open video generative models including CogVideoX-v1.5-I2V, CogVideoX-v1.5-T2V, and HunyuanVideo-T2V. \sys{} delivers significant efficiency improvements, achieving an end-to-end speedup of up to $2.33\times$ while maintaining high visual quality with a PSNR of up to 29, outperforming all prior methods. Additionally, we show that \sys{} is compatible with FP8 quantization, enabling additional efficiency gains without compromising quality. We summarize our key contributions as follows:
+
+\begin{itemize}[leftmargin=*]
+    \vspace{-5pt}
+    \item 
+    We conduct in-depth analyses of video DiTs' sparse patterns, revealing two inherent sparse attention patterns (\temporalhead{} and \spatialhead{}) for efficient video generation. 
+    %\SH{here readers will think this is a 2-class classification, and confuse with previous paragraph's 3-class}.
+    \item We propose \sys{}, a training-free sparse attention framework comprising an efficient \onlinesample{} and an efficient inference system for accurate and efficient video generation.
+    \item \sys{} delivers significant speedup while maintaining good video generation quality, paving the way for practical applications of video generative models. 
+\end{itemize}
+
+
+\begin{figure*}[t]
+    \begin{minipage}{\textwidth}
+        \centering
+        \includegraphics[width=0.95\textwidth]{figure/AlgorithmOverview2.pdf}
+        \captionof{figure}{Overview of \sys{} framework. (a) During generation, \sys{} adaptively classifies each attention head as either a \textit{\spatialhead{}} or a \textit{\temporalhead{}} and applies a dedicated sparse attention computation accordingly. (b) This adaptive classification is driven by \onlinesample{}, which extracts a small portion of $Q$, denoted as $Q_p$, to perform both spatial and temporal attention computations. \sys{} then selects the attention patter that yields the minimal MSE compared to full attention, ensuring accurate classification.}
+        \label{fig:algorithm_overview}
+    \end{minipage}
+\end{figure*}
+

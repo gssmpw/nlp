@@ -1,0 +1,364 @@
+\section{Method}
+
+We address the problem of task-based navigation and mapping while incrementally building a map of the environment that (1) provides a sparse, hierarchical and semantic representation for navigation that can be adapted for different tasks in real-time and (2) contains a dense geometric representation for collision-free planning.
+%
+We first present the bottom-up hierarchical mapping approach and then the top-down planning approach. 
+The methods interact with each other through new images acquired by taking an action.
+
+
+We seek a solution to the problem within a subclass of policies. 
+These policies first map the history of observations to a representation of the map as a vector of Gaussian parameters.
+They subsequently solve a trajectory planning problem that maximizes the progress towards achieving the specified task while retaining safety. 
+Such a policy might be summarized in the following steps:
+\begin{enumerate}
+\item $\hat{M}_{t}, \hat{x}_{t} \leftarrow MAPPER(y_{1:t})$ (described in section \ref{sec:mapping})
+\item $\mathcal{P}_{info} \leftarrow DISC(\hat{M}_{t}, \hat{x}_{t})$ (described in section \ref{sec:planning})
+\item $\mathcal{P}_{dyn} \leftarrow CTS(\hat{M}_{t}, \hat{x}_{t}, \mathcal{P}_{info})$ (described in section \ref{sec:trajopt}),
+\end{enumerate}
+where $DISC$ refers to the discrete planner and $CTS$ refers to the continuous planner. 
+
+
+\subsection{Hierarchical Semantic Perception}
+\label{sec:mapping}
+
+\textbf{Gaussian splatting.}
+A map of the scene is built with a set of Gaussians, each containing parameters comprising the mean $\mu$, covariance $\Sigma$, color $c$ and opacity $o$. To render an image at a given camera pose, the Gaussians are sorted and splatted on to the image space. Each splatted 3D Gaussian will have a corresponding 2D mean $\mu_{2D}$ and covariance $\Sigma_{2D}$ in the image space. The color of a pixel p is obtained according to:
+\[
+C_p = \sum_i^n c_i \alpha(p)_i \prod_j^{i-1}(1-\alpha_j)
+\]
+where
+\[
+\alpha_i(p) = o_i \cdot \exp(-\frac{1}{2}(p - \mu_{2D,i})^T\Sigma_{2D,i}^{-1}(p-\mu_{2D,i}).
+\]
+Depth can be similarly obtained by splatting the means of the Gaussians. In an incremental mapping approach, Gaussians are initialized at each mapping step and subsequently optimized. From a single color and depth observation, each pixel is back-projected to form a 3D pointcloud. A Gaussian is initialized at each 3D point with its corresponding color. The parameters of the Gaussians are optimized by rendering color and depth image through the differentiable rasterization process and a loss is computed against the original color and depth observations.
+
+\textbf{Dense language features.}
+For each observation $y_t$, we extract dense pixel-level language features $\mathbf{F}_{t} \in \R^{N_f}$ via the feature map $\Phi : \mathcal{Y} \rightarrow \mathcal{Z}$.
+In contrast to other approaches that compute and fuse multi-scale embeddings from CLIP and other foundation models, we use a lightweight approach from CLIP-DINOiser~\cite{wysoczanska2025clip}, which refines MaskCLIP~\cite{dong2023maskclip} features by incorporating localization priors extracted with self-supervised features from DINOv2~\cite{oquab2023dinov2}.
+
+\textbf{Language-embedded 3D Gaussian splatting.}
+We build our semantic mapping approach on language-embedded 3D Gaussian splatting. We optimize isotropic Gaussian parameters to enable rendering of scenes. 
+In addition to color and opacity, we embed a compressed language feature vector $\tilde{\textbf{F}_t} \in \R^{N_c}$ in each Gaussian's parameters.
+For a given camera pose, a reconstructed feature image $\hat{\textbf{F}_t} \in \R^{N_c}$ is rendered from the scene and the loss is computed against the original compressed feature image $\tilde{\textbf{F}_t}$ to optimize the Gaussian parameters.
+
+
+\textbf{Feature compression.}
+To capture rich semantic information, language features are typically high-dimensional vectors. For efficient computation and storage of language features in the Gaussians' parameters, we require a compact representation of the language features in the form of $\tilde{\textbf{F}}$.
+
+Most language-embedded Gaussian splatting approaches leverage alternate representations like features fields \cite{kerr2023lerf, yu2024language} or scene-specific autoencoders \cite{qin2024langsplat} to obtain $\tilde{\textbf{F}}$.
+However, these approaches do not generalize well to new and unknown environments.
+We perform dimensionality reduction on the feature space via Principal Component Analysis (PCA).
+To obtain a representative distribution of CLIP embeddings, we use Incremental Principal Component Analyis~\cite{ross2008incremental} (IPCA) to fit the COCO~\cite{lin2014microsoft} 2017 dataset.
+We note that different and larger datasets can be used as well.
+The computation of the basis vectors is done offline.
+At runtime, we simply need to project the features on to these vectors to obtain the principal components.
+
+For each image, we extract the full $N_f$-dimensional language features, obtain the first $N_c$ principal components and embed them in the map through the 3D Gaussian splatting process. We can then recover the original dimensions of the features with the inverse of the PCA for computing similarity with the task embeddings.
+
+
+\textbf{Submapping.}
+%
+\begin{figure}
+    \centering
+    \includegraphics[width=0.98\linewidth, trim={2.5cm 9cm 2.5cm 3cm},clip]{diagrams/LocalMapIllustration.pdf}
+    \caption{An illustration of the different parameters that are relevant to the submapping and collision checking process. $X_s$ denotes the current position of the robot, $X_l$ is the local goal along the path to the final goal $X_{goal}$. Submaps are loaded within the region bounded by $R_{loc}$.}
+    \label{fig:submap_collision}
+\end{figure}
+In this work, we augment the 3D Gaussian splatting framework with submaps. 
+As the robot navigates the environment, it receives color and depth measurements together with its estimated odometry, and incrementally builds a map.
+Since Gaussians are added at every mapping iteration, the number of Gaussians in the map can quickly grow to the order of millions of Gaussians and this can be challenging to manage on a SWaP-constrained robot. 
+To enable large-scale operations, our proposed mapping system efficiently creates submaps as the robot explores the environment. 
+
+By design, each submap contains a 6 degree-of-freedom (DoF) anchor pose which serves as the reference frame of its local coordinate system.
+The submap stores all parameters of the 3D Gaussians relative to the anchor pose.
+In every mapping iteration, the robot loads all submaps within the range $R_{loc}$ into the GPU memory and offloads any other submaps that are currently on the GPU.
+If there are no submaps within a specified range $r_{submap}$, the robot creates a new submap with a unique ID and the last odometry measurement as the anchor pose.
+Every Gaussian instantiated from a measurement $y_t$ is associated with the submap corresponding to $x_t$.
+These Gaussians are stored in the local reference frame of the submap.
+
+The submap design ensures safe and efficient navigation while significantly reducing the number of Gaussians that need to be considered by the continuous planning module~\ref{sec:trajopt}.
+As an example, in Fig.~\ref{fig:submap_collision}, the continuous planning module only plans on a map with 369,513 Gaussians instead of the global map which contains 2.47 million Gaussians. This drastically reduces the number of operations for collision checking and hence improves the planning efficiency. 
+In contrast to traditional voxel-based mapping that has a fixed discretization, our map design does not preallocate memory for the Gaussians, allowing for a flexible storage structure.
+This flexibility allows for denser maps in cluttered environments and sparser maps in large open spaces.
+
+Our submap design can also accomodate pose corrections from any underlying Simultaneous Localization and Mapping (SLAM) algorithm.
+This ensures map consistency across large-scale operations with multiple loop closures.
+Our method incorporates external pose graph corrections by updating the anchor poses of the submaps.
+For efficiency, we assume that the keyframes associated with each submap are locally consistent and are rigidly attached to the submap reference frame.
+
+\textbf{Metric-semantic clustering}
+In unstructured environments, approaches such as those in \cite{conceptgraphs, maggio2024clio, werby2024hierarchical} that use image segmentation priors may fail to give meaningful object clusters.
+We instead perform metric-semantic clustering on the language-embedded Gaussians directly. For the set of Gaussians in each submap, we compute the pairwise distances $q$ between all points using a sum of Euclidean distance $q_e$ and cosine-similarity $q_s$ of the compressed language feature vectors of each Gaussian, weighted by a parameter $\lambda$.
+\[
+    q = q_e + \lambda \cdot (1 - q_s)
+\]
+With the computed distance matrix, we perform agglomerative clustering to create object-level clusters in a hierarchy.
+For this work, we partition these clusters into three levels -- the submap, region and object levels.
+We note that unlike other feature compression methods, we can perform this clustering with our embedded features directly since the components from IPCA still retain important semantic features.
+This negates the need to recover the full feature dimensions, allowing for efficient dense clustering online.
+
+For a given task, we compute the utility of each submap by querying the object-level clusters to obtain a task-relevancy score.
+These clusters would correspond to the leaf nodes of the tree.
+From these clusters, we propagate the object-level relevancy up the tree to obtain utility scores for region- and submap-level nodes.
+Following Eq.~\ref{eq:propagation}, the utility of each node in the tree is the sum of the utilities of its children.
+The utility at the root of the tree serves as the corresponding utility of that submap. 
+This submap-level cluster information is stored in each submap along with the Gaussian splatting parameters.
+
+\subsection{Hierarchical Planning}
+\label{sec:planning}
+Since we care about potentially large-scale environments, we turn our attention to a hierarchical planning strategy with a discrete planner responsible for long-term reasoning and a continuous trajectory planner responsible for finding dynamically-feasible trajectories.
+
+%
+\begin{problem}
+\label{prob:1}
+\textbf{Discrete planning.} Given a set of vantage points and their associated utilities $(X,\Gamma)$ and task embedding $z$, we find the optimal sequence of vantage points $\mathcal{P}=x_1x_2...x_k$ that maximizes the utility along the path while staying within a given travel budget $\mathcal{B}$.
+\end{problem}
+Letting $w$ be a function on pairs of points $w: (x_i, x_j) \rightarrow [0, \infty)$, we solve
+\begin{equation}
+    \begin{aligned}
+        \max_{\mathcal{P} = (x_{1:k})} & \ \psi\left(z, y_{0:k}\right) \\
+        \text{subject to} & \\ 
+        \sum_{i = 1}^{k-1} w(x_{i}, x_{i+1}) & \leq \mathcal{B} \\
+        y_k & = h(x_k, m) \ \forall x_k \in \mathcal{P}
+    \end{aligned}
+\end{equation}
+
+Problem \ref{prob:1} requires us to find a sequence of vantage points (through the sparse components of the map in Fig.~\ref{fig:system-diagram}) from which the collected images $y_{0:k}$ maximize the chance of completing the task. 
+%
+We make a few simplifying assumptions at this stage: (i) that the locations are not correlated \ie that taking a measurement at $x_i$ does not affect the utility of $x_j \ \forall j \neq i$;  (ii) the path between a pair of points with weight $w \leq d_{wire}$ lies in free-space and (iii) visiting a vertex is enough to collect the information regardless of the orientation required for acquiring the image from the vantage point.
+
+With these assumptions, we can construct this problem as a graph search problem.
+We construct a graph $G = (V, E)$, whose vertices are the set of vantage points $X$.
+The utility function $\mathcal{u} : V \rightarrow [0, \infty)$ specifies the utility of each vertex. 
+The weight function on the edges is then $w : E \rightarrow [0, \infty)$ which is the Euclidean distance between the vertices.
+To find the optimal path we seek to solve the following problem:
+\begin{equation}
+\begin{aligned}
+% \max_{x \in \mathcal{P}} & \sum_{v \in \mathcal{P}}  \mathcal{u}(v) \\
+\max_{\mathcal{P} = (x_{1:k})} & \sum_{i = 1}^{k}  \mathcal{u}(x_{i}) \\
+\text{subject to} & \\
+%\sum_{e \in \mathcal{P}} w(e) & \leq \mathcal{B}. \\
+\sum_{i = 1}^{k-1} w(x_{i}, x_{i+1}) & \leq \mathcal{B}
+\end{aligned}
+\end{equation}
+
+Since the number of possible vertices is large \& we desire an efficient solution on-board low SWaP robots, we solve the latter problem in a hierarchical fashion.
+We assume the set of vertices is partitioned according to $V = \cup_{i = 1}^{p} V_{i}$ where $V_{i} \cap V_{j} = \emptyset$ for all $i \neq j$.
+We form a high level graph $\tilde{G} = (\tilde{V}, \tilde{E})$ whose vertex set $\tilde{V} = \{\tilde{v}_{1}, \tilde{v}_{2}, \dots, \tilde{v}_{p} \}$ corresponds to centroids of vertices in each partition. 
+For each vertex $\tilde{v}_i$ in $\tilde{V}$, we add an edge between $\tilde{v}_i$ and $\tilde{v}_j$ if $\vert\vert \tilde{v}_i - \tilde{v}_j \vert\vert_2 \leq d_{wire}$ for a user-defined parameter $d_{wire}$.
+Our path planning problem then involves finding the optimal path through this weighted graph whose cost does not exceed a given budget.
+The set of edges $\tilde{E} \subseteq \tilde{V} \times \tilde{V}$. 
+The weight function $\tilde{w} : \tilde{E} \rightarrow [0, \infty)$ specifies the weight of every edge in $\tilde{G}$ as the distance between centroids corresponding to the endpoint vertices. 
+The utility of every vertex in $\tilde{G}$ is given by the function $\tilde{\mathcal{u}} : \tilde{V} \rightarrow [0, \infty)$, with 
+\begin{equation}
+    \tilde{\mathcal{u}}(\tilde{v}_{i}) := \sum_{v \in V_{i}} \mathcal{u}(v).
+\label{eq:propagation}
+\end{equation}
+We first solve the high level problem:
+\begin{equation}
+\begin{aligned}
+\max_{\tilde{\mathcal{P}} = (\tilde{x}_{1:k})} & \sum_{i=1}^{k}  \tilde{\mathcal{u}}(\tilde{x}_{i}) \\
+\text{subject to} & \\
+\sum_{i = 1}^{k-1} \tilde{w}(\tilde{x}_i, \tilde{x}_{i+1}) & \leq \mathcal{B}. \\
+\end{aligned}
+\end{equation}
+We then plan the path through $G$ that visits the partitions $V_{i}$ in the order specified by the sequence of edges in $\mathcal{P}$.
+
+\textbf{Continuous trajectory planning.} 
+\label{sec:trajopt}
+%
+For the purpose of synthesizing feasible trajectories, we model the robot as an agent with unicycle dynamics.
+Its state $x = [p, \theta] \in \mathbb{R}^2 \times S^1$ consists of its position (on the ground plane $z = 0$), and heading angle $\theta$. 
+The control input $u = [v, \omega] \in \mathbb{R}^2$ consists of the translational and angular speed of the robot. 
+Its equations of motion are given by
+$\dot{x} = f(x,u)$, where $f : \mathbb{R} \times S^1 \times \mathbb{R}^2 \rightarrow \mathbb{R}^2 \times \mathbb{R}$ is defined as 
+\begin{equation}
+f(x, u) = 
+\begin{bmatrix}
+\cos{\theta} & 0 \\
+\sin{\theta} & 0 \\
+0 & 1 \\
+\end{bmatrix}
+\begin{bmatrix}
+v \\ 
+\omega \\
+\end{bmatrix}.
+\end{equation}
+
+The trajectory generation problem involves finding a dynamically feasible trajectory (per eq \ref{equ: low_level_planner}) that interpolates a given pair of boundary conditions.
+%
+We solve the problem as part of a receding horizon control scheme. 
+It is resolved at a set frequency, with the boundary conditions and free space updated using information based on accrued measurements. 
+We choose the furthest point along the path provided by the Discrete Planner that is within our planning horizon $H$ and treat this as the center of our goal region $\mathcal{X}_{goal}$ for each iteration.
+%
+\begin{problem}
+\label{prob:continous}
+\textbf{Continuous Trajectory Planning.} 
+Given an initial robot state $x_{0} \in \mathcal{X}_{free}$, and goal region $\mathcal{X}_{goal}$, find the control inputs $u(\cdot)$ defined on $[0,\tau]$ that solve:
+\begin{equation}
+\begin{aligned}
+    & \min_{u(\cdot), \tau}  \ J( u(\cdot), \tau) \\
+    & s.t. \ \text{for all }  t  \in [0,\tau] \\
+        &\dot{x}(t) = f(x(t), u(t)) , \  x(t) \in \mathcal{X}_{free},\\ 
+        &|| v(t) ||_2 \leq v_{max},  \  | \omega(t) | \leq \omega_{max}, \\ % 
+        &x(0), \theta(0) = x_0, \theta_{0},   \  x(\tau) \in \mathcal{X}_{goal}.\\ 
+\end{aligned}
+\label{equ: low_level_planner}
+\end{equation}
+%
+\label{prob:low-level-planning}
+\end{problem}
+
+Problem \ref{prob:continous} is a high-dimensional non-convex optimization problem. 
+Two key hurdles from a computational standpoint are the nonlinear dynamics of the robot as well as the presence of obstacles in the environment. 
+We therefore adopt a search-based procedure, motivated by the idea presented in~\cite{liu2017mpl}.
+In particular, we seek the minimum weight path in a directed graph formed by discretizing the continuous state space of the robot. 
+The vertices of the graph correspond to select states, whereas the edges correspond to motion primitives emanating from a particular state that remain within $\mathcal{X}_{free}$. 
+Each motion primitive is obtained by integrating a feasible fixed control input for a time interval $\delta t$. 
+This ensures that any path through the graph represents a dynamically viable trajectory without taking collisions into account. 
+The set of fixed controls is represented as the Cartesian product of uniform discretizations of spaces of feasible translational and angular speeds. 
+The set of feasible translational (angular) speeds, $[-v_{max}, v_{max}]$ ($[-\omega_{max}, \omega_{max}]$), is discretized by a grid of size  $N_{v}$ ($N_{\omega}$). 
+%
+In order to determine whether an edge of the graph lies in free space, we first discuss how we check whether the robot collides with an object in the environment.  
+To this end, we treat the robot as a normal random variable $R \sim \mathcal{N}(\mu_{rob}, \Sigma_{rob})$ with mean $\mu_{rob} \in \mathbb{R}^3$ and covariance $\Sigma_{rob} \in S_{++}^{3}$.
+We consider the robot to be in collision with a Gaussian point represented by the normal random variable $G_{i} \sim \mathcal{N}(\mu_{i}, \Sigma_{i})$ if their distance is below a specified collision radius $r_{coll} > 0$. 
+Defining the predicate $collide(R,G)$ that evaluates to true if the realizations of $R$ and $G$ represent a configuration in which a collision occurs, we have
+\begin{equation}
+collide(R, G_{i}) \Leftrightarrow || R - G_{i} ||_2 \leq r_{coll}.
+\end{equation}
+%
+%
+Since we have an uncertain map, the chance constraint $\mathbb{P}(x \in X_{free}) \geq 1 - \eta$ amounts to 
+\begin{equation}
+    \mathbb{P}( \cup_{G_{i} \in \hat{M}} \ collide(R, G_{i}) )\leq \eta,
+\end{equation}
+where $R$ is a random normal variable whose mean consists of the translational components of $x$, and whose variance is equal to $\Sigma_{rob}$. 
+We consider an edge of the graph corresponding to a motion primitive to lie within $\mathcal{X}_{free}$ just when each of the discretization points along the edge are collision-free per the equation above. 
+
+Since the number of Gaussians representing the environment is often very large, we compute approximate collision probabilities in a way that does not require iterating through all the Guassians for every potential collision point. 
+To prune away a large number of collision checks at the expense of a specified (small) tolerance in the error of estimation of the collision probability, we seek the smallest ``local radius'' $R_{loc}$ such that the probability of colliding with obstacles whose means lie within the radius is to within $p_{tol}$ of colliding with any of the obstacles in the whole environment. 
+The main point is that a smaller value of $R_{loc}$ allows us to focus on collision checking within a localized region of space, thus significantly decreasing both the running time and memory complexity of the collision-checking procedure without sacrificing safety of the robot. 
+To determine a meaningful value of $R_{loc}$, we seek an upper bound on the probability of collision with a Gaussian point whose mean lies at distance at least $R_{loc}$ from the robot. From the union bound, we have 
+\begin{equation}
+\begin{aligned}
+& P(\exists G_{i} \in \hat{M} \ : \ || \mu_{i} - \mu_{rob} ||_2 \geq R_{loc}, \ collide(R, G_{i})) \leq \\
+& \sum_{i \ : \ || \mu_{i} - \mu_{rob} ||_2 \geq R_{loc}} P( collide(R, G_{i}) ). 
+\end{aligned}
+\end{equation}
+Assuming that $R$ and $G_{i}$ are independent normal variables, we have that
+\begin{equation}
+R - G_{i} \sim \mathcal{N}(\mu_{rob} - \mu_{i}, \Sigma_{rob} + \Sigma_{i}),
+\end{equation}
+resulting in
+\begin{equation}
+\begin{aligned}
+& \hspace{20mm} \mathbb{P}( collide(R, G_{i}) ) = \\
+& \mathbb{P}( || (\mu_{rob} - \mu_{i}) + (\Sigma_{rob} + \Sigma_{i})^{\frac{1}{2}} Z_{std} ||_2 \leq r_{coll}),
+\end{aligned}
+\end{equation}
+where $Z_{std} \sim \mathcal{N}(0, I_{3})$ is a standard normal random variable used throughout the subsection. 
+%
+To make the calculation above more tractable, we assume that $\Sigma_{rob} = diag(\sigma_{rob}^2, \sigma_{rob}^2, \sigma_{rob}^2)$ and $\Sigma_{i} = diag(\sigma_{i}^2, \sigma_{i}^2, \sigma_{i}^2)$. 
+Hence we get 
+\begin{equation}
+\begin{aligned}
+& \hspace{20mm} \mathbb{P}( collide(R, G_{i}) ) = \\
+& = \mathbb{P}\left( \left|\left| \frac{\mu_{rob} - \mu_{i}}{\sqrt{\sigma_{rob}^2 + \sigma_{i}^2}} + Z_{std} \right|\right|_2 \leq \frac{r_{coll}}{\sqrt{\sigma_{rob}^2 + \sigma_{i}^2}} \right) \\
+& = \mathbb{P} \left( Z_{std} \in \mathcal{B}\left( \mathbf{e}_1 \frac{|| \mu_{rob} - \mu_{i} ||_{2}}{\sqrt{\sigma_{rob}^2 + \sigma_{i}^2}} ; \frac{r_{coll}}{\sqrt{\sigma_{rob}^2 + \sigma_{i}^2}}  \right) \right),
+\end{aligned}
+\end{equation}
+where the last inequality follows from the isotropic nature of the standard normal random variable. 
+Plugging in the latter equality into the union bound, and denoting 
+\begin{equation}
+S_{far}(R_{loc}) = \{ G_{i} \in \hat{M} \ : \ || \mu_{i} - \mu_{rob}||_2 \geq R_{loc} \},
+\end{equation}
+we get 
+\begin{equation}
+\begin{aligned}
+& \mathbb{P}(\exists G_{i} \in \hat{M} \ : \ || \mu_{i} - \mu_{rob} ||_2 \geq R_{loc}, \ collide(R, G_{i})) \leq  \\
+& \sum_{S_{far}} P \left( Z_{std} \in \mathcal{B}\left( \mathbf{e}_1 \frac{|| \mu_{rob} - \mu_{i} ||_{2}}{\sqrt{\sigma_{rob}^2 + \sigma_{i}^2}} ; \frac{r_{coll}}{\sqrt{\sigma_{rob}^2 + \sigma_{i}^2}}  \right) \right) \leq \\
+& \sum_{S_{far}} \mathbb{P} \left( Z_{std} \in \mathcal{B}\left( \mathbf{e}_1 \frac{R_{loc}}{\sqrt{\sigma_{rob}^2 + \sigma_{i}^2}} ; \frac{r_{coll}}{\sqrt{\sigma_{rob}^2 + \sigma_{i}^2}}  \right) \right) \approx \\
+& | \{ S_{far}(R_{loc}) \} | \  \mathbb{P} \left( Z_{std} \in \frac{\mathcal{B}(\mathbf{e}_1 R_{loc}; r_{coll})}{\sqrt{\sigma_{rob}^2 + \sigma_{avg}^2}} \right),
+\end{aligned}
+\end{equation}
+where in the last equality we made the approximation that the characteristic size of Gaussian points is $\sigma_{avg}$. 
+Finally, we assume that the density of Gaussian points is approximately uniform, and equal to $\rho$. 
+Therefore, denoting the number of all Gaussians in the global map by $N$, we make the last approximation 
+\begin{equation}
+| \{ G_{i} \in \hat{M} \ : \ || \mu_{i} - \mu_{rob} ||_2 \geq R_{loc} \} |  \approx 
+\left( N - \frac{4}{3}R_{loc}^{3} \pi \rho \right),
+\end{equation}
+resulting in the following estimate 
+\begin{equation}
+\begin{aligned}
+& P ( \exists G_{i} \in \hat{M} \ : \ || \mu_{i} - \mu_{rob} ||_2 \geq R_{loc}, \ collide(R, G_{i})) \lesssim \\
+& \left( N - \frac{4}{3}R_{loc}^{3} \pi \rho \right) \ P \left( \mathcal{N}(0, I_{3}) \in \frac{\mathcal{B}(\mathbf{e}_1 R_{loc}; r_{coll})}{\sqrt{\sigma_{rob}^2 + \sigma_{avg}^2}} \right). &
+\end{aligned}
+\end{equation}
+We are interested in finding the smallest $R_{loc}$ so that the very last expression, a monotonically decreasing function of $R_{loc}$, is below a specified tolerance $p_{tol}$. 
+Algorithmically we find this value via binary search (on the value of $R_{loc}$).
+
+The expression for the probability that a standard normal random variable in 3D lies inside the ball $\mathcal{B}(\mathbf{e}_{1} a;  b)$ may be obtained as 
+\begin{equation}
+\begin{aligned}
+& prob(a,b) = \\
+& = \int_{a-b}^{a+b} \frac{dx}{\sqrt{2\pi}} e^{-\frac{x^2}{2}} \left( 1 - \exp\left\lbrace -\frac{1}{2}(b^2 - (x-a)^2) \right\rbrace  \right) \\
+& = \int_{a-b}^{a+b} \frac{dx}{\sqrt{2\pi}} e^{-\frac{x^2}{2}}
+\ - \ \frac{\exp\left\lbrace \frac{1}{2}(a^2 - b^2) \right\rbrace}{\sqrt{ 2\pi }} \int_{a-b}^{a+b} e^{-ax} dx \\
+& = F_{normal}(c) \Big\vert_{c = a-b}^{c = a+b} -  \frac{\exp\left\lbrace -\frac{1}{2}((a-b)^2 - (a+b)^2) \right\rbrace}{\sqrt{ 2\pi } \ a},
+\end{aligned}
+\end{equation}
+where $F_{normal}(c) := \int_{-\infty}^{c} \frac{dx}{\sqrt{2\pi}} \exp\lbrace -\frac{x^2}{2} \rbrace$ is the cumulative distribution funtion of the 1D standard normal variable. 
+In the previous equation, we used the elementary fact that the probability that the standard normal variable in 2D lies outside a sphere (in this case - disk) of radius $r$ centered on the origin is $\exp\lbrace -\frac{r^2}{2} \rbrace$.
+Furthermore, for a fixed value of $b > 0$, $prob(a,b)$ is a monotonically decreasing function of $a$ on $[0, \infty)$. 
+The latter observation may easily be seen by noting that the reflection about the plane that passes through the midpoint of two spheres ($S_{near}$ and $S_{far}$) of the same radius whose centers lie on a ray emanating from the origin, with the center of $S_{near}$ being closer, maps $S_{near} \setminus S_{far}$ to  $S_{far} \setminus S_{near}$ in a way that leaves the Lebesgue measure intact while decreasing the density of the standard normal variable.
+
+The cost of each valid motion primitive is defined as  
+\[
+   J(u(\cdot), \tau) := \lambda_{t} \tau + (v^2 + w^2) \tau,
+\] 
+where $\lambda_{t}$ weights the time cost with the control efforts. Since the maximum velocity of the robot is bounded by $v_{max}$, we consider the minimum time heuristic as 
+\[
+h(p) := ||p_{goal} - p||_{2}/v_{max}.
+\]
+Finally, we use A* to search through the motion primitives tree.
+%
+
+\subsection{Implementation details}
+%
+\subsubsection{Mapping}
+We build our mapping module on the Gaussian splatting method presented by \cite{keetha2024splatam}.
+The most significant modifications are the submapping framework with pose estimates from visual-inertial odometry and the addition of Gaussian parameters for the language features.
+We note that any other Gaussian splatting method can be used as well if it can meet the compute and latency requirements.
+We compress the $N_f=512$ dimensional CLIP features to $N_c=24$ dimensions for embedding in the Gaussian parameters.
+We set the submap size $r_{submap}$ to 2 meters for indoor experiments and 5 meters for outdoor experiments.
+We resize the image stream to 320 $\times$ 240 for mapping and set the maximum depth range to 5 meters.
+To balance compute resources between the various modules, we limit the map update rate to 1 Hz.
+
+\subsubsection{Planning}
+We implemented both the discrete and continuous planning module in Python 3.8 with Pytorch 2.4.1 and implement the motion planning library from~\cite{liu2017mpl}.
+We set $p_{tol}$ to 0.001 and $\sigma_{rob}$ to 0.7 meters, and compute $R_{loc}$ to be 10 meters.
+The planning horizon $H$ is set to 5 meters.
+We adopted the idea of parallelized collision checks from~\cite{tao2024rt} to enable efficient continuous planning online.
+The discrete planner runs onboard the robot every 5 mapping iterations while the continuous planner runs at 1 Hz. 
+\subsubsection{Task specification}
+The task is specified in natural language by the user.
+We use a Vit-B-16 encoder for the CLIP backbone.
+Text embeddings are computed from the task prompt using the CLIP text encoder~\cite{liao2024clip}.
+These text embeddings are used for computing the relevancy of the feature embeddings in the map to the task.
+Task re-specification is done in the same way.
+In addition, the relevancy of all submap object clusters are recomputed and their relevancy scores are propagated up the hierarchical tree of each submap.
+We note that we do not need to re-cluster the submaps for each new task and only need to recompute the relevancy of the features embeddings of the clusters.
+Hence we have a consistent hierarchical submap structure that can be efficiently re-queried for various tasks.
+\subsubsection{Task termination}
+We use LLaVA OneVison~\cite{li2024llava} to determine if the task has been completed. 
+Given the language features of the current observation, we mask out pixels that are beyond the maximum depth range and compute the relevancy of the remaining pixels against the task.
+If the relevancy is beyond a threshold, we query the VLM module with the image and the task.
+We ask it to reply with a yes or no and a description of the scene.
+One such example is visualized in Fig.~\ref{fig:cushions_viz}.
+
+\subsubsection{Robot Platform}
+In all of our robot experiments, we used a Clearpath Jackal robot platform. 
+It is modified to carry an onboard computer with AMD Ryzen 5 3600 CPU, NVIDIA RTX 4000 Ada SFF GPU and 32 GB of RAM. 
+Additionally, the robot is equipped with a ZED 2i stereo camera for obtaining RGB, depth and pose measurements using the first generation position tracking module. 
+It also carries an Ouster OS1-64 LiDAR to generate ground truth odometry for evaluation. 

@@ -1,0 +1,79 @@
+\subsection{Lightweight Long Context Draft Model (LED)}
+% 还要说明我们需要长文本能力 balbalbla, 是由cross建模的
+\subsection{Anchor-Offest Indexing}
+\subsection{Hybrid Tree Attention}
+
+
+To address the above challenges, we propose three key innovations. First, we propose a novel KV caching mechanism that ensures constant memory usage regardless of context length. Second, we invent a sink position ID that enables seamless adaptation from short-context training to long-context inference, overcoming the limitations imposed by fixed RoPE bases. Moreover, we introduce a new attention aggregation method that combines Flash Attention for prefix computation with standard attention for tree mask handling, achieving compatibility and efficiency in speculative decoding. These contributions collaboratively pave the way for a more efficient and scalable speculative decoding framework tailored for long-context applications.
+
+\begin{figure}
+    \centering
+    \includegraphics[width=\linewidth]{Figure/1.pdf}
+    \caption{Enter Caption}
+    \label{fig:enter-label}
+\end{figure}
+
+\subsection{Memory-Efficient Draft Model}
+
+Although the state-of-the-art method EAGLE~\cite{li2024eagle} has demonstrated remarkable success in short-context speculative decoding, its applicability to long-context scenarios is limited. This limitation arises because EAGLE requires access to the target model's hidden states, which are not typically retained in conventional inference settings. Storing these hidden states would impose significant memory overhead, making the approach impractical for scenarios with extensive context lengths.
+
+To address this challenge, we adopt GliDe~\cite{du2024glide}, an alternative method that relies on the key-value (KV) cache of the target model for speculative decoding. The GliDe model is composed of three core components: a self-attention module, a cross-attention module, and a feedforward network (FFN) module. Input tokens are first passed through an embedding layer shared with the target model, ensuring that GliDe generates the same embeddings as the target model. Using these embeddings, the self-attention module produces high-quality query states. Subsequently, the cross-attention module computes the attention scores between the query states and the KV cache from the last layer of the target model. Finally, the FFN module, in conjunction with the target model's language modeling (LM) head, generates the speculated tokens. Because the KV cache is an inherent feature of transformer-based architectures and is always retained during inference, integrating GliDe does not impose any additional memory requirements on the target model. This design makes GliDe a more scalable and resource-efficient solution for speculative decoding in long-context scenarios.
+
+Despite GliDe's strong adaptability to long-context scenarios, the self-attention layer still maintains a KV cache that gradually grows over time as the sequence length increases. To address this issue, we introduce a slicing window mechanism for self-attention, where attention is computed only over a fixed-length window defined by the window size. Since the primary role of the self-attention layer is to generate high-quality query states, we believe that this modification does not rely heavily on long-context information. Subsequent experiments confirm this assumption. With this adjustment, the KV cache remains of fixed size during inference, ensuring that the memory usage of the entire model remains constant. This prevents the GPU memory requirements from increasing as the context length grows, thereby achieving a memory-efficient design.
+
+In order to further accelerate the training process of GliDe, we modify the implementation of the block-wise attention mask. The original GliDe uses this technique to ensure the consistency between the training stage and the inference stage regarding the use of the target model’s KV cache. Suppose that the target model has verified $t-1$ tokens and generated the $t$-th token. When the draft model is about to speculate the $(t+i)$-th token, the draft model can only access the target model's KV cache of the first $t-1$ tokens instead of the first $t+i-1$ tokens. To mitigate this issue, the original GliDe introduces the block-wise attention mask in the training stage: for a given attention matrix $A$, its block-wise variant should be written as:
+\begin{equation}
+    \mathrm{MaskBlock}\left(A_{jk}\right)=
+    \begin{cases} 
+        A_{jk}, & \text{if } \mathrm{block}(j)>\mathrm{block}(k), \\
+        -\infty & \text{otherwise.}
+    \end{cases}
+\end{equation}
+
+where $\mathrm{block}(j)$ is a function that returns the index of the block to which token $x_j$ belongs. However, such attention masks is not compatible with Flash Attention, which would reduce the training speed. To solve this problem, we will randomly mask the last few tokens of the input sequence and let the model learn to predict the subsequent tokens that are not adjacent to the current token, thus achieving an effect similar to the block-wise attention mask.
+
+\subsection{Sink Position ID}
+% 这里其实可以改成两阶段
+Conventional long-context training approaches are typically divided into three stages: pre-training on short texts with a small RoPE base, training on longer texts after expanding the RoPE (Rotary Position Embedding) base, and supervised fine-tuning (SFT). Throughout these stages, the RoPE base gradually increases, allowing the model to adapt incrementally to longer contexts. However, in the state-of-the-art methods for speculative decoding, this gradual adaptation does not hold. The draft model in speculative decoding requires access to certain outputs of the target model, such as hidden states or key-value caches. These outputs inherently encode the large RoPE base used by the target model. Consequently, the draft model must align with the target model by adopting the same large RoPE base, which introduces significant challenges during training.
+
+One primary issue arises when the draft model, trained on short texts in the first stage, is forced to extrapolate to longer contexts without any adjustment to its RoPE base. This sudden shift disturbs the relationship between the RoPE base and text length, making it difficult for the draft model to effectively handle long-context inputs. To address this issue, we propose Sink Position IDs, inspired by the concept of attention sinks. Sink Position IDs fix the initial few position indices, keeping them invariant to attention mechanisms. The remaining position indices are then adjusted with a randomly sampled skipping bias term. This adjustment ensures that the draft model is exposed to a variety of position index configurations during its initial training phase, enabling it to adapt to long-text data from the beginning.
+
+As illustrated in Figure \ref{}, this approach simulates long inputs by dynamically manipulating position indices within a fixed context window. Specifically, the context window is divided into two parts, the sink part and the skipping part, and a skipping bias term is added to the position indices of the skipping part. The bias term, as well as the length of the skipping part, vary across training samples. This design allows the model to adapt to both absolute and relative positions across the entire target context window during the first training stage. By maintaining the continuity of position indices within each part, this method closely resembles the original pre-training setup, preserving the model's pre-trained language modeling and comprehension capabilities well.
+
+\subsection{Attention Aggregation}
+
+Existing implementations of tree-based speculative decoding in Python are incompatible with Flash Attention due to the latter’s complex scheduling mechanisms, which do not support non-standard causal masks. This limitation is tolerable in the case of short texts, as the speedup provided by tree-based speculative decoding may compensate for the absence of Flash Attention. However, the situation changes dramatically in long-context settings. In such cases, the lack of Flash Attention can lead to significant memory overhead, potentially resulting in out-of-memory (OOM) errors. Flash Attention’s efficiency and memory optimization, particularly for handling large contexts, make it a necessity in these scenarios. 
+
+To address the incompatibility of tree-based speculative decoding with Flash Attention, we introduce a method called Attention Aggregation. The whole attention calculation can be formulated as calculating the attention score $\mathrm{Attn}\left(Q_{\mathrm{new}}, K_{\mathrm{all}}, V_{\mathrm{all}}\right)$, where
+\begin{align}
+    Q_{\mathrm{new}}&\in \mathbb{R}^{M \times d_{qk}}, \\
+    K_{\mathrm{all}} =
+    \begin{bmatrix}
+      K_{\mathrm{history}} \\
+      K_{\mathrm{new}}
+    \end{bmatrix}
+    &\in \mathbb{R}^{(M+N) \times d_{qk}}, \\
+    V_{\mathrm{all}} =
+    \begin{bmatrix}
+      V_{\mathrm{history}} \\
+      V_{\mathrm{new}}
+    \end{bmatrix}
+    &\in \mathbb{R}^{(M+N) \times d_v}.
+\end{align}
+
+Our method decomposes the attention calculation into two distinct parts to leverage Flash Attention where possible while accommodating the tree-based structure where necessary. The first component involves computing attention between the current query $Q_{\mathrm{new}}$ and the previously cached key-value (KV) pairs $K_{\mathrm{history}}$ and $V_{\mathrm{history}}$, formulated as $\mathrm{Attn}\left(Q_{\mathrm{new}}, K_{\mathrm{history}}, V_{\mathrm{history}}\right)$. This follows a chain structure, which is inherently compatible with Flash Attention. Flash Attention excels in this context by efficiently handling large-scale attention matrices through optimized memory and computation scheduling. The second component calculates attention between the current query $Q_{\mathrm{new}}$ and the current set of key-value pairs $K_{\mathrm{new}}$ and $V_{\mathrm{new}}$, formulated as $\mathrm{Attn}\left(Q_{\mathrm{new}}, K_{\mathrm{new}}, V_{\mathrm{new}}\right)$. This follows a tree structure, which requires a more flexible, standard implementation of attention due to its irregular causal masking patterns. This decomposition ensures that each component is processed using the most suitable attention mechanism.
+
+After both components of attention are computed, their respective intermediate results, the logarithmic values of the exponential sums ($\mathrm{LSE}_{hist}$ and $\mathrm{LSE}_{new}$), are preserved separately. These sums represent the normalization factors required for the softmax operation during attention computation. By retaining these values, we maintain precision and ensure consistency when combining the results. The final step involves aggregating the two attention components to produce a unified result. This is achieved by combining the corresponding weighted attention scores using their preserved exponential sums. 
+
+\begin{proposition}
+    \label{pro:attn_aggr}
+    The aggregated attention can be expressed as:
+    \begin{multline}
+        \mathrm{Attn}\left(Q_{\mathrm{new}}, K_{\mathrm{all}}, V_{\mathrm{all}}\right) = \\
+        \sigma\left(\mathrm{LSE}_{\mathrm{history}}-\mathrm{LSE}_{\mathrm{new}}\right)\mathrm{Attn}\left(Q_{\mathrm{new}}, K_{\mathrm{history}}, V_{\mathrm{history}}\right) + \\
+         \sigma\left(\mathrm{LSE}_{\mathrm{new}}-\mathrm{LSE}_{\mathrm{history}}\right)\mathrm{Attn}\left(Q_{\mathrm{new}}, K_{\mathrm{new}}, V_{\mathrm{new}}\right),
+    \end{multline}
+    where $\sigma(\cdot)$ is the sigmoid function.
+\end{proposition}
+
+The proof of Proposition \ref{pro:attn_aggr} is provided in Appendix \ref{appendix:attn_aggr}. This formulation ensures that the contributions from both components are weighted appropriately based on their normalization factors. By combining chain-structured and tree-structured attention in this manner, our approach achieves compatibility with Flash Attention for the chain component, retaining its memory and speed benefits. At the same time, it accommodates the flexibility required for tree-based decoding. This hybrid approach not only ensures efficient utilization of memory resources but also extends the applicability of speculative decoding to long-context scenarios without sacrificing performance.

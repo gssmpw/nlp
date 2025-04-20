@@ -1,0 +1,104 @@
+\section{Designs of \ours}
+\label{methodology}
+
+\input{tables/tab_longbench}
+\input{tables/tab_infbench}
+\input{tables/tab_latency}
+\input{tables/tab_latency_offload}
+
+The complete descriptions of our algorithms are detailed in \Cref{sec:algorithm}. Here, we describe the overview of our design.
+
+\textbf{Background.} 
+Given query, key, and value sequences $\bm{Q}, \bm{K}, \bm{V} \in \mathbb{R}^{H\times T\times d}$, the conventional multi-head attention output $\bm{O}$ is computed as
+$\bm{O} = \text{Concat}[\bm{O}_1, \dots, \bm{O}_H]$, where
+$\bm{S}_h = \bm{Q}_h\bm{K}_h^\top \in \mathbb{R}^{T\times T}$,
+$\bm{P}_h = \mathrm{softmax}(\bm{S}_h) \in \mathbb{R}^{T\times T}$,
+$\bm{O}_h = \bm{P}_h\bm{V}_h \in \mathbb{R}^{T\times d}$ for all $h = 1..H$,
+where $H$ denotes the number of attention heads, $T$ denotes the sequence length, $d$ denotes the embedding dimension, and softmax is applied row-wise~\cite{vaswani_attention_2023}. The causal masking and constant scaling are omitted for brevity.
+The $\bm{S}$ and $\bm{P}$ matrices are each called the \textit{attention scores} and \textit{probabilities}.
+
+\textbf{Efficient Modular Context Pruning.} 
+As mentioned in \Cref{motivation}, \ours seeks to select sparse important context chunks containing top-$k$ tokens. This is achieved by pruning stages, which effectively discard context chunks irrelevant to the current query. By applying multiple pruning stages, \ours is able to generate a sparse attention mask, which is a good approximation for the top-$k$ tokens.
+%The exact details are as follows.
+
+First, we note that the initial $n_\text{sink}$ tokens (\textit{sink} tokens) and $n_\text{stream}$ most recent tokens (\textit{streaming} tokens) are always included. We sparsely select the middle tokens in between the sink and streaming tokens. We aim to find a block sparse attention mask that approximately selects the top-$K$ key blocks with the highest attention scores for each query block. This allows us to perform efficient block sparse attention (BSA) while preserving the capabilities of the model~\citep{lee_training-free_2024}. For ease of explanation, in this section, we ignore the existence of sink and streaming tokens, as well as the causal part of the self-attention mechanism. Please refer to \Cref{sec:algorithm} for a full description of our algorithm.
+
+%TODO:: Consider adding verbal explanation
+\Cref{fig:context_pruning} illustrates how each pruning stage preserves only the most relevant contexts. 
+%A pruning stage narrows down the selection of the context tokens. 
+First, the input key tokens are partitioned into equally sized chunks.
+Next, we select a representative token for the key chunk. 
+Leveraging the idea of attention locality introduced in \citet{lee_training-free_2024}, where nearby tokens tend to display similar attention scores, representative tokens provide an estimate for the attention scores within their chunks. When choosing the representative tokens, we use a top-1 variant of the Hierarchical Mask Selection algorithm used in \citet{lee_training-free_2024}.
+
+Using the attention scores of these representative tokens, max-pooled across attention heads, we select the top-$K$ key chunks and discard the rest. The surviving tokens are used as the input key tokens for the next pruning stage. By iteratively applying these pruning stages, we can effectively obtain a good estimate of the top-$k$ tokens in the form of a sparse attention mask.
+
+In formal notation, we denote a pruning stage by $\mathcal{S}^{(i)} = (b_q^{(i)}, l_{c}^{(i)}, k^{(i)})$, where $b_q$ denotes the size of the query block, $l_{c}$ denotes the chunk size, $k$ denotes the number of tokens to keep, and the superscript $i = 1~..~N$ denotes the stage index.
+To speed up the process by parallel processing, the queries are grouped into blocks. Specifically, in the $i$th stage, the query $\bm{Q}$ is divided into multiple $b_q^{(i)}$-sized blocks.
+We denote the $m$th query block in the $h$th attention head in the $i$th pruning stage by $\bm{q}_{h,m}^{(i)} := \bm{Q}_{h, m\cdot b_q~:~(m+1)b_q-1} \in \mathbb{R}^{b_q\times d}$.
+
+For the initial stage, we select all of the keys $\mathcal{I}_{m}^{(0)} = [1, \dots, T]$ for each query block index $m$. Each pruning stage transforms this list of indices into a smaller list by discarding indices corresponding to less important contexts.
+
+The input sequence $\mathcal{I}_{m}^{(i-1)}$ to the $i$th pruning stage is divided into $l_{c}^{(i)}$-size contiguous chunks where the $j$th chunk contains $\mathcal{C}^{(i)}_{m,j} := \left[ \mathcal{I}^{(i-1)}_{m}[j\,l_{c}^{(i)}], \dots, \mathcal{I}^{(i-1)}_{m}[(j+1)l_{c}^{(i)}-1] \right]$.
+For each $j$th chunk, we pick a representative token from $\mathcal{C}^{(i)}_{m,j}$ independently for each attention head, using a top-1 variant of the algorithm used in \citet{lee_training-free_2024}. We denote the representative token index for the $h$th attention head as $r^{(i)}_{h,m,j} = \text{SelectRep}(\bm{q}_{h,m}^{(i)}, \mathcal{C}^{(i)}_{m,j})$.
+
+The representative tokens provide a way to estimate the maximum attention score within each chunk. We estimate each chunk's score by computing the maximum value across the attention heads and each query in the query block as
+%\begin{equation}
+$s^{(i)}_{m,j} := \max_{\text{{$\begin{matrix}[0.1] h=1..H, \\ t=1..b_q^{(i)}\!\!\!\!\! \end{matrix}$}}} (\bm{q}_{h,m}^{(i)})_{t}^\top \bm{k}_{h,r^{(i)}_{h,m,j}}$.
+%\end{equation}
+Finally, the top $K^{(i)} := k^{(i)}/l_c^{(i)}$ chunks with the highest estimated attention scores are selected for the next stage, as follows:
+\begingroup%
+\allowdisplaybreaks%
+\begin{align}
+    &\quad\quad\mathcal{I}^{(i)}_{m'} = \bigcup_{\hat{\jmath} \in \mathcal{T}^{(i)}_{m}} \mathcal{C}_{m, \hat{\jmath}}^{(i)}, \\
+    &\text{ where } \mathcal{T}^{(i)}_{m} = \underset{j}{\text{arg\,top\,}}\!_{K^{(i)}} (s_{m,j}^{(i)}), \\
+    &\text{and } m'=\text{\small$\begin{cases}
+        \lceil m\cdot{b_q^{(i)}}/{b_q^{(i+1)}} \rceil & \text{if } i \leq N, \\
+        m & \text{otherwise}.
+    \end{cases}$}
+\end{align}%
+\endgroup
+
+When all $N$ stages are done, we are left with sparse key indices $\mathcal{I}^{(N)}_m \in \{1, \dots, T\}^{k^{(N)}}$ for all query blocks $m = 1~..~T/b_q^{(N)}$, which can be used for efficient block sparse attention. 
+
+
+\textbf{Sparse Attention Mask Caching.}
+To further reduce latency during decoding, we cache the sparse attention mask for each pruning stage. We observe that the sparse attention mask exhibits temporal locality. Therefore, instead of recomputing it every decoding step, we update the output attention mask for the $i$th pruning stage periodically every $n_\text{refresh}^{(i)}$ steps using the latest query block. Additional details are provided in \Cref{sec:algorithm}.
+
+% TODO: Add Positional Embedding Scheme figure
+\textbf{Dynamic RoPE for OOL generalization.}
+We employ multiple RoPE interpolation strategies for the sparse key tokens for out-of-length generalization. 
+During token pruning, two strategies are employed:
+(1) \textbf{Chunk-indexed RoPE:}
+Each key chunk is given a single position ID, where the last chunk's position ID is offset by $n_\text{stream}$ from the current query. All keys in the chunk are given the same position ID.
+(2) \textbf{Relative-style RoPE:}
+During the hierarchical top-1 estimation algorithm, the left branch gets a position ID offset by $n_\text{stream} + 1$ from the current query, and the right branch gets a position ID offset by $n_\text{stream}$ from the current query. For chunk score estimation, the representative key is given a position ID offset by $n_\text{stream}$ from the current query.
+We apply strategy (1) for the first three layers of the LLM and strategy (2) for the rest. The reason for this choice is explained in detail in \cref{sec:visualization_streaming}.
+During block sparse attention, we use the StreamingLLM-style RoPE: The selected keys, including the sink and streaming keys, are given position IDs sequentially in their original order, where the most recent token is given the same position ID as the current query~\citep{xiao_efficient_2024}.
+Since this dynamic RoPE trick incurs some computational overhead, it can be disabled when the OOL generalization capability is not needed.
+
+\textbf{KV Cache Offloading.}
+We improve the KV cache offloading mechanism of HiP Attention~\citep{lee_training-free_2024} by enhancing its cache management policy.
+Similarly to HiP Attention, we manage the KV cache on the unified memory space while keeping a smaller key bank on the GPU memory, which acts as a cache.
+Note that we maintain two different key banks on the GPU for the mask-selection and block sparse-attention processes.
+We also keep a page table, which maps the global key index to an index within the GPU key bank, in the GPU memory as well.
+Upon a cache miss, the missing keys are fetched from the unified memory space and placed on the GPU bank.
+Unlike HiP Attention~\citep{lee_training-free_2024}, we employ the Least Recently Used (LRU) policy as the eviction mechanism.
+
+%The KV cache is dynamically offloaded from the GPU to the host memory by the Least Recently Used (LRU) policy.
+%We maintain a key bank with size $n_\text{GPU}$ on the GPU, and a key-value bank with size $n_\text{host}$, where $n_\text{GPU} \ll n_\text{host}$.
+%We also maintain a page table that maps the global page index to the GPU bank or contains \texttt{null} in case the token is offloaded to host memory.
+%During mask selection, the GPU kernel first tries to load the required keys from the GPU bank by checking the page table. In case of a cache miss, missing keys are loaded from the host memory, and caches the loaded keys replacing other keys in the GPU bank.
+%For the block sparse attention step, a separate key-value bank is maintained in a similar manner.
+%
+%Our KV cache offloading framework consists of a key bank on the GPU, key-value banks on the host memory, and a page table that connects these banks.
+%We denote the sizes of the key bank and the key-value banks as  $n_\text{GPU}$ and $n_\text{host}$ respectively, where $n_\text{GPU} \ll n_\text{host}$.
+%Separate key-value banks are maintained for the sparse mask selection step and the sparse attention step.
+%The page table maps the global page index to either the GPU bank or \texttt{null} when the token is offloaded to host memory.
+%We employ a Least Recently Used (LRU) policy as the eviction mechanism for our KV cache offloading framework.
+%During mask selection, the GPU kernel first checks the page table to load the required keys. 
+%If a cache miss occurs, the missing keys are fetched from the host memory and placed in the GPU bank according to the LRU policy. 
+%Similarly, a separate key-value bank is maintained for the block sparse attention step, following the same offloading and caching procedure.
+
+
+\textbf{Implementation.}
+We implement the GPU kernels for our method using the Triton language~\citep{tillet_triton_2019}. We implement a single GPU kernel for the pruning stage, which can be reused for all stages just with different parameters. For block sparse attention, we implement a method similar to FlashAttention~\citep{dao_flashattention_2022} for prefill and Flash Decoding~\citep{dao_flash_decoding} for decoding. We also combine PagedAttention~\citep{kwon_efficient_2023} to alleviate the overhead from KV cache memory management. To implement dynamic loading and offloading with host memory, we use Nvidia UVM (Unified Virtual Memory).

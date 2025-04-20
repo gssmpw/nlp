@@ -1,0 +1,168 @@
+\section{Background and Related Works}
+%\youngsuk{Background is too long, but we combined with related work here? then better cite thoroughly}
+\subsection{Low Precision Datatypes and IEEE 754 Floating Point Numbers}
+
+Traditionally, low precision (LP) datatypes refer to datatypes that use significantly fewer than 32 bits to represent a single number. 
+For example, FP16 uses 16 bits to represent floating point numbers.
+While there are many different low precision datatypes, including stateful ones \citep{qtip}, a certain subset has been standardized under the IEEE754 floating point (FP) \citep{IEEE754}. These datatypes often come with hardware acceleration for compute-bound workloads.
+
+IEEE floats (Table \ref{tab:fpdtype}) are defined with 1 sign bit, $e$ exponent bits, and $m$ mantissa bits.
+In shorthand, a $1+m+e$ bit datatype is written as E$e$M$m$.
+%For example, E5M2 refers to the FP8 construction that uses 5 mantissa bits and 2 exponent bits.
+The actual ``normal'' value represented by an IEEE float with sign bit $S$, mantissa $M$, and exponent $E$ is %\tao{this is for normal numbers only, subnormal numbers you don't have the 1, right? yes}
+$$(-1)^S (1+M) 2^{E - \texttt{bias}},$$ 
+where \texttt{bias} is a datatype-dependent integer exponent bias offset specified by \cite{IEEE754}. 
+% \youngsuk{what is the logic of deciding bias? give reference?}
+% \albert{I'm not sure the logic, but its from the IEEE spec}\tao{the bias is set so that E-bias can cover positive and negative exponents evenly, it's usually to be $\lfloor (max_E-1)/2 \rfloor$ like E4M3, $max_E=15$, and bias=7; and FP4, $max_E=3$, and bias=1}
+% \youngsuk{right. thanks! let's shortly mention that.}
+% \albert{but this is irrelevant to our paper? it doesn't matter how bias is decided nor is it something we care about}
+This exponent-mantissa construction means FP datatypes are scale-invariant with respect to quantization signal-to-noise ratio (SNR) bar over/underflow \citep{graphcore}.
+%While floats have wide hardware support, they are not very efficient at using information.
+%\tao{I don't understand this claim, FP32 is good.}.
+%\albert{Efficient means how low of a distortion you can get for a certain bitrate. A 4 bit trellis quantizer will get much lower distortion than FP4 on almost any input source. FP32 achieves low distortion on an absolute scale, but you can get the same distortion with much fewer bits.}
+%For example, FP4 represents $-0$ and $+0$ separately; this wastes $4 - \log_2(15) = 0.093$ bits. 
+%\youngsuk{good information, but necessary to mention this in context of what? to justify MX?}
+%\albert{^ just to point out that FP numbers are suboptimal}
+%\tao{this seems to justify FP4 is bad, then why still use FP4? I don't see a reason to use FP4 as a bad example here. we use fp4 because it is hardware supported and fast. The "bad" part is to show how we can still make training work with a bad dtype.}
+%\tao{is this example illustrating the higher-than-desirable distortion?}
+% No it just shows that we waste 1 entry out of 16, which naturally increases distortion since there are fewer codepoints.
+
+
+\begin{table}[t]
+\centering
+\caption{Common HW supported FP datatypes.}
+\label{tab:fpdtype}
+%\renewcommand{\tabcolsep}{2pt}
+\begin{tabular}{@{}ccccc@{}}
+\toprule
+\multirow{2}{*}{Name} & \multicolumn{4}{c}{Bits}    \\ \cmidrule(lr){2-5}
+                      & Total & Sign & Exponent & Mantissa                                                                                    \\ \midrule
+FP64                  & 64    & 1    & 11   & 52                                                               \\
+FP32                  & 32    & 1    & 8    & 23                                                                 \\
+FP16                  & 16    & 1    & 5    & 10                                                                          \\
+BF16                  & 16    & 1    & 8    & 7                                                                      \\
+FP8 \tiny{E4M3}       & 8     & 1    & 4    & 3                                                                        \\
+FP8 \tiny{E5M2}       & 8     & 1    & 5    & 2                                                                       \\
+FP4                   & 4     & 1    & 2    & 1                                                               \\ \bottomrule
+\end{tabular}
+\end{table}
+
+
+\subsection{LLM Training}
+
+The most common way to train a LLM involves computing a loss function, computing the gradient of the loss function with respect to the model parameters, and then updating the parameters with gradient information.
+For example, when pretraining a decoder-only LLM, one might use an autoregressive cross-entropy-based loss and the AdamW optimizer \citep{llama2, llama3}.
+While the exact training setup may differ, the core bottlenecks of training are the compute-bound forward and backward passes that calculate the loss and gradients, respectively.
+Within these two components, the majority of the FLOPs are in the linear layers -- at 30B parameters, over 90\% of the FLOPs are in the linear layers \citep{flopcount}.
+
+The forward pass for a linear layer with input dimension $n$ and output dimension $m$ computes $y = xW^T + b$, where $W \in \mathbb{R}^{m \times n}$ is a parameter matrix and $b \in \mathbb{R}^{m}$ is an optional bias term.
+To backpropagate through a linear layer, we need to calculate the gradient of $y$ with respect to $x, W,$ and $b$.
+These are given by $\frac{dL}{dx} = \frac{dL}{dy}W$, $\frac{dL}{dW} = \frac{dL}{dY}^Tx$, and $\frac{dL}{db} = \mathbbm{1}\frac{dL}{dy}$, where $\mathbbm{1}$ is the all-ones vector and $\frac{dL}{dy}$ is the backprop output from the previous (going backwards) operation in the chain rule \citep{backprop}.
+Each linear layer requires 3 computationally intensive matrix multiplications ($xW^T, \frac{dL}{dx}$, and $\frac{dL}{dW}$), 2 of which are in the backward pass.
+%\youngsuk{any good citation on backward operation? even under nonlinear, layernorm, distributed setting? (I have my own derivation though). We can defer detailed derivation to them.}
+
+
+\subsection{Mixed Precision Training}
+
+One way to accelerate training is with ``mixed precision'' (MP) training.
+In MP, parameters are kept in high precision and GEMM operands are converted to a LP datatype for a LP GEMM.
+%The quantization step can also be implemented as a ``copy buffer'' (such as in Megatron-LM \citep{megatronpaper}) with separate FP32 and LP copies of the parameters. 
+%The outputs of the matmuls are kept in high precision for accurate parameter updates.
+MP is a simple way to achieve the throughput benefits of LP datatypes since quantization usually has minimal overhead.
+%This is slightly numerically different but does not affect convergence in practice.
+End to end, BF16 MP is often $>70\%$ faster than FP32 training \citep{megatronpaper}.
+However, quantization introduces distortion in the GEMM operands and thus outputs.
+Since the forward and backward passes all happen in low precision, both the loss and the model updates can deviate from their ``true'' values.
+At low bitrates $\ll 16$, distortion can degrade model quality and even cause divergence, necessitating advanced training recipes.
+For example, FP8 MP recipes typically use E4M3 (more precision) in the forward pass and E5M2 (more range) in the backward pass due to the different properties of gradients, weights, and activations \citep{msamp, te}.
+%\youngsuk{Q: was it also applied to our case?}
+% no because there is only one fp4 formulation and I screwed up the fp8 experiments by not modifying TE correctly.
+
+At 4 bits, quantization distortion becomes even more difficult to manage.
+\cite{int4training} train smaller non-GPT transformers with INT4 GEMMs by using the non-randomized Hadamard transform in the forward pass and leverage score sampling (LSS) in the backward pass.
+Since LSS introduces additional overhead, they were only able to achieve an end-to-end speedup of 30\% over FP16, which is on par with FP8 mixed precision training \citep{msamp}. %\tao{are they also lossless? they don't test large transformers so idk, but iirc no for smaller transformers (albert)}
+We are also aware of a concurrent work by \cite{msfp4} that trains LLMs with FP4.
+There, the authors train billion parameter GPT models with FP4 in both the forward and backward pass by using a differentiable gradient estimator and keeping outliers in high precision, resulting in a perplexity gap of $>0.5$.
+Since their work was released after our paper went through the review process, we reserve a full comparison for future work.
+
+% Their method results in a significantly larger perplexity gap ($>0.5$) than ours at the cost of. 
+% It is also not clear how much overhead high precision outliers add in hardware, since even one outlier in a hardware GEMM tile requires ``activating'' the entire tile.
+% For a sufficiently bad outlier distribution, an additional sparse GEMM could cost more than the FP4 GEMM itself.
+% In contrast, our method has fixed overhead that is significantly lower than the cost of a 4 bit GEMM.
+
+
+\subsection{Stochastic Rounding}
+%\youngsuk{let's have mathematical description?}
+Mixed precision requires quantizing from a higher precision tensor to a LP tensor at every step -- this opens up flexibility in how the actual quantization happens.
+The canonical ``nearest rounding'' (NR) method rounds each high precision number to its closest representable value in the LP datatype \citep{IEEE754}.
+However, NR is not \textit{unbiased}, which we later show to be detrimental to low precision training.
+One way to achieve unbiased rounding is with ``stochastic rounding'' (SR), which randomly rounds a number to a representable value in the LP datatype so that, in expectation, the rounded number equals the original number \citep{sr}.
+%Since this introduces additional stochasticity, most SR implementations minimize variance by only rounding between the two closest representable LP values surrounding the number \citep{sr}.
+% \youngsuk{can reduce last couple of sentences via citation and math below.}
+
+SR can be implemented efficiently through \textit{dithering}, which adds random uniform noise to the input number and then performs NR \citep{sr}.
+For example, Amazon's Trainium line of chips can perform SR with dithering while adding less than 2\% overhead to a BF16 GEMM. % \citep{trainium, muhamed2023training}
+%\tao{this number still seems large, it should be less? in the end of sec4.2, it's 2\% overhead?}\albert{this is SR, not RHT} .
+Equation \ref{eqn:unifdither} describes SR with dithering for a uniform integer quantizer; the non-uniform case requires modifying the noise scale but is otherwise essentially the same.
+\begin{align}
+\label{eqn:unifdither}
+\delta &\sim \mathcal{U}(-0.5, 0.5) \\
+\text{SR}_{\text{dither}}(x) &= 
+\begin{cases} 
+      \lfloor x \rfloor & x+\delta < \lfloor x \rfloor + \frac{1}{2} \\
+      \lceil x \rceil & x+\delta \ge \lfloor x \rfloor + \frac{1}{2} 
+\end{cases}
+\end{align}
+% \youngsuk{Optional: want to use $\mathrm{SR}(x;D)$ with datatype $D$ and rounding $\lfloor x \rfloor_D$ w.r.t. D rather than $SR_{dither}(x)$? We can use $\mathrm{SR}(x;FP4) <- sotchastic round to fp4$ in Algo 2 }
+% \youngsuk{here $x$ is an integer?}
+% \youngsuk{Optional, can we define NE similarly with $n=0$ and use it for Algo 1 description $P_i = quantize\_to\_element\_format(V_i / X)$?}
+% \albert{SR\_dither refers to stochastic rounding implemented with dithering. x is a real number. This formula describes SR with dithering to the integers. This formula does not work for nonuniform (eg floating point) datatypes. You have to do some bitshifting there that is handled in hardware}
+
+SR can also be used anywhere where numbers are quantized.
+%For example, when adding two numbers of the same precision but with vastly different magnitudes, information from the smaller number is ``lost.''
+%This is problematic when applying model updates from the optimizer.
+For example, near the end of training, the model update norm is much smaller than the parameter norm and information in low precision updates can be``lost'' \citep{collage}.
+Here, stochastic rounding can be used to preserve the update \textit{in expectation}, which uses less memory than keeping a high precision copy of the parameters. %\tao{we should advance the mention Trn1 and its efficient support of SR earlier here (now in sec4 last paragraph).}
+
+\subsection{Microscaling (MX) FP Formats}
+
+The recently introduced microscaling floating point family of datatypes builds upon IEEE floats by adding a groupwise scale to a base IEEE float \citep{ocpmx}.
+% While MX could be used with a base integer datatype, this work focuses on MX floats since hardware MX implementations usually only support floats.
+This scale allows a MXFP tensor to take on a wider range of values without significantly increasing the total bitrate, with the caveat that entries in a group should be roughly the same magnitude for the scale to be useful.
+In practice, MX scaling is more important as the base datatype bitrate decreases.
+Whereas FP8 E4M3 has a dynamic range of $\frac{448}{2^{-9}} = 2.3\times10^6$, FP4 has a dynamic range of $\frac{6}{0.5} = 12$. 
+% \youngsuk{what is demonomator here? related to bias?}
+% \albert{The denominator is the smallest normal representable values} \tao{think we refer the `dynamic range` as the max/min values that can be represented with the format, what's the definition of dynamic range here? max value of two FP8 mul?}
+% \youngsuk{yes, formally defining dynmaic range would be helpful for newbies.}
+% \albert{dynamic range is a standard metric and term used to refer to min/max. https://en.wikipedia.org/wiki/Dynamic\_range. People can google it if they want to.}
+MX scaling enables MXFP4 to represent a much wider range of values \textit{across blocks}.
+%\tao{without scaling factors, FP8 E4M3 max value is 448, right? how does $2^{-9}$ chip in here? also for the later FP4 case 2^-9 is the smallest fp8 normal and 0.5 is the smallest fp4 normal} 
+
+%\youngsuk{mention MX is in more need for lower precision like fp4, than fp8 or higher, to compensate the usage of smaller number of bits to represent numbers.}
+The core hardware-supported MXFP formats generally follow similar patterns.
+Scales are shared across contiguous entries in memory (usually 32), and quantizing a scalar tensor to a MX tensor depends on the largest element in each group \citep{ocpmx,nvptx}.
+Algorithm \ref{alg:float2mx} describes the ``reference'' algorithm for quantizing a scalar tensor to MX, which can be implemented efficiently on modern AI accelerators \citep{nvcutlass}.
+Algorithm \ref{alg:float2mx} scales each group based on its maximum magnitude element and then performs nearest rounding to obtain a MX tensor. 
+% This means that quantizing a tensor stored in row-major format (groups span rows) may result in a \textit{different} MX tensor than quantizing the same tensor stored in column-major format (groups span columns). \albert{32 contiguous, row/column depends on r/c major}\tao{can you point me a reference for this?}\albert{algorithm 1. almost all the comments are answered by algorithm 1, which is directly from the OCP paper}
+% %\tao{nice catch, which one do we use? and any ablation?}
+%\albert{we use row major since that's what torch does. I didn't run an ablation, if we have time we can try in the appendix}
+
+\begin{algorithm}[t]
+\caption{Convert vector of scalar floats $V \in \texttt{HP\_DTYPE}^k$ to an MX block
+$\{X, P \in \texttt{LP\_DTYPE}^k\}$ (from \citep{ocpmx})}
+\label{alg:float2mx}
+\begin{algorithmic}[1]
+\REQUIRE $\texttt{emax}_\texttt{elem}$ = exponent of largest normal in \texttt{LP\_DTYPE}, $k=32$ for hardware support.
+%\youngsuk{input better be dtype (e.g., e2m1-FP4)? which will be used to decide emax and quantization function}
+%\albert{input is any real number, emax is a property of fp4}
+\STATE \texttt{shared\_exp} $\gets \lfloor \log_2(\max_{i}(|V_i|)) \rfloor - \texttt{emax}_\texttt{elem}$
+\STATE $X \gets 2^{\texttt{shared\_exp}}$
+\FOR{$i=1$ to $k$}
+  \STATE $P_i$ = \texttt{quantize\_to\_LP}$(V_i / X)$
+\ENDFOR
+\RETURN $X,\>\{P_i\}_{i=1}^k$
+\end{algorithmic}
+\end{algorithm}
+
+
+

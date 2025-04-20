@@ -1,0 +1,169 @@
+\section{Proposed Method: \rocketkv}
+\label{sec:3-proposed}
+
+
+\subsection{Observation} 
+
+As discussed previously in Sections~\ref{sec:1-intro} and~\ref{sec:2-related}, existing training-free KV cache eviction methods for decode phase acceleration can be categorized into two types: permanent KV cache eviction and dynamic KV token selection. To understand the effectiveness of strategies in each type, Figure~\ref{fig:observation} presents the accuracy comparison of four different methods for \textit{qasper} benchmark in LongBench~\cite{longbench2023} on Mistral-7B-Instruct-v0.2 model, where DuoAttention and SnapKV belong to the first type, and Quest and SparQ belong to the second type. As shown in the figure, the accuracy of all four methods drops significantly as the token budget becomes lower than 1024. In comparison, we present Exact-TopK as an oracle method that performs sparse attention on \textit{top-k} KV token indices selected based on the exact attention scores. Exact-TopK achieves negligible accuracy drop compared to the Full-KV attention even with a token budget of 256, which indicates that all those practical methods fail to accurately predict \textit{top-k} KV tokens at low token budgets.
+
+To improve the prediction accuracy, we observe that permanent KV cache eviction and dynamic KV token selection are complementary to each other and can be seamlessly combined together. In fact, we can perform permanent \kv eviction with a much larger token budget first and then conduct dynamic KV token selection on the remaining KV tokens. By doing this, the chance of permanently evicting important KV tokens is greatly reduced. Meanwhile, dynamic KV token selection only needs to perform on a subset of KV tokens rather than the original full set, significantly lowering the prediction difficulty.
+
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.5\textwidth]{figures/motivation_mistral-7b-instruct-v0.2.pdf}
+  %\vspace{-3ex}
+  \caption{Comparing permanent \kv eviction and dynamic KV token selection for \textit{qasper} benchmark.}
+  \label{fig:observation}
+\end{figure}
+
+
+
+\subsection{RocketKV}
+Based on the above observation, we propose \rocketkv, a two-stage \kv compression method for decode phase acceleration. As shown in Figure~\ref{fig:rocketkv}, \rocketkv performs coarse-grain \kv eviction at the first stage. The purpose of this stage is to remove KV tokens with low importance while trying to keep the majority of important tokens. In the second stage, it conducts fine-grain dynamic KV token selection on the remaining KV tokens followed by \textit{top-k} sparse attention. For a given token budget $t$ and associated compression ratio $c$, we evenly split the compression ratio across both stages so that each stage results in a compression ratio of $\sqrt{c}$. To achieve the best performance at each stage, we further propose a highly effective KV cache eviction and dynamic KV token selection method for each stage.
+
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.75\textwidth]{figures/rocketkv_overview.pdf}
+  %\vspace{-3ex}
+  \caption{Overview of \rocketkv with two consecutive stages.
+ }
+  \label{fig:rocketkv}
+    %\vspace{-3ex}
+\end{figure}
+
+
+
+\subsection{First Stage: SnapKV++} 
+
+
+\begin{algorithm}[t]
+\caption{SnapKV++} 
+\label{alg:snapkv++}
+\begin{algorithmic}
+%\begin{flushleft}
+%\REQUIRE
+\STATE \textbf{Input:}
+{sequence length $S$, query vector $q$, key tensor $K$, value tensor $V$, kernel sizes $ks_1$ and $ks_2$, kernel threshold $Thr$, \textit{top-k} KV indices $k$}
+\STATE {\color{darkgreen}\# \textit{compute Attention scores based on observation window}}
+\STATE $s_1 \gets score(q_{obs}, K_{pre})$
+\STATE {\color{darkgreen}\# \textit{accumulate attention score in seq. and group dim}}
+\STATE $s_2 \gets sum(s_1)$
+\STATE {\color{darkgreen}\# \textit{adaptively select kernel size for pooling}}
+\STATE $ks \gets ks_1$ if $S \geq Thr$ else $ks_2$
+\STATE {\color{darkgreen}\# \textit{perform pooling in seq. dim}}
+\STATE $s_3 \gets pool(s_2, ks)$
+\STATE {\color{darkgreen}\# \textit{get indices with \textit{top-k} attention scores}}
+\STATE $i \gets argtopk(s_3, k)$
+\STATE {\color{darkgreen}\# \textit{generate pruned KV cache}}
+\STATE $K_{cache} \gets K_{[i,obs]}, V_{cache} \gets V_{[i,obs]}$
+\STATE \textbf{return}  $K_{cache}, V_{cache}$
+%\end{flushleft}
+\end{algorithmic}
+\end{algorithm}
+%\vspace{-2ex}
+
+\begin{figure*}[!ht]
+  \centering
+  \parbox{0.9\textwidth}{
+    \centering
+\includegraphics[width=0.6\textwidth]{figures/hybrid_attention.pdf}
+    \label{fig:hybridkv}
+  }
+  \hspace{0.05\textwidth} % Adjust the space between the figure and the algorithm
+  \parbox{0.45\textwidth}{
+    \centering
+    \begin{algorithm}[H]
+      \caption{Hybrid Attention (only contains step 2 and 3)}
+      \label{alg:hybrid}
+      \begin{algorithmic}%[0]
+        %\REQUIRE 
+        \STATE \textbf{Input:}{query vector $q$, key tensor $K$, value tensor $V$, element-wise max/min key tensor $K_{max}/K_{min}$, top-r $q$ indices $r$, top-k KV indices $k$}
+        \STATE {\color{darkgreen}\# \textit{get \textit{top-r} indices along head dim from sum of $|q|$ in group dim}}
+        \STATE $i_1 \gets argtopk(sum(|q|, dim=group), r)$
+        \STATE {\color{darkgreen}\# \textit{get signs of \textit{top-r} indices from sum of q in group dim}}
+        \STATE $g \gets sign(sum(q_{[i_1]}, dim=group))$
+        \STATE {\color{darkgreen}\# \textit{fetch corresponding indices from paged min or max}}
+        \STATE $P \gets K_{max[i:g_i \geq 0]}, K_{min[i:g_i < 0]}$
+        \STATE {\color{darkgreen}\# \textit{compute approximation attention scores}}
+        \STATE $s_1 \gets score(q_{[i1]}, P)$   
+        \STATE {\color{darkgreen}\# \textit{get indices with top-k attention scores along seq. dim}}
+        \STATE $i_2 \gets argtopk(s_1, k)$
+        \STATE {\color{darkgreen}\# \textit{perform sparse attention}}
+        \STATE $y \gets attn(q, K_{[i2]}, V_{[i2]})$ 
+        \STATE \textbf{return} $y$
+      \end{algorithmic} 
+    \end{algorithm}
+  }
+  %\vspace{-6mm}
+  \caption{Illustration of hybrid attention with figure (up) and algorithm (bottom).}
+  \label{fig:hybridatt}
+  %\vspace{-4ex}
+\end{figure*}
+
+
+
+In the first stage, we propose SnapKV++ as an efficient KV cache compression method on the input prompt. Compared with the original SnapKV, SnapKV++ introduces two enhancements that greatly improve the performance: 1) Full compatibility to GQA, and 2) adaptive kernel size for pooling.
+
+The original SnapKV method keeps crucial KV tokens based on aggregated per-head attention scores across the observation window. In the case of GQA, each attention head within an attention group will keep a separate set of KV cache tokens, which could introduce redundant storage of the same KV token. To be fully compatible with GQA, SnapKV++ accumulates per-group rather than per-head attention score, and hence the selected KV tokens are shared across the entire attention group. 
+
+SnapKV uses pooling along the sequence dimension so that the critical KV tokens are selected along with their neighbor tokens. It demonstrates better accuracy with pooling because it retains the completeness of selected information.
+The employed kernel sizes for pooling are quite small (e.g., a kernel size of 7 for LongBench~\cite{longbench2023}). Since SnapKV++ is only used for coarse-grain KV token eviction at the first stage, we discovered that the optimal kernel sizes for pooling are much larger. In fact, the optimal kernel size can grow as the input sequence length increases. Therefore, SnapKV++ provides a simple adaptive kernel size selection mechanism based on the input sequence length: it selects a smaller kernel size if the input sequence length is shorter than a threshold value, otherwise, it will switch to a larger kernel size. Those two kernel sizes and threshold values are empirically determined in our work as shown in Section~\ref{sec:ablation}. We found this mechanism is sufficient to capture close-to-optimal performance in our studies, so we did not explore more sophisticated algorithms. 
+
+The overall algorithm of SnapKV++ is illustrated in Algorithm~\ref{alg:snapkv++}. We found that with those two enhancements, SnapKV++ greatly outperforms the original SnapKV method as shown in Section~\ref{sec:ablation}.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+\subsection{Second Stage: Hybrid Attention}
+Previous methods on dynamic KV token selection often leverage the sparsity in the head or sequence dimension of the Q or K tensor~\cite{quest2024, sparq2024, loki2024}  to estimate \textit{top-k} attention scores. Unfortunately, relying on the sparsity of a single dimension can only achieve a certain degree of compression ratio, beyond which the accuracy could drop rapidly, as shown previously in Figure~\ref{fig:observation}. In contrast, we propose a hybrid attention method which takes advantage of sparsity in both head and sequence dimensions together to achieve better estimation accuracy on KV token indices with \textit{top-k} attention scores. 
+
+Figure~\ref{fig:hybridatt} shows the detailed implementation of our proposed algorithm, which is inspired by Quest~\cite{quest2024} and SparQ~\cite{sparq2024}. Our hybrid attention algorithm can be decomposed into three steps:
+ \begin{itemize} 
+     \item Step 1: Group tokens in key tensor into consecutive pages along the sequence dimension and store element-wise min and max of each page as auxiliary storage. They are stored along the head dimension to enable efficient gathering in Step 2. The auxiliary storage is updated accordingly each time a new key token is generated and stored. 
+     \item Step 2: For each query q, accumulate $|q|$ in group dimension and find the r largest indices along the head dimension.  Then fetch only the corresponding indices in either element-wise min or max tensors depending on the sign of the sum of $q$ in group dimension at those indices. Finally calculate approximation attention scores based on those partial $q$ and element-wise vectors, and find \textit{top-k} indices along the sequence dimension. 
+     \item Step 3: Perform sparse attention by fetching the full key and value vectors from the \textit{top-k} indices.
+ \end{itemize}
+In our hybrid attention algorithm, the $K$ tensor is compressed along the sequence dimension first for auxiliary storage, and then selectively fetched along the head dimension for approximation attention calculation. For a given compression ratio $c$, we evenly split it between those two steps so that each step results in a compression ratio of $\sqrt{c}$. This would avoid significant accuracy loss caused by over-compression on a single dimension. Our method is fully compatible with GQA because all selections on the key and value vectors are based on per attention group rather than attention head, similar to our enhancement in SnapKV++. 
+
+
+\begin{table}[!t]
+\caption{Normalized KV cache storage (including auxiliary data) and traffic comparison between \rocketkv and other methods.}
+\centering
+\resizebox{0.5\textwidth}{!}{%
+\begin{tabular}{|c | c | c | c|} 
+ \hline
+ Method & Compression Ratio & Storage & Traffic \\ [0.5ex] 
+ \hline
+ SnapKV & $c$ & $1/c$ & $1/c$ \\ 
+ \hline
+ Quest & $c$ & $1+1/c$ & $1/c$ \\
+ \hline
+ SparQ & $c$ & 2 & $1/c$ \\
+ \hline
+ RocketKV & $c$ & $1/\sqrt{c}+2/c^{3/4}$ & $1/c$ \\
+ \hline
+\end{tabular}
+}
+\label{tab:cost_analysis}
+
+\end{table}
+
+\subsection{Cost Analysis and Comparison}
+The decode phase of LLM inference is typically memory bound~\cite{sparq2024} so the time spent in the attention module is roughly proportional to the total memory traffic. In this work, we use token budget $t$ to estimate the amount of memory traffic for each attention operation in the decode phase (we mainly focus on KV cache traffic since it contributes to the majority of memory traffic in this scenario). For example, a token budget of 512 means each attention module needs to fetch an equivalent total amount of 512 key and value pairs from the memory. For models with GQA, this token budget is defined for the entire attention group rather than each attention head. For a given sequence length $S$, the total compression ratio $c$ can be defined as $c=S/t$. 
+
+In \rocketkv, the total compression ratio is evenly split between two stages with each stage having a compression ratio of $\sqrt{c}$. Therefore, in the first stage, SnapKV++ results in both KV cache storage and traffic reduction of $\sqrt{c}$. In the second stage, we need to take the additional memory storage overhead introduced by approximation attention into consideration. Since we further evenly split the compression ratio $\sqrt{c}$ into $c^{1/4}$ between step 1 and 2 in the hybrid attention algorithm, it introduces a memory storage overhead of $(1/\sqrt{c}) \times (1/c^{1/4}) \times 2=2/c^{3/4}$ where $1/\sqrt{c}$ is the relative KV cache storage after SnapKV++ and both element-wise min and max tensors will introduce a storage overhead of $1/c^{1/4}$ on top of it. Therefore, the total KV cache storage and traffic in \rocketkv are $1/\sqrt{c}+2/c^{3/4}$ and $1/c$ of the full KV baseline, respectively. Table~\ref{tab:cost_analysis} compares the KV cache storage and traffic of \rocketkv against other methods at a given compression ratio $c$ and we can see that while all methods lead to KV cache traffic savings, only \rocketkv and SnapKV provide additional KV cache storage savings but Quest and SparQ require extra storage for auxiliary data.
+
+In terms of system-level optimizations, \rocketkv is fully compatible with FlashAttention~\cite{flashattention2022} as it does not modify attention in the prefill phase, as well as Tensor Parallelism~\cite{megatronlm2019} as all operations are symmetric across attention heads/groups. 
+

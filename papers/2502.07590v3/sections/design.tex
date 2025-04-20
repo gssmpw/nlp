@@ -1,0 +1,269 @@
+
+\section{\sys Overview}
+\label{sec:overview}
+
+Our empirical findings in \Cref{sec:finding} uncover inherent sparsity patterns in video DiT attention during training, some of which are different from sparsity in LLM inference for language tasks and have not been previously reported. 
+Due to high sparsity, by computing only the most critical KV pairs, the overall computational burden of full attention can be significantly reduced, leading to more efficient training. Moreover, this reduction in KV computations also lowers communication overhead in large-scale settings, where KV data is frequently exchanged for context parallelism. Together, they highlight the potential for substantial end-to-end speedups by exploiting attention sparsity in video DiT training.
+
+Building on this insight, we now discuss the unique challenges posed by these sparsity patterns and introduce the architecture of our solution, \sys.
+
+
+\subsection{Challenges}
+\label{sec:challenges}
+
+Sparsity entails design challenges in three basic aspects of the training system: algorithm, kernel, and parallelism.
+
+\begin{itemize}[leftmargin=*]
+\item \textbf{Critical KV identification:} Our first major challenge stems from the dynamic and uncertain distribution of critical KV pairs in video DiT training (\hyperlink{obs2}{Obs.2}). Any fixed sparse attention pattern becomes impractical when the critical KV varies dramatically with changing context and/or training steps. 
+While computing the complete attention score matrix (i.e., $\text{softmax}(QK^{T})$) and selecting the \topk entries per query fully capture these changing distributions, it does not save any computation of the attention score.
+Moreover, this would disrupt the fused kernels such as FlashAttention~\cite{dao2022flashattention1,dao2023flashattention2} with IO-awareness optimization, limiting the sparsity benefits to only the score-value ($AV$) computation, ultimately degrading overall performance.
+
+\item \textbf{Efficient sparse attention computation:} Even if the attention scores are available for identifying critical KVs, performing \topk selection at scale introduces considerable implementation hurdles. Specifically, the attention score tensor has a shape of $[H, S, S]$, where $H$ is the number of heads and $S$ is the sequence length, which can easily reach up to 100K.
+Saving such large tensors alone requires excessive GPU memory.
+Furthermore, following top-k selection, each query might access a very sparse set of KV entries in an irregular and scattered pattern. This irregularity can degrade parallel efficiency especially in memory access and result in low use of SM resources, making it difficult to fully reap the gains from sparsity.
+
+
+\item \textbf{Re-visiting context parallelism:} 
+The last challenge emerges when training with long video sequences that must be distributed across devices. 
+Existing context parallelism (CP), head-wise and sequence-wise, would fail to work efficiently once sparsity is introduced. 
+Head-wise CP can become problematic when certain heads exhibit higher degrees of sparsity than others (\hyperlink{obs3}{Obs.3}), creating load imbalances and stragglers. 
+Moreover, standard sequence-wise CP often transfers all KV pairs among devices without considering which ones are critical~\cite{liu2023ring}, unnecessarily increasing communication overhead. As a result, we need to overhaul the parallelization strategy to account for the idiosyncrasies due to sparsity.
+
+\end{itemize}
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.405\textwidth]{figures/sys_overview.pdf} 
+  \caption{\sys overview.}
+    \label{fig:sys_overview} 
+\end{figure}
+
+
+
+
+
+\subsection{\sys Architecture and Workflow}
+\sys addresses the three challenges with three key designs as summarized in Figure~\ref{fig:sys_overview}.
+
+
+\begin{itemize}[leftmargin=*]
+  \item {\bf \em Algorithm: Two-stage training with low-rank $QK$-estimation.} At the core of \sys lies an efficient low-rank estimation of query and key to approximate the attention score. Two low-rank matrices are trained for each attention module to approximate $QK^T$ (separate from FlashAttention). These matrices enable identification of critical KV pairs without fully computing attention scores or modifying FlashAttention kernels.
+  DiT training then becomes a two-stage process: in the first stage these low-rank matrices, called \textit{sparsity predictors} hereafter, are continuously learned until their approximation is accurate enough, and all attention is computed in full. 
+  Then we enter the second stage: in each step, when the sparsity level exceeds a threshold, we perform sparse attention over the critical KV pairs found by the low-rank estimations.  
+  
+  
+  \item {\bf \em Kernel: Critical KV estimation and sparse attention.}  To overcome the second challenge and maximize the benefits of sparse training, \sys introduces optimized kernels tailored for critical KV estimation and sparse attention. Specifically, a fused kernel calculates the approximate attention scores using learned low-rank matrices and performs top-$k$ selection at the desired sparsity level in a single pass to minimize intermediate memory consumption.
+  Additionally, \sys adopts a sparse attention kernel with query grouping to enhance memory access and computation parallelism, as queries that are close in position often share similar critical KVs as noted in \hyperlink{obs5}{Obs.5}.
+  
+  \item {\bf \em Parallelism: Sparsity-aware context parallelism.}  
+  Lastly, \sys leverages sparsity-aware context parallelism (CP) strategies to dynamically adapt to varying sparsity levels across different attention blocks and heads. It introduces new optimizations for sparse settings, including head-wise workload reallocation for standard head-wise CP and selective KV gathering for seq-wise CP. Further, \sys determines the optimal hybrid parallelism configuration for each attention block based on its head-wise sparsity patterns. By jointly optimizing computational load balancing (mitigating inefficiencies from sparsity-induced workload imbalances) and communication overhead across paradigms, it ensures optimal performance when parallelizing large video inputs.
+\end{itemize}
+
+
+
+
+
+
+
+
+
+
+\section{Two-Stage Training with Low-Rank Based Sparsity Prediction}
+\label{sec:algorithm}
+
+
+
+We now present \sys's training algorithm design as depicted in Figure~\ref{fig:algorithm}.
+
+\subsection{Sparsity Profiling}
+\label{sec:profiling}
+We first introduce \sys's profiler as the basic building block for both low-rank based sparsity prediction and two-stage training.
+The profiler periodically measures the sparsity level of each attention head as defined in~\Cref{sec:finding}, by separately computing the softmax of $QK^T$ without disrupting the normal full attention computation using FlashAttention. 
+To reduce the overhead, random sampling (e.g., by a factor of 16) on query $Q$ is used when examining each head's attention scores. 
+At iteration $i$, we update the exponential moving average of sparsity level of the current block $S^{i}$ with the latest sample $P^{i}$: $
+S^{i} = \alpha  P^{i} + (1 - \alpha) S^{i-1} $,
+where $\alpha$ is the smoothing factor that smooths out fluctuations due to sampling noise.
+The profiler maintains sparsity level for each attention head and block, which are used to train the low-rank query and key matrices and to determine the use of sparse computation.
+
+
+
+
+
+
+
+\subsection{Low-Rank based Sparsity Prediction}
+\label{sec:lowrank}
+For each attention block, we introduce two low-rank trainable matrices, $W_Q^{\text{lr}}$ and $W_K^{\text{lr}}$, which project the input to $Q_{\text{lr}}$ and $K_{\text{lr}}$ with an inner dimension $d_{\text{lr}}, d_{\text{lr}} \ll d_k$ (default: 16) where $d_k$ is the inner dimension of original query and key, $Q$ and $K$. 
+We train $W_Q^{\text{lr}}$ and $W_K^{\text{lr}}$ at \textit{each} iteration of DiT training such that $Q_{\text{lr}}K_{\text{lr}}^T$ can \textit{continuously} approximate $QK^T$ from the profiler. 
+Note this predictor training process is independent from the primary computation graph. 
+It ensure accurate approximation of attention patterns with minimal parameters and overhead (<10M for a 3B model).
+
+We train the sparsity predictor for each block using the following loss function: $0.95\cdot \text{CosLoss}(Q_\text{lr}K_{\text{lr}}^{T}, QK^{T}) + 0.05\cdot \text{NormLoss}(Q_\text{lr}K_{\text{lr}}^{T}, QK^{T})$.
+It encourages the low-rank projections to preserve the relative magnitudes of $QK^T$ elements while maintaining consistency with the original $QK^T$. During the forward pass, the sparsity predictor computes the approximation loss and immediately updates its parameters, reducing memory consumption by avoiding storage of intermediate $QK^T$ results. Random sampling on query $Q$ is also used to further rein in the overhead. 
+
+
+
+
+\subsection{Two-Stage DiT Training}
+\label{sec:two_stage}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.475\textwidth]{figures/algorithm_overview.pdf} 
+  \caption{Two-stage DiT training paradigm.} 
+  \label{fig:algorithm} 
+\end{figure}
+
+
+
+DiT training in \sys proceeds in two distinct stages to ensure effective exploitation of attention sparsity while maintaining model performance.
+
+
+\noindent\textbf{Stage 1: Full Training.}
+In the initial stage, the DiT model undergoes full training without sparse computations. The primary goal is to train the sparsity predictors for each attention block as said before. 
+This stage concludes once the average approximation loss across all blocks falls below a defined threshold (default: 0.01). Typically, this condition is met within 5K iterations, signaling that the sparsity predictors are adequately trained and ready for use. 
+
+
+
+
+
+
+\noindent\textbf{Stage 2: Sparse Training.}
+In Stage 2, sparse attention is utilized whenever possible to fully accelerate DiT training. 
+The key here is to determine whether to activate sparse computations, which is precisely what \sys's OP Dispatcher is responsible for. 
+The signal it uses is obviously the sparsity level: the profiler now runs with a lower frequency than that in Stage 1 due to the stabilized sparsity patterns to monitor each block's sparsity level.
+Then whether or not sparse attention is beneficial given a certain sparsity level hings on two factors, the computation speedup and the memory overhead.
+Computation speedup includes the gain from sparse attention minus the additional overhead from critical KV estimation using the low-rank sparsity predictor.
+Memory overhead also arises from the need of storing the critical KV indices.
+To efficiently navigate this tradeoff, we perform offline experiments to measure at various sparsity levels the corresponding speedups and memory requirements (using our re-designed kernels in \Cref{sec:kernels}) for varying video token lengths.
+Then OP Dispatcher enables sparse attention for a block when (1) the current memory utilization is sufficient for the corresponding memory overhead, and (2) the current sparsity level exceeds the threshold established offline for this setting.
+This block's low-rank sparsity predictor is used to locate the critical KV pairs, and sparse attention is performed using our optimized kernels. 
+
+
+
+
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.45\textwidth]{figures/attention_kernel_overview.pdf} 
+    \caption{(a) Full vs. sparse attention operations (head size: 1, token length: 51200, sparsity: 90\%, on H100). (b) Kernel overview in \sys.}
+  \label{fig:atten_kernel_overview} 
+\end{figure}
+
+
+
+\section{Efficient Kernels}
+\label{sec:kernels}
+This section tackles the challenges of sparse attention implementation, including: (1) critical KV estimation via top-K selection from $Q_{\text{lr}}K_{\text{lr}}^T$, and (2) hardware-aware sparse attention kernels with selected KV pairs. 
+
+\subsection{Critical KV Estimation with Kernel Fusion}
+\label{sec:estimation_kernel}
+
+\noindent\textbf{Memory constraints.} 
+The critical KV estimation involves low-rank matrix multiplication $Q_{\text{lr}}K_{\text{lr}}^T$ for approximating $QK^T$, followed by a \topk selection operation. 
+They present two major bottlenecks: (1) Storing the entire $Q_{\text{lr}}K_{\text{lr}}^T$ demands an excessive memory footprint.
+When \(H=16\) attention heads and \(S=100k\) video tokens are used, the resulting \([H, S, S]\) tensor requires $\sim$320GB memory in BF16.
+(2) \topk is memory-bound, saturating GPU memory bandwidth for large inputs and significantly reducing overall throughput.
+In Figure~\ref{fig:atten_kernel_overview}, \topk takes longer than full attention, consuming up to 80\% of the total naive sparse attention time. 
+
+\noindent\textbf{Kernel fusion.} 
+To reduce memory footprint and data movement overhead, we fuse \topk directly into the low-rank MatMul. Instead of materializing the large result tensor, partial MatMul results are immediately used for incremental \topk updates which is all we need here after all.
+A custom GPU kernel interleaves these steps, keeping only the \topk entries per query in registers. This reduces the space complexity from \(\mathcal{O}(S^2)\) to \(\mathcal{O}(S K)\) and minimizes data movement between HBM and on-chip registers.
+
+\subsection{Sparse Attention with Query Grouping}
+\label{sec:sparse_kernel}
+Implementing sparse attention naively where each query relies on distinct critical KV pairs yields limited speedups (about 1.4$\times$ in Figure~\ref{fig:atten_kernel_overview}), primarily due to uncoalesced memory access patterns and diminished tensor core utilization. Since each query can fetch disjoint KV entries, data reuse decreases dramatically, hindering parallel efficiency.
+As noted in \hyperlink{obs5}{Obs.5}, adjacent queries in the 3D spatial-temporal domain often share a large portion of critical KV pairs. 
+This allows us to cluster nearby queries into groups based on their proximity in 3D cubes (e.g., 2$\times$2$\times$2 voxels), and share the critical KV indices within a group. 
+We employ an adaptive offline profiling mechanism to accommodate variations in image resolution and frame rates across datasets and balance hardware efficiency. This mechanism determines the largest feasible group size that satisfies the required overlap ratio (e.g., 80\%) of critical KV for queries within a group. The central query in the group is used exclusively as the proxy to identify the shared critical KV pairs (reduce the estimation problem size as well). Then, these queries are processed together for their attention to improve memory access and computation efficiency.
+
+
+
+
+\section{Hybrid Sparsity-Aware Context Parallelism}
+\label{sec:parallelism}
+Sparsity in attention adds a new dimension to context parallelism (CP). In this section, 
+{we first analyze the performance of head-wise and sequence-wise CP in sparse settings with the best tuning. Building upon this, we propose a hybrid sparse CP strategy that computes the best configuration by jointly optimizing both forms of CP for each attention block.}
+
+\subsection{Modeling Context Parallelism with Sparsity}
+\label{subsec:parallel_modeling}
+We consider $N$ GPUs within a CP group, each initially processing a partial sequence and storing the corresponding $Q$, $K$, and $V$ chunks with shape [$H$, $S/N$, $D$], where $H$ is the number of heads, $S$ sequence length, and $D$ head dimension.
+
+\subsubsection{\bf \em Head-wise CP with Sparsity}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.475\textwidth]{figures/HCP_new.pdf} 
+  \caption{An example of load imbalance in HCP with four attention heads (different colors). A sequence is split into two chunks (different shades) each held by one GPU. A chunk's length on a head represents its relative computational burden, i.e. 1 minus the sparsity level. A GPU's total burden is the sum of that across all heads it hosts.}
+  \label{fig:hcp} 
+\end{figure}
+
+
+
+HCP redistributes the attention workload across the head dimension using all-to-all operations. Each GPU transitions from processing a sequence partition across all heads to handling a few heads for the entire sequence. However, the varying sparsity levels across heads introduce additional complexity and inefficiency.
+
+
+\noindent\textbf{Computation load imbalance.} The head-wise split for attention computation, combined with sparsity heterogeneity leads to uneven computational burdens across GPUs as shown in Figure~\ref{fig:hcp}. Here, attention heads are distributed uniformly across GPUs, resulting in a significant load imbalance: GPU0 becomes a straggler due to low sparsity levels of its heads. Swapping the head-GPU assignment reduces the end-to-end time by 35.7\% with more balanced workloads. This highlights the need for a {\textit{balanced head-wise reallocation}} to account for sparsity heterogeneity. 
+The best head allocation scheme within a HCP group can be found by a small combinatorial optimization problem that minimizes the maximum computational burden per GPU. We refer to this minimal per-GPU computation burden as $comp^{hcp}$. 
+
+
+\noindent\textbf{Communication cost.} 
+We turn to analyze the total communication volume of each GPU in a sparse HCP group. 
+Let $H_i^{r}$ represent the final number of heads allocated to GPU ${i}$. The training process involves four uneven all-to-all operations ($QKV$ and output) for each GPU, with total cost amounting to:
+$comm_i^{hcp}=3SD\max(H_i^{r}(N-1)/N , (H-H_i^{r})/N ) + SD\max((H-H_i^{r})/N, H_i^{r}(N-1)/N )$.
+
+
+\noindent\textbf{Memory cost.} 
+Similar to communication, the memory consumption for $QKV$ and output on each GPU of a HCP group could slightly differ due to the potential uneven head allocation, and is given by: {$mem_{i}^{hcp}=4 S D H_i^{r}$}.
+
+
+\subsubsection{\bf \em Sequence-wise CP with Sparsity} 
+SCP does not reallocate the computation burden. Instead, it computes the attention output for the local $Q$ with both local $KV$ and remote $KV$ gathered from other GPUs within the same group.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.45\textwidth]{figures/SCP_new.pdf} 
+    \caption{An example shows redundant communication of SCP in the same setting as in Figure~\ref{fig:hcp}. The width of each chunk represents the held KV size for that chunk. For simplicity, only GPU 0 is shown here after the KV gathering; GPU 1 should have a similar situation.}
+  \label{fig:scp} 
+\end{figure}
+
+
+\noindent\textbf{Communication cost.} 
+In standard SCP a GPU gathers all remote KV tensors, but this is unnecessary in the sparse setting as shown in Figure~\ref{fig:scp}(a). Only the critical KV tensors are needed now, which leads to \textit{selective KV gathering} as in Figure~\ref{fig:scp}(b). 
+Consequently, the actual communication volume is:
+{$comm_i^{scp}=2HDS/N\cdot \max(\sum_{j\in N,j\neq i}\alpha_{i}^{j}, \sum_{j\in N,j\neq i}\alpha_{j}^{i})$}, 
+where $\alpha_{i}^{j}$ denotes the fraction of KV tensors on GPU $j$ that is needed by GPU $i$.
+
+\noindent\textbf{Memory cost.} 
+Similarly, the memory consumption for additional non-local critical KV varies with $\alpha_{i}^{j}$ as well. It can be expressed as:
+{ $mem_i^{scp}=2HD\sum_{j\in N,j\neq i}(\alpha_{i}^{j}S/N).$}
+
+
+
+\subsection{Hybrid Sparse Context Parallelism } 
+
+The analysis of optimized HCP and SCP in sparse settings highlights their respective strengths and limitations. 
+HCP has a big impact on each GPU's computation load, while SCP does not. However, the communication overhead for both varies depending on the sparsity pattern.
+
+Naturally, HCP and SCP can be combined with HCP re-balancing the workloads across heads and SCP further splitting them across sequences for certain heads. For example, in an 8-GPU setup {with a HCP degree of 4,} ranks 0-3 and 4-7 form HCP groups where head-wise reallocation occurs. Each GPU pair across HCP groups (e.g., rank 0 and rank 4) then forms four SCP groups (SCP degree 2), with ranks in each SCP group handling different sequence chunks for the same heads. 
+By flexibly partitioning workloads across both dimensions, the hybrid approach (see Algorithm~\ref{algo::cp} in Appendix~\ref{appendix:algo}) can potentially achieve an optimal balance of computation and communication under certain sparsity pattern. 
+
+
+\noindent\textbf{Optimal CP configuration.} 
+To find the best configuration for hybrid CP, we formulate an optimization problem that arrives at the optimal HCP and SCP degrees $g^{h},g^{s}$ for each attention block:
+\begin{align}
+ \min\ & \mathop{\max}\limits_{i}\left({T_{i}^{comm}(g^{h},g^{s})}+{T_{i}^{comp}(g^{h},g^{s})}\right) \nonumber\\
+\text{s.t.}\ \ & T_{i}^{comp}(g^{h},g^{s})=f_i(comp^{hcp}(g^{h})), \label{cons:comp} \\
+& T_{i}^{comm}(g^{h},g^{s})=h_i(comm_i^{hcp}(g^{h})+comm_i^{scp}(g^{s})), \label{cons:comm} \\
+& mem_i\left(g^{h},g^{s}\right) = mem_i^{hcp}(g^h)+mem_i^{scp}(g^s) \leq M, \label{cons:mem} \\
+& g^{h} \cdot g^{s} = N,\;  g^{s}\ge 1, \; 1 \leq g^{h} \leq H.\label{cons:group} 
+\end{align}
+The objective is to minimize the maximum execution time, including both communication and computation on any GPU given the CP configuration $g^{h},g^{s}$. 
+The computation time depends on the minimum per-GPU computation burden $comp^{hcp}$ found for $g^{h}$ in cons.~\eqref{cons:comp}, while the communication time is directly determined by the communication volume in cons.~\eqref{cons:comm} (and intra- and inter-node bandwidths which are known).
+Cons.~\eqref{cons:mem} ensures that memory usage remains within acceptable limits, while \eqref{cons:group} imposes restrictions on group sizes: the HCP group size is bounded by the model's head count, and the product of the HCP and SCP group sizes must equal the total number of GPUs. 
+Given the limited search space and the stable sparsity patterns over training intervals, the optimization can be periodically solved with small overhead.
+For deployment, we dynamically determine whether to prioritize HCP-first or SCP-first intra-node placement based on their estimated communication volume under a specific configuration and sparsity pattern.
+
+
+
+

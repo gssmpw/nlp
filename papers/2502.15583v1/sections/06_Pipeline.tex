@@ -1,0 +1,48 @@
+
+
+
+
+
+
+% As shown in Figure~\ref{fig: dataflow}, our system design follows a Parameter Server (PS) architecture. The MLP layers (including bottom MLP and top MLP) are replicated to all GPUs and trained in a data-parallel style. The embedding layers are divided into two parts, most embedding tables are represented as TT tables which are also replicated to all GPUs while the remaining embedding parameters that can not be fit into GPU HBM are placed in host memory.
+
+% The CPU side serves as a parameter server, it will pre-fetch the embedding parameters for the next a few batches from the host memory to the \textit{Pre-fetch Queue} of different GPUs. And the GPUs act as workers that conduct forward and backward computation. The workers will first concatenate the embeddings from the TT tables and the pre-fetch queue to collect all embedding parameters for the working batch. Then the workers will synchronize the concatenated embeddings with the embedding cache (details in $\S$\ref{sec: cache design}) to make sure that all embeddings are updated (Step \circled{1}). The TT tables are trained in a data-parallel style. So that after forward and backward computation, we must synchronize the gradients of TT tables and embedding cache before updating the parameters (Step \circled{2}). Finally, the gradients of embedding parameters from host memory will be pushed into the \textit{Gradient Queue} and then the server will pull the gradients and update the embedding parameters in the host memory (Step \circled{3}).
+
+% In addition to the TT-based algorithmic innovations, we also introduce our system-level design to systematically address larger embedding tables that TT table can not handle. TT table can not solve all the problems that may be encountered when training massive DLRM on a single-GPU platform. Sometimes, after using TT table to compress large embedding tables, the compressed embedding table footprint is still too large to fit into GPU memory. 
+% In this case, some part of the model must be moved to CPU memory. Thus, we need a high-performance hybrid CPU-GPU system design to achieve comparable performance to the GPU-only case. 
+% To design a hybrid CPU-GPU training system, we abstract the workload of DLRM as a weighted data-flow graph. As shown in Figure~\ref{fig: dataflow}(a), the nodes in the graph are the main computation of \Mname. The edges represent the data transfer between different components, and the data transfer amount is also given in the graph. 
+% However, there still are two main questions that need to be addressed: \textit{\textbf{1) Where to store the components of \Mname? 2) Where to compute the forward and backward?}} 
+% To design a hybrid CPU-GPU training system, we need to split this graph into two parts and store them on CPU and GPU respectively and there are two main questions that need to be addressed: 
+
+
+% \textit{For the first question:} MLP forward and backward both have high computation amounts, and the footprint of MLP is also much smaller than embedding tables, there is no doubt to place MLP on GPU. The next one is the embedding table, it has a large footprint and low computation amount, so the embedding table is placed on CPU memory. TT table lookup consists of many batched-GEMM which means it also has high computation amount, and the footprint of TT slice $B \cdot T$ is $200\times$ larger than the uncompressed embeddings $B \cdot D$ so that if TT table is placed on CPU memory, it will incur large communication volume between CPU and GPU. And more importantly, the TT table's footprint is much smaller than the embedding table, and it can easily fit into GPU memory. In our design, we place the TT table on GPU. 
+
+% \textit{For the second question:} MLP and TT table are both stored in GPU memory, executing the forward and backward of MLP and TT table on GPU is a natural choice. As for the embedding table, although embedding tables are stored in CPU memory, the backward of embedding table requires a large amount of computation which will become a bottleneck if executed on CPU. In \Mname, the embedding table gradients are computed on GPU, and the only task for the CPU side is to receive the gradients and update the embedding tables. Based on the discussion above, our hybrid CPU-GPU system design for DLRM training is given in Figure~\ref{fig: dataflow}(b). We place the embedding tables on CPU memory, but only the embedding table lookup and update are done on the CPU and all other computations are executed by the GPU. Such system design not only minimizes CPU side computation but also minimizes communication volume between CPU and GPU.
+
+
+% \subsection{Solving RAW Conflict with Embedding Cache}\label{sec: cache design}
+% Pipelining is a commonly used technique to accelerate the training of deep learning on hierarchical memory architecture. The DLRM workload can also leverage pipeline training by overlapping the CPU side embedding parameter gathering and GPU side MLP forward and backward. However, such pipeline training design will incur a \textit{Read-After-Write (RAW)} conflict. As shown in Figure~\ref{fig: buffer}(a),  when MLP is processing data batch $i$, the embeddings of data batch $i+1$ will be pre-fetch at the same time. However, the update stage of batch $i$ have not finished yet, so the  pre-fetched embeddings may contain some ``stale'' parameters that have not been updated by the gradients of batch $i$.
+% % pre-fetched embeddings  
+
+% which leads to 
+% but the new embeddings updated by  have not been fed back to CPU yet.
+% and influences the predicting accuracy of the DLRM model since the embedding table in DLRM is also trainable parameters which need to be update in every iteration.
+
+% To tackle this RAW conflict, we design an \textit{Embedding Cache} to track the embeddings that will be used for training in the next few batches and keep the GPU side embeddings up to date. The process of GPU side embedding synchronization has been shown in Figure~\ref{fig: buffer}(b).
+% %
+% The pre-fetched embeddings batch contains the indices and the embedding parameters. When a new pre-fetched embedding batch comes, the embedding cache will search the indices from the index table.
+% %
+% If the index is found in the cache, it means that this embedding has been used by several previous batches and needs to synchronize like the $\mathsf{Emb2}$ in Figure~\ref{fig: buffer}(b). After embedding synchronization, all embeddings are up to date and ready to be trained.
+% %
+
+% To minimize the size of the embedding cache, we use a ``life cycle (LC)'' system to manage the embeddings in the cache. Once the training process of an input batch is finished, the embeddings will be pushed into the cache and be assigned with LC values equal to the maximum length of the Requests Queue (pre-fetch queue and gradient queue). If the CPU pulls a batch from the gradient queue, the LC value of the corresponding embeddings will be decremented by 1. And once the LC value of an embedding is equal to 0, the embedding will be evicted from the cache. With such a  life cycle management system, we are able to only keep the required embeddings into the embedding cache, and minimize its memory demand.
+
+
+% The pipeline training workflow and the embedding buffer design has been shown in Figure~\ref{fig: buffer}(b). The CPU side embedding tables lookup\&update and GPU side MLP forward\&backward works simultaneously. The retrieved embedding batch will be pushed into the \textit{Pre-fetch Queue} (Step \circled{1}). Later, GPU will get embedding batch from the pre-fetch queue (Step \circled{2}), but the embeddings obtained is not ready for subsequent computation since it may contain some staled embeddings. An embedding synchronization needs to be applied (Step \circled{3}), the synchronization serves two main purposes: 1) Getting the up-to-date embeddings from embedding buffer and substituting the corresponding embeddings in the batch and 2) Concatenating the embedding batch with embeddings from TT table. Then the synchronized embeddings will be sent to MLP to finish the remaining training process. After an iteration of training is done, the embedding buffer will be renewed with the updated embeddings (Step \circled{4}), and the updated embeddings will also be pushed into the \textit{Update Queue} to update the embedding tables on CPU memory (Step \circled{5}). With our embedding buffer design, the read-after-write conflict can be solved at runtime with very low overhead.  
+
+
+
+
+
+
+

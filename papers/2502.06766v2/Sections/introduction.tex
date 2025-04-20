@@ -1,0 +1,61 @@
+\section{Introduction}
+\label{introduction}
+\begin{figure}[!ht]
+    \centering
+    \includegraphics[width=0.9\linewidth]{Figures/main_diagram_standard.png}
+    \includegraphics[width=0.9\linewidth]{Figures/main_diagram_topk.png}
+    \caption{(top) Typical attention requires each query vector to compute an inner product with each key vector in the context window.  In practice, most key vectors produce insignificant attention scores, and therefore contribute very little to subsequent hidden states, so much of this computation is wasted. (left-bottom)  \topk attention retrieves only the keys that contribute significantly to the attention computation, leaving the gray arrows out and achieving sublinear runtime. }
+    \label{fig:diagram}
+\end{figure}
+
+Long context inference is the process by which models analyze large document collections or follow long and detailed instructions. 
+The \emph{context} is a series of tokens, like a set of documents or a set of files in a codebase. 
+Increasingly, models are trained to handle larger and larger context lengths, with new models training on contexts in the millions \citep{liu2024worldmodelmillionlengthvideo}.
+
+Inference is done using a trained model and is divided into two steps: \emph{prefill} and \emph{decoding}. In the prefill stage, tokens pass forward through the model, and their key and value activations from the attention mechanism of each layer are stored in a list. 
+This list is called the \emph{KV cache} \citep{pope2023efficiently}. 
+In the decoding stage, the model uses the KV cache to generate new tokens one at a time. 
+In a standard attention mechanism, each new token attends to every cached token in the context. 
+When the context length is very large, both the prefill and decoding stages can become prohibitively expensive.
+
+The prefill stage incurs an $O(N^2)$ compute and memory cost due to the large attention matrix formed in the computation (where $N$ is the number of tokens in the context). To mitigate this, brute-force methods such as Ring Attention~\citep{liu2023ringattentionblockwisetransformers} were developed. This approach uses round-robin communication between servers to scale computation linearly in the number of GPUs. Despite its apparent effectiveness, while the prefill stage occurs only once, because the decoding stage occurs many hundreds of times for a single user request, the algorithm limited in its practicality outside of the data-center.
+
+Every step during the decoding stage incurs an $O(N)$ compute and memory cost, as each new token must attend over all previous tokens in the cached context. As context lengths grow, the KV cache can become prohibitively large. If each of the $N$ tokens in the context is embedded into a vector of size $D$ (the \emph{hidden dimension}) then the number of floating point numbers in the cache is $2NDL$, where $L$ is the number of network layers. For a value of $D=4096$ and $L=32$ as in the Llama-3 8B architecture \citep{grattafiori2024llama3herdmodels}, at $N=100,000$ the memory required for the cache alone is 52GB, assuming 16 bit floating point format \citep{zhang2024pqcacheproductquantizationbasedkvcache}. At this context length the cache is unable to fit on most commodity GPUs. 
+
+One approach to save memory during decoding is to offload the KV cache to CPU memory \citep{sheng2023flexgen}. However, the additional data movement required to implement this strategy is itself prohibitive. In the above example, just a single layer's worth of KV cache data is 1.6GB and this payload must be schlepped back and forth hundreds or thousands of times during a single generation. Attacking the problem from a different angle, cache eviction methods try to maintain a fixed cache size on the GPU by selectively removing token vectors deemed irrelevant \citep{zhang2023h2oheavyhitteroracleefficient}, but because it can be difficult to tell which vectors will be needed in the future, these strategies ultimately hurt performance.
+
+\begin{figure}[t!]
+    \centering
+    \includegraphics[width=\linewidth]{Figures/TopK_OpenLLM_Leaderboard_Tasks_Base_title_figure.pdf}
+    \caption{Performance on selected OpenLLM Leaderboard tasks using only the top-\texttt{k} keys for each attention computation. Typical questions have a context length of $\sim1000,$ yet only 10 keys are needed to achieve the same performance as full attention. We evaluate an extended set of models in \Cref{fig:lm_eval_harness_topk_results}.}
+    \label{fig:lm_eval_harness_topk_results_teaser}
+\end{figure}
+
+In contrast to the compute and communication intensive solutions discussed thus far, we base our proposal on a simple fact: 
+
+\begin{minipage}{1.0\linewidth}
+\centering
+\textit{Modern LLMs only need to pay attention\\to a handful of tokens at a time.}
+\end{minipage}
+
+We exploit this observation to perform fast long context decoding with very little GPU memory. 
+We build an implementation of attention in which keys and values are stored in a vector database in CPU memory. 
+When attention is computed using a query vector at decoding time, we retrieve only the \kk keys with the highest attention scores. 
+This can be done in sublinear time using an approximate \kk-nearest neighbor search over the cache database, enabling long context inference using plentiful and cheap CPU memory, and without the heavy computational overhead required for full attention. Due to the fact that the constraint on the number of relevant keys constrains the CPU-GPU transfer volume, our approach incurs minimal data movement costs compared to other KV cache offloading methods since only a fraction of the token representations ever need to be transported between GPU and CPU memory.
+% on the PCIe bus.
+
+To build a deeper understanding of why our approach works, through an array of controlled experiments we interrogate the core ``\topk'' assumption on which we base our method; that attention in modern LLMs is an inherently sparse operation. 
+% We analyze the validity of the \topk assumption through various experiments.
+While methods exploring the restriction of the attention mechanism to the \topk scores have been studied extensively \citep{guptaMemoryefficientTransformersTopk2021, liu2024retrievalattentionacceleratinglongcontextllm, zhang2024pqcacheproductquantizationbasedkvcache}, 
+prior work does not specifically endeavor to solve resource constrained long-context decoding using scalable tools like approximate nearest neighbor search, nor do they demonstrate million token context inference on single, commodity GPUs.
+% \topk has yet to be framed in the context of resource-constrained long context decoding with approximate nearest neighbor search. 
+% Existing implementations have not been taken to the extreme scale of 1 million tokens.
+
+
+Our primary contributions are summarized as follows:
+\begin{itemize}[topsep=0.0cm,itemsep=-0.2cm,leftmargin=0.5cm]
+    \item We propose a simple method for sublinear long context generation using \topk attention over preprocessed states in a vector database.
+    \item We show that this technique achieves high fidelity on common benchmarks and long-context tasks (\Cref{fig:lm_eval_harness_topk_results_teaser}).
+    \item We provide an empirical analysis on why \topk attention works and demonstrate its effectiveness at the million token scale.
+    \item We demonstrate the flexibility of our method by varying the \topk budget on a per-layer basis.
+\end{itemize}

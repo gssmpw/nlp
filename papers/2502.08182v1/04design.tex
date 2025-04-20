@@ -1,0 +1,461 @@
+%-------------------------------------------------------------------------------
+\section{The \sys System}
+%-------------------------------------------------------------------------------
+
+This section presents \sys, an latency-SLO-aware memory offloading 
+system for LLM inference. 
+%
+This section starts with \syss design goals~(\S\ref{sec:designgoals}), an overview~(\S\ref{sec:overview}), followed by the design of each  component.
+
+\subsection{Design Goals.}
+\label{sec:designgoals}
+%
+We design \sys with the following goals. 
+
+\squishlist
+%
+\item{\textbf{Meeting latency SLOs.}}
+%
+Departing from \deepspeed, the top priority of \sys is to meet latency SLOs, aligning with the overarching goal of memory offloading: reducing operational costs. 
+
+\item{\textbf{Maximizing host memory usage.}}
+%
+Once adhering to latency SLO, unlike \flexgen, \sys should maximize host memory usage to \eg, support larger models, enable greater batch sizes and/or longer sequence lengths, or allow the models to produce longer outputs. 
+
+\item{\textbf{Fine-grained dynamic adjusting.}}
+%
+\sys should dynamically (rather than statically as with \flexgen) decide the amount of memory offloaded to the host, considering factors such as the sequence length and batch size of serving requests, the associated latency SLOs and, particularly, the current machine status.
+\squishend
+
+\subsection{Overview}
+\label{sec:overview}
+%-----------------------------------
+
+\PN{Deployment scenario.} 
+%
+\sys operates on a single machine equipped with multiple GPUs, where each hosts a model. 
+%
+These GPUs may contend on the PCIe bandwidth. 
+%
+\sys takes as input a serving request and its associated SLO. 
+%
+Such an SLO may not be the end-to-end one: upper level components can adjust the SLO passed to \sys based on, \eg, networking delays that are 
+already incurred. 
+%
+\sys next checks whether this SLO can be met by the GPUs it 
+manages~(\S\ref{subsec:des:contention}), as there are situations where 
+the SLO cannot be met at all. 
+%
+For example, a deployed model with weights requiring memory far exceeding the GPU's capacity forces a large state to be offloaded to host memory, 
+causing long data transfer times that violate the SLO. 
+%
+If the SLO can be met, \sys schedules the request on one of the GPUs. 
+%
+If not, \sys passes the request to the upper-level scheduler, which can 
+avoid the SLO violation, by, \eg, sending the requests to other node hosting
+models without memory offloading. 
+%
+
+%
+\PN{Components and workflow.}
+%
+To meet the design goals, at its core, \sys operates on the \interval~(\S\ref{sec:runtimememorymanager}), 
+an internal tunable knob that captures the tradeoff between 
+meeting SLOs and maximizing host memory usage. 
+%
+A small \interval makes \sys offload more LLM state to host memory and thus 
+may potentially slow down inference, being more prone to SLO violations.  
+%
+A large \interval achieves the opposite. 
+%
+As further explained in \S\ref{sec:runtimememorymanager}, using \interval to control 
+the aforementioned tradeoff is enabled by a unique characteristic of LLM: 
+during serving, each layer takes the same amount of computation time. 
+%
+Thanks to \interval, meeting the design goals of \sys is reduced to automatically and dynamically adjusting the \interval for each GPU instance. 
+%
+\sys achieves this in two stages: first an offline stage and then 
+an online stage, as we detail next. 
+
+As shown in Figure~\ref{fig:overview}, \sys consists of three components: 1) a performance 
+\analyzer, to find the optimal \interval~(\ie, the smallest one that meets SLO) under no bandwidth contention; 2) per-GPU runtime memory 
+managers, which take as input \interval, and transfers layer state between GPU 
+and host memory basd on the \interval; and 3) per-bus runtime 
+bandwidth coordinators, which adjust the \interval for all GPUs 
+sharing a bus at the granularity of each inference iteration. 
+%
+
+The performance \analyzer operates offline~(\ie, not on servers that handle user requests) to find the optimal \interval.
+%
+Specifically, to ensure no bandwidth contention, the performance 
+\analyzer operates on a dedicated server,
+where each GPU exclusively occupies a single PCIe bus.
+%
+Upon deploying a new model on a GPU that \sys manages, the model is passed to the performance \analyzer. 
+%
+The \analyzer generates a stream
+of prompts and executes them on the model to generate a performance \record. 
+%
+A performance \record stores the optimal \interval for all valid combinations of SLOs, sequence length, and batch size. 
+%
+Generating a performance \record beforehand is possible due to, again, LLM's deterministic execution time. 
+%
+Unlike performance \analyzer, the memory manager and bandwidth coordinators operate online on normal servers that serve user requests. 
+
+
+
+The workflow of \sys is as follows.
+%
+When a request comes,
+\BC{1}
+%
+\sys first waits for a GPU instance hosting the corresponding model to become available.
+%
+\BC{2}
+%
+Based on the target SLO~(minus the waiting time), the 
+sequence length, and the batch sizes of the request, 
+\sys consults the performance \record of the model to obtain the optimal
+\interval. 
+%
+\BC{3} 
+%
+The \interval and the requests are passed to the bandwidth coordinator, which 
+generates an adjusted \interval for each GPU instance that shares the bus considering their bandwidth utilization. 
+%
+\BC{4} 
+%
+The bandwidth coordinator passes the request to the selected GPU, and the 
+set of adjusted \interval to the runtime memory managers of all GPUs sharing the bus. 
+%
+The runtime memory manages applies the adjusted \interval before the next inference iteration. 
+%
+
+
+%---------------------------
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\columnwidth]{figures/overview.pdf}
+    \caption{The architecture and workflow of \sys.}
+    \label{fig:overview}
+\end{figure}
+
+%% %---------------------------
+
+
+\subsection{Runtime Memory Manager}
+\label{sec:runtimememorymanager}
+%
+\PN{Insight.}
+%
+A key design behind \interval is to exploit a special characteristic of LLM:  during inference, the computation time of each layer is always identical, even in different iterations.
+%
+This is because, as discussed in \S\ref{sec:llm}, 1) each layer consists of the 
+same structure~(\ie, same number of matrices of the same size for the corresponding matrices); 
+%
+2) each layer performs the same operations, 
+%
+and 3) the size of the input to each layer remains the same~(\ie, either all 
+input tokens in prefill or one token in decoding). 
+%
+
+
+\PN{\Interval.}
+%
+Using this, \sys proposes \interval. 
+%
+An \interval of $i$ means that for every $i$ layer, the state of the last layer is offloaded to CPU memory, while the state of other layers are always 
+in GPU memory. 
+%
+We term the last layer \oflayer. 
+%
+
+The memory manager in \sys transfers the state between host and GPU memory following a decided \interval. 
+%
+To maximize performance, \sys also follows the design scheme of overlapping computation with data transfer~(\S\ref{sec:overview}). 
+%
+However, unlike \deepspeed and \flexgen that prefetches the \oflayer only when 
+the computation is on the exact previous layer, the memory manager in \sys prefetches the state of the \oflayer by initiating the loading upon the computation on the first layer 
+in the \interval.  
+%
+Therefore, with \sys, 
+the transfer time is hidden by the computation time of multiple layers, rather than one layer as \deepspeed and \flexgen. 
+
+
+%---------------------------
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=\textwidth]{figures/overlap.pdf}
+    \caption{An overview of how a memory manager works. 
+ The upper part represents the compute stream, where each block denotes 
+ a layer with pink blocks being the offloaded layers. 
+    %
+ The lower part is the copy stream. 
+ The two streams execute in parallel, with "S" meaning synchronization points between the streams.}
+    \label{fig:selectn}
+\end{figure*}
+
+%% %---------------------------
+
+Figure~\ref{fig:selectn} concretizes the above discussion by showing a scenario where the \interval is 4. 
+%
+In this case, the states of layers 1 to 3 and 5 to 7 are always in the GPU memory, while layers 4 and 8 are \oflayer. 
+%
+Before computing layers 1 and 5, \sys prefetches the state of layers 4 and 8, respectively. 
+%
+Next, before computing layers 4 and 8, \sys ensures that their state 
+is ready in the GPU memory. 
+%
+Once the computation is done, \sys moves their state back to CPU. 
+
+The \interval offers an effective mechanism to resolve the tension between meeting the SLO and maximizing host memory usage. 
+%
+A small \interval maximizes host memory usage, since more layers are offloaded there, but can only support looser SLO, since there are fewer layers 
+whose computations are used to hide the load of the \oflayer. 
+%
+In fact, \sys is reduced to \deepspeed if the \interval is set to $1$. 
+%
+A larger \interval increases GPU memory usages, but can meet stricter SLO. 
+%
+
+The above design simplifies resolving the aforementioned tension to 
+selecting an optimal (\ie, the smallest \interval that meets the SLO of given input requests). 
+%
+The following subsections present how \sys performs the selection with a 
+two-phase approach. 
+
+\subsection{Generating Performance \Record}
+\label{sec:generatingperformance}
+%-------------------------------------------------------------------------------
+
+\PN{Challenge.}
+%
+To decide the optimal \interval, one must know the computation time and the transfer time of each layer. 
+%
+A challenge \sys encounters is that while the computation time of each layer 
+is highly deterministic~(\ie, the time is always the same), it is not
+predictable; one cannot easily estimate beforehand the computation time 
+of each layer, as we have shown in~\S\ref{sec:estimating}. 
+%
+As a result, this forces \sys to measure this computation time during runtime. 
+%
+An naive approach is to measure the computation time on the real production server every time the actual requests arrive. 
+%
+However, this 1) increases GPU usage, thereby 
+leading to extra operational costs; 2) incurs an extra latency caused by 
+measurements during runtime. 
+
+
+\begin{table}[t]
+    \centering
+    \small % 使用较小的字体
+    \begin{tabular}{c|cccc}
+        \hline
+        \textbf{} & \textbf{128} & \textbf{256} & \textbf{512} & \textbf{1024} \\ \hline
+        \textbf{4}   & 5 & 4 & 3 & 2 \\
+        \textbf{8}   & 4 & 3 & 2 & 1 \\
+        \textbf{16}  & 3 & 2 & 1 & 1 \\
+        \textbf{32}  & 2 & 1 & 1 & 1 \\
+        \textbf{64}  & 1 & 1 & 1 & 1 \\  \hline
+        % \textbf{128} & 1 & 1 & 1 & 1 \\ \hline
+    \end{tabular}
+    \vspace{0.6cm}
+    \caption{Performance \record for a given SLO. 
+ Row: batch size. Column: sequence length. Larger batch sizes and sequence lengths are omitted, as the optimal \interval is one.}
+    \label{tab:batchtpotdecode}
+\end{table}
+
+
+
+\PN{Insight.}
+%
+\sys overcomes this challenge, again by leveraging the deterministic nature of the computation time on each layer.
+%
+Our obsveration is that, with the deterministic nature, for a given model and hardware platform, assuming no bandwidth contention, 
+the computation time of each layer depends solely on 
+the size of the prompts, namely the sequence length and batch size.  
+%
+Therefore, \sys can obtain the accurate execution time of each layer 
+by simply executing one iteration of the model on the target machine.  
+%  
+
+
+\PN{Design.}
+%
+The above insight allowed \sys to decide the optimal \interval offline with 
+a model \analyzer. 
+%
+The \analyzer is invoked every time a new model is scheduled to 
+be deployed on a GPU instance managed by \sys. 
+%
+The \analyzer takes as input a list of potentially possible SLOs, 
+and for each SLO, generates a performance \record. 
+%
+The performance \record stores, for a pair of input sequences and batch size, 
+the optimal \interval, assuming no bandwidth contention. 
+%
+Table~\ref{tab:batchtpotdecode} shows one such example. 
+
+Under the hood, the \analyzer works in the following steps. 
+%
+For a given SLO, it first enumerates all possible pairs of batch size and sequence length. 
+%
+For any given pair, the \analyzer generates a prompt of that size with 
+random content. 
+%
+It next uses the prompt to run one iteration of prefill and decoding. 
+%
+During execution, the \analyzer measures 1) $t_\text{trans}$: 
+the time to transfer a layer from CPU to GPU memory; 2) 
+and then $t_\text{compute}$: the computation time of a single layer. 
+%
+Therefore, to ensure the layer transferring time does not cause SLO violations, 
+the maximum number of layers that can be offloaded 
+is $L_{\text{offload}} = \left\lfloor \frac{t_\text{compute} \cdot (1 + \delta)}{t_\text{trans}} \right\rfloor$, where $\delta$ is the SLO quotient
+over the computation time without offloading. 
+%
+Finally, the optimal \interval for this pair of sequence length and batch size is given by \(\left\lfloor \frac{L}{L_{\text{offload}}} \right\rfloor\), 
+where \(L\) is the total number of decoder layers in the model.
+
+
+
+
+Creating performance \records is practical for the following reasons. 
+%
+First, the number of combinations of batch size, sequence length, and SLOs that need to be enumerated is actually small, since the \analyzer only needs to operate at a specific granularity for these values to be effective.
+%
+For example, the current prototype uses 2-millisecond granularity for SLOs and requires batch sizes and sequence lengths to be powers of two.
+%
+\sys selects the optimal offloading interval for combinations not listed in the performance record by conservatively choosing from the nearest combination.
+%
+With this granularity, the number of target SLOs in production is typically 
+at the scale of hundreds, since latency SLOs for interactive LLM tasks, which
+sys targets, rarely exceed one second.
+% 
+Although there can be an infinite number of batch size and sequence length pairs, if their product exceeds a certain threshold, the optimal \interval becomes 1, since the computational time of a single layer exceeds the 
+transfer time of that layer.  
+%
+Therefore, the possible pairs of the batch size and sequence length the \analyzer needs to sample is at most 100 for our evaluated models.  
+%
+Second, given a batch size and sequence length pair, obtaining the optimal
+\interval is fast, which usually takes 1-2 seconds for our models. 
+%
+The above two factors combined mean that the process of creating a performance \record is fast, requiring at most 40 minutes for our models. 
+%
+This is much shorter than the frequency of deploying a new model in production, 
+which is at the scale of months. 
+
+
+\PN{Supporting the separation of prefill and decoding.}
+%
+An emerging LLM deployment scheme is to deploy prefill and decoding phases on separate instances~\cite{distserve, splitwise}. 
+%
+Such separation maximizes performance by allowing each stage to 
+fully leverage GPUs optimized for their specific workloads. 
+%
+In addition, the separation facilitates independent scaling of the two phases. 
+
+Unfortunately, both \deepspeed and \flexgen do not consider the separation
+of prefill and decoding; 
+%
+they offload the same portion of the model state to host memory for both phases, 
+thereby causing significantly longer delays during the decoding phase. 
+
+
+A key benefit enabled by the \analyzer is to effectively support the seperation of prefill and decoding.   
+%
+In this case, the \analyzer creates the performance \record for prefill and decoding separately, thereby considering the different characteristics of the two phases. 
+%
+Hence, departing from prior work, \sys can use a different \interval that is most suitable for the corresponding phase. 
+%
+In general, the compute-intensive prefill phase requires a shorter \interval, 
+while the memory-intensive decoding phase requires a larger \interval.  
+%
+
+
+
+%-------------------------------------------------------------------------------
+\subsection{Addressing Bandwidth Contention}
+\label{subsec:des:contention}
+
+%
+The \analyzer chooses the optimal \interval by assuming 
+an ideal scenario where each GPU can utilize the whole PCIe bandwidth. 
+%
+However, as discussed in \S\ref{sec:bandwidth}, real-world inference scenarios may incur bandwidth contention among different GPU instances.  
+%
+\sys addresses this issue with a per-bus runtime bandwidth coordinator, that adjusts \interval for contented GPU instances at the granularity of each inference iteration~(\ie, at the granularity of generating an output token), as we detail next. 
+%
+
+The coordinator performs the adjustment by observing that, given an input request, each GPU instance has a minimum and maximum \interval. 
+%
+The minimum \interval is derived from the performance \record~(\S\ref{sec:generatingperformance}); 
+%
+any \interval below the minimum violates the SLO of the input.  
+%
+The maximum \interval depends on the model memory deployed on the GPU. 
+%
+Since \sys enables deploying models that require more memory than the GPU has, the 
+\interval must remain below a threshold to avoid exceeding GPU capacity. 
+%
+For models whose required memory is within the GPU capacity, the
+maximum \interval is infinite. 
+
+Critically, the \interval also 
+precisely controls the usage of PCIe bandwidth. 
+%
+A small \interval incurs higher bandwidth usage since layers are swapped more frequently between host and GPU memory, while a large \interval incurs lower bandwidth. 
+%
+Furthermore, given an \interval, the consumed bandwidth can be accurately estimated, as shown in Lines 4-13 of Figure~\ref{fig:code}. 
+
+Therefore, with the above setup, to avoid SLO violations, the coordinator needs 1) to pick, for each contented GPU instance, 
+a valid \interval that falls between the minimum and maximum interval; 
+%
+and 2) ensures that the sum of the PCIe bandwidth consumed for each \interval 
+is below the PCIe bandwidth. 
+%
+In addition, another goal of \sys is to optimize the right set of \interval to maximize the total usage of host memory. 
+%
+\sys can also adopt other reasonable optimization goals. 
+%
+For the sake of simplicity, the rest of the discussion assumes two contented 
+GPU instances, but the algorithm can be easily extended to more instances. 
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\columnwidth]{figures/code.png}
+    \caption{The adjustment algorithm performed by the coordinator. }
+    \label{fig:code}
+\end{figure}
+
+%
+Figure~\ref{fig:code} shows how the coordinator works. 
+%
+Upon receiving a new request, the coordinator first checks if this request's SLO can possibly be met by checking if its minimum \interval is less than the maximum one~(Lines 34-35).  
+%
+If no valid interval can be found, the request is returned to the upper level 
+scheduler~(\S\ref{sec:overview}). 
+%
+Otherwise, the coordinator enumerates all possible combinations of \intervals for the two GPU instances to find all the valid ones~(Lines 39-42). 
+%
+Next, the coordinator finds the interval pairs that maximize host GPU memory 
+usage~(Line 45). 
+%
+Once the valid interval pairs are decided, the request is served on one GPU 
+with the chosen interval while the other GPU adjusts the interval in the next 
+iteration~(Lines 47-48). 
+%
+We note that a special case is that the other GPU is idle, and in this case, 
+the request is served with the minimum \interval. 
+%
+
+\subsection{Implementation}
+%
+\sys is implemented based on the vLLM framework, leveraging its efficient memory management and inference capabilities. 
+To optimize performance, \sys uses separate CUDA streams for computation and data transmission. 
+By enabling parallel execution through stream overlap, \sys significantly reduces latency and improves throughput during inference.
+
+We encapsulated \sys into a Python library that allows seamless integration with Transformer-based models. 
+This library dynamically manages the decoder layers of the model, enabling efficient scheduling and resource allocation. 
+With this design, users can easily wrap existing Transformer models to take advantage of \sys without requiring extensive modifications while benefiting from enhanced performance and scalability.
+

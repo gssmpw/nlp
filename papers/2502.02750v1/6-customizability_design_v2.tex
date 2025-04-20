@@ -1,0 +1,234 @@
+\section{Design and Implementation}
+\label{sec:design}
+
+In this section, we present \name's architecture and discuss how it addresses the challenges described in \S\ref{sec:challenges}.
+Figure~\ref{fig:system-diagram} shows a diagram of the system.
+At a high level, \name allows users to run custom eviction \emph{policy functions}, which are implemented as eBPF functions in the kernel. The policy functions are triggered by particular events (\eg folio eviction, access, admission), and they operate on a user-specified number of variable-sized \emph{eviction lists}, which store \emph{pointers} to the folios managed by the policy. The policy functions decide which folios to admit or evict to and from the lists based on metadata (\eg folio access frequency and recency, which thread accessed the folio), which is stored in eBPF maps. At eviction time, \name runs a user-defined eviction function to propose a set of \emph{eviction candidates} for the kernel to evict.
+We find that while this interface is relatively simple, it is quite flexible, and can support a very wide set of eviction policies from the literature either exactly, or approximately.
+
+We now describe \name's design in detail, starting with our design choice to implement \name's eviction policies within the kernel, rather than in userspace, to ensure scalability (challenge 1 from \S\ref{sec:challenges}).
+
+
+\begin{figure}[t!]
+    \centering
+    \includegraphics[width=0.35\textwidth]{figures/cache_ext_system_diagram.pdf}
+    \caption{Overview of \name. Eviction lists hold pointers to folios.}
+    \label{fig:system-diagram}
+\end{figure}
+
+\subsection{Policies in Kernel or Userspace?}
+\label{subsec:kernel-vs-userspace}
+
+Our first key design decision is whether to run \name's policies in the kernel or in userspace.
+While from a development standpoint it might be simpler to run the eviction policies in userspace, doing so would require notifying userspace about all page cache events. However, modern SSDs can service millions of IOPS, each of which may trigger a page cache event (\eg folio access, insertion). 
+
+We run a set of experiments to estimate the ``best-case'' overhead of such a userspace-offload architecture. We attach eBPF programs to existing kernel tracepoints (folio inserted, accessed, and evicted). The eBPF programs use a lockless ring buffer to notify userspace on each event~\cite{bpf-ringbuf}. Since no userspace logic actually processes these events, this provides an optimistic measure of this architecture's overhead.
+
+We run two applications on a standard enterprise SSD to evaluate this architecture: YCSB workloads using RocksDB~\cite{rocksdb}, a key-value store, and a file search workload using ripgrep~\cite{ripgrep}, a parallelized grep-like tool, where we search the Linux kernel sources 10 times. The workloads are allocated 8~GiB and 1~GiB of memory, respectively. We run these applications on both the baseline system and with the eBPF benchmark programs. The results are presented in Table~\ref{tab:motivation-overhead}, with the benchmark yielding up to a 20.6\% performance decrease, \emph{without even implementing a custom eviction policy.} 
+
+\begin{table}
+    \centering
+    \footnotesize
+    \begin{tabular}{lrrr}
+        \toprule
+        Workload & Baseline    & Benchmark   & \% Degradation \\
+        \midrule
+        YCSB A   & 82,808 op/s & 69,089 op/s & -16.6\% \\
+        YCSB C   & 76,166 op/s & 62,578 op/s & -17.8\% \\
+        Uniform  & 44,618 op/s & 35,443 op/s & -20.6\% \\
+        Search   &       42.3s &       44.4s &  -4.7\% \\
+        \bottomrule
+    \end{tabular}
+    \caption{Performance of workloads without and with userspace-dispatch.}
+    \label{tab:motivation-overhead}
+\end{table}
+
+Thus, based on the results of our experiments, we rule out implementing page cache policies in userspace, and instead opt to run the policies within the kernel as eBPF functions. We decide to use eBPF as it has already proven to match the kernel's performance, even in performance-critical domains such as networking~\cite{xdp} and storage~\cite{xrp}. While eBPF programs face many restrictions due to the verifier, we find that \name can provide sufficient flexibility for custom policies, as we describe below.
+
+
+
+
+
+
+
+
+\subsection{Interface}
+\label{subsec:kernel-impl}
+Caching is an active area of research, with many recently-proposed eviction and admission algorithms~\cite{adaptsize,robinhood,lhd,lrb,baleen,sieve,s3-fifo,ripq} that aim to take advantage of different features of a workload (\eg recency, frequency, size), using various techniques (\eg conditional probability models~\cite{lhd}, Markov chains~\cite{adaptsize}, machine learning~\cite{lrb}).
+To ensure flexibility, \name should allow developers to experiment with a wide range of caching policies, including relatively sophisticated ones. We now describe \name's API and demonstrate how it can be used to create a wide range of policies, addressing challenge 2 in \S\ref{sec:challenges}.
+
+
+\subsubsection{Policy Functions}
+\label{subsubsec:design_policy_functions}
+
+\name allows applications to define custom eviction policies %
+as \emph{policy functions}, a set of eBPF programs that trace caching events and determine which folios should be evicted from the page cache. 
+Policy functions can be triggered by five events: policy initialization, requests for eviction, folio admission, folio access, and folio removal. The policy function interface is implemented using eBPF's recent \texttt{struct\_ops} kernel interface~\cite{struct-ops}, as shown in Figure~\ref{fig:cache-ext-ops}.
+
+These five events are central to caching decisions in the page cache. %
+Notably, requests for eviction and folio removal are different: the former involves the kernel asking the policy to propose folios to evict, and the latter is the kernel informing the policy that a folio was actually evicted. This distinction exists for the following two reasons. A folio can be evicted in circumvention of the ``normal'' eviction path if, for example, the file containing it is deleted. Conversely, in rare cases, proposing a folio for eviction does not guarantee that it will be evicted (\eg the folio is in active use by the kernel).
+
+We use eBPF's \texttt{struct\_ops} feature in order to minimize the verifier changes needed to add new eBPF hooks. \texttt{struct\_ops} was designed to allow kernel subsystems to expose modular interfaces to eBPF components, and has already been used for TCP congestion control algorithms, FUSE eBPF filesystems, handling HID driver quirks, and \texttt{sched\_ext}~\cite{sched_ext,fuse-bpf,bpf-extensible-network,hid-bpf}. \texttt{struct\_ops} programs are loaded into the kernel like any other eBPF program.
+Using \texttt{struct\_ops} also makes it much easier to extend \name and add new hooks. For example, we implemented an extension to \name that added a page cache admission filter with only 15 additional lines of verifier-related code.
+
+
+
+
+
+\begin{figure}
+    \centering
+    \begin{lstlisting}[language=C]
+// Policy function hooks
+struct cachebpf_ops {
+    s32  (*policy_init)(struct mem_cgroup *memcg);
+    // Propose folios to evict
+    void (*evict_folios)(struct eviction_ctx *ctx, struct mem_cgroup *memcg);
+    void (*folio_added)(struct folio *folio);
+    void (*folio_accessed)(struct folio *folio);
+    // Folio was removed: clean up metadata
+    void (*folio_removed)(struct folio *folio);
+    char name[CACHEBPF_OPS_NAME_LEN];
+};
+
+struct eviction_ctx {
+    u64 nr_candidates_requested; /* Input  */
+    u64 nr_candidates_proposed;  /* Output */
+    struct folio *candidates[32];
+};
+    \end{lstlisting}
+    \caption{\texttt{struct\_ops} for \name and eviction context.}
+    \label{fig:cache-ext-ops}
+\end{figure}
+
+
+
+\subsubsection{Eviction Lists}
+\label{subsubsec:design_eviction_lists}
+
+Eviction algorithms are implemented on a wide range of data structures. 
+Nevertheless, we observe that many of these policies can be implemented either exactly or approximately using linked lists, where the policy iterates over one or more lists and evicts items based on a calculated per-item score. For example, the ``classic'' eviction policies, (\eg LRU, MRU) are all based on lists, with items inserted or evicted from the head or tail of a list. Similarly, families of policies like ARC~\cite{arc} or segmented LRU~\cite{segmented} can be implemented using multiple variable-sized lists, where items are inserted into any list or moved between lists. Even recent ``state-of-the-art'' policies, such as LHD, S3-FIFO, or LRB either store data directly in a list~\cite{s3-fifo,sieve}, or simply select a sample of objects and evict the ones with the lowest \emph{score}~\cite{lhd,lrb}. 
+
+In order to facilitate an interface flexible enough for all these policies, \name is built around an \emph{eviction list API}, a simple interface for policies to construct and manipulate a set of variable-sized linked lists. Each node in the list corresponds to a single folio, and stores a pointer to that folio, rather than the folio itself. Importantly, the actual folios are still stored and maintained by the default kernel page cache implementation, in order to minimize changes to the kernel.
+
+This API is implemented as a set of eBPF \texttt{kfuncs} (in-kernel functions that are exposed to eBPF programs) and is shown in Table~\ref{table:cache-ext-eviction-lists-api}.\footnote{The actual functions have a ``\name'' prefix to prevent name collisions, but we omit it for brevity.}
+For example, \texttt{init()} will typically call \texttt{list\_create()} to create a new eviction list, and \texttt{folio\_added()} will call \texttt{list\_add()} to add the folio to a list. Newly-created lists are added to a ``registry'', an internal per-policy hash table which maps between the list IDs (exposed to eBPF) and the lists themselves. Notably, these lists are \emph{indexed} -- that is, given a folio pointer, the APIs can directly obtain that folio's list node. This property is necessary for operations such as deletion from the list, and is facilitated using a per-policy hash-table which maps from folios to list nodes. We discuss the use of this hash table further in \S\ref{subsec:design_safe_memory_referencing}.
+
+
+\begin{table}[t!]
+\centering
+\small
+\begin{tabular}{|p{0.95\columnwidth}|}
+\hline
+\multicolumn{1}{|c|}{\textbf{Eviction list API}} \\
+\hline
+\texttt{u64 list\_create(struct mem\_cgroup *memcg)}\\
+\hline
+\texttt{int list\_add(u64 list, struct folio *f, bool tail)}\\
+\hline
+\texttt{int list\_move(u64 list, struct folio *f, bool tail)}\\
+
+\hline
+\texttt{int list\_del(struct folio *f)}\\
+\hline
+\texttt{int list\_iterate(struct mem\_cgroup *memcg}\\
+\texttt{\quad u64 list,}\\
+\texttt{\quad s64(*iter\_fn)(int id, struct folio *f),}\\
+\texttt{\quad struct iter\_opts *opts,} \\
+\texttt{\quad struct eviction\_ctx *ctx)} \\
+\hline
+\end{tabular}
+\caption{\name eviction list API.}
+\label{table:cache-ext-eviction-lists-api}
+\end{table}
+
+
+\subsubsection{Eviction Candidate Interface}
+\label{subsubsec:eviction-interface}
+To facilitate eviction, policy functions iterate over their eviction lists in order to determine which folios to evict. Note that policies do not directly evict folios -- rather, they propose \emph{eviction candidates} to the kernel, which checks if the folios are indeed valid eviction targets (\ie not pinned or in other use by the kernel) and evicts them if so.
+
+The eBPF framework currently does not provide a clean way to iterate over the eviction lists, so \name provides a new iteration \texttt{kfunc} which allows policy functions to specify how to iterate over a list and make decisions for each node. Specifically, \texttt{list\_iterate()} takes a list to iterate over, an options struct, an eviction context, and a callback function. The callback function, which is also an eBPF program, is called on each node, and the policy decides whether to keep or evict that folio. Folios chosen for eviction are added to the \texttt{candidates} array in the \texttt{eviction\_ctx} struct. The options struct specifies how the interface should treat evaluated folios. For example, they can be left in place, moved to the tail of the list, or moved to a different list. This enables implementing policies that make use of multiple lists and require balancing the lists, such as S3-FIFO or ARC. We also provide a ``batch scoring'' mode for this interface, where the callback function is used to compute \emph{scores} for $N$ folios, with the $C$ folios with the lowest score chosen for eviction. This mode can be used for policies such as LFU.
+
+In order to ensure correct verification of our callback functions, we added $\sim$80 lines to the eBPF verifier to ``register'' our iteration interfaces, on top of eBPF's existing support for callback functions. Additionally, to protect against eBPF program misbehavior, this interface performs the requisite bounds-checking and enforces loop termination.
+
+
+\subsubsection{eBPF limitations}
+\label{subsubsec:ebpf-limitations}
+
+We ran into a number of challenges when implementing \name's eviction list API. eBPF maps, the standard way to maintain state in eBPF programs, do not provide interfaces that both store items in a specified order while also providing random access, both of which are necessary in order to implement eviction properly. Specifically, eBPF provides maps such as \texttt{BPF\_MAP\_TYPE\_QUEUE} and \texttt{BPF\_MAP\_TYPE\_STACK}, which provide \texttt{pop()} and \texttt{push()} operations, but do not allow deleting or accessing elements from the ``middle'' of the map. Conversely, \texttt{BPF\_MAP\_TYPE\_HASH} provides random access, but no method to easily maintain an ordering of elements (\eg MRU order). A notable exception is \texttt{BPF\_MAP\_TYPE\_LRU\_HASH}, which provides both an LRU structure and random-access, but is too deeply tied to its specific algorithm for our purposes~\cite{bpf_map_type_hash}. This necessitated the development of a custom data structure for \name.
+
+While eBPF has started to introduce experimental support for custom data structures and more complex locking in eBPF, this support is not yet mature enough for our use case~\cite{kflex,bpf-arena,red-black-tree-bpf}. As such, we designed our list API to be managed by the kernel and exposed to eBPF via \texttt{kfuncs}. Additionally, in order to avoid concurrency issues and verifier limitations around locking, the provided API is concurrency-safe and makes use of locks under the hood, in the kernel implementations. As eBPF matures, new features could further reduce overhead and provide even more flexibility for eBPF policies.
+
+
+\subsubsection{Example: LFU Policy}
+\label{subsubsec:design_mru_example}
+
+
+
+\begin{figure}
+\begin{lstlisting}[language=C,basicstyle=\ttfamily\small]
+u64 lfu_list;
+int lfu_policy_init(struct mem_cgroup *cg) {
+    lfu_list = list_create(cg);
+    return 0;
+}
+void lfu_folio_added(struct folio *folio) {
+    u64 freq = 1;
+    list_add(lfu_list, folio, true); // Add to tail
+    bpf_map_update_elem(&freq_map, &folio, &freq);
+}
+void lfu_folio_accessed(struct folio *folio) {
+    u64 *freq = bpf_map_lookup_elem(&freq_map, &folio);
+    __sync_fetch_and_add(freq, 1); // Increment freq
+}
+long score_lfu(int id, struct folio *folio) {
+    return bpf_map_lookup_elem(&freq_map, &folio);
+}
+void lfu_evict_folios(struct eviction_ctx *ctx, struct mem_cgroup *cg) {
+    struct iter_opts opts = { /* Set scoring mode */ };
+    list_iterate(cg, lfu_list, score_lfu, &opts, ctx);
+}
+void lfu_folio_removed(struct folio *folio) {
+    bpf_map_delete_elem(&freq_map, &folio);
+}
+\end{lstlisting}
+\caption{Simplified LFU implementation with \name.}
+\label{figure:example-lfu}
+\end{figure}
+
+To get a better sense of how \name's policy functions can be used to implement custom policies, we walk through implementing a simple eviction policy, LFU, using \name. LFU evicts the least-frequently accessed item in the list, which requires storing additional metadata. Our LFU implementation uses a single list and an eBPF map to store folio access frequencies. It approximates LFU using \name's batch scoring mode to select the $C$ (\eg 32) least-frequently accessed folios out of $N$ (\eg 512) folios.
+
+A simplified version of the policy is shown in Figure~\ref{figure:example-lfu}. When the policy is loaded and \texttt{lfu\_policy\_init()} is called, we create a new eviction list. When a folio is added, \texttt{lfu\_folio\_added()} adds the folio to the tail of the list using \texttt{list\_add()} and initializes its frequency to 1 in the \texttt{freq\_map} eBPF map (not shown). When a folio is accessed, we increment its frequency. When eviction is triggered, \texttt{lfu\_evict\_folios()} calls \texttt{list\_iterate()}, which calls the \texttt{score\_lfu()} callback function on $N$ nodes in the list. The score function returns the frequency of each folio as its score. \name then selects the $C$ folios with the lowest scores as eviction candidates. When a folio is evicted by the kernel, \texttt{lfu\_folio\_removed()} is called, and the folio's metadata is removed from the map. Additionally, it is not necessary to remove the folio from the list on eviction, as this is taken care of by \name. We discuss this point further in \S\ref{subsec:design_safe_memory_referencing}.
+
+
+
+
+
+
+\subsection{Isolation}
+\label{subsec:design_isolation}
+
+We now tackle the third challenge from \S\ref{sec:challenges}: how to allow applications to deploy their own policy functions without interfering with other applications' policies, while preserving the sharing property of the page cache, whereby applications can avoid having to load duplicate pages into memory. 
+
+We make the observation that implementing policies within a cgroup can address this challenge. %
+This is due to the fact that within a cgroup, processes have the same custom eviction policy, and different cgroups running on the same server can each use their own eviction policy. In addition, deploying policy functions per-cgroup fits the common pattern of deploying modern applications via containers, which isolate each application in its own memory cgroup. Note that processes from cgroup A can still access page cache memory managed by cgroup B, and benefit from accessing shared data. %
+
+To support per-cgroup policies, we extend eBPF's \texttt{struct\_ops} functionality to support cgroup-specific \texttt{struct\_ops} (currently, it only supports system-wide policies). This involved adding a cgroup identifier (in the form of a file descriptor) to the kernel's \texttt{struct\_ops} loading interface, along with corresponding libbpf interfaces in userspace. %
+
+
+
+\subsection{Memory Safety}
+\label{subsec:design_safe_memory_referencing}
+
+We must ensure that \name does not allow unsafe memory accesses when interacting with folio pointers (challenge 4 from \S\ref{sec:challenges}). Specifically, \name must ensure that eBPF programs return valid pointers to the kernel (\ie in the eviction candidate interface). Otherwise, a malicious eBPF program could return invalid values, leading to memory corruption or a kernel crash. Frameworks like \texttt{sched\_ext} solve this in part by using PIDs as identifiers for processes in userspace dispatch. However, folios do not have analogous easily-obtainable unique identifiers, so we resort to using folio pointers.
+
+In order to validate these pointers, we implement a registry of ``valid folios'' in the system. When a folio enters the page cache, \name adds it to the registry. When a folio is evicted, it is removed from the registry. When a \name eviction proposes a set of folio eviction candidates, the kernel uses the registry to verify that each candidate is indeed a valid folio before proceeding with eviction. This registry is implemented as a hash table with a per-bucket lock, which also stores a folio's list node (as described in \S\ref{subsubsec:design_eviction_lists}), which maps from folio pointer to list node. We find that this design incurs minimal overhead, which we evaluate in \S\ref{subsec:eval-overhead}. Future developments in eBPF may make it easier to keep track of ``trusted'' pointers, potentially allowing us to remove this check and further reduce overhead.
+
+We also protect against adversarial behavior by providing a fallback for eviction. For example, if the kernel asks a faulty policy to evict 10 folios, but it only proposes 5 candidates, the kernel will fall back to its default policy and evict additional folios. Similarly, when a folio is evicted, the kernel ensures that it is removed from any eviction list it is present in, in order to release memory resources and minimize stale references lying around. Similar fallbacks are present in other frameworks, such as \texttt{sched\_ext}, which implements a watchdog that forcibly removes misbehaving policies.
+
+
+
+
+\subsection{Kernel Implementation Complexity}
+\label{subsec:kernel-complexity}
+
+Implementing \name required adding $\sim$2000 lines to the kernel. Only a fraction of these lines touched core kernel code: 210 lines in the page cache (most of which are the new eBPF hooks), 80 lines in the verifier (supporting our callback functions), and 80 lines in cgroup code. Additionally, implementing per-cgroup \texttt{struct\_ops} required 220 lines in the kernel and 75 lines in libbpf. The remaining lines implemented pure \name functionality: 750 lines for \name's eviction list \texttt{kfuncs}, and 580 lines to implement registry operations and register \name with the verifier.

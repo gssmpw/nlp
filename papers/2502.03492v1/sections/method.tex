@@ -1,0 +1,106 @@
+\section{Method}
+With analysis presented in \cref{sec:preliminary}, our goal is to teach LLMs the ability of critiquing without human supervision.
+We propose {\ours}, a two-stage training approach: (1) synthesizing high-quality critiques by reasoning about execution feedback, then (2) refining the critic through reinforcement learning.
+Once trained, the critic model can be used at test time, paired with any generator models, to iteratively refine solutions.
+A complete overview of the pipeline is provided in \cref{appendix:pipeline}, with critique samples in \cref{appendix:samples}.
+
+\subsection{Problem Statement}
+We focus on code generation as our primary domain as it provides clear objective metrics through test cases, following previous work~\cite{mcaleese2024llm}.
+Given a programming problem $x$ (specified in natural language) and a solution $y$ (code implementation), our goal is to enable iterative refinement of solutions, which centers on two key components: (1) a generator model $\pi(y \mid x)$ that proposes solutions, and (2) a critic model $Q_\theta(c|x,y)$ that provides textural feedback $c$ for improvement.
+
+\paragraph{Assumptions.}
+Let $\mathcal{D} = \{(x_i, T_i)\}_{i=1}^N$ be our training dataset, where each problem $x_i$ is paired with unit tests $T_i$.
+We have access to a sandbox environment that executes code against test cases, which serves as the evaluation function $R(y)$ that returns 1 if $y$ passes all tests, 0 otherwise.
+Notably, the sandbox does not assist critique generation at test time.
+While not required, we treat the generator model as a \emph{black-box}, allowing our approach to build upon existing strong generators without access to their parameters.
+
+
+\paragraph{Objective.}
+While directly measuring the helpfulness of critiques remain challenging, we can define a \emph{proxy task} that evaluates whether the critique leads to improved solutions.
+Given an initial solution $y^\prime \sim \pi(\cdot \mid x)$, the critic analyzes it and produces textual feedback $c$. The generator then uses this feedback to revise the solution, producing an improved output $y$.
+Let $z = (x, y^\prime)$ represent the problem-solution pair.
+Our objective is to train the critic model $Q_\theta$ to maximize the expected solution quality:
+\begin{equation}\label{eq:objective}
+    \mathcal{J}(\theta) = \mathbb{E}_{z\sim \mathcal{D} \times \pi, y \sim \pi_\theta(\cdot \mid z)}[R(y)],
+\end{equation}
+where $\pi_{\theta}(y \mid z) = \sum_{c} {Q_\theta}(c \mid z) \pi(y \mid z, c)$ denotes the improved solution distribution through marginalization over possible critiques.
+Notably, although \cref{eq:objective} defines a single-turn critique-revision task, we observe that the trained model generalizes to multi-turn revisions (\cref{sec:exp_critique_revision}).
+
+\paragraph{Defining the Critique Space.} We structure the critique space into three components (\cref{fig:illustration}): (1) an analysis of the solution's strengths and weaknesses, (2) actionable improvement suggestions, and (3) a final judgment of correctness (correct/incorrect). During inference, these components enable iterative critique-revision, where the process stops once the judgment indicates the solution is correct. This design balances discrimination and critiquing, both essential for iterative refinement, as discussed in \cref{sec:preliminary}.
+
+
+
+
+\subsection{Stage I: Execution-guided Critique Synthesis}\label{sec:sft}
+Although conceptually straightforward, learning effective critiques is challenging due to the large critique space, where only a small fraction leads to successful revisions. Our experiments with Qwen2.5-Coder~\cite{hui2024qwen2} (\cref{tab:cc_res} show that models struggle to generate informative critiques for self-improvement, aligning with previous findings~\cite{huang2023large}. Self-critique without additional feedback yields minimal gains (7.88\% → 8.36\%) and rarely converts incorrect solutions to correct ones, highlighting the limited ability of models to correct their own mistakes.
+
+\paragraph{Reasoning over Execution.}
+While the initial critiquing ability is limited, previous work~\cite{ni2024next} has shown that LLMs can effectively reason over execution feedback.
+\cref{tab:cc_res} demonstrates that when LLMs reason over execution feedback to generate critiques (Self-critique w/ Execution Feedback), they achieve substantial improvements, as compared to directly using raw execution feedback for revisions (11.76\% vs. 8.97\%).
+This suggests that while directly using raw execution feedback is inefficient, we can leverage the model's reasoning ability over execution feedback to help generate more accurate and informative critiques.
+
+\paragraph{Critique Synthesis.} Building on the above insight, we develop a critique synthesis approach that leverages execution feedback to train models in generating effective critiques.
+Our approach samples high-quality synthesized critiques from a hinted distribution ${Q_\theta}(c \mid z, h)$, where hints $h$ are constructed by analyzing initial solutions $y^\prime$ through sandbox execution.
+We map different execution outcomes to specific hint templates as shown in \cref{tab:hint}: (1) for passing solutions, we encourage concise positive feedback; (2) for completely failing solutions, we suggest restarting from scratch; and (3) for partially failing solutions, we provide the exact error message and test case details to help pinpoint the issue.
+
+
+\paragraph{Supervised Finetuning.}
+Similar to context distillation~\cite{snell2022learning,guan2024deliberative}, we exclude these hints and conduct supervised finetuning to encourage the model to internalize the critiquing strategies.
+We observe leveraging execution feedback for supervised finetuning is beneficial mainly in two aspects: (1) it helps learn the format; (2) while it marginally improves the critique-revision performance due to the high frequency of instructing correct solutions to wrong (\cref{tab:cc_res}), it substantially boosts discrimination by providing ground-truth correctness (\cref{tab:cc_discrimination}).
+
+
+
+
+
+
+
+\input{tables/codecontests_res}
+
+\subsection{Stage II: Reinforced Critique Generation}
+While our critique synthesis approach with predefined templates provides a strong foundation, it may not capture all nuanced feedback scenarios required for complex programming tasks. To overcome this limitation, we formulate critique generation as a reinforcement learning problem, allowing the critic to adaptively learn feedback strategies through direct optimization of solution improvement.
+
+
+Our goal is to maximize the performance in \cref{eq:objective}.
+To optimize $Q_\theta$, one natural approach is using policy gradient methods~\cite{sutton1999policy}:
+\begin{equation*}
+\begin{aligned}
+    &\nabla_\theta \mathbb{E}_{y \sim \pi_{\theta}}[R(y)] \\
+    = &\nabla_\theta \mathbb{E}_{y \sim \sum_c Q_\theta(c|x,y)\pi(y|x,c)}[R(y)] \\
+    = &\nabla_\theta \sum_y R(y) \sum_c Q_\theta(c|x,y)\pi(y|x,c) \\
+    = &\sum_y R(y) \sum_c \nabla_\theta Q_\theta(c|x,y)\pi(y|x,c)
+\end{aligned}
+\end{equation*}
+The double summation over both solution space $y$ and feedback space $c$ introduces high variance in gradient estimates:
+\begin{equation*}
+    \mathrm{Var}(\nabla_\theta) = \mathbb{E}[(\nabla_\theta - \mathbb{E}[\nabla_\theta])^2] \propto |\mathcal{Y}| \cdot |\mathcal{C}|.
+\end{equation*}
+where $|\mathcal{Y}|$ and $|\mathcal{C}|$ are the sizes of solution and critique spaces respectively.
+In this scenario, using value networks to predict credit assignment remains challenging, as we observe significant instability when using Proximal Policy Optimization (PPO; \citealt{schulman2017proximal})\,---\,the learned networks produce noisy estimates of critique quality.
+We present detailed experimental observations in\cref{appendix:credit_assignment}.
+
+
+
+
+
+
+\input{tables/main_res}
+
+\paragraph{Variance Reduction.}
+To combat these variance issues, we adopt Group Relative Policy Optimization (GRPO; \citealt{shao2024deepseekmath}) that avoids using value networks for learning credit assignment and reduces variance through group-based relative advantages. Specifically, for each problem-solution pair $z=(x,y^\prime)$, we samples a group of critiques $\{c_1, c_2, ..., c_G\}$ from $Q_\theta(\cdot|z)$ and computes advantages:
+\begin{equation*}
+    A_i = \frac{R(y_i) - \mu_G}{\sigma_G},
+\end{equation*}
+where $y_i \sim \pi(\cdot|z,c_i)$ is the improved solution generated using critique $c_i$, and $\mu_G$ and $\sigma_G$ are the mean and standard deviation of rewards within the group.
+This approach normalizes rewards across different problem types and naturally focuses training on problems where critique quality can make a meaningful difference, as problems that are too easy or too hard produce zero relative advantages.
+The final training objective is:
+\begin{equation*}
+\begin{aligned}
+    &\mathcal{J}(\theta) = \mathbb{E}_{z \sim \mathcal{D}, \{c_i\}_{i=1}^G \sim Q_{\theta_{\text{old}}}(y|x)} \Big[ \\
+    &\quad\frac{1}{G} \sum_{i=1}^G \Big(\min\big(\frac{Q_\theta(y_i|x)}{Q_{\theta_{\text{old}}}(y_i|x)}A_i, \operatorname{clip}_\varepsilon \big(\frac{Q_\theta(y_i|x)}{Q_{\theta_{\text{old}}}(y_i|x)}\big)A_i\big)\Big) \\
+    &\quad- \beta\mathbb{D}_{\text{KL}}(Q_\theta\|Q_{\text{ref}})\Big],
+\end{aligned}
+\end{equation*}
+
+where $\operatorname{clip}_\varepsilon$ represents clipping the value to $[1-\varepsilon, 1+\varepsilon]$ and $\mathbb{D}_{\text{KL}}(Q_\theta\|Q_{\text{ref}}) = \frac{Q_{\text{ref}}(y_i|x)}{Q_\theta(y_i|x)} - \log\frac{Q_{\text{ref}}(y_i|x)}{Q_\theta(y_i|x)} - 1$ denotes the KL regularization term that alleviates over-optimization.
+
+

@@ -1,0 +1,416 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+% The preceding line is only needed to identify funding in the first footnote. If that is unneeded, please comment it out.
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{dblfloatfix}
+\usepackage[numbers]{natbib}
+\usepackage[normalem]{ulem}
+
+\newcommand{\cm}{\textcolor{blue}}
+\newcommand{\cmr}{\textcolor{red}}
+
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+    T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+\begin{document}
+
+\newcommand{\mahsa}[1]{\textcolor{teal}{#1}}
+\newcommand{\mahsacm}[1]{\textcolor{blue}{#1}}
+
+
+
+\title{LLM Inference Acceleration via \\
+Efficient Operation Fusion
+}
+
+\author{\IEEEauthorblockN{Mahsa Salmani}
+\IEEEauthorblockA{\textit{d-Matrix} \\
+Santa Clara, CA, USA \\
+msalmani@d-matrix.ai}
+\and
+\IEEEauthorblockN{Ilya Soloveychik}
+\IEEEauthorblockA{\textit{d-Matrix} \\
+Santa Clara, CA, USA \\
+ilyas@d-matrix.ai}
+}
+
+\maketitle
+
+\begin{abstract}
+The rapid development of the Transformer-based Large Language Models (LLMs) in recent years has been closely linked to their ever-growing and already enormous sizes.
+%\mahsacm{primarily driven by their ever-increasing sizes, which serve as the foundation for their enhanced generative capabilities and expanding range of applications.} 
+Many state-of-the-art language models contain hundreds of billions to trillions of parameters and require dedicated hardware resources for both training and inference. One of the key challenges inherent to the Transformer architecture is the requirement to support numerous non-linear transformations that involves normalization. For instance, each decoder block typically contains at least one Softmax operation and two Layernorms. 
+The computation of the corresponding normalization scaling factors becomes a major bottleneck because it requires spatial collective operations. In other words, when it comes to the computation of denominators for Softmax and Layernorm, all vector elements must be aggregated into a single location, requiring significant communication. These collective operations slow down inference on Transformers by approximately 20\%, defeating the whole purpose of distributed in-memory compute.
+
+In this work, we propose an extremely efficient technique that can completely hide the overhead caused by such collective operations. Note that each Softmax and Layernorm operation is typically followed by a large linear layer. Since non-linear and linear operations are performed on different hardware engines, they can be easily parallelized once the algebra allows such commutation. By leveraging the inherent properties of linear operations, we can defer the normalization of the preceding Softmax and Layernorm until after the linear layer is computed. Now we can compute the collective scaling factors concurrently with the matrix multiplication and completely hide the latency of the former behind the latter. Due to the algebraic equivalence, such parallelization preserves the numerical accuracy while significantly improving the hardware utilization and reducing the overall latency.
+
+%This allows the computation of collective scaling factors to proceed concurrently with the matrix multiplication, effectively masking the latency of normalization behind the linear operation. Due to algebraic equivalence, this parallelization preserves numerical accuracy while significantly improving hardware utilization and reducing overall latency.
+
+%Note that each softmax and layernorm are always followed by a large linear layer. The non-linear and linear operations are performed by different hardware engines and can be easily parallelized once the algebra permits such commutation. Thanks to the natural properties of linear operations, we can postpone normalization of the preceding softmax and layernorm to be performed after the linear layer is complete. Now we can compute the collective scaling factors concurrently with the matrix multiplication and completely hide the latency of the former behind the latter. Due to the algebraic equivalence, such parallelization has no effect on the numerical accuracy while significantly boosting the utilization of the hardware and reducing the latency.
+\end{abstract}
+
+\begin{IEEEkeywords}
+large language models, inference acceleration, operation fusion, collective operations, in-memory computing 
+\end{IEEEkeywords}
+
+
+\section{Introduction}
+Transformer-based architectures \cite{b1}, particularly large language models (LLMs), have recently gained significant attention due to their impressive capabilities and performance across a wide range of tasks. These LLMs, such as GPT series \cite{brown} and LLama series \cite{touvron}, have demonstrated exceptional potential across a wide range of practical applications, including text generation, conversational processing, and knowledge-based question answering. However, as the size of LLMs grows, their hardware and memory requirements increase significantly, limiting their applicability and hindering their deployment in real-world scenarios. 
+
+Various approaches targeting different aspects of compute optimization have been studied to address the computational and memory issues arising in such LLMs, including model compression techniques \cite{wang, zhu}, knowledge distillation \cite{ho}, pruning \cite{xia, chen}, development of lower precision formats \cite{rohani1, rohani2} for efficient quantization \cite{franter, jin}, approximations, and other software optimizations \cite{qin}. These methods are commonly employed to reduce both the computational demands and latency of inference in Transformers. 
+
+Notably, most of such methods make the compute more efficient at the expense of model performance, as each compression technique introduces errors through approximations. Consequently, any approach that can enhance computational efficiency or reduce latency in high-dimensional computations while preserving the accuracy of the underlying system becomes of paramount importance. These advancements would be crucial in ensuring the practical deployment and scalability of large-scale LLMs, particularly in real-time applications where both speed and accuracy are critical.
+%\mahsacm{(such as those in autonomous driving, speech recognition, medical diagnoses, etc.).}
+
+%\mahsa{Executing the Transformer-based LLMs on existing hardware  necessitates the existence of collective operations \cite{coll_commun}. In particular, the frequent scaling operations in Transformer architecture (e.g., various normalizations and Softmax computations) require data to be shared, aggregated, or distributed across different processing units in the hardware. This aggregation leads to extensive collective operations necessary to complete the required computations efficiently.}
+
+One of the main challenges in executing Transformer-based LLMs on existing hardware lies in handling numerous non-linear functions that are not necessarily hardware-friendly. In particular, non-linear operations involving normalization, such as Layernorm and Softmax, require computation of the denominator, which necessitates data aggregation across multiple processing units. Such collectives sitting on the critical path often take much time to execute \cite{coll_commun, hoefler} and create numerous bottlenecks.
+%Various parallelization techniques have been extensively studied in the literature to improve computational efficiency and mitigate the latency imposed by these collective operations
+
+To address these challenges, various parallelization techniques have been extensively explored in the literature, aiming to ultimately enhance the computational efficiency and reduce the latency caused by these operations during LLM inference \cite{shoeybi, kim}. 
+%\mahsa{By leveraging parallel processing, collective operations that were traditionally bottlenecks can be executed more efficiently, ultimately reducing latency and increasing throughput during LLM inference.} 
+However, the existing parallelization approaches primarily target higher-level computations, such as data, model, or even pipeline parallelization.
+
+In this work, we introduce a novel approach to enhance computational efficiency and reduce latency specifically at the Transformer-layer level. In particular, we present a latency reduction strategy for computing Layernorm and Softmax in Transformer-based LLMs. Our technique leverages an innovative operation fusion strategy that takes advantage of the inherent structure of the Transformer block architecture and the sequential ordering of layers within each block to streamline and accelerate the computation process. By targeting execution optimization at the granular level of Transformer layers, we ensure a balance between efficiency and performance without compromising model integrity. Importantly, our approach derives algebraically-equivalent equations, avoiding the need for quantization or approximations, thus preserving the model's accuracy.
+%Our experimental analysis reveals that the proposed operation fusion technique leads to a substantial reduction of around {20\%} in latency when implemented on the Corsair \cite{corsair}, a high-performance d-Matrix inference accelerator hardware
+
+%Considering that in executing LLMs the collectives often arise from the architecture of the Transformer models, where certain operations, like normalization and softmax mechanisms, require data to be shared, aggregated, or distributed across different engines of the hardware.  
+%In this work, we propose a novel approach aimed at enhancing computational efficiency and reducing latency specifically at the transformer-layer level. In particular, we present a latency reduction strategy for computing Layernorm and Softmax in transformer-based large language models. The proposed technique leverages an operation fusion strategy that exploits the architecture of transformer blocks and the order of layers within each block to accelerate the necessary computations. This approach focuses on optimizing the execution at a granular level within the transformer layers, ensuring both efficiency and performance.
+\vspace{1em}
+\noindent \textbf{Notation.}
+The following notation is used in the article. Matrices are denoted by capital bold letters $\mathbf{M}$ and vectors by lower case bold $\mathbf{v}$. The operator product of matrices $\mathbf{A}$ and $\mathbf{B}$ of appropriate sizes is written as $\mathbf{A}\cdot\mathbf{B}$ or $\mathbf{A}\mathbf{B}$, while their element-wise product would be denoted by $\mathbf{A}\odot\mathbf{B}$. 
+%For matrix $\mathbf{M}$, we write $\| \mathbf{M} \|_F$ for its Frobenius norm and $\| \mathbf{M} \|$ for its spectral norm; for vector $\mathbf{v}$, by $\|\mathbf{v}\|$ we denote its Euclidean norm. 
+Given vector $\mathbf{m}$, we denote by $\mathbf{M} = \operatorname{Diag}(\mathbf{m})$ the diagonal matrix with elements of $\mathbf{m}$ on the main diagonal.
+
+
+\section{Methodology}
+\label{motiv}
+One of the key challenges associated with the Transformer architecture is the presence of numerous non-linear transformations that involve normalization. Such normalization inherent in operations like Softmax and Layernorm is essential for ensuring the correct scaling of activations, preventing them from exploding or shrinking during training. The computation of such normalization scaling factors necessitates spatial collective operations. More specifically, the calculation of denominators of Softmax and Layernorm requires the aggregation of vector elements into a single location for proper processing. These collective operations are so time-consuming and introduce substantial delays, significantly slowing down the inference process. More importantly, such spatial aggregation defeats the entire purpose of distributed or in-memory compute that all hardware accelerators for LLMs are trying to achieve.
+
+In this work, we propose an efficient technique that can completely eliminate the overhead caused by such collective operations in the Transformer architectures. The main idea is based on the observation that all the non-linearities at hand are followed by matrix multiplications. Being a linear operation matrix multiplication commutes with scaling, thus allowing the normalization of Softmax or Layernorm to be deferred and performed immediately after the multiplication. Leveraging this commutativity allows us to completely hide the computation of the denominators behind the corresponding matrix multiplications since these are performed on separate hardware components. The former is executed by the Single Instruction Multiple Data (SIMD) unit \cite{hughes}, while the latter is performed on a Digital In-Memory Compute (DIMC) unit \cite{mannocci, wang_dimc}. In other words, we fuse the respective non-linear operations with their subsequent matrix multiplications into single operations, thereby accelerating the overall computation. 
+
+Fig.~\ref{gen_archs} compares the conventional architecture and the proposed fused architecture. The non-linear operation with collection in Fig.~\ref{fig_conven_op_arc} denotes either a Layernorm or a Softmax block, which can be decomposed into two sub-operations as discussed above: an element-wise sub-operation and a collective sub-operation, see Fig.~\ref{fig_fused_op_arc}. The element-wise sub-operation can be fused by the linear operation, which is the proceeding linear layer. By executing the aggregation in the collective sub-operation concurrently with the matrix multiplication between the element-wise sub-operation and the linear operation, the latency imposed by the collective operations can be effectively hidden, significantly accelerating the overall computation.
+
+%\cmr{explain who are the sub-operations in the figure: the first is a non-linear operation that can be decomposed into at least two sub-operations—an element-wise sub-operation combined with an aggregative sub-operation, either through division or multiplication. This non-linear operation is executed on a compute device such as a Single Instruction, Multiple Data (SIMD) unit \cite{hughes}. The second operation is a linear operation performed on a separate compute device, such as a Digital In-Memory Compute (DIMC) unit \cite{mannocci, wang_dimc}.}
+
+
+
+%Fig.~\ref{fig_fused_op_arc}
+
+%Leveraging the commutative property of the operations, the aggregative sub-operation of the first operation can overlap with, or be executed concurrently alongside, the second operation. This overlap enables efficient utilization of hardware resources, where the aggregative results seamlessly contribute to the desired outcome while significantly reducing overall latency. The generic architecture illustrating the proposed technique is shown in .}
+
+%\mahsa{As a general approach, the proposed technique targets scenarios with a given computation  
+%\mahsa{(non-linear)} 
+%consisting of at least two operations: the first operation is performed by the first compute device, such as a Single Instruction, Multiple Data (SIMD) device %\cite{{hughes}}, and the second operation is executed by another compute device, such as a Digital In-Memory Compute (DIMC) device \cite{mannocci, wang_dimc}. %\cmr{I am lost. what is the "given operation"? combination of LN and linear layer? how is it an "operation". it is a subgraph.} 
+%The first operation can be decomposed into several sub-operations, allowing at least one of these sub-operations to overlap or be executed concurrently with the second operation.}
+%Intermediate results from the sub-operations are utilized to facilitate efficient computation on the DIMC device 
+%\cmr{how do we make it more efficient on DIMC?}.
+%The aggregated results from the sub-operations yield the desired outcome, significantly reducing overall latency. The generic architecture of the proposed technique is depicted in Fig.~\ref{gen_archs}.
+\begin{figure}[htbp]
+    \centering
+    % First subfigure
+    \begin{subfigure}[b]{0.45\columnwidth}
+        \centering
+        \includegraphics[width=0.6\linewidth]{new_figs/n_gen_arc1_n.pdf} % Replace with your image file
+        \caption{}
+        \label{fig_conven_op_arc}
+    \end{subfigure}
+    \hfill
+    % Second subfigure
+    \begin{subfigure}[b]{0.53\columnwidth}
+        \centering
+        \includegraphics[width=\linewidth]{new_figs/n_gen_arc2_n.pdf} % Replace with your image file
+        \caption{}
+        \label{fig_fused_op_arc}
+    \end{subfigure}
+    \caption{Conventional (a) vs. fused-operation (b) architecture.}
+    \label{gen_archs}
+\end{figure}
+ 
+Fig.~\ref{total_arc} demonstrates the typical architecture of a Transformer-based model. Each decoder block of such a model would contain one Softmax operation and two Layernorms, each followed by a matrix multiplication. Application of our fusion technique can reduce the total latency of inference on such LLMs by approximately 15-20\% for different hardware architectures.
+
+%\cmr{ move it to results section? Our experimental analysis demonstrates that the proposed operation fusion technique achieves an approximate {20\%} reduction in latency on the Corsair \cite{corsair}, a d-Matrix inference accelerator hardware.}
+%By doing so, we demonstrate that the computational efficiency can be improved, achieving a reduction in latency of approximately 20{\%}. 
+\begin{figure*}[t]
+\centering
+\centerline{\includegraphics[width=0.68\textwidth]{new_figs/transformer_arc_new.pdf}}
+\caption{Transformer architecture.}
+\label{total_arc}
+\end{figure*}
+
+%\cmr{is this a repetition of a paragraph from the intro? why do we need it here?} 
+%\mahsacm{we need it to wrap up the this section, and emphasize that we are focusing on improving efficiency in inference phase. }
+
+%\mahsa{In summary,} \cmr{how can you put summary in the middle of text? this work is centered on developing methods and device architectures aimed at accelerating compute workloads, particularly in Transformer-based language models and related architectures, with a specific focus on improving the efficiency of the inference phase. These advancements have the potential to enhance performance in machine learning applications, including natural language processing and other high-dimensional computation tasks.}
+
+%\section{Operation Fusion}
+%In both Layernorm and Softmax operations, the computation involves performing normalization, where the denominator necessitates an aggregation of multiple values, making it computationally intensive. Typically, Layernorm and Softmax operations are succeeded by a linear operation, i.e., \mahsa{a matrix multiplication that involves a static weight (e.g., feed forward layer) or a matrix multiplication where the matrix is dynamic and changes during computation. (e.g., those performed in the self-attention mechanism to compute the $\mathbf{K}$, $\mathbf{Q}$, and $\mathbf{V}$ matrices), see Fig.~\ref{total_arc}.} By decomposing these operations into separate numerator and denominator computations, it becomes evident that the order of \mahsa{applying the computed denominator}—whether before or after the linear operation—does not affect the final result due to algebraic equivalence. This commutative property enables parallelization, wherein the numerator computation and the subsequent linear operation can proceed concurrently with the calculation of the denominator. By overlapping these computations, the overall latency is significantly reduced without affecting the accuracy of the result.
+
+Next, we explain how the fusion technique works in practice for both Layernorm and Softmax operations. We would like to emphasize that the fusion methodology proposed here guarantees that the fused operation produces exactly the same results as the original sub-graph due to their algebraic equivalence.
+
+%By leveraging this fusion strategy, we achieve a significant improvement in computational efficiency and a notable reduction in latency, making it a practical solution for optimizing Transformer workloads without compromising performance. \cmr{you have to mention HW. the point is that we have 2 DIFFERENT pieces of HW and they can run simultaneously.}
+
+%\mahsa{In our design, we 
+%leverage the decomposition of computations to 
+%exploit the two separate hardware components typically used for linear and non-linear operations. A sub-operation resulting from decomposing the non-linear operation is executed on one of the hardware components. Meanwhile, the other sub-operation from the decomposition is fused with the preceding linear operation and executed on the second hardware component. The concurrent execution of these two hardware components leads to significant improvements in computational efficiency and a notable reduction in latency, thereby optimizing Transformer workloads without compromising performance.}
+
+%The fused operations technique can be implemented to improve the performance of certain operations involved in computing workloads, such as those of transformer-based neural network models.  In an example, this technique can be applied to cases in which a first operation performed by a first compute device (e.g., SIMD device) can be split into atomized sub-operations and one of the atomized sub-operations can be performed concurrently with a second operation performed by a second compute device (e.g., DIMC device) using the results from the first sub-operation.  The first and second operations can also be atomized sub-operations of a target operation.  Afterwards, the results can be aggregated in another sub-operation to produce the intended result.  In such cases, the concurrent operation can reduce the latency of the operations and improve overall performance.  
+%\clearpage
+
+
+\subsection{Fused Layernorm}
+Layernorm is one of the key components in modern LLMs \cite{xiong_laynorm}. It adaptively scales the input across the features for each data point and thus
+helps stabilize the learning process.
+
+Given the input vector $\mathbf{x} \in \mathbb{R}^{1\times n}$, the Layernorm first computes the mean and the variance of the elements as 
+\begin{equation}
+\label{eq_mean_var}
+\bar{\mathbf{x}} = \tfrac{1}{n} \sum_1^{n} x_i, \quad \sigma^2(\mathbf{x}) = \tfrac{1}{n} {(\mathbf{x}-\bar{\mathbf{x}} 
+\mathbf{1})(\mathbf{x}-\bar{\mathbf{x}}
+\mathbf{1})^T},
+\end{equation}
+and after normalization, Layernorm applies trainable scale factors $\boldsymbol{\gamma}$ and bias $\boldsymbol{\beta}$ to allow the model to adjust the normalized values as follows
+\begin{equation}
+\label{eq_norm}
+\mathbf{y} =\frac{\mathbf{x}-\bar{\mathbf{x}} \mathbf{1}}{{\sqrt{\sigma^2+\epsilon}}} \odot \boldsymbol{\gamma} + \boldsymbol{\beta}.
+\end{equation}
+% \begin{align}
+% \mathbf{y} & =\frac{\mathbf{x}-\bar{\mathbf{x}} \cdot \mathbf{1}}{\nu(\mathbf{x})} \times \gamma + \beta \\
+% &= \frac{\mathbf{x}-\bar{\mathbf{x}} \cdot \mathbf{1}}{\sqrt{(\mathbf{x}-\bar{\mathbf{x}} \cdot \mathbf{1})(\mathbf{x}-\bar{\mathbf{x}} \cdot \mathbf{1})^T}} \times \gamma + \beta
+% \end{align}
+% \begin{equation}
+% \mathbf{y} = \frac{\mathbf{x}-\bar{\mathbf{x}} \cdot \mathbf{1}}{\nu(\mathbf{x})} \times \gamma + \beta = \frac{\mathbf{x}-\bar{\mathbf{x}} \cdot \mathbf{1}}{\sqrt{(\mathbf{x}-\bar{\mathbf{x}} \cdot \mathbf{1})(\mathbf{x}-\bar{\mathbf{x}} \cdot \mathbf{1})^T}} \times \gamma + \beta
+% \end{equation}
+If $\boldsymbol{\Gamma} \in \mathbb{R}^{n \times n}$ denotes the diagonal matrix whose diagonal elements are 
+%derived \cmr{derived? look how it is written in SLaNC paper} from 
+the components of the vector $\boldsymbol{\gamma}$, i.e., $\boldsymbol{\Gamma}= \operatorname{Diag}(\boldsymbol{\gamma})$, and $\mathbf{E} \in \mathbb{R}^{n \times n}$ denotes a matrix in which all elements are equal to 1, Eq.~\ref{eq_norm} can be expressed in matrix form as
+\begin{equation}
+\label{eq_fused_layernorm_final}
+\mathbf{y} = \frac{\mathbf{x}-\bar{\mathbf{x}} \mathbf{1}}{\sqrt{\sigma^2+\epsilon}} \odot \boldsymbol{\gamma} + \boldsymbol{\beta} =  \frac{\mathbf{x}} {\sqrt{\sigma^2+\epsilon}} \left ( \mathbf{I} - \tfrac{1}{n} \mathbf{E} \right )  \boldsymbol{\Gamma} + \boldsymbol{\beta} .
+\end{equation}
+%Note that in LLaMA models, LayerNorm is replaced by RMSNorm, which omits the mean subtraction step. However, our proposed operation fusion technique can still be effectively applied to the RMSNorm layer in LLaMA models.
+%As previously mentioned, LayerNorm is typically followed by a matrix multiplication, either within a fully-connected layer or an explicit matrix multiplication performed in the self-attention mechanism to compute the $\mathbf{K}$, $\mathbf{Q}$, and $\mathbf{V}$ matrices, see Fig.~\ref{total_arc}).
+Note that $\mathbf{I}$, $\mathbf{E}$, and $\boldsymbol{\Gamma}$ are all static matrices, and hence $\left ( \mathbf{I} - \tfrac{1}{n} \mathbf{E} \right ) \boldsymbol{\Gamma}$ in Eq.~\ref{eq_fused_layernorm_final} can be computed at the compile time with no impact on the inference latency.
+
+Finally, the output of the Layernorm is directly fed into the following linear layer. Namely, if $\mathbf{F} \in \mathbb{R}^{n \times m}$, the result of the matrix multiplication, $\mathbf{yF}$, can be written as 
+\begin{equation}
+\mathbf{y} \mathbf{F} =  \underbrace{\left( \frac{\mathbf{x}} {\sqrt{\sigma^2+\epsilon}} \Bigl(\mathbf{I} - \tfrac{1}{n} \mathbf{E} \Bigr)  \boldsymbol{\Gamma} + \boldsymbol{\beta} \right )}_{\text{conventional Layernorm}} \mathbf{F}.
+\end{equation}
+
+The standard Transformer architecture prescribes to first complete the Layernorm and then perform the matrix multiplication, following the architecture in Fig.~\ref{fig_conven_op_arc}. 
+
+Our proposed fusion methodology, instead, suggests following an operation decomposition as below: 
+\begin{equation}
+\label{eq_fused_layernorm}
+\mathbf{y} \mathbf{F} = \underbrace{\frac{1}{\sqrt{\sigma^2+\epsilon}}}_{\text{collective sub-op}} \times \underbrace{\Bigl( \mathbf{x} \big(\mathbf{I} - \frac{1}{n} \mathbf{E} \big)  \boldsymbol{\Gamma}\mathbf{F} \Bigr)}_{\text{fused Layernorm}}   + \boldsymbol{\beta}  \mathbf{F}.
+\end{equation}
+%In conventional Transformer computations, the Layernorm operation is completed first, and its result is then passed as input to the following linear layer. However, as shown in Eq.~\ref{eq_norm}, the output of Layernorm depends on computing the variance, which involves intensive spatial operations to aggregate all vector elements into a single location. These collective operations present significant challenges to the  efficient compute of Layernorm and introduce substantial overhead.
+In  Eq.~\ref{eq_fused_layernorm}, the Layernorm computation is first decomposed into an element-wise computation, i.e., $\mathbf{x} \big(\mathbf{I} - \frac{1}{n} \mathbf{E} \big) \boldsymbol{\Gamma}$, and a denominator with aggregative operations, i.e., $\sqrt{\sigma^2+\epsilon}$. Then, exploiting the commutative property, while the linear layer is executed as $\mathbf{x} \big(\mathbf{I} - \frac{1}{n} \mathbf{E} \big) \boldsymbol{\Gamma} \mathbf{F}$ in the linear processing engine (e.g., DIMC), the aggregation required for the denominator is concurrently performed in the non-linear processing engine (e.g., SIMD). Fig.~\ref{fused_norm} illustrates the architecture of the fused Layernorm, highlighting the operation decomposition and fusion process. Note that in this architecture, $\boldsymbol{\beta}$ is omitted for simplicity but it can be computed as part of the linear operation, if required.
+\begin{figure}[h]
+%\centering
+\centerline{\includegraphics[width=0.4\textwidth]{new_figs/fused_layernorm_v2.pdf}}
+\caption{Architecture of fused Layernorm.}
+\label{fused_norm}
+\end{figure}
+
+We would like to note that in the Transformer block, as shown in Fig.~\ref{total_arc}, there are two different architectural configurations with respect to Layernorm and the residual connection. In this work, we describe the architecture where the residual connection is branched before the Layernorm step. However, our proposed fused Layernorm architecture can be easily applied to the configuration where the residual connection is branched immediately after Layernorm.
+% \begin{align}
+% \mathbf{y} \mathbf{F} & = \left( \frac{\mathbf{x}} {\sqrt{\sigma^2+\epsilon}} \big(\mathbf{I} - \frac{1}{n} \mathbf{E} \big)  \boldsymbol{\Gamma} + \boldsymbol{\beta} \right ) \mathbf{F}.
+% %&= \frac{\mathbf{x}} {\nu(\mathbf{x})} \big(\mathbf{I} - \frac{1}{h} \mathbf{E} \big) \Gamma \mathbf{F} + \beta \mathbf{F} \\
+% %&= \frac{1} {\sqrt{\sigma^2+\epsilon}}  \times \mathbf{x} \big(\mathbf{I} - \frac{1}{h} \mathbf{E} \big) \Gamma \mathbf{F} + \beta \mathbf{F}
+% \end{align}
+
+%the non-linear normalization operation is decomposed into two sub-operations: one that processes the immediate elements in the numerator and another that involves the aggregation of all vector elements in the denominator. The linear operation can be fused with the numerator computation, effectively bypassing the need for the aggregative operation at this stage. While the linear operation is being executed in the linear processing engine (e.g., DIMC), the aggregation required for the denominator is concurrently performed in the non-linear processing engine \mahsa{(e.g., SIMD), see Section~\ref{motiv}}. Finally, the results from these two operations are combined to compute the final output, maintaining accuracy while significantly improving computational efficiency and reducing latency. Fig.~\ref{fused_norm} illustrates the architecture of the fused Layernorm, highlighting the operation decomposition and fusion process. Note that in this architecture, $\boldsymbol{\beta}$ is omitted for simplicity but it can be computed as part of operation~2 if required.}
+
+
+\subsubsection*{RMSNorm in Llama Models}
+%\begin{figure}[htbp]
+% \begin{figure*}[t]
+%     \centering
+%     % First subfigure
+%     \begin{subfigure}[b]{\columnwidth}
+%         \centering
+%         \includegraphics[width=0.5\linewidth]{figs/llama_arc.pdf} % Replace with your image file
+%         \caption{}
+%         \label{fig:subfig1}
+%     \end{subfigure}
+%     \hfill
+%     % Second subfigure
+%     \begin{subfigure}[b]{\columnwidth}
+%         \centering
+%         \includegraphics[width=0.9\linewidth]{figs/llama_arc_fused.pdf} % Replace with your image file
+%         \caption{}
+%         \label{fig:subfig2}
+%     \end{subfigure}
+%     \caption{Llama architecture (a) and the fused-RMSNorm (b).}
+%     \label{gen_archs}
+% %\end{figure}
+% \end{figure*}
+
+% \begin{figure}[h]
+% \centering
+% \centerline{\includegraphics[width=0.52\textwidth]{figs/llama_arc_fused_merged.pdf}}
+% \caption{Fused RMSNorm in Llama architecture.}
+% \label{fused_norm}
+% \end{figure}
+The Llama family of models exploit a different type of normalization instead of Layernorm---the so-called RMSNorm \cite{{zhang_rms}}. RMSNorm assumes the mean of the activation vector is zero and thus reads as 
+\begin{equation}
+\label{rms_norm}
+\operatorname{RMSNorm}(\mathbf{x}) = \frac{\mathbf{x}}{\sqrt{\tfrac{1}{n} \mathbf{x} \mathbf{x}^T}} \odot \boldsymbol{\gamma}.
+\end{equation}
+Additionally, the subsequent linear layer in Llama’s Multi-Layer Perceptron (MLP) differs from the standard Transformer MLPs by incorporating an up-projection, a gating mechanism (e.g., SwiGLU), and a down-projection. Specifically, in Llama’s MLP, the input is first projected into a higher-dimensional space (up-projection), then modulated by a gating function that selectively adjusts activations, and finally reduced back to the original dimensionality (down-projection). 
+
+Despite these architectural distinctions, our operation fusion approach integrates seamlessly with Llama models' layers. By leveraging algebraic equivalences, our method fuses computations in the up-projection and gating stages, preserving the exact accuracy of the original layer while reducing latency through optimized intermediate operations. 
+
+
+\subsection{Fused Softmax}
+Similarly to Layernorm, the Softmax in Transformers is typically followed by a matrix multiplication. If $\mathbf{x}, \mathbf{y}\in \mathbb{R}^{1\times n}$ denote the input and output vectors of a Softmax\footnote{In practice, the computation involves computing the element-wise maximum, $\operatorname{max}_i(\mathbf{x})$, and then applying Softmax function to $\mathbf{x}-\operatorname{max}_i(\mathbf{x})$. Note that the fusion methodology applies in this case without alterations.}, respectively,
+%namely, $\mathbf{y} = \tfrac{[e^{x_1}~e^{x_2}~\cdots~e^{x_n}]}{\sum_i e^{x_i}}$
+% \begin{equation}
+% \mathbf{y} = \frac{[e^{x_1}~e^{x_2}~\cdots~e^{x_n}]}{\sum_i e^{x_i}},
+% \end{equation}
+the output of the following matrix multiplication reads as
+\begin{equation}
+\mathbf{y} \mathbf{V} = \underbrace{\Bigl( \frac{[e^{x_1}~e^{x_2}~\cdots~e^{x_n}]}{\sum_i e^{x_i}}\Bigr)}_{\text{conventional Softmax}}  \mathbf{V},
+\end{equation}
+where $\mathbf{V} \in \mathbb{R}^{n \times m}$ denotes the Values matrix.
+
+Analogously to the treatment of Layernorms described above, the fusion methodology applies here as well. We can first compute the exponential numerators, use them for the matrix operation and then apply normalization as illustrated in Fig.~\ref{fig_fused_softmax}.
+
+%, with the output of Softmax written as $\tfrac{[e^{x_1}~e^{x_2}~\cdots~e^{x_n}]}{\sum_i e^{x_i}}$. 
+
+%The output of a conventional Softmax architecture followed by a linear layer can be written as 
+% \begin{equation}
+% \label{eq_fused_softmax}
+% \mathbf{y} \mathbf{V} = \Bigl(\frac{[e^{x_1}~e^{x_2}~\cdots~e^{x_n}]}{\sum_i e^{x_i}}\Bigr) \mathbf{V}.
+% \end{equation}
+Note that unlike the Layernorm case, $\mathbf{V}$ is now a matrix of activations and not a static weight matrix. Despite that, the fusion algorithm is still perfectly applicable here because the matrix multiplication retains its linear nature.
+
+%The architecture for the fused Layernorm is illustrated in Fig.~\ref{fig_fused_softmax}.
+\begin{equation}
+\label{eq_fused_softmax}
+\mathbf{y} \mathbf{V} = \underbrace{\frac{1}{\sum_i e^{x_i}}}_{\text{collective sub-operation}}  \underbrace{\Bigl([e^{x_1}~e^{x_2}~\cdots~e^{x_n}]\mathbf{V} \Bigr)}_{\text{fused Softmax}} .
+\end{equation}
+
+%The architecture for the fused Layernorm is illustrated in Fig.~\ref{fused_softmax}.
+%. This approach enables parallel execution of the numerator computations alongside the aggregation in the denominator,   while preserving accuracy and reducing latency.
+%If $\mathbf{x} = [x_1, x_2, \cdots, x_n]$ denotes the input of Softmax function, each element of the output $\mathbf{y} \in \mathbb{R}^{1 \times n}$ can be represented as $y_i = \tfrac{e^{x_i}}{\sum_i e^{x_i}}$, where the aggregation in the denominator necessitates spatial collective operations. Given the linear layer that typically follows the Softmax operation, a similar decomposition and operation fusion strategy as employed in LayerNorm can be applied to Softmax. This approach enables parallel execution of the numerator computations alongside the aggregation in the denominator, effectively reducing computational latency without compromising accuracy.
+\vspace{-5pt}
+\begin{figure}[h]
+\centering
+\centerline{\includegraphics[width=0.4\textwidth]{new_figs/fused_softmax_v2.pdf}}
+\caption{Architecture of fused Softmax.}
+\label{fig_fused_softmax}
+\end{figure}
+
+
+
+\section{Experimental Results}
+The proposed technique is based on an algebraically equivalent reformulation of the involved operations, ensuring that it maintains complete accuracy without any degradation. Therefore, our methodology can be easily applied to any architecture that involves a Layernorm or Softmax followed by a linear operation, in particular it applies to any Transformer-based LLM.
+While the key advantage of this technique lies in its ability to significantly reduce the latency, its overall effectiveness largely depends on the underlying hardware architecture and the implementation of computations and collective operations. Key factors such as the throughput and capabilities of different computing units handling linear and non-linear operations play a crucial role in determining the performance gain achieved with the proposed method. 
+
+In order to provide an experimental analysis, we implemented the proposed approach on Corsair \cite{corsair}, our recently launched AI accelerator as described in Section~\ref{motiv}. The experimental results demonstrate that we get a latency reduction of 20\% on most state-of-the-art LLMs such as Llama2 and LLama3. These findings highlight the effectiveness of the fusion strategy in optimizing Transformer-based computations, further validating its potential for accelerating Artificial Intelligence (AI) workloads on advanced hardware platforms. Due to space constraints, we defer the rigorous analysis of computational time gains to our next publication.
+
+\section{Conclusion}
+In this work, we introduced an operation fusion technique designed to enhance the computational efficiency and reduce the latency of Transformer-based large language models. By decomposing and fusing specific non-linear and linear operations, i.e., those that involve normalization, such as Layernorm and Softmax, with their succeeding linear transformations, we achieved mathematically equivalent results without compromising model accuracy. Deployment of the proposed approach on modern AI accelerators demonstrates a 20\% reduction of inference latency. These findings underscore the potential of operation fusion strategies to address the computational challenges posed by large scale Transformer-based models, paving the way for more efficient and scalable implementations in real-world applications. Future work will explore extending this methodology to other architectural components and further optimizing hardware-software co-design.
+% \begin{table}[htbp]
+% \caption{Table Type Styles}
+% \begin{center}
+% \begin{tabular}{|c|c|c|c|}
+% \hline
+% \textbf{Table}&\multicolumn{3}{|c|}{\textbf{Table Column Head}} \\
+% \cline{2-4} 
+% \textbf{Head} & \textbf{\textit{Table column subhead}}& \textbf{\textit{Subhead}}& \textbf{\textit{Subhead}} \\
+% \hline
+% copy& More table copy$^{\mathrm{a}}$& &  \\
+% \hline
+% \multicolumn{4}{l}{$^{\mathrm{a}}$Sample of a Table footnote.}
+% \end{tabular}
+% \label{tab1}
+% \end{center}
+% \end{table}
+
+% \begin{figure}[htbp]
+% \centerline{\includegraphics{fig1.png}}
+% \caption{Example of a figure caption.}
+% \label{fig}
+%\end{figure}
+
+
+%Advances in Neural Information Processing Systems
+\begin{thebibliography}{00}
+\bibitem{b1} A. Vaswani, ``Attention is all you need," Adv.\ Neural Inf.\ Process.\ Syst., vol. 30, 2017, pp. 5998–6008.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\bibitem{brown} T. B. Brown, B. Mann, N. Ryder, M. Subbiah, J. Kaplan, P. Dhariwal, A. Neelakantan, P. Shyam, G. Sastry, A. Askell, S. Agarwal, A. Herbert-Voss, G. Krueger, T. Henighan, R. Child, A. Ramesh, D. M. Ziegler, J. Wu, C. Winter, C. Hesse, M. Chen, E. Sigler, M. Litwin, S. Gray, B. Chess, J. Clark, C. Berner, S. McCandlish, A. Radford, I. Sutskever, and D. Amodei, ``Language models are few-shot learners," Adv.\ Neural Inf.\ Process.\ Syst., vol. 33, 2020, pp. 1877–1901.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\bibitem{touvron} H. Touvron, L. Martin, K. Stone, P. Albert, A. Almahairi, Y. Babaei, N. Bashlykov, S. Batra, P. Bhargava, S. Bhosale, et al., ``Llama 2: Open foundation and fine-tuned chat models," arXiv preprint arXiv:2307.09288, 2023..
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\bibitem{wang} W. Wang, W. Chen, Y. Luo, Y. Long, Z. Lin, L. Zhang, B. Lin, D. Cai, and X. He, ``Model compression and efficient inference for large language models: A survey," arXiv preprint arXiv:2402.09748, 2024.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\bibitem{zhu} X. Zhu, J. Li, Y. Liu, C. Ma, and W. Wang, ``A Survey on Model Compression for Large Language Models," Trans.\ Assoc.\ Comput.\ Linguistics, vol. 12, pp. 1556–1577, 2024.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\bibitem{ho}  N. Ho, L. Schmid, and S. Y. Yun, ``Large language models are reasoning teachers," arXiv preprint arXiv:2212.10071, 2022.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\bibitem{xia} M. Xia, T. Gao, Z. Zeng, and D. Chen, ``Sheared Llama: Accelerating language model pre-training via structured pruning," arXiv preprint arXiv:2310.06694, 2023.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\bibitem{chen} T. Chen, T. Ding, B. Yadav, I. Zharkov, and L. Liang, ``Lorashear: Efficient large language model structured pruning and knowledge recovery," arXiv preprint arXiv:2310.18356, 2023.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\bibitem{rohani1} B. Darvish Rouhani, D. Lo, R. Zhao, M. Liu, J. Fowers, K. Ovtcharov, A. Vinogradsky, S. Massengill, L. Yang, R. Bittner, A. Forin, H. Zhu, T. Na, P. Patel, S. Che, L. C. Koppaka, X. Song, S. Som, K. Das, S. T., S. Reinhardt, S. Lanka, E. Chung, and D. Burger, ``Pushing the limits of narrow precision inferencing at cloud scale with Microsoft floating point," in Advances in Neural Information Processing Systems, vol. 33, H. Larochelle, M. Ranzato, R. Hadsell, M. F. Balcan, and H. Lin, Eds., pp. 10271–10281, Curran Associates, Inc., 2020.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\bibitem{rohani2} B. Darvish Rouhani, R. Zhao, A. More, M. Hall, A. Khodamoradi, S. Deng, D. Choudhary, M. Cornea, E. Dellinger, K. Denolf, et al., ``Microscaling data formats for deep learning," arXiv preprint arXiv:2310.10537, 2023.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\bibitem{franter} E. Frantar, S. Ashkboos, T. Hoefler, and D. Alistarh, ``GPTQ: Accurate post-training quantization for generative pre-trained transformers," arXiv preprint arXiv:2210.17323, 2022.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\bibitem{jin} J. Lin, J. Tang, H. Tang, S. Yang, W.-M. Chen, W.-C. Wang, G. Xiao, X. Dang, C. Gan, and S. Han, ``AWQ: Activation-aware weight quantization for on-device LLM compression and acceleration," Proc.\ Mach.\ Learn.\ Syst., vol. 6, pp. 87–100, 2024.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\bibitem{qin} Z. Qin, W. Sun, H. Deng, D. Li, Y. Wei, B. Lv, J. Yan, L. Kong, and Y. Zhong, ``Cosformer: Rethinking softmax in attention," arXiv preprint arXiv:2202.08791, 2022.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\bibitem{coll_commun} A. Faraj, X. Yuan, and D. Lowenthal, ``Collective communication," in Encyclopedia of Parallel Computing, D. Padua, Ed. Boston, MA: Springer, 2011, pp. 241–247.
+%Available: \url{https://doi.org/10.1007/978-0-387-09766-4_163}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\bibitem{hoefler} T. Hoefler, T. Schneider, and A. Lumsdaine, ``Accurately measuring overhead, communication time and progression of blocking and nonblocking collective operations at massive scale," Int.\ J.\ Parallel Emergent Distrib.\ Syst., vol. 25, no. 4, pp. 241–258, 2010.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\bibitem{shoeybi} M. Shoeybi, M. Patwary, R. Puri, P. LeGresley, J. Casper, and B. Catanzaro, ``Megatron-LM: Training multi-billion parameter language models using model parallelism," arXiv preprint arXiv:1909.08053, 2019.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\bibitem{kim} T. Kim, H. Kim, G. I. Yu, and B. G. Chun, ``BPIPE: Memory-balanced pipeline parallelism for training large language models," in Int.\ Conf.\ Mach.\ Learn., 2023, pp. 16639–16653. PMLR.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\bibitem{hughes} C. J. Hughes, ``Single-instruction multiple-data execution," Morgan \& Claypool Publishers, 2015.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\bibitem{mannocci} P. Mannocci, M. Farronato, N. Lepri, L. Cattaneo, A. Glukhov, Z. Sun, and D. Ielmini, ``In-memory computing with emerging memory devices: Status and outlook," APL Machine Learning, vol. 1, no. 1, 2023.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\bibitem{wang_dimc} D. Wang, C.-T. Lin, G. K. Chen, P. Knag, R. K. Krishnamurthy, and M. Seok, ``DIMC: 2219TOPS/W 2569F2/b digital in-memory computing macro in 28nm based on approximate arithmetic hardware," in 2022 IEEE Int.\ Solid-State Circuits Conf.\ (ISSCC), vol. 65, pp. 266–268, 2022.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\bibitem{xiong_laynorm} R. Xiong, Y. Yang, D. He, K. Zheng, S. Zheng, C. Xing, H. Zhang, Y. Lan, L. Wang, and T. Liu, ``On layer normalization in the transformer architecture," in Int.\ Conf.\ Mach.\ Learn., pp. 10524–10533, PMLR, 2020.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\bibitem{zhang_rms} B. Zhang and R. Sennrich, ``Root mean square layer normalization," Adv.\ Neural Inf.\ Process.\ Syst., vol. 32, 2019.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\bibitem{corsair} d-Matrix, ``White paper: d-Matrix Corsair redefines performance and efficiency for AI inference at scale," White Paper, November 2024. [Online]. Available: https://www.d-matrix.ai/wp-content/uploads/2024/11/d-Matrix-WhitePaper-Technical-FINAL.pdf
+
+
+
+
+
+
+%\bibitem{achiam} J. Achiam, S. Adler, S. Agarwal, L. Ahmad, I. Akkaya, F. L. Aleman, D. Almeida, J. Altenschmidt, S. Altman, S. Anadkat, and R. Avila, GPT-4 Technical Report. arXiv preprint arXiv:2303.08774, 2023.
+%\bibitem{dubey} A. Dubey, A. Jauhri, A. Pandey, A. Kadian, A. Al-Dahle, A. Letman, A. Mathur, A. Schelten, A. Yang, A. Fan, and A. Goyal, The Llama 3 Herd of Models. arXiv preprint arXiv:2407.21783, 2024.
+
+
+
+% \bibitem{b2} J. Clerk Maxwell, A Treatise on Electricity and Magnetism, 3rd ed., vol. 2. Oxford: Clarendon, 1892, pp.68--73.
+% \bibitem{b3} I. S. Jacobs and C. P. Bean, ``Fine particles, thin films and exchange anisotropy,'' in Magnetism, vol. III, G. T. Rado and H. Suhl, Eds. New York: Academic, 1963, pp. 271--350.
+% \bibitem{b4} K. Elissa, ``Title of paper if known,'' unpublished.
+% \bibitem{b5} R. Nicole, ``Title of paper with only first word capitalized,'' J. Name Stand. Abbrev., in press.
+% \bibitem{b6} Y. Yorozu, M. Hirano, K. Oka, and Y. Tagawa, ``Electron spectroscopy studies on magneto-optical media and plastic substrate interface,'' IEEE Transl. J. Magn. Japan, vol. 2, pp. 740--741, August 1987 [Digests 9th Annual Conf. Magnetics Japan, p. 301, 1982].
+% \bibitem{b7} M. Young, The Technical Writer's Handbook. Mill Valley, CA: University Science, 1989.
+\end{thebibliography}
+\vspace{12pt}
+\color{red}
+
+
+\end{document}

@@ -1,0 +1,263 @@
+\section{Architecture Overview} \label{sec:overview}
+\begin{figure}[ht]  % 'ht' means here or at the top
+\vspace{-0.4em}
+\includegraphics[width=0.5\textwidth]{figures/SystemOverview.jpg} 
+\caption{Data Guard System Architecture.}  % Adding a caption
+\label{fig:SystemOverview}  % Adding a label for referencing
+\vspace{-1em}
+\end{figure}
+Figure~\ref{fig:SystemOverview} shows the overall system architecture of Data Guard. 
+Data producers provide semantic descriptions of data in the form of {\em policy labels} that are assigned to {\em fields} in a table. 
+{\em Fields} refer to data elements in a table and represent the unit at which data masking is applied. 
+Thus, a field can reference a column, a row, a cell or portion of data within a cell. 
+The mapping of policy labels to fields is stored in a {\em Data Catalog} as shown in Figure~\ref{fig:SystemOverview}. 
+Policies in Data Guard are authored in a domain-specific language (DSL) and stored in a {\em Policy Catalog} which provides APIs to query policies from the catalog. 
+Each policy is assigned to a purpose and policy label pair. A policy definition has an associated boolean condition that determines whether a data element with the corresponding policy label is masked or preserved during data access.       
+Figure~\ref{fig:SystemOverview} shows an example policy that is assigned to $ads$ purpose and $employer$ label. 
+The {\em Policy Compiler} consumes the policy label-field mapping and policy definitions as inputs and generates purpose-specific static views which are registered with the data warehouse. 
+User queries submitted via Spark or Trino that access tables (e.g. $T_1$ and $T_2$ in Figure~\ref{fig:SystemOverview}) are transparently redirected by a routing module called {\em ViewShift} to the appropriate data-masking views ($jobs.V_1$ and $ads.V_2$ respectively in Figure~\ref{fig:SystemOverview}) based on the accessor's purpose (i.e $jobs$ and $ads$ in Figure~\ref{fig:SystemOverview}). 
+We next describe the access control model and system implementation details of Data Guard architecture.
+
+\section{Access Control Model}
+In this section, we introduce the main abstractions that enable purpose-limitation and fine-grained access control capabilities of Data Guard: (i) data access policies, (ii) data-masking views, and (iii) field paths. 
+
+\subsection{Data Access Policies}
+A data access policy in Data Guard specifies: (i) a {\em purpose} under which the policy is applicable, (ii) a {\em label} that determines the data elements to which the policy applies, and (iii) a set of access control {\em rules} that specify the conditions under which access to a data element with a given label is allowed or denied. We next introduce each of these concepts followed by a formal definition of a data access policy. 
+ 
+\subsubsection{Purpose}
+The access control model described in this paper is motivated by the {\em purpose limitation} principle introduced in the GDPR regulation~\cite{GDPR16}. Purpose limitation requires that data is collected from {\em data subjects} (i.e. individuals whose personal data is collected) for an explicitly declared purpose and is only processed for use cases compatible with the purpose under which it is collected. Further, usage of an individual's data for newer purposes is driven based on consents from the individual. At LinkedIn, a purpose is used to indicate the business justification for data collection or data processing. Purposes can either map to an external product such as advertising and jobs, or correspond to internal use cases such as security and business analytics. 
+
+% Data Guard organizes purposes into a directed acyclic graph where a directed edge from purpose $A$ to purpose $B$ indicates that purpose $B$ is a child of parent purpose $A$.  A child purpose can have multiple parent purposes and each child purpose inherits policies assigned to each of its parent purposes. In case of a parent-child policy conflict, the more restrictive policy is given precedence. Organizing purposes into a hierarchy and enabling policy inheritance minimizes policy duplication across related purposes. 
+At LinkedIn, purposes are organized as a directed acyclic graph which enables policy inheritance across purposes and minimizes policy duplication. For simplicity of discussion however, we assume henceforth that purposes are arbitrary string literals (such as {\em ads} and {\em jobs}) for the remainder of the paper. 
+%Data Guard organizes purposes into a directed acyclic graph where a directed edge from purpose $A$ to purpose $B$ indicates that purpose $B$ is a child of parent purpose $A$.  A child purpose can have multiple parent purposes and each child purpose inherits policies assigned to each of its parent purposes. In case of a parent-child policy conflict, the more restrictive policy is given precedence. Organizing purposes into a hierarchy and enabling policy inheritance minimizes policy duplication across related purposes. 
+
+Purpose limitation is ensured by requiring each data access to specify a valid purpose. At LinkedIn, all production workloads access warehouse data using service accounts. Similar to role-based access control systems where roles are assigned to a user, we assign a purpose to each service account. The purpose of the service account determines the access control policies that are enforced by Data Guard on the accessed tables. 
+
+\subsubsection{Policy Labels}
+Data producers provide semantic description of data in the tables they produce using {\em policy labels}. Figure~\ref{fig:SystemOverview} shows a data producer assigning policy labels $employer$ and $education$ assigned to $col_1$ and $col_2$ of table $T_1$. In general, data producers can assign policy labels either to:
+(i) a table, (ii) column in a table (either a top-level or a nested column), (iii) cells, or (iv) sub-cell-level data elements within arrays, structs and maps. As we will see in Section~\ref{subsec:fieldpaths}, this fine-grained assignment of policy labels allows Data Guard to apply data masking at much finer granularities than existing solutions. 
+
+Figure~\ref{fig:SystemOverview} also shows that policy labels are stored as metadata inside a {\em Data Catalog}. This design choice is motivated by recent trends in data architecture where data catalogs such as Horizon~\cite{Horizon}, Unity~\cite{Unity} and DataHub~\cite{Datahub} have emerged as the foundational infrastructure component to address data discovery and data governance needs of large organizations. These catalogs serve as the inventory of the critical data assets (e.g. warehouse tables) of an organization and store a variety of metadata such as schemas, lineages and ownership associated with these assets. These catalogs are therefore well-suited for storing compliance metadata such as {\em policy labels}. 
+
+At LinkedIn, policy labels are carefully curated and organized into a hierarchical structure referred to as {\em ontology}. An ontology-based organization not only classifies data in our ecosystem, but also captures relationships between these data classes. Ontology also supports advanced use cases at LinkedIn related to reasoning and inference on compliance metadata. A detailed discussion on the design of our ontology is beyond the scope of this paper. We note however that the access control model proposed in this paper does not require an ontology-based organization of policy labels. For simplicity, we therefore assume that policy labels are arbitrary string values for the remainder of the paper. 
+
+Policy labels link policies to the data elements (e.g. tables, columns, and cells) to which policies apply. The cardinality of policy labels is typically much smaller than the number of data assets and fields across all tables in a warehouse. Defining policies using policy labels significantly reduces policy duplication and allows policies to be consistently applied across tables in a warehouse as well as across non-warehouse data assets such as online data stores and data streams. Further, it automatically ensures compliance of newly created tables containing data elements tagged with one or more previously defined labels. 
+
+\subsubsection{Policy Language} \label{subsubsec:policies}
+Data masking in Data Guard is controlled using rules that are assigned to a purpose and policy label pair. 
+\begin{definition} \label{def:policy}
+Let $\mathcal{P}$ denote the set of purposes and $\mathcal{L}$ denote the set of policy labels. A policy in Data Guard is a tuple $(p,l, \langle c, a \rangle)$ where $p \in \mathcal{P}$ and $l \in \mathcal{L}$. $\langle c, a \rangle$ is a condition and action pair (or, a rule) where:
+\begin{itemize}
+\item $c$ is a compound SQL predicate composed of simple predicates connected using the boolean operators $\lbrace AND, OR, NOT \rbrace$. Each simple predicate in $c$ is of the form $(x \circ y)$ where:
+\begin{enumerate}
+\item where $x \in \mathcal{X}$ is a set of attributes (defined below),
+\item $y \in dom(x)$ is the domain of values of attribute $x$.
+\item $\circ$ represents a relational operator from the set of relational operators $\lbrace =, \neq, <, >, \leq, \geq, BETWEEN, IN, \\ LIKE, IS NULL \rbrace$.
+\end{enumerate}
+\item $a \in \mathcal{A}$ represents an action from the set of actions $\mathcal{A}$ that the access control system must take when $c$ is true.
+\end{itemize} 
+\end{definition}
+Thus, the example policy shown in Figure~\ref{fig:SystemOverview} can be represented as a tuple: $(ads, employer, \langle allowEmplForAds=true, KEEP \rangle)$.
+ 
+The set $\mathcal{X}$ of attributes over which policy conditions are defined is a union of data subject attributes (e.g. opt-in/opt-out consents, user location), data accessor attributes (e.g. accessor's role and location), and system attributes (e.g. availability/security zone where the system is located in). The set of actions $\mathcal{A}$ of interest in this paper is the set $\lbrace KEEP, MASK \rbrace$, where the action $KEEP$ allows access to the target data while $MASK$ redacts the data. For simplicity, we only consider a specific form of data redaction in this paper, where the target data element is either replaced with $NULL$ value or the tuple containing the target data element is filtered from the result set. Assignment of non-null replacement values to target data elements is an area of ongoing work and will be discussed in greater detail in Section~\ref{sec:considerations}. 
+
+At LinkedIn, policies are managed like source code and policy changes are manually reviewed before they are committed to a code repository. Further, we run a number of validation checks on policies to avoid duplication and ensure that policies can be successfully parsed and compiled by the policy compiler. The changes committed to the repository are pushed to a {\em Policy Catalog}  which provides APIs to query policies by purpose and policy labels.
+
+Without loss of generality, all policies considered in the remainder of the paper are $KEEP$ policies i.e. the data element referenced by a policy label is preserved if the policy condition evaluates to true and masked otherwise. We further restrict our attention to policies based on data subject consents for the remainder of this paper. In doing so, we aim to highlight:
+\begin{enumerate}
+\item the scalability challenges that need to be addressed to enforce consents of a large population of data subjects during data accesses, and 
+\item the unique challenges such policies introduce for enabling fine-grained data masking. 
+\end{enumerate}
+
+\subsection{Data-Masking Views} \label{subsec:views}
+Data Guard uses views as the interface for access control. Each data-masking view is a SQL representation of applicable data policies on a table for a given purpose. The applicable policies for a given purpose are found by matching policy labels assigned to fields in a table against the labels assigned to policies. The matched policies are then translated to SQL by the {\em Policy Compiler}, the implementation of which will be discussed in detail in Section~\ref{subsubsec:pc}. 
+
+We illustrate an example data-masking view created by Data Guard in Figure~\ref{fig:SystemOverview}. 
+Let us assume that the table $T_1$ shown in the figure is keyed by an $id$ column containing data subject identifiers. 
+The figure also shows that $T_1$ contains a column $col_2$ that has $education$ data with an applicable policy for the $ads$ purpose. 
+For simplicity, let us assume that all data subject attributes referenced in policy definitions are stored in the $member\_settings$ table which is also keyed by the data subject identifier. 
+A naively implemented policy compiler generates the following view SQL for $ads$ purpose which masks $col_2$ based on the value of the attribute $allowGenderForAds$ in the $member\_settings$ table:
+% Define SQL code style
+\lstdefinestyle{sqlstyle}{
+    language=SQL,
+    basicstyle=\ttfamily\footnotesize,
+    keywordstyle=\color{blue},
+    commentstyle=\color{gray},
+    stringstyle=\color{orange},
+    showstringspaces=false,
+    morekeywords={SELECT, FROM, WHERE, AND, OR, INSERT, INTO, UPDATE, DELETE}, % Add SQL keywords here
+    frame=single, % Add a border around the code
+    breaklines=true, % Automatically break long lines
+}
+\lstset{style=sqlstyle}
+% Example SQL code
+\begin{figure}[ht] 
+\vspace{-1em}
+\begin{lstlisting} 
+SELECT T1.id, T1.col1, CASE WHEN allowGenderForAds = true THEN T1.col2 ELSE NULL END AS col2
+FROM T1 JOIN member_settings T2 ON T1.id = T2.id;
+\end{lstlisting}
+\vspace{-1em}
+ \caption{A data-masking view for $ads$ purpose}
+\label{fig:viewsql}
+\vspace{-1em}
+\end{figure}
+
+The view SQL shown in Figure~\ref{fig:viewsql}, while inefficient, has the important property that it is {\em schema-preserving} i.e. it has the same schema as the underlying table $T_1$. This invariant is maintained across all views created by Data Guard. The schema-preserving property ensures that applications can switch consumption from tables to views without needing to make code changes. Each view generated by Data Guard is registered within a purpose-specific database (e.g. $ads.V_1$ in Figure~\ref{fig:SystemOverview}), which facilitates search and discovery of views in the data catalog. In Section~\ref{sec:impl}, we discuss a number of optimizations which will be used to rewrite the view SQL in Figure~\ref{fig:viewsql} in order to make it performant.
+
+The decision to use SQL views as the interface for access control was motivated by the following reasons: 
+\begin{itemize}
+\item {\em Portability}:  Views are engine-agnostic and work out of the box with engines like Spark and Trino.
+\item {\em Debuggability}: Views make masking logic visible to end users and allow consumers to reason about {\em what} data is being filtered and {\em why}.
+\item {\em Version control}: Views can be versioned in the same manner as software artifacts. Thus, changes to view logic (due to policy and label changes) can be tested by data consumers before they are deployed in production. 
+\item {\em Agility:} Implementing changes to policy compiler is much faster than making changes to the compute engine code, which caters to a much larger set of use cases beyond access control.
+\item {\em Optimizations:} A dedicated policy compilation layer provides the flexibility of implementing custom optimizations (e.g. bitmap optimization discussed in Section~\ref{subsubsec:bitmap}) when generating view SQL. Such use-case specific optimizations are otherwise non-trivial to implement inside general-purpose compute engines. 
+\end{itemize}
+As shown in Figure~\ref{fig:SystemOverview}, accesses to tables are routed to an appropriate masking view based on the purpose of access using a component called {\em ViewShift}.  ViewShift along with the schema-preserving property of the masking views allows applications to seamlessly switch consumption from tables to views without incurring significant migration costs. 
+
+%We note an interesting parallel between our system and object-oriented programming. Raw data in tables can be seen as analogous to private data members of an object encapsulated inside data-masking views which constitute the public interface, while the routing of table accesses to views is similar to the concept of dynamic method dispatching central to runtime polymorphism implemented in languages like Java and C++.
+
+\subsection{Field Paths} \label{subsec:fieldpaths}
+\subsubsection{Motivation}
+Existing solutions~\cite{Stonebraker74, Rizvi04,Xue23, Agrawal05} support data masking at row, column and cell-level granularity. These masking operations are typically accomplished using traditional projection and selection operators. 
+%\begin{figure}[htbp]
+%    \centering
+ %   \includegraphics[width=0.5\textwidth]{figures/relation_slice.png}  % Replace with your image file
+%    \caption{User data presented in a relation}
+ %   \label{fig:relation_slice}  % This is the label for referencing the figure
+%\end{figure}
+As mentioned in Section~\ref{intro}, Data Guard's access control model supports masking data at much finer granularities than is possible with previous solutions. This need for finer grained data masking is motivated by prevalence of non-relational data in LinkedIn's warehouse (and indeed, many modern data warehouses~\cite{Snowflake} and lakehouses~\cite{Databricks}). It is common to model data using relation-valued attributes and {\em collection} types such as arrays and maps. Masking data selectively inside such data structures cannot be done using relational operators such as projection and selection alone.  
+
+Let us consider an example relation $\mathcal{R}$ with the following schema:
+\begin{tabbing}
+    \hspace{1cm} \= \hspace{5cm} \= \kill
+    \textbf{$col_1$}: \> \texttt{VARCHAR} \\
+    \textbf{$col_2$}: \> \texttt{STRUCT<$field_{21}$:BIGINT, $field_{22}$:VARCHAR>} \\
+    \textbf{$col_3$}: \> \texttt{ARRAY<STRUCT<$field_{31}$:VARCHAR, $field_{32}$:DOUBLE>>} \\
+    \textbf{$col_4$}: \> \texttt{MAP<VARCHAR, ARRAY<STRUCT<$field_{41}$:VARCHAR, } \\
+                    \> \texttt{$field_{42}$:BOOLEAN>>>}
+\end{tabbing}
+Figure~\ref{fig:relationexample} shows an instance of $\mathcal{R}$. 
+\definecolor{gray1}{gray}{0.9}
+\definecolor{gray2}{gray}{0.8}
+\definecolor{gray3}{gray}{0.7}
+\definecolor{gray4}{gray}{0.6}
+\definecolor{gray5}{gray}{0.5}
+\begin{figure}[htbp]
+\vspace{-1em}
+ \resizebox{0.5\textwidth}{!}{
+\begin{tabular}{|c|c|c|c|c|c|c|c|}
+    \hline
+    \multirow{2}{*}{\textbf{$col_1$}} & \multicolumn{2}{c|}{\textbf{$col_2$}} & {\textbf{$col_3$}} & {\textbf{$col_4$}} \\ \cline{2-3}
+    & \textbf{$field_{21}$} & \textbf{$field_{22}$} &   &  \\ \hline
+    abc \cellcolor{gray1} & 123 & foo & 
+    \begin{tabular}{|c|c|}
+        \hline
+        \textbf{$field_{31}$} & \textbf{$field_{32}$} \\ \hline
+        s1 \cellcolor{gray4} & \cellcolor{gray4} 113.2 \\ \hline
+        % s2 & 123.3 \\ \hline
+    \end{tabular} &  
+    NULL \\ \hline
+    def \cellcolor{gray2} \cellcolor{gray2} & 243 \cellcolor{gray2}  & bar \cellcolor{gray2}  & NULL \cellcolor{gray2}  & NULL  \cellcolor{gray2} \\ \hline
+    ghj \cellcolor{gray1} & 123 \cellcolor{gray3} &  bar \cellcolor{gray3} & 
+    \begin{tabular}{|c|c|}
+        \hline
+        \textbf{$field_{31}$} & \textbf{$field_{32}$} \\ \hline
+        s1 \cellcolor{gray4} & 345.2 \cellcolor{gray4} \\ \hline
+        s3 & 212.0 \\ \hline
+    \end{tabular} & 
+    \begin{tabular}{|c|c|c}
+        \hline
+        \textbf{key} & \textbf{value} \\ \hline
+        % \multirow{2}{*}{\textbf{key}} & \multicolumn{2}{c|}{\textbf(value)} \\ \cline{2-3}
+        % & \textbf{$field_{41}$} & \textbf{$field_{42}$} \\ \hline
+        k1 & \begin{tabular}{|c|c|}
+            \hline
+            \textbf{$field_{41}$} & \textbf{$field_{42}$} \\ \hline
+            v1 & true \\ \hline
+            v2 & false \cellcolor{gray5} \\ \hline
+        \end{tabular} \\ \hline
+        k2 & NULL \\ \hline
+    \end{tabular} \\ \hline
+\end{tabular}
+\vspace{1em} % Space between the tables
+\begin{tabular}{|c|l|}
+\hline
+\cellcolor{gray1} &  $\$.col_1$ \\
+\hline
+\cellcolor{gray2} & $\$.[?(@.col_1='def')]$ \\
+\hline
+\cellcolor{gray3} &  $\$.[?(@.col_1='ghj')].col_2$ \\
+\hline
+\cellcolor{gray4} & $\$.col_3.[item].[?(@.field_{31}='s1')]$  \\
+\hline
+\cellcolor{gray5} & $\$.col_4.[value].[item].[?(@.field_{41}='v2')].field_{42}$  \\
+\hline
+\end{tabular}
+}
+\caption{Example of a nested relation. Data Guard's field path expressions allow masking of data inside nested attributes such as structs, arrays and maps. 
+%The shaded cells with different gray scales in the figure represent the following paths, from light to dark respectively: \\
+%$\$.col_1$ \\
+%$\$.[?(@.col_1='def')]$ \\
+%$\$.[?(@.col_1='ghj')].col_2$ \\
+%$\$.col_3.[item].[?(@.field_{31}='s1')]$ \\
+%$\$.col_4.[value].[item].[?(@.field_{41}='v2')].field_{42}$ \\
+}
+\label{fig:relationexample}
+\vspace{-1em}
+\end{figure}
+
+In order to mask data at a sub-cell granularity (e.g. $field_{31}$, $field_{42}$ shown in Figure~\ref{fig:relationexample}), we need an operator for selecting this data. There have been prior proposals~\cite{Colby90} which introduce recursive selection and projection operators, which can be used to select and mask data at sub-cell granularity. While there have been efforts to extend SQL language to support recursive operations~\cite{sql1999}, very few commercial and open-source systems support such extensions. While introducing these extensions to existing open source systems like Spark and Trino is in theory possible, it would require a significant modification of the SQL standard adopted by these systems and a non-trivial investment of effort to drive alignment across the open-source community. On the other hand, there have been numerous path DSLs such as XMLPath \cite{XPath} and JsonPath \cite{rfc9535} that have been developed and successfully adopted to support element-wise operators. Given these trade-offs, using a DSL to evaluate field paths efficiently during data access was a cost-effective alternative. Leveraging existing DSLs such as XPath and JsonPath was not an option due to several limitations that prevent their usage for structured data handling. XPath is intended exclusively for processing XML documents. JsonPath is schema-unaware and does not distinguish between types such as maps and structs. Nevertheless, we use JsonPath to guide the design of the field path DSL described next. 
+
+\subsubsection{Field Path Expressions}
+In this section, we provide a formal definition of {\em field path} that is used to select data at a sub-cell-level for non-atomic data types such as structs, arrays and maps. 
+\begin{definition} \label{def:fieldpath}
+A \emph{field path} is a sequence of operators $P_1, P_2, \ldots, P_n$, where each operator $P_i$ operates on the result set of $P_{i-1}$ and has one of the following types:
+\begin{enumerate}
+\item {\bf Root access operator}: Denoted by a special symbol $\$$, this operator is an identity operator whose result set is the input relation. The root access operator is always the first operator in the sequence of operators for any given field path.  
+\item {\bf Transform operator}:  A transform operator is immediately preceded by either a root access or another transform operator and is prefixed with a $.$ symbol. There are three types of transform operators:
+    \begin{enumerate}
+        \item {\bf Dereference operator}: This operator is of the form $.<name>$ and projects a sub-attribute of a composite attribute. 
+        \item {\bf Filter operator}: This operator selects a subset of a relation that satisfies a given condition. The operator is of the form $[?(<condition>)]$, where condition is a SQL predicate string on the input relation.
+        \item {\bf Unnest operator}: a cell-wise transform operator that applies all subsequent operators on each cell of inner relations in collection-type attributes such as arrays and maps. There are three forms of unnest operators:
+        \begin{enumerate}
+            \item $[item]$: an operator that applies to array types and provides access to the array items, 
+            \item $[key]$: an operator that applies to map types and provides access to the map keys, and 
+            \item $[value]$: an operator that applies to map types and provides access to the map values.
+        \end{enumerate}
+    \end{enumerate}
+\end{enumerate}
+\end{definition}
+
+\subsubsection{Examples}
+We next provide examples of field path expressions that demonstrate their ability to select data elements from the different attributes of the relation shown in Figure~\ref{fig:relationexample}.
+\begin{enumerate} 
+\item A dereference operator following a root access operator can be used to select an attribute from a relation. For example, $\$.col_1$ selects $col_1$.  
+\item A filter operator following a root access operator is referred to as a {\em row selector} and has the ability to select rows from a relation. For example, the field path $\$.[?(@.col_1='def')]$ selects rows from the relation satisfying $col_1 = 'def'$.  
+\item A row selector followed by a dereference operator selects cell values of an attribute from the selected rows. For example, the field path $\$.[?(@.col_1='ghj')].col_2$ selects values of $col_2$ from rows satisfying the condition $col_1='ghj'$. 
+\item A filter operator following an unnest operator on a collection type field (e.g. arrays and maps) filters elements of the collection. For example, the field path $\$.col_3.[item].[?(@.field_{31}='s1')]$ selects elements of $col_3$ such that each element satisfies the condition $field_{31} = 's1'$.  Similarly, the field path $\$.col_4.[value].[item].[?(@.field_{41}='v2')].field_{42}$ selects values of the field $field_{42}$ from the collection of map values satisfying $field_{41}='v2'$. 
+\end{enumerate}
+In summary, field path expressions allow data selection at much finer granularities than is possible using traditional selection and projection operators available in commercial databases.
+
+In order to mask data addressed by a field path expression, we need the ability to assign policy labels to them. Thus, the field paths associated with a relation are stored with the schema of the relation in the data catalog. Some field paths are automatically extracted from the schema when a schema is ingested into the data catalog. Additional field paths such as row selectors are added to the catalog by owners of the schema. 
+
+\subsubsection{Data-Masking Operator} \label{subsubsec:masking_operator}
+We next describe how the field path expressions are used to define data masking operations on a data element. Given an input relation $\mathcal{R}$, a data access policy $p$, and a field path $f$, the data-masking operator is a relational algebra function denoted by $mask(\mathcal{R}, p, f)$ and defined as follows:
+\begin{equation}
+    mask(\mathcal{R}, p, f) = 
+    \begin{cases}
+    \sigma_{\neg\text{pred OR p.cond}}(\mathcal{R}), \text{if $f=\$.[?(pred)]$} \\
+    {\tau_{f \rightarrow m(f)} (\sigma_{\neg\text{p.cond}}(\mathcal{R})))} \cup \sigma_{\text{p.cond}}(\mathcal{R}), \text{otherwise}
+    \end{cases}  
+\label{eq:enforcement}
+\end{equation}
+where $\tau$ denotes a transformation operator that masks the data element at path $f$ by applying a masking function $m$ and reassembles the transformed attribute (potentially, a nested relation) back into its original structure. 
+Equation~\ref{eq:enforcement} shows that when $f$ does not contain a dereference operator, the masking operator reduces to a {\em row-level mask} and removes the matching rows from the result set. 
+Otherwise, the transformation operator functions as a {\em column-level mask} applying the function $m$ to values of $f$. The masking function $m$ in Equation~\ref{eq:enforcement} has the following behavior:
+\begin{itemize}
+    \item If $f$ is an atomic attribute, $m(f)$ sets the value of $f$ to NULL.
+    \item If $f$ is an array element, $m(f)$ removes the element from the array.
+    \item If $f$ is a map key, $m(f)$ removes the key value pair from the map,
+    \item If $f$ is a map value, $m(f)$ sets the map value to NULL.
+\end{itemize}
+In summary, field paths and data masking operators give us the capability of masking data at a very fine granularity. The exact implementation of the data-masking operator will be discussed in detail in Section~\ref{subsubsec:pc}. 

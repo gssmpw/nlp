@@ -1,0 +1,492 @@
+
+
+\section{Introduction}
+
+The rapid integration of large language models (LLMs) into online systems has spurred significant research aimed at improving their inference efficiency. Unlike traditional batch-processing environments, online usage demands a nuanced understanding of performance, prioritizing what is often termed ``goodput'' \cite{zhong2024distserve}—the maximum number of requests that can be served while meeting stringent constraints on time-to-first-token (TTFT) and time-per-output-token (TPOT). This shift in focus underscores the necessity of developing advanced inference and serving algorithms that optimize goodput, ensuring efficient and cost-effective deployment of LLMs in latency-sensitive applications.
+
+An important approach to improving LLM inference efficiency is prefix reuse. In autoregressive LLMs, prompts with shared prefixes can leverage the intermediate representations (i.e. key and value tensors, often stored in the key-value (KV) cache) of the common prefix, reducing both memory usage and computational overhead during inference. A notable implementation of this idea is RadixAttention, which stores the KV cache of processed queries and automatically reuses shared prefixes by maintaining a radix tree \cite{zheng2024sglang}. This tree tracks cached values and matches them with new incoming prompts, enabling efficient reuse without requiring manual intervention. To manage memory constraints imposed by the fixed size of the KV cache, the system employs a least recently used (LRU) eviction policy for cached values. This method is particularly impactful in scenarios where many prompts share prefixes, offering substantial savings in compute and memory. Moreover, its ``out-of-the-box'' functionality simplifies adoption by eliminating the need for users to manually analyze or encode prefix structures, making it a practical solution for real-world applications.
+
+Automatic prefix reuse enabled by RadixAttention can substantially improve goodput in many realistic settings, particularly when there is large overlap among query prompts. However, under a stream of queries, the performance of RadixAttention becomes dependent on the order in which queries are processed (i.e., the ``schedule''), and its implications for latency remain poorly understood.
+
+
+The main scheduling algorithms considered in prior work are \emph{First Come First Serve (FCFS)}, which processes queries in arrival order, and \emph{Longest Prefix Match (LPM)}\footnote{LPM is the default query scheduling algorithm in SGLang v0.4.1. Meanwhile, FCFS is an option in SGLang and the default scheduling algorithm in vLLM v0.6.6.}, which greedily maximizes KV cache reuse at each scheduling step. In the offline setting (where all queries are known in advance), Theorem 3.1 in \cite{zheng2024sglang} shows that LPM indeed maximizes cache reuse. However, the online setting, where queries arrive over time under tight time-to-first-token constraints, was not characterized.
+
+
+In this work, we provide a theoretical exploration of RadixAttention scheduling in the online regime, focusing on non-preemptive 
+scheduling. Our analysis and experiments show that existing scheduling approaches can lead to large TTFT spikes under heavy traffic, motivating a new scheduling algorithm that more robustly balances prefix reuse and waiting time. Specifically, we design a mechanism that exploits the benefits of LPM but mitigates its performance risks in high-load scenarios, resulting in superior performance for \emph{long-prompt, short-output} (i.e., prefill-dominant) queries where RadixAttention delivers significant efficiency gains. Examples of such applications include document summarization, coding assistants, and prompts with detailed instruction sets among others \cite{anthropic_prompt_caching}. Recently, a well-studied generation use case that can benefit from faster prefill is the scaling of test-time compute (TTC) via \textit{best-of-N} sampling, where $N$ outputs are generated in parallel and a verifier model is used to score them~\cite{snell2024scaling, cobbe2021training}. TTC has enabled recent LLMs to dramatically improve performance on reasoning benchmarks for domains like coding and math~\cite{guo2025deepseek}.
+
+\subsection{Contributions}
+
+\begin{itemize}
+    \item In Section \ref{sxn:problem_setting}, we introduce a formal model for analyzing the LLM query scheduling problem. Our model draws inspiration from prior work on the roofline model \cite{imai2024predicting} and incorporates experimental observations to ensure practical relevance. Despite its grounding in real-world considerations, the model remains sufficiently simple to facilitate analytical insights, including a formal specification of the ``query stream'' (Definition \ref{def:query_stream}) and a computational model for LLMs (Definition \ref{def:llm_computation}), enabling further exploration of the problem.
+    %
+    \item We show that the decision problem of determining whether a TTFT constraint can be satisfied for a given query stream is NP-Hard when using Radix Attention (Theorem \ref{thm:decision_nphard}). This is in contrast to the case without Radix Attention, where latency is trivially minimized by FCFS, or the case with Radix Attention and uniform arrival times, where latency is minimized by LPM \cite{zheng2024sglang}.
+    %
+    \item Although the decision problem is NP-hard, we introduce a data generative model (see Definition \ref{def:shuffled_queue}) that effectively captures the behavior of realistic query streams in key applications. Additionally, we present a generalized algorithm, $k$-LPM (Algorithm \ref{alg:klpm}), which outperforms both FCFS and LPM under this data generative model (see Theorem \ref{thm:klpm_separation} and Corollary \ref{corollary:klpm_better}).
+    %
+    \item We validate our theoretical results with experiments demonstrating that our predictions hold in practice by running a Llama-3.1-8B-Instruct model on the SGLang serving framework using real prompts.
+    In particular, the $k$-LPM algorithm is able to attain reduced P99 TTFT across a range of request rates and settings of the hyperparameter $k$. 
+    %
+    \item Finally, in Appendix \ref{sxn:extra_theory} we prove that an approximation algorithm exists that, for a length $n$ query stream $\Qcal$ and TTFT constraint $T$, either 1) certifies no schedule exists satisfying the TTFT constraint, or, 2) returns a schedule such that the $(1-p)$-th percentile TTFT is at most $T$ for $p \in (0,1)$. Furthermore, this algorithm runs in $\Ocal(n \cdot \exp(1/p \log 1/p))$ time.
+\end{itemize}
+
+
+\subsection{Related Work}
+
+There has been significant interest in prior work on scheduling LLM queries in order to maximize throughput while satisfying TTFT constraints. Some examples are FastSwitch, which employs a priority-based scheduler with preemption to dynamically allocate resources to effectively reduce TTFT and GPU idleness \cite{shen2024fastswitch}, and Orca, which employs iteration-level scheduling, processing each model iteration separately allowing for flexible batching and immediate response to newly arrived requests \cite{yu2022orca}. Many other papers increase throughput subject to latency constraints by innovations to the processing schedule of incoming prompts \cite{zhong2024distserve, patel2024splitwise, jain2024intelligent, agrawal2024taming}. Collectively, this prior work underscores the importance of dynamic scheduling in achieving high throughput without compromising latency guarantees.
+
+The most relevant work to ours addresses scheduling of LLM queries with consideration of prefix reuse. \citet{zheng2024sglang} introduced RadixAttention and the LPM scheduler, which we build upon, but their work provides only limited exploration of scheduling strategies. \citet{srivatsa2024preble} proposes a priority-based local scheduler in Section 3.3 aimed at balancing prefix reuse and waiting times. The scheduler works by assigning requests to priority groups based on prefix cache hit rate and then selects a number of prompts in each group proportionally to its priority, but no accompanying analysis is provided. \citet{qin2024mooncake} integrates RadixAttention in local instances but primarily emphasizes maintaining a disaggregated KV cache to balance the decode and prefill phases, enhancing throughput while adhering to latency constraints in highly overloaded scenarios.
+
+Analytic exploration of LLM inference efficiency is relatively limited, with some notable examples. \citet{kim2024effect} propose INFERMAX, an analytical framework for evaluating schedulers and deriving theoretical performance bounds, while identifying prefix-sharing awareness as a future direction. \citet{yang2024queueing} analyze the behavior of LLM queries using an M/G/1 queue while accounting for unknown decoding length, and \citet{guldogan2024multi} examine multi-bin batching to boost throughput. These studies underscore the value of theoretical approaches, which our work advances through a focus on prefix-aware scheduling.
+
+
+\subsection{Notation} Let bold lower case letters denote strings, e.g., $\xb$ or $\yb$, over some fixed alphabet. Let $|\xb|$ denote the length of string $\xb$. Let $\overlap(\xb, \yb)$ denote the length of the maximal prefix overlap between $\xb$ and $\yb$.
+
+\section{Computational Model of RadixAttention}\label{sxn:problem_setting}
+
+In this section, we provide a model of LLM computation that allows for theoretical study of RadixAttention under different scheduling algorithms. Consider a single LLM instance (that may be on a single GPU or parallelized across multiple GPUs in various ways). This LLM instance can process queries using continuous batching. The time for a single pass can be understood from the ``roofline model'' (see Appendix A.2 of \cite{imai2024predicting} for details on applying the roofline model to LLM inference). 
+
+First, we define the query stream as a collection of prompts with associated arrival times. 
+\begin{definition}\label{def:query_stream}
+    (Query stream) Let a query stream of length $n$ be denoted by $\Qcal = (\xb_i, t_i)_{i \in [n]}$, where $\xb_i$ is an arbitrary length string in some fixed alphabet\footnote{This alphabet will be the set of tokens in practice.} and $t_i \geq 0$ is the arrival time of the $i$-th query.
+\end{definition}
+
+
+Note that this definition specifies a fixed finite collection of queries rather than a distribution as is common in queuing theory. We make this choice to simplify the analysis under the added complexity of prefix reuse, and to enable focus on the ``burst traffic'' behavior of TTFT rather than stable state behavior of the queue. That is, we are most interested in the behavior of scheduling algorithms in the periods of time where queries arrive faster than they can be processed and so the queue becomes temporarily long.
+
+We present a formal model for the computation time of an LLM operating with a batch size of one under a specified queue ordering. This model captures both the time to process each prompt---accounting for prefix reuse from the preceding query---and the constraint that processing cannot start before a prompt's arrival time. We focus on scenarios where the prefill stage constitutes the primary contributor to total inference time, and where RadixAttention provides the largest improvement within that stage.
+
+\begin{definition}[LLM Instance Computation]\label{def:llm_computation}
+Consider a stream of queries $\mathcal{Q} = \{(\mathbf{x}_i, t_i)\}_{i \in [n]}$. Suppose these queries are processed in the order $\mathbf{x}_{j_1}, \mathbf{x}_{j_2}, \ldots, \mathbf{x}_{j_n}$. Let $R(j_k)$ denote the completion time of the $j_k$-th query. Then
+\begin{align*}
+  R&(j_1) = \lvert \mathbf{x}_{j_1}\rvert, \\
+  R&(j_k) = \max\{ R(j_{k-1}),\, t_{j_k} \} +(1+\cattn \cdot\lvert \mathbf{x}_{j_k}\rvert)  \bigl(\lvert \mathbf{x}_{j_k}\rvert
+  \;-\; \overlap(\mathbf{x}_{j_k}, \mathbf{x}_{j_{k-1}})\bigr).
+\end{align*}
+In other words, the $j_k$-th query cannot start processing until its arrival time $t_{j_k}$. Its processing cost is proportional to the prompt length minus the prefix it shares with the previous query. We assume the cache is empty initially, so the first query costs $\lvert \mathbf{x}_{j_1}\rvert$.
+\end{definition}
+
+During inference, the prefill stage involves a forward pass over all input tokens. The above formula for $\Rcal(j_k)$ captures the dominant computational cost of a forward pass through an autoregressive transformer architecture. Layers such as the query, key, and value projections or MLP modules scale linearly with the number of tokens that must be processed in a query. Meanwhile in the attention mechanism, each token must attend to all previous tokens. Taking into account the cached prefix, this step scales with $|\xb_{j_k}|(|\xb_{j_k}| - \overlap(\xb_{j_k}, \xb_{j_{k-1}}))$. For short to medium sequence lengths, the point-wise feed-forward network (FFN) typically dominates computation time. For long sequence lengths, self-attention dominates, as it scales quadratically. We capture the relative cost of the MLP versus self-attention operations for a fixed architecture by the $\cattn$ constant. By focusing on a prefill-dominated regime, we simplify the analysis while retaining real-world relevance.
+
+
+\subsection{Batch Size and Prefix Cache}
+
+The original specification of RadixAttention does not leverage reuse of prefixes of prompts in a single batch (see Algorithm 1 in \cite{zheng2024sglang}).
+However, more recent development in SGLang has enabled within batch prefix sharing. In this case, behavior of scheduling algorithms in the batched setting can be closely approximated by the batch size one setting in Definition \ref{def:llm_computation}. Computing a query processing order and then dividing the queries into $B$ sized bins sequentially provides a schedule for the $B$ batch size setting that attains the same amount of prefix reuse. The only difference is that the time that the $i$-th query is finished being processed will be the same as when the $\lceil i /B \rceil$-th query is finished being processed. This difference will be negligible when the query arrival rate is high relative to the batch size.
+
+A discrepancy between Definition~\ref{def:llm_computation} and the behavior of RadixAttention is that our model assumes only the last processed prompt is cached, whereas RadixAttention allocates a fixed amount of memory for caching. We choose to make this simplification to avoid introducing an additional hyperparameter and because the behavior remains similar under standard settings. Specifically, we expect the behavior to be similar when prompt length is fairly uniform and the query arrival rate is high relative to the TTFT constraint.
+
+In our experiments (Section \ref{sxn:experiments}), we use dynamic batch size and a fixed memory pool for the prefix cache in the SGLang framework and observe that our theoretical predictions based on Definition \ref{def:llm_computation} are still accurate.
+ 
+
+\section{Complexity of Scheduling Under TTFT Constraints}
+
+We first explore the complexity of the decision problem for determining whether there exists a schedule for a fixed queue that satisfies a given TTFT constraint $T$ for each query. By reduction to the \texttt{3-PARTITION} problem, we show that it is NP-Hard to decide feasibility of a queue under a TTFT constraint, despite this problem being trivial in the case where there is zero prefix reuse (where FCFS is optimal) or in the offline setting where all arrival times are uniform (where LPM is optimal).
+
+\subsection{NP-Hardness of Feasibility Determination}
+
+\begin{figure*}
+    \centering
+    \includegraphics[width=0.8\linewidth]{images/qq_figure.png}
+    \caption{This figure graphically represents the imposed structure for any feasible schedule in the query stream construction of Theorem \ref{thm:decision_nphard}. Note that the only flexibility in the schedule is how the set of strings $\{\xb_i\}_{i\in[3m]}$ fits into the $m$ time windows of size $H$. The solid lines represent arrival times and the dashed lines represent processing start times.}
+    \label{fig:qq_figure}
+\end{figure*}
+
+We provide the definition of the $\tpart$ problem, which is NP-Hard in the strong sense. See SP15 in the appendix of \cite{garey1979computers} for reference.
+\begin{definition}\label{def:tpart}
+    ($\tpart$) Let $m \in \mathbb{N}$ and $H > 0$. Given a set $\Acal$ of $3m$ integers such that $H/4 < a < H/2$ for all $a \in \Acal$ and $\sum_{a \in \Acal} a = mH$, decide if $\Acal$ can be partitioned into $m$ disjoint sets $\Acal_1,...,\Acal_m$ such that $\sum_{a \in \Acal_i} a = H$ for all $i \in [m]$.
+\end{definition}
+
+The intuition behind the proof of Theorem \ref{thm:decision_nphard} is as follows. The introduction of prefix reuse along with non-uniform arrival times allows us to construct query pairs that must be processed at a particular time. As an example, let query $\xb$ arrive at time $H$ and query $\yb$ arrive at $T + H$ where $\xb$ and $\yb$ have the same prompt. In order to achieve prefix reuse between these two prompts without any idle time while satisfying the TTFT constraint $T$, $\xb$ must finish being processed at $T + H$ and $\yb$ must start being processed at this time. By using this idea to introduce constraints on processing times, we may construct $m$ ``windows'' of size $H$ that a set of prompts may be feasibly scheduled within. By then constructing a set of queries with processing time equal to the integers in Definition \ref{def:tpart}, deciding the existence of a feasible schedule solves the $\tpart$ problem.
+
+\begin{theorem}\label{thm:decision_nphard}
+    Deciding if there is a processing order in query stream $\Qcal$ (Definition \ref{def:query_stream}) such that a TTFT constraint $T$ is satisfied under the computational model of Definition \ref{def:llm_computation} is an NP-Hard problem.
+\end{theorem}
+
+\begin{proof}
+Let $\Acal$ be an instance of the $\tpart$ problem defined in Definition \ref{def:tpart}. We construct a query stream $\Qcal$ such that determining whether the queries can be scheduled to meet the TTFT constraint $T = (m + m^2)H$ under the computation model of Definition~\ref{def:llm_computation} is equivalent to deciding the $\tpart$ instance.
+
+\emph{Query construction.} 
+
+Define:
+\begin{itemize}
+    \item $\Xcal$: A set of $3m$ queries $\{\xb_i\}$, where each prompt consists of a unique character, leading to zero prefix overlap between queries. Furthermore, $|\xb_i| = a_i$ for some indexing that matches $\Acal$. Assign all $\xb_i$ the same arrival time $t = (m + m^2)H$.
+    \item $\Ycal$: An ordered set of $m$ queries $\{\yb_i\}$, each of length $mH$, each composed of a unique character not appearing in $\Xcal$. Assign arrival time $t_i = i(H + mH)$ to $\yb_i$.
+    \item $\Zcal$: A set of $m$ queries $\{\zb_i\}$ where each $\zb_i$ is identical to $\yb_i$ in content but arrives at time $t_i = T + i(H + mH)$.
+    \item $\wb_1$ and $\wb_2$: Two additional queries, each of length $T$, composed of characters distinct from those in $\Xcal \cup \Ycal$. Let $\wb_1$ arrive at $t = 0$ and $\wb_2$ arrive at $t = 2T$. 
+\end{itemize}
+Set the overall query stream to be
+\[
+\Qcal \;=\; \Xcal \,\cup\, \Ycal \,\cup\, \Zcal \,\cup\, \{\wb_1,\wb_2\}.
+\]
+
+\emph{Scheduling constraints.} 
+
+Observe:
+\begin{enumerate}
+    \item $\wb_1$ must begin processing at time $t=0$. Since $|\wb_1|=T$ and there is no prior cache, it finishes exactly at $t=T$.
+    \item Since $\wb_2$ composed of characters distinct from those in $\Xcal \cup \Ycal$, $\wb_2$ has zero cache overlap when it arrives at $t=2T$ \footnote{It is trivial to show that some queries must be processed between $\wb_1$ and $\wb_2$ in order to meet the TTFT constraint.}. Then, $\wb_2$ must begin processing exactly at $t=2T$ to finish by $3T$, thereby forcing \emph{all} queries in $\Xcal \cup \Ycal \cup \Zcal$ to be completed within the time window $[T, 2T)$.
+\end{enumerate}
+
+Within $[T, 2T)$, the only possible nontrivial cache overlaps come from pairs and $(\yb_i, \zb_i)$ because all other queries have prompts with distinct characters. For each $i\in [m]$, the maximal prefix overlap between $\yb_i$ and $\zb_i$ reduces the processing time by $|\yb_i|$. However, to fit all queries from $\Xcal \cup \Ycal \cup \Zcal$ into $[T,2T)$, \emph{every} possible overlap must be fully utilized. This rigid constraint implies:
+\begin{itemize}
+    \item The total time to process $\Ycal$ and $\Zcal$ (accounting for maximum $\yb_i$--$\zb_i$ overlap) is: 
+    \[
+        \sum_{\yb_i \in \Ycal} |\yb_i|
+        \;=\; m^2H \;=\; T - mH.
+    \]
+    \item Processing must then be continuous (no idle time) in $[T,2T)$, and must attain maximum overlap between every $\yb_i$ and $\zb_i$. In turn, this implies that $\yb_i$ must finish being processed at exactly $T + i(H + mH)$ so that $\zb_i$ can be processed immediately as it arrives without violating the TTFT constraint on $\yb_i$. 
+\end{itemize}
+
+\emph{Partition of $\Xcal$ and relation to $\tpart$.}
+
+We next show that \(\Xcal\) must be partitioned into \(m\) disjoint batches, each of total length \(H\).  
+Observe that for each \(i\in[m]\), since \(\zb_i\) must start right when \(\yb_i\) finishes, we have 
+\[
+\yb_i \text{ end (and thus) } \zb_i \text{ begin at } T + i(H + mH).
+\]
+Then \(\yb_{i+1}\) must be processed starting from $T + i(H + mH) + H$
+in order to finish by \(T + (i+1)(H + mH)\) and maintain the “no idle time” schedule. Since $\zb_i$ is identical to $\yb_i$, its processing time is zero in this case. Therefore, between \(\zb_i\) finishing at \(\,T + i(H + mH)\) and \(\yb_{i+1}\) starting at \(\,T + i(H + mH) + H,\) there is exactly a length-\(H\) sub-interval available.   
+Since \(\sum_{\xb_i\in\Xcal} |\xb_i| = mH,\) the only way to fill these \(m\) sub-intervals continuously is to divide \(\{\xb_i\}\) into \(m\) disjoint groups, each summing to exactly \(H\).  But deciding such a partition is precisely the \tpart{} problem.  Consequently, scheduling \(\Qcal\) to meet the TTFT constraint is possible if and only if the instance \(\Acal\) of \tpart{} admits a feasible partition.
+
+\end{proof}
+
+
+In Appendix \ref{sxn:extra_theory}, we further explore the general problem of scheduling queries to satisfy a TTFT constraint. In Theorem \ref{thm:percentile_approx}, we prove that there exists an algorithm that accepts a query stream and TTFT constraint $T$ and either certifies that there is no schedule satisfying constraint $T$ or returns a schedule such that the $(1-p)$-th percentile TTFT is at most $T$ in $\Ocal(n \cdot \exp(1/p \log 1/p))$ time.
+
+\section{$k$-LPM Scheduling Algorithm}\label{sxn:klpm}
+
+In this section, we introduce our proposed scheduling algorithm, $k$-LPM, that generalizes the FCFS and LPM scheduling algorithms. Note that it reduces to LPM when $k = \infty$ and reduces to FCFS when $k=1$. 
+
+Below, we show that $k$-LPM can achieve superior performance in terms of TTFT on random queues under a data generative model that captures the relevant properties of realistic use cases for RadixAttention (Theorem \ref{thm:klpm_separation}). This shows that, despite the intractability of the general scheduling problem, it is still possible to obtain theoretically grounded improvement over existing methods in realistic settings. In Section \ref{sxn:experiments}, we further support this improvement with experiments showing that the $k$-LPM algorithm achieves better TTFT performance than FCFS or LPM on queues constructed using real prompt distributions.
+
+\begin{algorithm}
+\caption{$k$-LPM}
+\label{alg:klpm}
+\begin{algorithmic}[1]
+\State \textbf{Input:} Input queue of prompts and arrival times $\Qcal=(\xb_i, t_i)$
+\While{true}
+    \State Process the oldest query, i.e., $\xb_i$ such that $i = \argmin_j t_j$
+    \For{$i = 1, \dots, k-1$}
+        \State Process $\xb$ that maximizes the prefix cache hit rate
+    \EndFor
+\EndWhile
+\end{algorithmic}
+\end{algorithm}
+
+The intuition behind Algorithm \ref{alg:klpm} is that it first performs $k$ greedy prefix-match steps in the spirit of LPM to maximize prefix reuse. 
+After these $k$ steps, it processes the oldest query in the queue, mirroring FCFS. 
+This strategy circumvents the LPM failure case, where a query could be unprocessed if its prompt never have sufficiently high prefix overlap. 
+At the same time, it retains the significant prefix-reuse advantage that LPM provides.
+
+\subsection{Data Generative Model}
+
+Although deciding whether a TTFT constraint can be satisfied for a given query stream is NP-Hard (see Theorem \ref{thm:decision_nphard}), we are able to show that under a data generative model capturing properties of practical use cases, $k$-LPM achieves an improvement on the maximum TTFT. Our data generative model has the following additional structure.
+
+
+\textbf{Tree structured queries:} Recall that the maximum prefix reuse is attained for a fixed set of prompts by DFS traversal of the radix tree constructed from all prompts. Hence, RadixAttention can only provide significant efficiency gains if the sum of edges of the radix tree constructed from prompts in a query steam is significantly less than the sum of prompt lengths. Fortunately, many applications of LLMs fulfill this assumption.
+
+
+In this section, we restrict our attention to instances where queries in a queue approximately follow a tree structure of low height. An example of such prompt structure used in \cite{360brew} is:
+\begin{gather*}
+    \xb = \texttt{(base\_prompt)(user\_context)(doc)},
+\end{gather*}
+Here, all queries share the same $\texttt{(base\_prompt)}$, and multiple queries may share the same $\texttt{(user\_context)}$.
+
+Examples of such structures include generative usecases: personalized content generation~\cite{zhang2024personalization}, conversational context-aware question answering~\cite{zaib2022conversational}, and the predictive usecase with LLMs as engagement predictors in recommendation systems~\cite{wu2024survey}.
+These scenarios exemplify applications where the prompt structure remains consistent while the user context varies, allowing for efficient processing and relevant responses. By focusing on such structured instances, we can better analyze and optimize the computational models for LLMs under constrained scheduling conditions.
+
+Our data generative model considers the simplest case of prompts constructed from a height two prefix tree, where the edges at each depth are constant. The arrivals of the queries are regular, but the order of the arrivals is sampled uniformly from all permutations of the queue. This is the simplest model that captures the interplay between the tree structure of the prompt prefixes and the arrival rate of the queries under randomness in the queue arrival order. For ease of exposition, we keep with the $\texttt{(user)}$ and $\texttt{(doc)}$ terminology of the previous example use case. However, these ideas apply generally to query streams with approximately tree-structured prompts.
+
+\begin{definition}[Regular Arrival Shuffled Queue]\label{def:shuffled_queue}
+Let $n, u, k, d, s \in \mathbb{N}$ be parameters such that $k$ divides $n$. We form a collection of $n$ queries, each denoted by $\texttt{(user)(doc)}$, where:
+\begin{itemize}
+    \item $\texttt{(user)}$ is a substring of length $u$, repeated in exactly $k$ distinct queries.
+    \item $\texttt{(doc)}$ is a substring of length $d$, unique to each query.
+    \item Each $\texttt{(user)}$ and $\texttt{(doc)}$ starts with a distinct character from a large enough alphabet, ensuring zero overlap among different $\texttt{(user)}$ or $\texttt{(doc)}$ substrings.
+\end{itemize}
+Thus, there are $n/k$ distinct user substrings, each used $k$ times, and $n$ distinct doc substrings, one per query, yielding $n$ total prompts. We construct the \emph{regular arrival shuffled queue} $\Qcal_n = \{(\xb_{\sigma(i)},\, s \cdot \sigma(i)) \mid i \in [n]\}$ by sampling a permutation $\sigma$ uniformly randomly from the symmetric group $S_n$, and assigning arrival time $s \cdot \sigma(i)$ to the $i$-th prompt.
+\end{definition}
+
+The structural assumptions in Definition \ref{def:shuffled_queue} can certainly be relaxed. In real settings, there would likely be negligible but non-zero overlap between unique user and documents, and the repitions of each user may not be uniform. Here, we avoid these details to focus on clarity regarding the most pertinent structure.
+
+\subsection{TTFT Improvement from $k$-LPM }
+
+In scenarios where each query can be processed swiftly—specifically, when the processing time of a given query is less than the inter-arrival interval $s$—the FCFS scheduling algorithm is optimal. However, in more practically relevant burst-traffic regimes where queries arrive in rapid succession and cannot be processed fast enough, a backlog of unprocessed queries inevitably forms. To illustrate this, consider a toy example with $\cattn=0$, $n = 4$ queries, a replication factor $k = 2$, and parameters $u = 5$ and $d = 5$. The queries are denoted as $\xb_1 = \texttt{(user)}_1\texttt{(doc)}_1$, $\xb_2 = \texttt{(user)}_2\texttt{(doc)}_2$, $\xb_3 = \texttt{(user)}_1\texttt{(doc)}_3$, and $\xb_4 = \texttt{(user)}_2\texttt{(doc)}_4$. In the case where the inter-arrival time $s = 10$, FCFS scheduling is clearly optimal, resulting in a uniform TTFT of 10 units for each query. Conversely, in the case with $s = 0$, representing a burst-traffic scenario, the LPM scheduling strategy becomes optimal. Under FCFS, the processing order is $\xb_1$, $\xb_2$, $\xb_3$, $\xb_4$ and $\ttft_i = 10 \cdot i$ with $\max(\ttft_i) = \ttft_4 = 40$. Under LPM, the processing order is rearranged to $\xb_1$, $\xb_3$, $\xb_2$, $\xb_4$ with TTFTs of 10, 15, 25, and 30, and $\max(\ttft_i) = 30$. This example underscores the improvement of TTFT from cache reuse in practical scenarios.
+
+In the following theorem, we show that $k$-LPM has a lower maximum TTFT than FCFS or LPM\footnote{We assume that ties in prefix overlap are broken by uniform sampling in the LPM algorithm.} with high probability on instances of the regular arrival shuffled queue (Definition \ref{def:shuffled_queue}). We set the hyperparameter $k$ in $k$-LPM to match the number of user repetitions defined in Definition~\ref{def:shuffled_queue} for simplicity. In practice, the hyperparameter $k$ in $k$-LPM can be determined through back-testing or by employing an adaptive multi-armed bandit approach to achieve better performance than the provable improvement observed in the simple setting. In our experiments (Section \ref{sxn:experiments}), we empirically measure the performance for varying values of the hyperparameter $k$.
+
+
+Intuitively, the theorem shows that when $s$ is small and $u$ is large, LPM is much better than FCFS, and $k$-LPM retains this advantage. On the other hand, when $s$ is relatively large, FCFS is better and $k$-LPM retains a $\frac{1}{k}$ factor of the $sn$ reduction in TTFT. For intermediate values of $s$ and $u$, $k$-LPM is better than both algorithms as we prove in Corollary \ref{corollary:klpm_better}. 
+
+\begin{theorem}[LPM/FCFS vs.\ $k$-LPM]
+\label{thm:klpm_separation}
+Let $\Qcal_n$ be a regular arrival shuffled queue (Definition~\ref{def:shuffled_queue}) of length $n$ with $k$ repetitions of each user prefix, user history length $u$, document length $d$, and inter-arrival gap $s$.  Suppose the queue starts being processed at time $T \ge s\,n$, and let $\ttft_i$ denote the time-to-first-token of the $i$-th query under a specified scheduling algorithm. Then, under the computational model of Definition~\ref{def:llm_computation} with $\cattn = 0$:
+
+\begin{itemize}
+\item
+\textbf{(LPM)} 
+For every $\epsilon>0$ and $\delta \in (0,1)$, there is an $n_0$ such that for all $n \ge n_0$, with probability at least $1-\delta$ (with respect to random shuffle and randomness in LPM),
+\[
+\max_{i\in [n]}\,\ttft_i
+~\;\ge\;
+T \;+\;
+\bigl(1 - \epsilon\bigr)\;n\,\Bigl(\tfrac{u}{k} + d\Bigr).
+\]
+
+\item
+\textbf{(FCFS)}
+For every $\epsilon>0$ and $\delta \in (0,1)$, there is an $n_0$ such that for all $n \ge n_0$, with probability at least $1-\delta$ (over the random shuffle),
+\[
+\max_{i\in [n]}\,\ttft_i
+~\;\ge\;
+T \;+\;
+\bigl(1 - \epsilon\bigr)\;n\,\bigl(u + d - s\bigr).
+\]
+
+\item
+\textbf{($k$-LPM)} 
+Deterministically (i.e.\ for any arrival order), Algorithm~\ref{alg:klpm} satisfies
+\[
+\max_{i\in [n]}\,\ttft_i 
+~\;\le\;
+T \;+\;
+n\,\Bigl(\tfrac{u}{k} + d - \tfrac{s}{k}\Bigr).
+\]
+\end{itemize}
+\end{theorem}
+
+\begin{proof}
+
+\textbf{LPM:} Label the queries so that $1,2,\dots,n$ are in ascending order of arrival times, i.e.\ $t_1\le t_2\le \cdots \le t_n$.  Let $\sigma(\cdot)$ be the permutation specifying the \emph{processing order} under LPM.  We show that with high probability, \emph{some} query among the \emph{earliest arrivals} (say indices $[q]$) is processed in a \emph{very late position} ($> j$).
+
+Concretely, for integers $q<j$, define the event
+\[
+\bigl\{\exists\,i \in [q] : \sigma(i)> j\bigr\}
+\;=\;
+\bigl\{\text{some earliest-$q$ arrival is not processed among the first $j$ positions}\bigr\}.
+\]
+Since the processing order of LPM with uniformly random tie breaking is independent from the arrival times, $\sigma$ is a uniform random permutation of $[n]$. A standard combinatorial bound then gives:
+\[
+\PP\!\Bigl(\,\forall i\in[q],\,\sigma(i)\le j\Bigr)
+~\le~
+\prod_{r=0}^{q-1} \frac{j-r}{n-r}
+~\le~
+\Bigl(\frac{j}{n}\Bigr)^q.
+\]
+We set $q = n^{3/4}$ and $j = n - n^{1/2}$. Then,
+\begin{align*}
+    \PP(\exists_{i \in [q]} ~ \sigma(i) > j)
+    &\geq 1 - \Big(\frac{n - n^{1/2}}{n}\Big)^{n^{3/4}} \\
+    &= 1 - (1 - 1/n^{1/2})^{n^{3/4}} \\
+    &= 1 - ((1 - 1/n^{1/2})^{n^{1/2}})^{n^{1/4}}.
+\end{align*}
+By the known limit $\lim_{x \rightarrow \infty} (1 - \frac{1}{x})^x = \frac{1}{e}$, we can conclude that there exists $n_0 \in \mathbb{N}$ such that, for any $n \geq n_0$, $\PP(\exists_{i \in [q]} ~ \sigma(i) > j) \geq 1 - \delta$.
+
+
+
+For a fixed ordering $\xb_{i_1},...,\xb_{i_n}$, the time at which the $j$-th query is finished being processed can be written as:
+\begin{gather}\label{eqn:q_to_j_prob}
+    \ttft_{i_j} + t_{i_j} = T + \lceil j / k \rceil \cdot u + d \cdot j,
+\end{gather}
+since under LPM, $\lceil j / k \rceil$ unique user prefixes and $j$ unique document suffixes will be processed.
+
+
+If the event occurs, then there must be a query of index $i \in [q]$ that has not been processed at time $T + \lceil j/k \rceil \cdot u + d \cdot j$. Since $t_i \leq q \cdot s$ for all $i \in [q]$, this implies there exists $i \in [q]$ such that:
+\begin{gather*}
+    \ttft_i \geq T + \lceil j/k \rceil \cdot u + d \cdot j - q \cdot s \\
+    \geq T + j(u/k + d) - qs
+\end{gather*}
+By substituting in the values $q = n^{3/4}$ and $j = n - n^{1/2}$, we conclude the theorem bound for LPM in the theorem statement.
+
+
+\textbf{FCFS: } Label the queries so that $1,2,\dots,n$ are in ascending order of arrival times, i.e.\ $t_1\le t_2\le \cdots \le t_n$. FCFS processes these queries in the order $1,2,\dots,n$.
+
+Under the $\cattn=0$, query~$i$'s computational time equals:
+\small{
+\[
+\begin{cases}
+(u + d)\,, 
+&\text{if the user prefix differs from that of query $i-1$,}\\[6pt]
+d\,, 
+&\text{if query $i$ has the same user prefix as query $i-1$.}
+\end{cases}
+\]
+}
+(For $i=1$, there is no previous query, so the time cost is always $u + d$.)
+
+\smallskip
+
+Define an \emph{indicator} variable 
+\[
+I_i 
+~\;=\;
+\begin{cases}
+1, & \text{if queries $i$ and $i-1$ share the same user prefix},\\
+0, & \text{otherwise}.
+\end{cases}
+\]
+Note that $\EE[I_i] = \frac{k-1}{n-1}$ for all $i=2,...,n$, since the probability that the $i$ and $(i-1)$-th queries share the same $\user$ prefix is $\frac{k-1}{n-1}$. Then, the time needed to process the entire queue is given by:
+\begin{gather*}
+    \ttft_{n}
+    = T + |\xb_{1}| + \sum_{i=2}^n  (|\xb_{i}| - uI_i) - t_n \\
+    = T + n(u + d) - sn - u\sum_{i=2}^n  I_i.
+\end{gather*}
+Markov's inequality states that $\PP(X \geq a) \leq \frac{\EE[X]}{a}$, where $X$ is a non-negative value and $a > 0$.  Applying this to $X = \sum_{i=2}^n  I_i$ with respect to randomness in the the queue order implies:
+\begin{gather*}
+    \PP\Big(\sum_{j=2}^n I_i \geq \sqrt{n}\Big) \leq \frac{(k-1)\sqrt{n}}{n-1}
+    \leq 
+    \frac{k}{\sqrt{n}}.
+\end{gather*}
+This implies that as $n \rightarrow \infty$, $\frac{1}{n}\sum_{i=2}^n I_i$ converges to zero in probability. Then the formula can be written as:
+\begin{gather*}
+    \ttft_n \geq T + n(u + d - s - \epsilon_n'),
+\end{gather*}
+where $\epsilon_n'$ converges to zero in probability as $n \rightarrow \infty$. By the relation $\max_{i\in[n]}(\ttft_i) \geq \ttft_n$, we conclude the lower bound for the FCFS algorithm in the theorem statement.
+
+\textbf{$k$-LPM:} First, note that all queries in the queue must finish being processed by $t = T + n(\frac{u}{k} + d)$. Additionally, the $i$-th query must be 
+processed by time $T + i(u + kd)$, since this is the time needed to complete $i$ groups of user queries, and hence complete $i$ FCFS steps after the start time $T$.
+
+\begin{align*}
+    \ttft_i &\leq \min\{T + i(u+kd) - t_i, ~ T +  n(\frac{u}{k} + d) - t_i \} \\
+    = &\min\{T + i(u+kd) - i \cdot s, ~ T + n(\frac{u}{k} + d) - i \cdot s \} \\
+    = &\min\{\,T + i(u + kd - s), ~ T + n(\frac{u}{k} + d) - i s\}.
+\end{align*}
+
+We want a uniform bound for all \(i \in [n]\). Hence, we may bound over the maximum of all indices and then relax the domain to the entire real line.
+\begin{align*}
+\ttft_i &\leq \max_{i \in [n]} \min\{\,T+i(u + kd - s),\, T+ n(\frac{u}{k} + d) - i s\} \\
+&\leq
+\max_{i \in \mathbb{R}}
+\min\{\,T+ i(u + kd - s),\,T+n(\frac{u}{k} + d) - i s\}.    
+\end{align*}
+
+
+Observe that 
+\(f_1(i) = T + i(u + kd - s)\) is increasing in \(i\), 
+while 
+\(f_2(i) = T + n(\frac{u}{k} + d) - i s\) is decreasing in \(i\). 
+The maximum of \(\min\{f_1(i), f_2(i)\}\) occurs where these two lines intersect. We solve 
+$$
+i(u + kd - s) = n\!\bigl(\frac{u}{k} + d\bigr) - i s,
+$$
+which implies,
+$$
+i(u + kd) = n\!\bigl(\frac{u}{k} + d\bigr).
+$$
+\[
+\Rightarrow i^*
+\;=\;
+\frac{\,n\bigl(\frac{u}{k} + d\bigr)\,}{\,u + kd\,}
+\;=\;
+\frac{n}{k}.
+\]
+Plugging \(i^*\) into \(f_1\) and \(f_2\) yields
+\[
+f_1\bigl(i^*\bigr)
+\;=\;
+\frac{n}{k}\,\bigl(u + kd - s\bigr),
+\quad
+f_2\bigl(i^*\bigr)
+\;=\;
+\frac{n}{k}\,\bigl(u + kd - s\bigr),
+\]
+so
+\[
+\max_{\,i\in \mathbb{R}}\,
+\min\{f_1(i),\,f_2(i)\}
+\;=\;
+\frac{n}{k}\,\bigl(u + kd - s\bigr).
+\]
+Hence for all \(i\in [n]\),
+\begin{align*}
+\ttft_i
+\;&\le\;
+\max_{\,i \in [n]}\,
+\min\Bigl\{\,i\bigl(u + kd - s\bigr),\,n\Bigl(\tfrac{u}{k}+d\Bigr) - i\,s \Bigr\} \\
+\;&\leq\;
+\frac{n}{k}\,\bigl(u + kd - s\bigr).
+\end{align*}
+
+    
+\end{proof}
+
+
+\begin{corollary}\label{corollary:klpm_better}
+    For any values of $s$, $k$, $u$, and $d$ such that $0 < s < u$ and $k > 1$, and for any $\delta \in (0,1)$, there exists $n_0 \in \mathbb{N}$ such that $k$-LPM achieves a lower maximum TTFT that LPM and FCFS simultaneously on the regular arrival shuffled queue (Definition \ref{def:shuffled_queue}) for any value of $n \geq n_0$ with probability at least $1 - \delta$.
+
+    This result holds for any value of $\cattn \geq 0$ in the computational model of Definition \ref{def:llm_computation}.
+\end{corollary}
+
+
+\begin{proof}
+
+From the conditions that $k > 1$ and $s > 0$, it follows that:
+\begin{gather*}
+     T + n(\frac{u}{k} + d - \frac{s}{k}) < T + n(\frac{u}{k} + d).
+\end{gather*}
+Furthermore, from the condition that $u > s$, it follows that:
+\begin{gather*}
+    T + n(\frac{u}{k} + d - \frac{s}{k}) < T + n(u + d - s).
+\end{gather*}
+Hence, by Theorem \ref{thm:klpm_separation}, the corollary statement holds when $\cattn=0$. We extend to all $\cattn > 0$ by observing that $|\xb_i| = u + d$ is constant under Definition \ref{def:shuffled_queue}. Therefore, the time needed to process a query of the regular arrival shuffled queue under Definition \ref{def:llm_computation} with order indexed by $j > 1$ is:
+\begin{gather*}
+    (1 + \cattn|\xb_j|)(|\xb_j| - \overlap(\xb_j, \xb_{j-1}))
+    \\= (1 + c)(|\xb_j| - \overlap(\xb_j, \xb_{j-1})),
+\end{gather*}
+for some constant $c$ that depends only on $u$ and $d$. Rescaling $s$ by this $1 + c$ term extends the result to all $\cattn > 0$ and concludes the proof.
+
+\end{proof}
+
+
+\section{Experiments}\label{sxn:experiments}
+
+In this section, we measure the performance of $k$-LPM versus FCFS and LPM in a realistic setting. Our results validate the predictive power of the computational model from Section \ref{sxn:problem_setting} and the data generative model from Definition \ref{def:shuffled_queue} in real-world serving scenarios. 
+
+
+\subsection{Experimental Setup}
+
+In our experiments, we use the Llama-3.1-8B-Instruct model \cite{dubey2024llama} with tensor parallelism across eight A100 GPUs. We run the experiment using the SGLang v0.4.1 serving framework. In particular, we evaluate the timing metrics using SGLang's serving benchmark utility \cite{sglang_bench_serving} and only modify the benchmarking dataset. We implement the $k$-LPM algorithm as an extension to the current LPM implementation in SGLang. Finally, we construct the dataset used for benchmarking by sampling four prompts with shared user history from the 8k context length prompts described in \cite{360brew} for $2100$ prompts in total. We then randomly shuffle the ordering of these prompts and use $100$ for warm up of the benchmarking server.
+
+\subsection{Performance of $k$-LPM}
+
+We measure P99 TTFT vs. request rate for varying values of $k$ in the $k$-LPM algorithm. Our key observation (Figure \ref{fig:request_rate_ttft_all_k}) is that setting the hyperparameter to $k=2$ achieves reduced P99 TTFT across a wide range of request rates compared to FCFS and LPM. Note that SGLang's benchmarking utility uses a Poisson arrival process, so ``request rate'' refers to the average number of requests per second. 
+
+\begin{figure}[ht]
+    \centering
+    \includegraphics[width=0.65\linewidth]{images/request_rate_ttft_all_k.png}
+    \caption{We measure P99 TTFT versus request rate for five values of the hyperparameter $k$ on 2000 randomly shuffled prompts from the usecase described in \cite{360brew}. Note that $k=1$ corresponds to FCFS and $k=\infty$ corresponds to LPM.}
+    \label{fig:request_rate_ttft_all_k}
+\end{figure}
+
+The experimental results not only highlight the benefits of the $k$-LPM scheduling algorithm but also demonstrate that our theoretical framework---as encapsulated by Theorem~\ref{thm:klpm_separation}---accurately predicts scheduling behavior in real-world settings. This holds true even though the experiments do not strictly adhere to all of the assumptions required by the theorem. In particular, we make the following observations:
+
+\begin{itemize}
+    \item \textbf{$k$-LPM consistently outperforms both FCFS and LPM.} Over a wide range of request rates considered, $k$-LPM achieves a lower TTFT. This underscores its robust advantage, especially under moderate to heavy loads. Additionally, we note that large values of $k$ (e.g., $k=1000$) behave like $k=\infty$. 
+    
+    \item \textbf{FCFS shows better performance at low request rates, while LPM is advantageous at higher rates.} This matches our theoretical insight in Theorem~\ref{thm:klpm_separation}, where a larger inter-arrival time $s$ favors FCFS, but as $s$ decreases (i.e., the request rate grows), LPM becomes more efficient than FCFS.
+
+        
+    \item \textbf{$k$-LPM performance remains robust under realistic models and prompt data, even when the theoretical assumptions are relaxed.} 
+    Despite using a real LLM, an off-the-shelf serving framework, and a prompt dataset from an industrial use case, the observed scheduling behaviors closely match our theoretical predictions. 
+    
+    First, in our experiments, prompt structures are only approximately tree-like. In practice, user histories exhibit negligible overlap, which does not noticeably affect $k$-LPM's performance. Moreover, the near-random tie-breaking assumptions in Theorem~\ref{thm:klpm_separation} appear reasonable for these real-world prompts. 
+
+    Second, in the experiments, query processing begins as soon as the first query arrives rather than waiting for the entire query stream to finish. This implies that the assumption that processing begins at time $T \geq sn$ in Theorem \ref{thm:klpm_separation} is inconsequential when the randomness in the order of user queries is on the order of the average queue size.
+    
+    Finally, relaxing the exact match between $k$ and the number of replicas still reduces TTFT. Although Theorem~\ref{thm:klpm_separation} assumes $k$ equals the number of user history replicas exactly, our experiments with four replicas of each user history show that smaller choices (e.g., $k=2$ or $k=3$) still yield substantial TTFT improvements.
+
+\end{itemize}
+
+
+\section{Future Work}
+
+The primary objectives of this work were to formalize the LLM query scheduling problem in the context of RadixAttention and to develop a practical scheduling algorithm for latency-sensitive applications. This theoretical framework not only informs the design of new methods, but is particularly valuable given the current lack of empirical benchmarks for comparing scheduling strategies. However, further advancements in this area will necessitate empirical evaluation using real-world arrival patterns
+
+The proposed problem formulation and theoretical results leave many interesting extensions open. One open question is whether there is an algorithm which returns a schedule satisfying a constraint on the $(1-p)$-th percentile TTFT in $\poly(1/p)$ time, i.e., a polynomial time approximation scheme. Additional directions of interest would be extending the computational model of Section \ref{sxn:problem_setting} to handle distributional query streams or non-constant decoding length. Finally, generalizing the data generative model of Definition \ref{def:shuffled_queue} may be interesting to capture other properties of real data.
+
+
+
+
+
+

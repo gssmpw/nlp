@@ -1,0 +1,168 @@
+\section{Investigations}
+With this setup, we systematically analyse and ablate each component of the training pipeline, ultimately refining an optimised cook-book for training \slms. We specifically examine the influence of model family, initialisation, size, and architectural choices (e.g., dropout, positional embedding, etc.). We analyse optimisation parameters and data characteristics. Lastly, we explore alternative training objectives beyond standard next-token prediction, including speech-text interleaving and direct preference optimisation using synthetic data. 
+
+\subsection{Model \& Optimisation}
+\newpara{Hyper-parameters.} Unless specified otherwise, we use a context length of $512$ tokens and an effective batch size of $256$, employing gradient accumulation when necessary, as preliminary results indicated this configuration yields the best overall performance. We set the peak learning rate to $1e-3$ to enhance training speed and use a warmup period of $1\%$ of the total training steps, as this proved more effective than the fixed $100$-step warmup used in the original TWIST. To improve training stability, particularly with large learning rates, we apply gradient normalisation with a norm of $0.5$ at no additional cost, following~\citet{geiping2023cramming}. Unless modified later in our investigation, we use an inverse-square root scheduler and the AdamW optimiser~\citep{loshchilov2017decoupled}.
+
+\begin{figure}[t!]
+  \includegraphics[width=\columnwidth]{media/twist_vs_gslm.png}
+  \caption{Comparing PPL of different models of similar parameter count, with and without TWIST initialisation.}
+  \label{fig:initialisation}
+\end{figure}
+
+\newpara{Initialisation.} \citet{twist} empirically demonstrated that initialising \slms with pre-trained text \ac{LM}s can enhance convergence speed and improve model performance. We examine the effect of this initialisation within our setup across different model types. To do so, we train multiple models, both with and without TWIST initialisation, while staying within our compute budget. As shown in Figure~\ref{fig:initialisation}, TWIST initialisation benefits all evaluated models at the beginning of training, though its overall impact by the end varies. Notice, the x-axis in Figure~\ref{fig:initialisation} represents theoretical FLOPs, calculated as $6 * N_{params} * D_{tokens}$ following~\citet{hoffmann2022training}. However, due to variations in model architecture and implementation, practical efficiency differs, leading to varying amounts of compute processed within $24$ hours. 
+
+Results suggest that benefits of TWIST initialisation can be substantial, especially for top-performing models like Qwen$2.5$. As a result, we prioritise investigations based on existing pre-trained text \ac{LM}s. Interestingly, the results in Figure~\ref{fig:initialisation} demonstrate that Qwen$2.5$ outperforms other models even without TWIST initialisation, perhaps suggesting that their architectural design choices or size might also provide some benefit.
+
+\newpara{Optimal model size \& family.} \citet{cuervo2024scaling} conducted a scaling analysis on GSLM-style \slms, estimating the optimal model size and token count for a compute-efficient model. However, using a text LM initialisation might impact these findings. As we observe, TWIST initialisation greatly impact model performance, suggesting that prioritising larger models may be more effective than simply increasing the dataset size. Additionally, various model families gain different advantages from TWIST initialisation; for example, Qwen$2.5$ models show significantly better performance compared to OPT models. In Figure~\ref{fig:model_choice}, we compare the results under the pre-defined compute budget within model families\footnote{We use the text LM original names for clarity, but note that the actual size will be notably smaller due to reduced vocabulary size, e.g Qwen$2.5$-$0.5$B has $358$M parameters. Full model sizes can be found in Appendix \ref{sec:model_sizes}.}. We note that the best model sizes for both MobileLLM \cite{mobilellm}, SmolLM$2$ \cite{smollm2} and Pythia \cite{pythia} are $\sim300M$ parameters, while for OPT the best is $125$M. According to \citet{cuervo2024scaling}, the estimated optimal model size is approximately $66$M parameters. However, the best-performing model, Qwen$2.5$, is significantly larger. Since there are no smaller models in this family, it is difficult to determine whether this deviation is due to the quality of the initialisation or other factors. Moving forward, we proceed with both OPT-$125$M and Qwen$2.5$-$0.5$B.
+
+\begin{figure}[t!]
+  \includegraphics[width=\columnwidth]{media/twist_models.png}
+  \caption{Comparing PPL of different models under TWIST initialisation.}
+  \label{fig:model_choice}
+\end{figure}
+
+\newpara{Dropout.} The original OPT models includes dropout to mitigate overfitting. Although dropout is beneficial for regularisation, it effectively decreases the number of gradient updates per parameter without shortening the update-step wall time. Hence, reduces the number of parameter updates per second. Following \citet{geiping2023cramming}, we experiment with removing dropout and observed improved performance in our setup.
+
+\newpara{Positional Encoding.} Transformers rely on positional encoding to capture the order of input tokens. Many modern LMs, including the Qwen models, use Rotary Position Embedding~\citep{su2023roformerenhancedtransformerrotary}. This method uses a hyperparameter, $\theta$, to control the trade-off between granularity and the ability to handle long contexts. $\theta$ is often tuned to accommodate longer context lengths \citep{qwen2, roziere2023code}. Since our context length is significantly shorter than that of the original LLM, we explore reducing $\theta$ for potential performance gains. Our findings show that setting $\theta=10,000$ with a context length of $1024$ enhances performance, so we adopt this configuration moving forward. We note that since we increase the context length, we need to reduce the batch size as well, to not run into memory problems when training. We reduce the batch size by a half and keep the same amount of gradient accumulation steps, which gives us an effective batch size of $128$.
+
+\begin{figure}[t!]
+  \includegraphics[width=\columnwidth]{media/optim_analysis.png}
+  \caption{Comparing validation PPL of our best model with different optimisers and schedulers.}
+  \label{fig:optim}
+\end{figure}
+
+\newpara{Optimiser and Scheduler.} Various optimisers and schedulers have been developed to enhance training efficiency, reduce memory usage \citep{shazeer2018adafactoradaptivelearningrates, dettmers20228bitoptimizersblockwisequantization}, or accelerate convergence \citep{pagliardini2024ademamix, chen2023lion}. With limited compute, faster convergence and better memory efficiency can be especially important. We first consider efficient optimisers, specifically AdamW with fused kernels, and $8$-bit AdamW, but observe no notable improvements in batch size or runtime compared to standard AdamW. This could do with the relatively small model size, resulting in a minimal memory footprint of the optimisers. We then compare AdamW with two state-of-the-art optimisers: AdaLomo \cite{lv2023adalomo} and AdEMAMeix \citep{pagliardini2024ademamix}. Results, presented in Figure~\ref{fig:optim}, suggest that with the original InverseSqrt scheduler used by \citet{twist}, using AdEMAMeix improves validation loss, compared to AdamW, with AdaLomo far behind.
+
+Next, we analyse a cosine decay learning rate scheduler, in place of the original InverseSqrt as this was shown to improve convergence \cite{loshchilov2016sgdr}. We consider the previous optimisers, and provide the validation loss throughout training in Figure~\ref{fig:optim}. We see that this notably improved the loss for AdamW, and slightly harmed results for AdEMAMeix. Overall, AdamW with a cosine schedule provide the best setup, far outperforming the original setup.
+
+\subsection{Data}
+Next, we examine how the training data-mix influences performance in a compute-constrained setting. Specifically, we explore whether diversity in accents, speaking styles, etc. is beneficial and assess whether synthetic data can enhance semantic modelling abilities.
+
+\begin{table}[t!]
+  \centering
+  \resizebox{\columnwidth}{!}{
+  \begin{tabular}{l|cc|cccc}
+    \toprule
+    Model & \multicolumn{2}{c|}{Data} & \multicolumn{4}{c}{Metric}\\
+    \midrule
+          & Div. & Syn. & sBLIMP$\uparrow$ & sSC$\uparrow$ & tSC$\uparrow$ & GenPPL$\downarrow$ \\
+    \midrule
+    OPT125M& \xmark & \cmark & 55.28 & \bf{55.46} & \bf{75.18} & \bf{96.8} \\
+           & \cmark & \cmark & 55.06 & 55.00 & 74.83 & 116.6\\
+           & \xmark & \xmark & \bf{55.88} & 54.52 & 70.82 & 160.3 \\
+           & \cmark & \xmark & 55.65 & 54.78 & 70.18 & 172.7 \\           
+    \midrule
+    Qwen-0.5B & \xmark & \cmark & 56.45 & \bf{55.59} & \bf{78.01} & \bf{88.3} \\
+              & \cmark & \cmark & 56.17 & 55.37 & 77.13 & 101.3 \\
+              & \xmark & \xmark & \bf{56.60} & 53.50 & 71.14 & 145.4 \\
+              & \cmark & \xmark & 56.10 & 53.72 & 70.66 & 161.8 \\
+    \bottomrule
+  \end{tabular}
+  }
+  \caption{Analysing impact of training data diversity and synthetic data on \slm performance. The default \method recipe does not use diverse data (only Libri-light and LibriSpeech), but uses the synthetic sTinyStories data.}
+  \label{tab:data_analysis}
+\end{table}
+
+\newpara{Diverse Data.} We begin by examining how dataset diversity impacts model performance. Many leading speech datasets, such as those based on audiobooks \citep{ls, ll}, consist of relatively clean, single-speaker recordings within a specific content domain. To introduce greater diversity in speaking styles and content, we curate additional datasets, including VoxPopuli \cite{vp}, Tedlium \cite{tedlium}, PeopleSpeech \cite{people}, and SWC \cite{swc}. For all mentioned datasets, we use the official data cleaning and preprocessing scripts when available. Specifically, for Libri-light, we apply the official Voice Activity Detection model to remove silences and generate smaller audio segments. To evaluate the impact of dataset diversity, we compare the performance of \slms trained using our best training recipes using a subset of LibriSpeech and Libri-light against all curated datasets. This comparison is conducted for both OPT-$125$M, which processes a large number of tokens during training, and Qwen-$0.5$B, which encounters significantly less data due to model size. Results are summarised in Table~\ref{tab:data_analysis}. We observe that dataset diversity has an overall negative effect on model performance. We hypothesise this is due to the models struggling in modelling rich and complex audio under such low compute resources.
+
+\begin{figure}[t!]
+  \centering
+  \includegraphics[width=\columnwidth]{media/dpo_slider.png}
+  \caption{Analysing the optimal part of the 24 hour compute budget that should be used for DPO, with the rest used for pre-training.\label{fig:dpo}}  
+\end{figure}
+
+\begin{table*}[t!]
+  \centering
+  \resizebox{\textwidth}{!}{
+  \begin{tabular}{l|ccccccc}
+    \toprule
+      & Compute (GPU days) & Parameters & sBLIMP $\uparrow$ & sStoryCloze $\uparrow$ & tStoryCloze $\uparrow$ & GenPPL $\downarrow$ & Auto-BLEU $\downarrow$\\
+
+    \midrule
+    TWIST-350M \cite{twist} & 40*V100 & 305M & 56.20 & - & - & 137.3 & 3.46 \\
+    TWIST-1.3B \cite{twist} & 160*V100 & 1B & 57.00 & 52.4 & 70.6 & 131.8 & 3.20 \\
+    TWIST-7B \cite{twist} & ? & 7B & 59.00 & 55.3 & 74.1 & 93.7 & 3.06 \\
+    TWIST-13B \cite{twist} & ? & 13B & 59.20 & 55.4 & 76.4 & - & -\\
+    Scaled Optimal \cite{cuervo2024scaling} & ? & 823M & \bf{61.3} & \bf{56.7} & \bf{78.0} & - & -\\
+    \midrule
+    Predicted Optimal \cite{cuervo2024scaling} & 1*A5000 & 78M & 56.85 & 54.09 & 70.49 & - & -\\
+    
+    \midrule
+    TWIST-350M (Original recipe) & 1*A5000 & 305M & 51.52 $\pm$ .19 & 53.65 $\pm$ .57 & 68.80 $\pm$ .47 & 259.2 $\pm$ 6.7 &  3.26 $\pm$ .46 \\
+    TWIST-350M + sTinyStories & 1*A5000 & 305M & 51.21 $\pm$ .26 & 54.17 $\pm$ .54 & 72.40 $\pm$ .18 & 159.0 $\pm$ 6.0 & 4.18 $\pm$ .24 \\
+    \method (-DPO) (ours) & 1*A5000 & 358M & \underline{56.45} $\pm$ .17 & \underline{55.59} $\pm$ .30 & \underline{78.01} $\pm$ .27 & \underline{88.3} $\pm$ 1.0 & 3.47 $\pm$ .17 \\
+    \method (ours) & 1*A5000 & 358M & \textbf{58.86} $\pm$ .20 & \textbf{58.04} $\pm$ .51 & \textbf{82.04} $\pm$ .21& \textbf{62.8} $\pm$ 4.1 & 3.88 $\pm$ .11 \\
+    \bottomrule
+  \end{tabular}
+}
+\caption{Comparing \textit{slamming} to leading \slms, and predicted optimal performance for the compute. We also consider TWIST-$350$M using our code and compute budget, but with the original training recipe. $\pm$ indicates distance to min/max of $3$ seeds.  \label{tab:slam}}
+\end{table*}
+
+\newpara{Synthetic Data.} Recent studies have highlighted the potential of synthetic data generated through \ac{TTS} \citep{cuervo2024scaling} or direct text-to-unit conversion \citep{scaling_interleaving}. Hence, we examine the impact of including synthetically generated speech within our constrained compute setup. To do so, we synthesised the TinyStories dataset \citep{tinystories} using a single-speaker \ac{TTS} model \citep{wang2021fairseq}, as it is computationally efficient. Additionally, prior research has shown that HuBERT units largely remove speaker information \citep{maimon2023dissc}. TinyStories has been demonstrated to enhance text \ac{LM} performance and improve \slms~\citep{cuervo2024scaling}. Results are presented in Table~\ref{tab:data_analysis}. Results indicate that incorporating such synthetic data into the training data-mix significantly boosts both modelling and generative performance metrics, across all evaluated setups. We also consider adding the synthetic data to the original TWIST recipe, and the results in the bottom of Table \ref{tab:slam} suggests that while this helps with semantic metrics, it is far from enough without other optimisations we introduced.
+
+We see that across all datasets, and specifically with our best mixture Libri-Light, LibriSpeech and sTinyStories, Qwen-$0.5$B outperforms OPT-$125$M so we continue with it to the final stages.
+
+
+\subsection{Text Interleaving} 
+Several recent \slms combine both speech and text modalities, either predicting both simultaneously \citep{defossez2024moshi, fang2024llama, xie2024mini} or training on interleaved data \citep{spiritlm, scaling_interleaving}. Beyond enhancing cross-modal abilities, this has been shown to improve the semantic capabilities of \slms, even in speech-only evaluations. Building on these studies, we investigate whether speech-text interleaving can enhance semantic ability in speech-only tasks, even under strict computational constraints.
+
+For this we use Whisper-large-v3-turbo to get aligned transcriptions of our data, except sTinyStories for which we get alignment from the \ac{TTS}. We follow \citet{scaling_interleaving} by selecting speech spans with length from a Poisson distribution with $\lambda=10$ totalling $30\%$ of the interleaved data. Following \citet{spiritlm} we train with balanced batches regarding token count between text data, speech data and interleaved data. We use a subset of RedPajama \citep{weber2024redpajama} filtered by Gopher \citep{rae2021scaling} rules as our text data.
+
+We find that under our setup performance is notably worse than speech-only \method in all metrics. We hypothesise that in the \textit{slamming} setup the larger vocabulary (leading to more parameters), and fewer speech tokens led to under-trained models. We leave for future work to find the minimal compute budget to benefit from text-interleaving or to consider other efficient approaches.
+
+\begin{table*}[t!]
+  \centering
+  \resizebox{\textwidth}{!}{
+  \begin{tabular}{l|cccccccc}
+    \toprule
+      & GPUs & Params & Num tokens & sBLIMP $\uparrow$ & sStoryCloze $\uparrow$ & tStoryCloze $\uparrow$ & GenPPL $\downarrow$ & Auto-BLEU $\downarrow$\\
+    \midrule
+    \multicolumn{9}{l}{\bf{Speech only pre-training}} \\
+    GSLM \cite{gslm}& 8*V100 & 100M & 1B & 54.2 & 53.3 & 66.6 & $\emptyset$ & $\emptyset$ \\
+    SyllableLM \cite{baade2024syllablelm}& 4*A40 & 300M & 16B & 63.7 & $\emptyset$ & 75.4 & $\emptyset$ & $\emptyset$ \\
+    TWIST-350M \cite{twist} & 8*V100 & 305M & 10.8B & 56.20 & $\emptyset$ & $\emptyset$ & 137.3 & 3.46 \\
+    TWIST-1.3B \cite{twist} & 32*V100 & 1B & 10.8B & 57.00 & 52.4 & 70.6 & 131.8 & 3.20 \\
+    TWIST-7B \cite{twist} & 32*V100 & 7B & 36B & 59.00 & 55.3 & 74.1 & 93.74 & 3.06 \\
+    TWIST-13B \cite{twist} & 32*V100 & 13B & 36B & 59.20 & 55.4 & 76.4 & $\emptyset$ & $\emptyset$\\
+    Scaled Optimal \cite{cuervo2024scaling} & $\emptyset$ & 823M & 82B & \bf{61.3} & 56.7 & 78.0 & $\emptyset$ & $\emptyset$\\
+    Moshi \cite{defossez2024moshi} & ?*H100 & 7B & ? & 58.9 & \bf{58.7} & \bf{81.8} & $\emptyset$ & $\emptyset$ \\
+    SpiritLM \cite{spiritlm} & 64*A100 & 7B & 100B & 58.0 & 54.8 & 72.9 & $\emptyset$ & $\emptyset$ \\
+    \midrule
+    \multicolumn{9}{l}{\bf{Joint speech-text pre-training / preference optimisation}} \\
+    \citet{scaling_interleaving} & $\emptyset$ & 9B & $\sim$1T & $\emptyset$ & \bf{62.4} & 82.9 & $\emptyset$ & $\emptyset$ \\
+    Moshi \cite{defossez2024moshi} & ?*H100 & 7B & $\sim$720B & 58.8 & 60.8 & 83.0 & $\emptyset$ & $\emptyset$ \\
+    SpiritLM \cite{spiritlm} & 64*A100 & 7B & 100B & 58.3 & 61.0 & 82.9 & $\emptyset$ & $\emptyset$ \\
+    AlignSLM-1.3B \cite{lin2024alignslm} & 64*A100 & 1B & 10.8B + $\sim$158B & 59.8 & 55.0 & 80.0 & $\emptyset$ & $\emptyset$ \\
+    AlignSLM-7B \cite{lin2024alignslm} & 64*A100 & 7B & 36B + $\sim$158B & \bf{62.3} & 61.1 & \bf{86.8} & $\emptyset$ & $\emptyset$ \\
+    \midrule    
+    \method (-DPO)       & 2*A100 & 358M & 16.7B & 58.53 & 58.15 & 80.71 & 67.3 & 3.25 \\
+    \method & 1*A5000 & 358M & 1.4B + 5M & 58.86 & 58.04 & 82.04 & 62.8 & 3.88 \\        
+    \method (scaled) & 2*A100 & 358M & 16.7B + 9M & \bf{61.11} & \bf{61.30} & \bf{84.18} & \bf{46.6} & 3.75 \\
+    \bottomrule
+  \end{tabular}
+}
+\caption{Analysing the effect of scaling up compute for \method. Number tokens refers to total, not necessarily unique, tokens used for training (estimated from the provided information). We separately mark DPO tokens with a +.}\label{tab:scaling}
+\end{table*}
+
+\subsection{Synthetic Data Preference Optimisation} 
+
+Preference optimisation methods have been shown to enhance the performance of text LLMs \cite{ouyang2022training} and, more recently, \slms \cite{lin2024alignslm}. With preference optimisation, we aim to train our model to generate outputs that better align with a specified reward function or preference set.
+
+We evaluate how preference optimisation affects \slm performance while considering our constrained computational budget. Using an \textit{off-policy} approach with pre-generated preference data, we apply DPO to enhance training efficiency. Specifically, we synthetically generate the SWAG \citep{swag} text corpus for evaluating semantic knowledge. SWAG consists of text prefixes paired with multiple possible suffixes, where only one is semantically plausible. For preference data, we use the first sentence as the prompt, the correct suffix as the positive continuation, and a randomly chosen incorrect suffix as the rejected continuation. To ensure quality, we filter out samples with repetitive patterns, identified by an auto-BLEU score above $0.3$. We generate all recordings using Kokoro TTS \citep{kokoro}, incorporating four speakers (two male and two female), evenly split between British and American accents. This process results in a total of $47$k SWAG preference pairs.  
+
+For DPO we use $\beta=0.1$ (see Appendix \ref{sec:app_recipe} for full hyperparameters). In initial tests, we observe that after DPO training, the model shows increased likelihood at the cost of repeated patterns, a known issue with DPO~\citep{divpo}. To address this, we apply a repetition penalty with a factor of $1.1$, following the approach of \citet{ctrl}, and find that it helps mitigate the problem. Future work could explore alternative solutions, such as proposed by \citet{divpo}. 
+
+We begin by examining how the allocation of budget for DPO impacts performance, particularly when it comes at the cost of a shorter pre-training phase. Figure~\ref{fig:dpo} depicts the results. We observe significant improvements across all metrics when applying DPO for at least $30$ minutes compared to not using DPO at all. However, allocating a higher proportion of the budget to DPO does not yield further gains and can even degrade model performance. Thus we stick to $30$ minutes out of $24$  hours for DPO, using the rest for pre-training. 
+
+
+\section{Final Recipe} 
+\label{sec:recipe}
+Building on these empirical findings, we develop the final \method recipe. Using it, we train \slms based on Qwen$2.5$-$0.5$B. We then compare \method to the TWIST model family across various sizes: $350$M, $1.3$B, $7$B, and $13$B. We also present results for TWIST-$350$M using our computational constraints but following TWIST's original training recipe, along with our synthetic data. Finally, we report results for the top-performing model from ~\cite{cuervo2024scaling}, including their predicted optimal performance under our compute budget based on \slm scaling laws. Results are reported in Table~\ref{tab:slam}. The results indicate that \method delivers performance that is either superior or on par with baseline models while requiring significantly fewer computational resources (e.g., a single A$5000$ for a day compared to $160$ days on a V$100$).
+
+\section{Increasing Compute} 
+\label{sec:scale}
+
+Similarly to \citet{geiping2023cramming}, we analyse whether the proposed approach holds well also in increased compute budget. We opt for $48$ hours on $2$ A$100$ GPUs as a reasonable academic budget for larger scale tests, and represents $\sim10$ times more compute than the \textit{Slamming} setting. We use exactly the same \method recipe for more steps, and increase the batch size times $2$. We provide the full results in Table \ref{tab:scaling}. We note that the performance continues to improve across all metrics, also outperforming methods which have far larger compute scales. We note that DPO training on synthetic data for $2$ epochs, notably boosts performance.
+
+

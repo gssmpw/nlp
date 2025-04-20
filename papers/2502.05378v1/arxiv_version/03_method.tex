@@ -1,0 +1,229 @@
+\newcommand{\GT}{\text{GT}}
+\newcommand{\cov}{\text{Cov}}
+\newcommand{\pos}{\text{pos}}
+\newcommand{\rot}{\text{rot}}
+\newcommand{\MSE}{\text{MSE}}
+\newcommand{\BCE}{\text{BCE}}
+
+\section{Learning Active 3D Mapping}
+
+\subsection{Overview}
+
+\noindent \textbf{Problem definition.}
+%
+Active 3D mapping aims to control an agent, such as an unmanned aerial vehicle (UAV) or wheeled robot, to efficiently and exhaustively reconstruct a 3D scene.
+The agent starts at a random location within the scene, and at each time step $t$, it receives an RGB-D image $I_t$ and must predict the next one $c_t = (c^\pos_t, c^\rot_t)$ in the immediate surrounding of the agent.
+Here, $c^\pos_t$ denotes the position coordinates, and $c^\rot_t$ represents the orientation angles. 
+%We constrain $c^{pos}_{t}$ to remain in proximity to $c^{pos}_{t-1}$ to ensure smooth and realistic movements.
+The agent continually predicts successive $c_t$ until a predefined time limit $T$ is reached. The final output is the reconstructed 3D point cloud of the explored environment.
+
+
+\noindent \textbf{Overview of our approach.}
+%
+Existing approaches for active mapping~\citep{guedon2022scone,guedon2023macarons} typically predict the next camera pose $c_t$ in a greedy manner, which often suffers from getting stuck in limited areas.
+To address this limitation, we propose a novel approach that predicts a long-term goal camera pose and uses it to guide the next camera pose selection.
+%
+% Figure~\ref{fig:pipeline} gives an overview of our approach. % this figure is not really an overview - we do not necessarily need an overview figure
+Given all past observations and camera poses, our model predicts two key components centred on the agent's current pose $c_t$: 
+(1) a value map $M_{c_t}$, which estimates the surface coverage gain of candidate poses $c$ in the surrounding of $c_t$, and 
+(2) an obstacle map $O_{c_t}$, which accounts for both visible and predicted unseen obstacles in the environment. 
+From the value map $M_{c_t}$, we derive the long-term goal pose $c_g$ and combine it with the obstacle map $O_{c_t}$ to compute an optimal path $\tau_t = (c_t, c_{t+1}, \cdots, c_g)$ that navigates the agent from its current pose $c_t$ to the goal pose $c_g$.
+This long-term goal-driven strategy helps the model avoid the pitfalls of short-sighted decisions and enhances coverage efficiency.
+
+In the following, we first describe the model for $M_{c_t}$ and $O_{c_t}$ prediction in Section~\ref{sec:method_model}, then followed by the decision-making process to determine the next best path $\tau_t$ in Section~\ref{sec:method_decisionmaking}. Finally, in Section~\ref{sec:method_training}, we introduce the training algorithm for our model.
+
+\subsection{Coverage Gain and Obstacle Prediction Model} 
+\label{sec:method_model} 
+
+Figure~\ref{fig:pipeline} depicts the deep model we use to predict the coverage gains and the obstacle map. We detail this model below.
+
+\noindent \textbf{Mapping Progress Encoder.} 
+%
+Let's denote $\mathcal{P}_t$ the reconstructed point cloud at each time step $t$, obtained by adding the back-projected depth image $I_t$ to the previously accumulated point cloud $\mathcal{P}_{t-1}$.
+Directly encoding the point cloud via 3D neural networks can be complex and inefficient. Therefore, we convert the 3D point cloud into multiple 2D images as inputs to a 2D-based encoder.
+
+To be specific, we first centre and crop the point cloud based on the agent's current position $c_t$. Centering the input on the agent makes the model invariant to the agent's position and thus improves generalization.
+Then, the point cloud is divided into $K$ horizontal layers along the gravity axis. For each layer, we average the occupancy value along the gravity axis to transform each 3D data into a 2D image. In this image, each pixel encodes the density of 3D points within a specific height range. The stack of $K$ point cloud projected images provides a simplified yet informative representation of the 3D structure.  
+% \vincent{While the maps are mostly 2D, this representation allows the agent to distinguish between doors, which are traversable, and windows, which are not.}\vincentrmk{I added the last sentence because i was confused by the need for several slices when Shiyao presented them to me.}
+% \shizhermk{The last sentence is not accurate. Both doors and windows are travesable. We don't need to distinguish them.}
+
+
+% \antoinermk{It's actually not really a 2D representation of the 3D structure, as you have a stack. Maybe you could write: The stack of $K$ images provides an informative representation of the 3D structure, which is dense along the $X$ and $Y$ axes but quantized along the $Z$ axis.}
+% \antoinermk{Maybe we could even justify this a bit more (but it is probably not needed) by explaining that in the real world, agents exploring indoor environments generally don't need to have dense information along the gravity axis. If the agent doesn't fly, then it's obvious; And if it does fly, then it generally is interested only in knowing if it is above an object or not + the positions of the floor and ceiling}
+% \vincentrmk{I simply remove 2D}
+
+Similarly, we project the 3D trajectory of the agent's past camera poses onto a 2D plane where each pixel denotes the frequency of visits to that location. This plane serves to mitigate the exploratory value of previously traversed regions. We define $\mathcal{E}_{c_t}$ to include the $K$ point cloud projected images and a single historical trajectory image.
+
+Given the stacked 2D images of $\mathcal{E}_{c_t}$, we employ an Attention UNet~\citep{attentionunet} encoder with 4 downsampling convolutional blocks to extract mapping progress features $e_{c_t}$.
+
+\input{figures/pipeline}
+
+\textbf{Coverage Gain Decoder.}
+%
+This decoder predicts from $e_{c_t}$ a 3D value map $M_{c_t} \in \mathbb{R}^{H_c \times W_c \times N_c}$ centered on the agent.  
+It is composed of two upsampling convolutional blocks with an attention mechanism.
+The first two dimensions of the predicted value map, $H_c$ and $W_c$, correspond to the camera's 2D position in the environment, while the third dimension $N_c$ represents different camera orientations. 
+Each value in $M_{c_t}$ quantifies the estimated coverage gain achievable by moving the camera along the shortest trajectory from its current pose to the specific camera pose. 
+The value map $M_{c_t}$ guides the selection of both long-term goal poses $c_g$ and intermediate poses along the trajectory, enabling a two-stage optimization for efficient exploration, which will be discussed in Section~\ref{sec:method_decisionmaking}.
+
+
+\textbf{Obstacle Map Decoder.} 
+%
+This decoder predicts the geometric layout $O_{c_t} \in \mathbb{R}^{H_o \times W_o}$ of the current moving plane, also from the encoder output $e_{c_t}$. $O_{c_t}$ is a binary map representing potential obstacles around the current agent location, which is used for path planning. To be noted, $O_{c_t}$ includes not only visible obstacles but also anticipated unseen obstacles based on the structure of the partially reconstructed point cloud, providing useful priors for navigation.
+%
+This decoder is implemented using  Attention U-Net with 4 upsampling convolutional blocks, and the output is passed through a sigmoid activation function to generate the binary obstacle map.
+
+
+\subsection{Decision Making for Next-best-path Prediction}
+\label{sec:method_decisionmaking} 
+
+We derive both a long-term goal $c_g$ and next-best-path $\tau_t = (c_t, c_{t+1}, \ldots, c_g)$ from the predicted $M_{c_t}$ and $O_{c_t}$, employing different decision making strategies for training and inference. During training, we balance exploitation and exploration, while we prioritize exploitation during inference.
+
+\textbf{Training phase.} We rely on the Boltzmann exploration strategy~\citep{cesa2017boltzmann} to sample a camera pose as the goal $c_g$ based on the value map $M_{c_t}$. The probability of selecting a camera pose $c$ as the goal is given by:
+%
+\begin{equation}
+P(c_g = c) = \frac{\exp(M_{c_t}[c] / \beta)}{\sum_{c' \in C} \exp(M_{c_t}[c'] / \beta)} \> ,
+\end{equation}
+%
+where $C$ represents all possible camera poses within $M_{c_t}$, $\beta$ is the temperature parameter that balances exploration and exploitation, and $M_{c_t}[c]$ denotes the value of the cell for candidate $c$. 
+
+Once the long-term goal $c_g$ is sampled, we use the Dijkstra algorithm to find the shortest obstacle-free path from the current position $c^\pos_t$ to goal position $c^\pos_g$ with a ground truth obstacle map. 
+To select camera orientation along the path, we also leverage $M_{c_t}$ to sample one orientation from $N_c$ potential orientations at each position. 
+This strategy enhances data diversity and alleviates the risk of converging to local optima.
+\input{figures/training_algorithm_alt}
+
+
+
+\textbf{Inference phase.} 
+%
+At inference, we take $c_g$ as the pose with the maximum value in $M_{c_t}$, and the path planning is based on the predicted obstacle map $O_{c_t}$ instead of ground truth.
+Each position in the trajectory is assigned the optimal orientation from the heatmap $M_{c_t}$ for its location.
+In practice, the predicted obstacle map may not be entirely accurate. Encountering an unexpected obstacle requires halting the trajectory and initiating a new decision-making phase.
+
+
+\subsection{Model Training}
+\label{sec:method_training} 
+
+
+% \input{figures/training_algorithm_alt}
+% \input{figures/training_algorithm}
+
+
+Algorithm~\ref{alg:training} outlines the training procedure for our model.
+We first gather training data from all training scenes using the current model, and then update the model with the new data. This process is repeated iteratively until the model achieves convergence.
+We detail below the data collection, training objectives to update the model, and the training strategy.
+
+
+\noindent \textbf{Training data collection.}
+After sampling the goal pose $c_g$ and the trajectory $\tau_t$, we generate ground truth labels to train the value map $M_{c_t}$ and obstacle map $O_{c_t}$.
+
+For $M_{c_t}$, we compute the coverage gain for the cell that corresponds to $c_g$ as the ground truth label.
+Let $\calP_t$ and $\calP_g$ denote the reconstructed point clouds at pose $c_t$ and $c_g$ respectively, where $\calP_g$ is the result of accumulating depth information into $\calP_t$ as the agent moves along the trajectory $\tau_t$. By comparing the reconstructed point clouds with the ground truth point cloud $\calP^\GT$, we can obtain the coverage gain $\Delta \Cov_{c_t \rightarrow c_g}$:
+%
+\begin{equation}
+\Delta \Cov_{{c_t}\rightarrow {c_g}} = \frac{1}{N_{\text{GT}}} \sum_{i=1}^{N_{\text{GT}}} \left[ \mathbf{1}\left( \min_{y \in \mathcal{P}_g} \Vert x_i^{\text{GT}} - y \Vert < \epsilon \right) - \mathbf{1}\left( \min_{y \in \mathcal{P}_t} \Vert x_i^{\text{GT}} - y \Vert < \epsilon \right) \right] \> ,
+\label{coverage-gain}
+\end{equation}
+%
+where $N_{\text{GT}}$ is the number of points in $\calP^\GT$, $ \| \cdot \| $ denotes the Euclidean distance, and $\varepsilon$ is a predefined distance threshold. Consequently, we set $\Delta \Cov_{c_t \rightarrow c_g}$ as the ground truth value for $M_{c_t}[c_g]$.
+
+% :
+% %
+% \begin{equation}
+% \Delta \cov_{c_t\rightarrow c_g} = \frac{1}{|\calP^\GT|} \sum_{p^\GT\in\calP^\GT} \left[ \mathbf{1}\left( \min_{p \in \calP_g} \Vert p^\GT - p \Vert < \epsilon \right) - \mathbf{1}\left( \min_{p \in \calP_t} \Vert p^\GT - p \Vert < \epsilon \right) \right] \> ,
+% \label{eqn:coverage-gain}
+% \end{equation}
+% %
+% where $\varepsilon$ is a small predefined distance threshold.
+
+For $O_{c_t}$, we use the 3D mesh of the scene to derive the ground truth obstacle map $O_{c_t}^\GT$.
+Specifically, we intersect the 3D mesh with a plane at the agent's height, and project this intersection onto a 2D grid. This 2D grid is binarized to distinguish between obstacles and free space. Finally, we centre the 2D grid around the agent's current position as $O_{c_t}^\GT$.
+
+To enhance the efficiency of data generation, we further perform a data augmentation by leveraging the property of Dijkstra's algorithm, where every sub-path of a shortest path is also a shortest path. From a given path $\tau_t = (c_0 = c_t, \dots, c_m = c_g)$, we compute the coverage gain $\Delta \Cov_{c_i \rightarrow c_j}$ for each segment of the path $(c_i, c_j)$ where $0 \leq i < j \leq m$. More specifically, we update the ground truth values along the Dijkstra path $M^\text{GT}_{c_i}[c_j] = \Delta \Cov_{c_i \rightarrow c_j}$.
+We also collect the input $\mathcal{E}_{c_i}$ and the ground truth of surrounding obstacles $O_{c_i}^\GT$ for each $c_i \in \tau_t$.
+This significantly increases the number of training samples derived from a single trajectory.
+
+We store all augmented pairs $\{d_l\}_{l=1}^{L}, d_l = {(\mathcal{E}_{c_i}, M_{c_i}^\text{GT}, O_{c_i}^\GT)}$ in memory for training, where $L$ is the length of the trajectory.
+
+\noindent \textbf{Multi-task training.}
+We jointly train the coverage gain and obstacle map prediction using data stored in memory. 
+We use the mean squared error~(MSE) loss for training the coverage gain prediction, and the binary cross-entropy~(BCE) loss for training the obstacle map prediction.
+To balance these two tasks effectively, we apply learnable uncertainty weights for each task, following~\cite{multi-weights}. Our multi-task loss function for sample $d_l$ is formulated as follows:
+%
+\begin{equation}
+    \calL{(\theta;d_l)} = 
+    \frac{1}{2\sigma_1^2} \calL_\MSE(M_{c_i}^\GT, \hat{M}_{c_i}) + 
+    \frac{1}{\sigma_2^2} \calL_\BCE(O_{c_i}^\GT, \hat{O}_{c_i}) + 
+    \log \sigma_1 + \log \sigma_2 \> ,
+    \label{eqn:training_loss}
+\end{equation}
+%
+where $\theta$ represents the model parameters, $\sigma_1$ and $\sigma_2$ are learnable uncertainty weights, $\hat{M}_{c_i}$ and $\hat{O}_{c_i}$ are the model's predictions for the coverage gain and obstacle maps respectively.
+
+\noindent \textbf{Training strategy.}
+%
+We adopt a curriculum training strategy~\citep{JMLR:v18:16-212, yuan2022easy, yan2021continual, de2021continualsurvey} to train our model, starting with easier-to-predict samples and gradually incorporating the entire dataset. 
+In particular, we consider that the initial steps of a trajectory are more challenging since the agent has limited observations. 
+Therefore, during the first $N_e$ training iterations, we exclude samples from the first 10 steps in a trajectory. After $N_e$ iterations, all samples in a trajectory are used in training.
+
+During each training iteration, we use a balanced combination of previously stored data from the memory and newly collected data generated by the current model~\citep{wulfmeier2018incremental, memoryreplay, rolnick2019experience, aljundi2019online}, which helps prevent catastrophic forgetting. Each training phase is limited to $E$ epochs to balance between enhancing performance and preventing overfitting on sub-optimal data.
+
+
+
+% \vincent{
+% Training our encoder and decoders efficiently is challenging because its input depends on the previous trajectory of the agent: we need to build a training set representative of what the agent will  have seen at inference, while encouraging the agent to find efficient trajectories. To address this, we combine self-supervised and continual learning strategies. \vincentrmk{is it really self-supervised and continual learning?  it sounds closer to reinforcement learning to me} \shiyaormk{Maybe it's not the self-supervised learning since we used the ground truth point cloud to compute the coverage gain, but it's quite similar to continual learning. If we explain this as RL seems also works, but we haven't compared it with any RL methods, nor do we have a future reward. My suggestion maybe we can define it as continual learning but in an in-domain fashion} We iteratively sample trajectories across diverse scenes, leveraging the model's current predictions to gather training data. The model is continuously updated with this incoming data and subsequently utilized to collect further samples. We repeat this cycle until the model achieves convergence.
+
+% We detail this training procedure as well as the deep model and its input and output representations.
+% }
+
+% % Inspired by continual learning~\cite{volpi2021continual,memory}, starting from a model  initialized randomly, we begin by collecting trajectories from diverse scenes and updating our model. Subsequently, we make an in-domain shift using the updated model to guide further data collection and conduct additional training iterations. We iterate this process---data collection, and model updating---until convergence.
+
+% % We will discuss in more details this approach below.
+
+% \vincent{
+% \textbf{Data collection.} During this process, we first collect the  ground truth for the obstacle map surrounding the camera's position, $O_{c_t}^\GT$. We generate $O_{c_t}^\GT$ by intersecting the map 3D mesh with a plane at camera height, projecting the intersection in a 2D tensor and binarizing it to differentiate obstacles.
+
+% \vincentrmk{I dont like calling this an `image' as it is not an really image, we already use map for the scene. Is 2D tensor appropriate?}
+
+% To train the coverage gain decoder, we move the agent and its camera from $c_t$ to $c_g$ along trajectory $\tau_t$ computed by the decision-making step. 
+% We update the 
+% point cloud $\calP_t$ reconstructed at time $t$ into a consolidated point cloud $calP_g$ using the depth maps captured along the trajectory. By comparing $\calP_g$ with the ground truth point cloud $\calP^\GT$, we can compute the coverage gain $\Delta \cov_{c_t \rightarrow c_g}$ achieved with this trajectory:
+% %
+% \begin{equation}
+% \Delta \cov_{c_t\rightarrow c_g} = \frac{1}{|\calP^\GT|} \sum_{p^\GT\in\calP^\GT} \left[ \mathbf{1}\left( \min_{p \in \calP_g} \Vert p^\GT - p \Vert < \epsilon \right) - \mathbf{1}\left( \min_{p \in \calP_t} \Vert p^\GT - p \Vert < \epsilon \right) \right] \> ,
+% \label{coverage-gain}
+% \end{equation}
+% %
+% where $\varepsilon$ is a small predefined distance threshold.
+
+% Coverage gain $\Delta \cov_{c_t\rightarrow c_g}$ serves as the ground truth for a single cell in score map $M_{c_t}$. This cell is computed by discretizing the position and orientation of target pose $c_g$.
+
+% From a single trajectory, we can in fact generate more than only one training sample. Leveraging the property that every sub-path of a shortest path computed by Dijkstra's algorithm is itself a shortest path, we implement a data augmentation strategy to enhance efficiency. For a path $\tau_t = (c_0 = c_t, \dots, c_m = c_g)$, we compute $\Delta \cov_{{c_i}\rightarrow {c_g}}$ using Eq.~\eqref{coverage-gain} for each pair $(i, j)$ where $0 \leq i < j \leq m$. 
+% This augmentation approach significantly increases the amount of training data generated from each Dijkstra trajectory.
+
+% Additionally, at each node $c_i$ of the trajectory $\tau_t$, we can also collect the ground-truth of surrounding obstacles $O_{c_i}^\GT$.
+% }
+
+% % and generate the process embedding $\mathcal{E}_{c_i}$.
+
+% %We store these data pairs $\{\mathcal{E}_{c_i}, M_{c_i}^{\text{GT}}, O_{c_i}^\GT\}$ into our Memory to training.
+
+
+% In summary, we store collected training pairs $\{(P_{c_i}, (M_{c_i}^{\text{GT}[c_g]}, O_{c_i}^\GT)) \}$ into our Memory for training.\vincentrmk{I still need to clean the notations a bit}
+
+% The beginning of the training stage is critical for effective continual training. We begin training after two rounds of data collection. The first training session uses carefully filtered, easier-to-predict samples, following an 'easy-to-hard' approach \cite{JMLR:v18:16-212}. 
+
+% \vincentrmk{I dont understand what you do here} \shiyaormk{The training process is divided into n iterations. Except for the first iteration, each iteration consists of two parts: data collection and model training. The first iteration is solely responsible for data collection. After completing data collection in the second iteration, we initiate the first training session for the model. To better initialize the model, we filtered out some "challenging" data. These challenging data refer to the early stages of each trajectory when understanding of the environment is limited, making it extremely difficult to predict heatmaps and obstacles. For the first training session, we only use data from each trajectory after the 10 step.}
+
+% Each training phase is limited to five epochs to balance performance improvement and overfitting prevention. Subsequent updates use an equal amount of previous data from the Memory and freshly collected data to avoid catastrophic forgetting.
+
+% For multi-task learning, we use data pairs ${\mathcal{E}_{c_i}, M_{c_1}^\GT, O_{c_i}^\GT}$ from the Memory. $M_i$ contains partial ground truth for camera poses, while $O_{c_i}^\GT$ is a complete binary obstacle map. We use the MSE loss for training the coverage gain decoder the BCE loss for training the obstacle map decoder. To combine properly these two learning tasks, we adopt learnable uncertainty weights for each task as in \cite{multi-weights}. Out multi-task loss function is thus:
+% %
+% \begin{equation}
+%     \calL{(\theta)} = 
+%     \frac{1}{2\sigma_1^2} \calL_\MSE(M_{c_i}^\GT, \hat{M}_{c_i}) + 
+%     \frac{1}{2\sigma_2^2} \calL_\BCE(O_{c_i}^\GT, \hat{O}_{c_i}) + 
+%     \log \sigma_1^2 + \log \sigma_2^2 \> ,
+% \end{equation}
+% %
+% where $\theta$ represents the model parameters, $\sigma_1^2$ and $\sigma_2^2$ are learnable uncertainty weights, $\hat{M}_{c_i}^\GT$ and $\hat{O}_{c_i}$ are the model's predictions for the coverage gain and obstacle maps respectively. This formulation allows the model to automatically balance the importance of each task during training, adapting to the inherent differences in task complexity and data availability.

@@ -1,0 +1,55 @@
+\section{Background}
+\label{sec:background}
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.9\linewidth]{figures/mllm.pdf}
+    \caption{MLLM with cross-attention.}
+    \label{fig:mllm-architecture}
+\end{figure}
+\textbf{Cross-attention} Cross-attention~\cite{vaswani2017attention} is a variant of self-attention to model interactions between different sequences. The input to cross-attention consists of two sequences $x \in \mathbb{R}^{S_Q \times d_{\text{embed}}}$ and $y \in \mathbb{R}^{S_{KV} \times d_{\text{embed}}}$, where $S_Q$ and $S_{KV}$ denote the sequence lengths of $x$ and $y$, respectively, and $d_{\text{embed}}$ is the embedding dimension. The input sequence $x$ is multiplied with the projection matrices $W_Q\in \mathbb{R}^{d_{\text{embed}} \times d}$ to obtain the queries $Q\in \mathbb{R}^{S_Q \times d}$, while the input sequence $y$ is multiplied with the projection matrices $W_{K}, W_{V}\in \mathbb{R}^{d_{\text{embed}} \times d}$ to obtain the keys and values $K, V\in \mathbb{R}^{S_{KV} \times d}$, where $d$ is the hidden dimension. The attention output $O \in \mathbb{R}^{S_Q \times d}$ is then computed as:
+\begin{equation*}
+\label{eqn:attn}
+    O = \text{softmax}(\frac{QK^T}{\sqrt{d}})V
+\end{equation*}
+\textbf{Multimodal Large Language Models} As LLMs continue to evolve, researchers are investigating how to incorporate vision and other modalities into these models. One common way is to embed cross-attention layers into the language model. This design has been adopted by a number of models including Flamingo~\cite{alayrac2022flamingo}, Otter~\cite{li2023otter}, mPLUG-Owl3~\cite{ye2024mplugowl3}, IDEFICS~\cite{laurencon2023idefics}, and LLama 3-V~\cite{grattafiori2024llama3v}. Broadly, these models follow the architecture illustrated in Figure~\ref{fig:mllm-architecture}. They include a visual encoder, a projection layer, and an LLM. Cross-attention layers are interleaved between the layers of the LLM. Language inputs are fed directly into the LLM and the resulting intermediate representations are passed to the cross-attention layers as $x$. Visual inputs are processed by the visual encoder and the projection layer to produce visual tokens, which are then passed to the cross-attention layers as $y$, enabling the incorporation of visual information.
+
+\textbf{Challenges with Large Visual Inputs} 
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{figures/runtime_breakdown.pdf}
+    \caption{Runtime breakdown for a single iteration of mPLUG-Owl-7b and OpenFlamingo-3b with Ring Attention and LV-XAttn on 16 A100 GPUs. mPLUG-Owl-7b has 4 cross-attention layers distributed across its 28 LM blocks, while OpenFlamingo-3b inserts 1 cross-attention layer after each of its 24 LM blocks. LV-XAttn reduces the time spent on cross-attention computation by 93\% for mPLUG-Owl-7b and by 53\% for OpenFlamingo-3b, compared to Ring Attention.}
+    \label{fig:runtime_breakdown}
+    \vspace{-1ex}
+\end{figure}
+When applied to scenarios with large visual inputs, cross-attention requires significant memory resources and hence present a scaling challenge. The standard implementation of attention involves materializing the matrix product $QK^T \in \mathbb{R}^{S_Q \times S_{KV}}$, resulting in memory complexity that scales with the product of text sequence and the visual sequence length. The large amount of visual tokens from long videos inputs thus causes a memory bottleneck. For example, in mPLUG-Owl3, an hour-long video sampled at 1 fps is encoded to a visual input with more than 2 million tokens. 
+
+While memory-efficient methods like Flash Attention~\cite{dao2022fa, dao2023fa2} reduce the memory footprint of attention operations to enable handling longer context lengths, the amount of memory required still often surpasses the capacity of a single worker. For example, processing an hour-long video with a language input of 4096 tokens in mPLUG-Owl3 demands 298 GB of memory for the cross-attention operation, even with Flash Attention.
+
+To handle large visual inputs, distributed attention approaches have been proposed. These methods can be categorized into two classes: head-parallelism and sequence-parallelism. Head-parallelism methods such as Deepspeed-Ulysses~\cite{jacobs2024ds} and Megatron-LM~\cite{korthikanti2023megatron-lm} distribute the computation of different attention heads across multiple workers. However, their scalability is limited by the number of attention heads, which imposes an upper bound on memory capacity and thus maximum sequence length.
+
+To overcome this limitation, sequence-parallelism methods such as Ring Attention~\cite{liu2024ring} propose distributing the attention operation across multiple workers along the sequence dimension. Specifically, with $n$ workers, each worker $i$ is responsible for storing one block of query, key and value $Q_i\in \mathbb{R}^{\frac{S_{Q}}{n} \times d}, K_i \in \mathbb{R}^{\frac{S_{KV}}{n} \times d}, V_i \in \mathbb{R}^{\frac{S_{KV}}{n} \times d}$ and computing the attention block $O_i \in \mathbb{R}^{\frac{S_Q}{n} \times d}$. Computation of $O_i$ can be decomposed to
+\begin{equation*} \label{eqn:ring-attn}
+  O_i = \text{softmax}(\frac{Q_i[K_0, ..., K_{n-1}]^T}{\sqrt{d}})[V_0, .., V_{n-1}]
+\end{equation*}
+$O_i$ is computed iteratively by transmitting key-value blocks among workers in a ring-like fashion. To facilitate the block-wise computation of $O_i$, worker $i$ has to maintain necessary softmax statistics $m_i \in \mathbb{R}^{\frac{S_Q}{n}}$ and $l_i \in \mathbb{R}^{\frac{S_Q}{n}}$. During round $r$, worker $i$ computes partial attention using the blocks $Q_i$, $K_{(i-r) \mod n}$, and $V_{(i-r) \mod n}$ and updates $O_i, m_i$ and $l_i$. The key-value block is then sent to worker $i+1$ while a new key-value block is received from worker $i-1$.
+
+While Ring Attention can be used to distribute the cross-attention operation, the presence of large key-value blocks makes Ring Attention communication-bound, resulting in highly inefficient cross-attention operations. As illustrated in Figure~\ref{fig:runtime_breakdown}, despite comprising only 2\% of the total parameters, cross-attention operations can account for up to 87\% of the iteration time when using Ring Attention.
+
+
+
+
+
+% % In the next iteration, worker $i$ computes partial attention with blocks $Q_i$, $K_{j-1}$ and $V_{j-1}$. As long as the communication of the key-value blocks is fully overlapped with the attention computation, Ring Attention incurs no communication overhead.
+
+% \subsection{Cross-Attention in Multimodal Large Language Models}
+% \textbf{Cross Attention} As LLMs continue to evolve, researchers are investigating the incorporation of vision and other modalities into these models. One common way is to embed cross-attention layers into the language model. In cross-attention, the input consists of two sequences from different modalities: $x \in \mathbb{R}^{S_Q \times d_{\text{embed}}}$ and $y \in \mathbb{R}^{S_{KV} \times d_{\text{embed}}}$, where $S_Q$ and $S_{KV}$ denote the sequence lengths of $x$ and $y$, respectively. The query matrix $Q \in \mathbb{R}^{S_Q \times d}$ is derived from $x$, while the key matrix $K \in \mathbb{R}^{S_{KV} \times d}$ and the value matrix $V \in \mathbb{R}^{S_{KV} \times d}$ are obtained from $y$. The attention output $O \in \mathbb{R}^{S_Q \times d}$ is then calculated in the same manner as in Equation~\ref{eqn:attn}.
+
+
+
+
+% % \textbf{Extending to Long Context: Ring Attention (or maybe just talk about techniques for long context including head parallelism?}
+% % \begin{itemize}
+% %     \item to process longer visual inputs, need more memory
+% %     \item talk about ring attention. partition k, v
+% %     \item talk about imbalance of q and kv, using real world dataset like MMIU and Video-MMeE. this causes non-overlap of comp and comm
+% % \end{itemize}

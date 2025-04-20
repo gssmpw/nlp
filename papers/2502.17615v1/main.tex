@@ -1,0 +1,930 @@
+\documentclass{article}
+
+%%% ready for submission %%%
+\usepackage[final]{cpal_2025}
+
+\input{math_commands}
+
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{amsthm,amsmath,amssymb,bm}
+\usepackage{algorithm, algpseudocode}
+\usepackage{enumitem}
+\usepackage{wrapfig}
+\usepackage{xfrac}
+\usepackage{subcaption}
+\usepackage{color}
+
+\newcommand{\evec}{\texttt{Top1}}
+
+\newtheorem{defin}{Definition}
+\newtheorem{theorem}{Theorem}
+\newtheorem{corollary}{Corollary}
+\newtheorem{lemma}{Lemma}
+\newtheorem{prop}{Proposition}
+\newtheorem{asump}{Assumption}
+\newtheorem{property}{Property}
+\newtheorem{cond}{Condition}
+\newtheorem{hypo}{Hypothesis}
+
+\newcommand{\calF}{\mathcal{F}}
+
+\algblock{ParFor}{EndParFor}
+% customising the new block
+\algnewcommand\algorithmicparfor{\textbf{parfor}}
+\algnewcommand\algorithmicpardo{\textbf{do}}
+\algnewcommand\algorithmicendparfor{\textbf{end\ parfor}}
+\algrenewtext{ParFor}[1]{\algorithmicparfor\ #1\ \algorithmicpardo}
+\algrenewtext{EndParFor}{\algorithmicendparfor}
+
+%%% to compile a preprint version, e.g., for submission to arXiv, add the [preprint] option %%%
+%\usepackage[preprint]{cpal_2025}
+
+%%% to compile a camera-ready version, add the [final] option %%%
+%\usepackage[final]{cpal_2025}
+
+
+%add packages
+\usepackage{url}
+
+\title{Provable Model-Parallel Distributed Principal Component Analysis with Parallel Deflation}
+
+
+\author{%
+  Fangshuo Liao\textsuperscript{1}, ~Wenyi Su\textsuperscript{1}, ~Anastasios Kyrillidis\textsuperscript{1}\\
+  \textsuperscript{1}Computer Science Department, Rice University\\
+  \texttt{\{Fangshuo.Liao,bs82,anastasios\}@rice.edu}
+}
+
+\begin{document}
+
+
+\maketitle
+
+
+\begin{abstract}
+We study a distributed Principal Component Analysis (PCA) framework where each worker targets a distinct eigenvector and refines its solution by updating from intermediate solutions provided by peers deemed as ``superior''. 
+Drawing intuition from the deflation method in centralized eigenvalue problems, our approach breaks the sequential dependency in the deflation steps and allows asynchronous updates of workers, while incurring only a small communication cost. 
+To our knowledge, a gap in the literature -- \textit{the theoretical underpinning of such distributed, dynamic interactions among workers} -- has remained unaddressed.
+This paper offers a theoretical analysis explaining why, how, and when these intermediate, hierarchical updates lead to practical and provable convergence in distributed environments. 
+Despite being a theoretical work, our prototype implementation demonstrates that such a distributed PCA algorithm converges effectively and in scalable way: 
+through experiments, our proposed framework offers comparable performance to EigenGame-$\mu$, the state-of-the-art model-parallel PCA solver.
+\end{abstract}
+
+
+\vspace{-0.1cm}
+\section{Introduction}
+\vspace{-0.1cm}
+Currently, datasets have gotten large, encompassing billions, if not trillions, of entries spanning various domains \cite{zhong_2019_publaynet, liu_2023_largest, penedo2024fineweb, dolma, wangDiffusionDBLargescalePrompt2022, schuhmann2022laion, raffel2020exploring, penedo2024refinedweb, xue2020mt5, abadji2022towards}. 
+This scale advanced various distributed optimization protocols, such as federated learning \cite{brendan_2016_communicationefficient}, and, notably, the development of multiple distributed ML software packages \cite{kim_optional, dean2012large}. 
+Specialized frameworks such as Ray \cite{liang_2018_rllib}, Spark \cite{meng2016mllib}, Hadoop \cite{hadoop}, and JAX \cite{jax2018github} have become popular due to their ability to speed computations significantly. 
+
+However, at the algorithmic level, most distributed implementations simulate the behavior of the centralized versions of the underlying algorithms. 
+That is, how distributed algorithms navigate the parameter landscape is often designed such that we achieve a similar outcome as if data is available in one location. There are a few key reasons for this: \vspace{-.2cm}
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Mathematical Understanding}: When there is sufficient theoretical understanding of the centralized version, it is often a desired goal to attain the same result by designing algorithms to emulate the centralized counterparts. This ensures consistency and theoretical understanding. \vspace{-.1cm}
+    \item \textbf{Algorithm Simplicity}: Since centralized algorithms are better understood, distributed variants that replicate the algorithms' outcomes enjoy the same simplicity and interpretation. \vspace{-.1cm}
+    \item \textbf{Benchmarking}: By simulating the centralized execution, comparing the accuracy and convergence properties of the distributed implementation in practice becomes easier.  \vspace{-.15cm}
+\end{itemize}
+Yet, precisely simulating centralized algorithms in a distributed fashion could pose some challenges.
+Take as a characteristic feature the notion of \textit{synchrony} in distributed implementations, as this leads to training dynamics closer to centralized training. 
+Synchronization among workers means proper orchestration \cite{zeng_2024_a, tan_2022_adaptive}:
+Synchronized implementations that wait for some or all workers to finish each iteration before proceeding can suffer from stragglers and load imbalance \cite{wang_2023_fluid, ambati_2019_understanding}.
+Yet, while asynchronous motions seem like a favorable alternative, developing an asynchronous learning method is often complicated \cite{stripelis_2022_semisynchronous, tyagi_2023_accelerating, huba2022papaya}, set aside the lack of theoretical understanding in many cases.
+
+This work addresses a fundamental question in distributed systems: whether and how to orchestrate workers, by focusing on a specific problem - Principal Component Analysis (PCA) \cite{pearson1901liii, hotelling1933analysis, wold_1987_principal, majumdar2009image, wang2013sparse, d2007direct, jiang2011anomaly, zou2006sparse}. While PCA is conceptually straightforward, developing efficient distributed implementations remains an active research challenge, recently reinvigorated by the introduction of EigenGame \cite{gemp_2020_eigengame, gemp2022eigengame}.
+EigenGame departs from traditional data-parallel approaches to distributed PCA, where each worker processes a portion of the data or covariance matrix. Instead, it introduces a model-parallel framework inspired by game theory, where each worker computes specific principal components. This novel approach enables PCA computation on massive datasets, as demonstrated with the Meena conversation model and ResNet-200 \cite{he2015deep} activations on ImageNet \cite{imagenet2009deng}.
+However, EigenGame's theoretical guarantees rely on a strict hierarchical structure: each worker handles exactly one component and must wait for the convergence of higher-priority principal components (those with larger eigenvalues) before proceeding. While effective, this hierarchical dependency has theoretical limitations, as the impact of approximation errors in higher-ranked eigencomponents on subsequent calculations remains uncharacterized in \cite{gemp_2020_eigengame}.
+
+\textbf{Our approach and contributions.} 
+This work advances model-parallel distributed PCA by building upon the collaborative computation framework introduced by \cite{gemp_2020_eigengame,gemp2022eigengame}. Our approach proposes a provable parallel computation of principal components without imposing strict sequential dependencies among workers. Our primary contributions are:
+\vspace{-0.2cm}
+\begin{itemize}[leftmargin=*]
+    \item We introduce a distributed PCA framework that fundamentally transforms computational dynamics. Different from traditional sequential computational model, Our approach enables multiple workers to compute distinct principal components in parallel.\vspace{-0.1cm}
+    \item In cases where the covariance is unknown or cannot be efficiently estimated, our algorithm can be modified to accommodate data that comes in mini-batches.\vspace{-0.1cm}
+    \item We provide theory that validates the convergence properties of our proposed algorithm. By formalizing the interaction between parallel computations and convergence rates, we establish a theoretical benchmark for distributed PCA algorithms. This contribution underscores our algorithm's efficiency and enhances the understanding of parallel deflation processes in PCA. \vspace{-0.1cm}
+    \item Through experiments, we demonstrate the practical efficacy of our algorithm. Our approach meets the performance of existing algorithms on datasets as large as ImageNet \cite{imagenet2009deng}, justifying our theory and highlighting the applicability of our method. \vspace{-0.2cm}
+\end{itemize}
+
+\subsection{Related Works}
+\vspace{-0.2cm}
+\noindent \textbf{Eigenvector-based approaches.} PCA has been fundamental to statistical data analysis since its introduction by Pearson in 1901 [cite]. The method was later formalized within a multivariate analysis framework by Hotelling \cite{hotelling1933analysis}, establishing its theoretical foundations. In its classical form, PCA involves computing an empirical covariance matrix from the data, followed by its eigendecomposition. This formulation allows the application of numerous efficient numerical methods, including QR decomposition \cite{golub1996matrix}, xLAHQR \cite{dhillon2000xlahqr}, the Lanczos method \cite{lanczos1950iteration}, and ARPACK \cite{lehoucq1998arpack}, some of which are implemented in numerical linear algebra packages such as ScaLAPACK \cite{scalapack1997}. 
+These methods are effective but often require complete knowledge of the covariance matrix prior to computation.
+
+\noindent\textbf{Centralized stochastic approaches.} With large datasets, iterative and gradient-based methods for PCA have gained prominence.
+Krasulina and Oja \& Karhunen proposed two of the earliest stochastic gradient descent methods for online PCA \cite{krasulina1969method, oja1985stochastic}. 
+The application of the
+least square minimization to the PCA has also received attention \cite{miao1998fast, yang1995projection, bannour1995principal, kung1994adaptive}.
+More recently, \cite{arora2012stochastic} and \cite{shamir2015stochastic} have proposed efficient stochastic optimization methods that adapt to the streaming model of data (stochastic) and focus on the theoretical guarantees of gradient-based methods in such non-convex scenarios; see also \cite{boutsidis2014online, garber2015online, shamir2016fast, kim2020stochastic}.
+Other approaches include manifold methods \cite{demidovich2024streamlining, chen2024sequential, wang2023incremental, absil2008optimization}, Frank-Wolfe methods \cite{beznosikov2023sarah}, Gauss-Newton methods \cite{zhou2023stochastic}, coordinate descent methods \cite{lei2016coordinate}, accelerated methods \cite{xu2018accelerated}, as well as variants of the PCA problem itself \cite{journee2010generalized, yuan2013truncated, han2014scale, kim2019simple, kim2019scale}.
+Nevertheless, these methods are primarily designed as centralized algorithms.
+
+\noindent \textbf{Data-parallel distributed approaches.}
+Prior distributed PCA approaches span several key directions. One line of work utilizes randomized linear algebra and SVD projections in distributed settings, yielding strong theoretical guarantees \cite{kannan2014principal, liang2014improved, boutsidis2016optimal, fan2019distributed}. For distributed subspace computation, recent methods combine FedAvg with Orthogonal Procrustes Transformations \cite{li2021communication,mcmahan2017communication,schonemann1966generalized, cape2020orthogonal}. Approaches for computing leading principal components leverage both convex \cite{garber2017communication} and Riemannian optimization for improved efficiency \cite{huang2020communication,alimisis2021distributed}. Notable recent advances include an asynchronous Riemannian gradient method that achieves low computational and communication costs \cite{wang2023incremental}. The field has also expanded to address specialized scenarios, including Byzantine-robust computation \cite{charisopoulos2022communication, zari2022membership}, streaming data analysis \cite{allen2017first, yu2017single}, shift-and-invert preconditioning \cite{garber2016faster}, and coreset-based approaches \cite{feldman2020turning}.
+
+\textbf{Model-parallel distributed approaches.} While most prior work focuses on data-parallel approaches, where each machine computes all principal components using local data, DeepMind's EigenGame \cite{gemp_2020_eigengame} introduced a novel model-parallel framework. Their approach reformulates PCA as a collaborative game, where each principal component computation acts as a player maximizing its utility through Riemannian gradient ascent. Though initially presented as a sequential process with proved convergence guarantees, EigenGame extends to a distributed setting where components are optimized simultaneously across machines. While this parallel extension offers practical benefits, its theoretical convergence properties remain unanalyzed, a limitation that persists in subsequent improvements \cite{gemp2022eigengame}.
+
+Our work complements existing literature mostly theoretically, but also practically. By eliminating the requirement for sequential completion of principal components, our algorithmic framework achieves comparable empirical performance to EigenGame \cite{gemp_2020_eigengame} on large-scale datasets. Crucially, we establish rigorous convergence guarantees for parallel computation, providing the theoretical foundation that has been missing in existing model-parallel approaches.
+
+\vspace{-0.1cm}
+\section{Problem statement and background}
+\vspace{-.2cm}
+Let $\bfY\in\R^{n\times d}$ be the matrix representing an aggregation of $n$ properly scaled, centered data points, each with $d$ features. The empirical covariance matrix is given by $\bm{\Sigma} = \bfY^\top\bfY\in\R^{d\times d}$. Let $\bfu_k^\star$ and $\lambda_k^\star$ be the $k$th eigenvector and eigenvalue of $\bm{\Sigma}$, with $\lambda_1^\star\geq \dots\geq \lambda_d^\star$. Then $\bfu_k^\star$ is the $k$th principal component of the data matrix $\bfY$. Therefore, when $\bm{\Sigma}$ can be easily computed, principal component analysis aims at finding the top-$K$ eigenvectors of the empirical covariance matrix $\bm{\Sigma}$, where $K \leq d$.
+
+\textbf{The leading eigenvector problem.} Finding the leading eigenvector is the cornerstone of finding multiple eigenvectors, and is thus utilized by many PCA algorithms. Mathematically, the problem of finding the leading eigenvector $\bfu_1^\star$ can be formulated as the following optimization problem: \vspace{-0.2cm}
+\begin{align}
+    \label{eq:top1_evec}
+    \bfu_1^\star  = 
+    \underset{\substack{ \mathbf{v} \in  \mathbb{R}^d: \|\mathbf{v}\|_2 = 1 \\} }{\arg\max}
+    \mathbf{v}^{\top} \boldsymbol{\Sigma} \mathbf{v}. \\[-15pt] \nonumber
+\end{align}
+In practice, algorithms like power iteration and Hebb's rule are used to solve the leading eigenvector.
+\begin{defin}[Power Iteration]
+    \label{def:power_iter}
+    The power iteration algorithm ${\normalfont \texttt{PowIter}}\paren{\bm{\Sigma},\bfv, T}$ outputs a vector $\bfx_T$ based on the following iterates: % with $\bfx_0 = \bfv$
+    \vspace{-0.2cm}
+    \begin{gather*}
+        \bfx_0 = \bfv;\quad \hat{\bfx}_{t+1} = \bm{\Sigma}\bfx_t; \quad 
+        \bfx_{t+1} = \hat{\bfx}_{t+1} /\norm{\hat{\bfx}_{t+1}}_2.
+    \end{gather*}
+\end{defin}
+\begin{defin}[Hebb's Rule]
+    \label{def:hebb_rule}
+    The Hebb's Rule ${\normalfont \texttt{Hebb}}\paren{\bm{\Sigma},\bfv, T}$ with some fixed step size $\eta$ outputs a vector $\bfx_T$ based on the following iterates: % with $\bfx_0 = \bfv$
+    \begin{gather*}
+        \bfx_0 = \bfv;\quad \hat{\bfx}_{t+1} = \bfx_t + \eta \bm{\Sigma}\bfx_t; \quad 
+        \bfx_{t+1} = \hat{\bfx}_{t+1} /\norm{\hat{\bfx}_{t+1}}_2.
+    \end{gather*}
+    \vspace{-0.7cm}
+\end{defin}
+Under mild assumptions, the output $\bfx_T$ of both the power iteration and Hebb's rule converges to the top eigenvector of the input matrix $\bm{\Sigma}$, as the number of steps $T\rightarrow\infty$. 
+Notably, the power iteration enjoys a linear convergence rate \cite{shamir2015stochastic}.
+
+\textbf{Top-$K$ eigenvector using sequential deflation.} An extension of (\ref{eq:top1_evec}) is the top-$K$ eigenvector problem, where one aims to find $\bfu_1^\star,\dots\bfu_K^\star$. 
+Since $\bfu_1^\star,\dots,\bfu_K^\star$ form an orthonormal set, finding the top-$K$ eigenvector can be mathematically formulated as: \vspace{-0.15cm}
+\begin{equation}
+    \label{eq:top_k_evec}
+    \bfU^\star = [\bfu_1^\star,\dots,\bfu_K^\star] \in \underset{\bfV\in\{\bfQ_{:,:K}:\;\bfQ\in\text{SO}(d)\}}{\arg\max}
+    \left\langle \boldsymbol{\Sigma} \mathbf{V}, \mathbf{V} \right \rangle, 
+\end{equation}
+where $\text{SO}(d)$ denotes the group of rotations about a fixed point in $d$-dimensional Euclidean space. 
+A classical way to solve (\ref{eq:top_k_evec}) is through \textit{deflation} \cite{hotelling1933analysis}.
+Deflation operates in the following manner. Once the top component $\mathbf{u}_1^\star$ is approximated, the matrix $\bm{\Sigma}$ undergoes further processing to reside in the subspace orthogonal to the one spanned by the first eigenvector. This process is iterated by finding the leading eigenvector as in \eqref{eq:top1_evec} on the deflated matrix, resulting in an approximation of the second component $\mathbf{u}_2^\star$, and so forth, as described below:
+\begin{gather}
+    \label{eq:deflation}
+    \bm{\Sigma}_1 = \bm{\Sigma};\quad \bfv_k = \evec\paren{\bm{\Sigma}_k, \hat{\bfv}_k, T}; \nonumber \\
+    \bm{\Sigma}_{k+1} = \bm{\Sigma}_k - \bfv_k\bfv_k^\top\bm{\Sigma}_k\bfv_k\bfv_k^\top,    
+\end{gather}
+where $\evec\paren{\bm{\Sigma}_k, \hat{\bfv}_k, T}$ abstractly denotes any iterative algorithm initialized at $\hat{\bfv}_k$ and returns a normalized approximation of the top eigenvector of the deflated matrix $\bm{\Sigma}_k$ after $T$ iterations of execution. Consider the eigendecomposition $\bm{\Sigma} = \sum_{k'=1}^d\lambda_{k'}^\star\bfu_{k'}^\star\bfu_{k'}^{\star\top}$. When $T\rightarrow\infty$ and $\evec\paren{\bm{\Sigma}_k, \hat{\bfv}_k, T}$ solves the top eigenvector of $\bm{\Sigma}$ exactly, one can show that $\bm{\Sigma}_k = \sum_{k'=k}^d\lambda_{k'}^\star\bfu_{k'}^\star\bfu_{k'}^{\star\top}$ and $\bfv_k = \bfu_k^\star$. However, when $T$ is finite, it is shown in \cite{liao2023errorpropagation} that each $\evec\paren{\bm{\Sigma}_k, \hat{\bfv}_k, T}$ produces a non-negligible error that accumulates and propagates through the deflation process.
+
+\textbf{Stochastic algorithm to find top-1 principal component.} When the dataset becomes large, the covariance matrix $\bm{\Sigma}$ may not be efficiently computed, making the previous routine of first computing the covariance matrix and then its eigenvector infeasible. Alternatively, people estimate $\bm{\Sigma}$ with $\hat{\bm{\Sigma}} = \hat{\bfY}^\top\hat{\bfY}$, where $\hat{\bfY}$ is a mini-batch of the dataset. In this case, Hebb's rule can be written as
+\[
+    \hat{\bfx}_{t+1} = \bfx_t + \eta \hat{\bfY}^\top\paren{\hat{\bfY}\bfx_t}; \bfx_{t+1} = \hat{\bfx}_{t+1} / \norm{\hat{\bfx}_{t+1}}_2
+\]
+Notice that the stochastic estimate of the covariance matrix $\hat{\bm{\Sigma}}$ is never explicitly computed.
+
+\section{The Parallel Deflation Algorithm}
+\label{sec:algorithm}
+\begin{wrapfigure}{r}{0.52\textwidth}
+    \vspace{-0.8cm}
+    \begin{minipage}{0.52\textwidth}
+        \begin{algorithm}[H]
+            \caption{Parallel Deflation}
+            \label{alg:parallel_deflation}
+            \begin{algorithmic}[1]
+                \Require $\bm{\Sigma}\in\R^{d\times d}$; \# of workers $K$; sub-routine for top eigenvector $\texttt{PCA}(\cdot,\cdot,\cdot)$; \# of iterations $T$; global communication rounds $L\geq K$.
+                \Ensure Approximate eigenvectors $\left\{\bfv_k\right\}_{k=1}^K$.
+                \For{$k=1,\dots, K$}
+                    \State Randomly initialize $\hat{\bfv}_{k,\texttt{init}}$ with unit norm;
+                \EndFor 
+                \For{$\ell=1,\dots, L$}
+                    \ParFor{$k =1,\dots, K$}
+                        \If{$k\leq \ell$}
+                            \State \text{Receive $\bfv_{1,\ell-1},\dots,\bfv_{k-1,\ell-1}$}
+                            \State $\bm{\Delta}_{k',\ell} = \bfv_{k',\ell-1}\bfv_{k',\ell-1}^\top\bm{\Sigma}\bfv_{k',\ell-1}\bfv_{k',\ell-1}^\top$
+                            \State $\bm{\Sigma}_{k,\ell} = \bm{\Sigma} - \sum_{k'=1}^{k-1}\bm{\Delta}_{k',\ell}$
+                            \State $\bfv_{k,\ell} \leftarrow \texttt{Top1}\paren{\bm{\Sigma}_{k,\ell},\bfv_{k,\ell-1},  T}$
+                            \State \text{Broadcast $\bfv_{k,\ell}$}
+                        \Else
+                            \State $\bfv_{k,\ell} := \hat{\bfv}_{k,\texttt{init}}$;
+                        \EndIf
+                    \EndParFor
+                \EndFor
+                \State\textbf{return} $\left\{\bfv_{k,L}\right\}_{k=1}^K$
+            \end{algorithmic} 
+        \end{algorithm}
+    \end{minipage}
+    \vspace{-0.5cm}
+\end{wrapfigure} 
+\textbf{Algorithm overview.}
+Our framework distributes the computation of $K$ principal components across $K$ distinct workers, where worker $k$ is responsible for computing the $k$-th principal component. Our innovation lies in reformulating the traditional deflation process for distributed settings. The conventional sequential deflation requires the $k$-th eigenvector computation to wait for the completion of all previous $k-1$ eigenvectors, creating a strict dependency chain that inhibits parallelization. We overcome this limitation through an iterative two-phase approach:
+
+--\textit{Initial Estimation}: Each worker $k$ computes an approximate version of the $k$-th deflated matrix using preliminary estimates of the first $k-1$ eigenvectors from other workers.
+
+--\textit{Iterative Refinement}: Workers computing the first $k-1$ eigenvectors continuously provide updated estimates to worker $k$, enabling progressive refinement of the deflated matrix and the $k$-th eigenvector estimation.
+
+This parallel approach eliminates the need for worker $k$ to wait for the complete convergence of the first $k-1$ eigenvectors before beginning its computation. The complete specification of our parallel deflation algorithm is presented in Algorithm~\ref{alg:parallel_deflation}. We detail the explanation below:
+
+The computation process is divided into $L$ communication rounds (\textbf{Line 4}). 
+In the $\ell$th communication round, the $k$th worker will compute an approximation of the $k$th principal component $\bfv_{k,\ell}$ by running their own sub-routine in parallel, following the rule that the $k$th worker only deflates its matrix and starts computing the $k$th principal component after the first $k-1$ workers have computed some rough estimation of the first $k-1$ principal components (\textbf{Lines 7-10}). 
+Therefore, in the $\ell$th communication round, there can be two scenarios for worker $k$: $i)$ if $\ell < k$, this means that not all of the first $k-1$ workers have computed some approximation of their own principal component.
+Therefore, worker $k$ does not deflate the matrix and output $\bfv_{k,\ell} = \hat{\bfv}_{k,\texttt{init}}$; $ii)$ If $\ell \geq k$, then the first $k-1$ workers have at least computed one approximation of their own principal component. 
+In this case, worker $k$ deflates the matrix using the most updated vectors $\bfv_{1,\ell-1},\dots\bfv_{k-1,\ell-1}$ (\textbf{Line 7}), compute its approximation of the $k$th principal component by calling the $\texttt{Top1}\paren{\cdot}$ on the deflated matrix starting from its output in the previous communication round (\textbf{Line 10}), and then broadcast the current approximation to the other workers for the next communication round (\textbf{Line 11}). 
+An illustration of the algorithm is given in Figure~\ref{fig:diagram}.
+
+\begin{wrapfigure}{l}{0.45\textwidth}
+    \vspace{-0.8cm}
+    \begin{minipage}{0.45\textwidth}
+        \hspace{-0.4cm}\includegraphics[width=1.1\textwidth]{ParallelDeflationDiagram.pdf}
+    \end{minipage}
+    \caption{Illustration of the parallel deflation algorithm.}
+    \label{fig:diagram}
+    \vspace{-0.8cm}
+\end{wrapfigure}
+\textbf{Extension to Stochastic PCA.}
+The algorithm described above can be applied to the case where the covariance matrix is either known or can be efficiently estimated. However, in many machine learning scenarios, the covariance matrix may not be direcly accessible. For instance, when data drawn from an underlying distribution comes in a streaming fashion \cite{allen2017first}, the traditional approach of first estimating the covariance matrix and then solves for its eigenvector is no longer efficient. Moreover, for large datasets that contains hundreds of thousands of features, it is impossible to compute or even store the covariance matrix \cite{gemp2022eigengame,gemp_2020_eigengame}. In these cases, our algorithm can be adapted to estimate the principal components in a stochastic fashion.
+
+Let $\hat{\bfY}$ denote the mini-batch that the algorithm receives in the $t$th iteration. Starting from \textbf{Line 8}, whose major computation burden is on $\bfv_{k',\ell-1}^\top\bm{\Sigma}\bfv_{k',\ell-1}$, we notice that the covariance matrix is estimated as $\bm{\Sigma}\approx \hat{\bm{\Sigma}} = \hat{\bfY}^\top\hat{\bfY}$. In this case, we have: \vspace{-0.1cm}
+\begin{align*}
+    \bfv_{k',\ell-1}^\top\hat{\bm{\Sigma}}\bfv_{k',\ell-1} & = \bfv_{k',\ell-1}^\top\hat{\bfY}^\top\hat{\bfY}\bfv_{k',\ell-1}\\
+    & = \|\hat{\bfY}\bfv_{k',\ell-1}\|_2^2.
+\end{align*}
+Therefore, each $\bm{\Delta}_{k',\ell}$ in Algorithm~\ref{alg:parallel_deflation} can be written as $\bm{\Delta}_{k',\ell} = \|\hat{\bfY}\bfv_{k',\ell-1}\|_2^2\bfv_{k',\ell-1}\bfv_{k',\ell-1}^\top$. Thus, \textbf{Line 9} becomes: \vspace{-0.2cm}
+\begin{align*}
+    \bm{\Sigma}_{k,\ell} \approx\hat{\bm{\Sigma}_k} = \hat{\bfY}^\top\hat{\bfY} - \sum_{k'=1}^{k-1}\|\hat{\bfY}\bfv_{k',\ell-1}\|_2^2\bfv_{k',\ell-1}\bfv_{k',\ell-1}^\top. \\[-15pt] \nonumber
+\end{align*}
+This new form of $\bm{\Sigma}_{k,\ell}$ allows an efficient estimation of the matrix-vector product $\bm{\Sigma}_{k,\ell}\bfx$, as in: \vspace{-0.2cm}
+\begin{align}
+    \hat{\lambda}_{k'} & = \|\hat{\bfY}\bfv_{k'}\|_2^2;\quad \forall k'\in[k-1]\label{eq:compute_lambda_est}; \quad 
+    \bm{\Sigma}_{k,\ell}\bfx = \hat{\bfY}^\top\hat{\bfY}\bfx_t - \sum_{k'=1}^{k-1}\hat{\lambda}_{k'}\paren{\bfv_{k',\ell-1}^\top\bfx_t}\cdot \bfv_{k',\ell-1}. \\[-20pt] \nonumber
+\end{align}
+In the current form of Algorithm~\ref{alg:parallel_deflation}, the computation of \textbf{Lines 8-9} takes $O\paren{Kd^2}$ time. 
+Moreover, when calling the $\texttt{Top1}$ function in \textbf{Lines 10}, any matrix-vector multiplication $\bm{\Sigma}_{k,\ell}\bfx$ will take $O\paren{d^2}$ time. Notice that in (\ref{eq:compute_lambda_est}), the complexity of computing each $\bfY\bfv_{k'}$ is $O\paren{nd}$. Thus computing $\hat{\lambda}_{k'}$ takes $O\paren{nd}$. In total,(\ref{eq:compute_lambda_est}) 
+has a complexity of $O\paren{Knd}$. In (\ref{eq:compute_lambda_est}), computing the first term $\hat{\bfY}^\top\hat{\bfY}\bfx$ involves computing first $\bfy_t = \hat{\bfY}\bfx_t$, which takes $O\paren{nd}$, and then $\hat{\bfY}^\top\bfy_t$, which also takes $O\paren{nd}$. Thus, computing the first term $\hat{\bfY}^\top\hat{\bfY}\bfx_t$ takes $O\paren{nd}$ in total. For the second term, each summand takes $O(d)$ to compute, giving the complexity of computing the second term as $O\paren{kd}$. Therefore, each iteration of (\ref{eq:compute_lambda_est}) takes $O\paren{(n+k)d}$. This implies a saving in the computation cost, since in this case, $n$ is the batch size and can be much smaller than $d$. The complete algorithm in the stochastic setting is given in Algorithm~\ref{alg:sto_para_defl} in the Appendix.
+
+\textbf{Communication Analysis:}
+Let $C_{\text{comm}}$ be the time for one all-reduce operation across workers. The total communication cost per iteration is:
+\begin{equation}
+    T_{\text{comm}} = \frac{1}{2} K(K-1) C_{\text{comm}} \cdot d
+\end{equation}
+For high-latency environments,  $C_{\text{comm}}$ can be large, resulting in a larger communication cost. In this case, one could use a larger $T$, leading to a smaller communication cost (see Appendix \ref{sec:ablation}). Additionally, we should notice that the communication can happen in parallel as the local computation of the eigenvectors. From this perspective, our algorithm also has the potential to be extended to an asynchronous version, where the eigenvectors are updated asynchronously, resulting in a non-blocking computation on each worker.
+
+\textbf{Connection with EigenGame.} The EigenGame \cite{gemp_2020_eigengame} considers the problem of solving the top-$K$ eigenvectors of a matrix as a game between $K$ players, with the $k$th player solving $\bfv_k$ by maximizing its utility: $\bfv_k = \arg\max_{\bfv:\norm{\bfv}_2=1}\mathcal{U}_k\paren{\bfv\mid \bfv_1,\dots\bfv_{k-1}}$, where: \vspace{-0.2cm}
+\begin{align}
+    \label{eq:eiggame_util}
+    \mathcal{U}_k\paren{\bfv\mid \left\{\bfv_{k'}\right\}_{k'=1}^{k-1}} = \bfv^\top\bm{\Sigma}\bfv - \sum_{k'=1}^{k-1}\frac{\paren{\bfv_{k'}^\top\bm{\Sigma}\bfv}^2}{\bfv_{k'}^\top\bm{\Sigma}\bfv_{k'}}. \\[-15pt] \nonumber
+\end{align}
+Similarly, the deflation algorithm in (\ref{eq:deflation}) also bears a game formulation, where the utility of the $k$th player is given by: \vspace{-0.15cm}
+\begin{small}
+\begin{align}
+    \label{eq:deflation_util}
+    \mathcal{V}_k\paren{\bfv\mid \left\{\bfv_{k'}\right\}_{k'=1}^{k-1}} = \bfv^\top\paren{\bm{\Sigma} - \sum_{k'=1}^{k-1}\bfv_{k'}\bfv_{k'}^\top\bm{\Sigma}\bfv_{k'}\bfv_{k'}^\top}\bfv = \bfv^\top\bm{\Sigma}\bfv - \sum_{k'=1}^{k-1}\bfv_{k'}^\top\bm{\Sigma}\bfv_{k'}\cdot\paren{\bfv_{k'}^\top\bfv}^2. \\[-15pt] \nonumber
+\end{align}
+\end{small}
+It should be noted that both the EigenGame utility $\mathcal{U}_k$ and the deflation utility $\mathcal{V}_k$ depend on only the policy of the first $k-1$ players. Moreover, when the first $k-1$ players recovers the top-$(k-1)$ eigenvectors exactly, we shall have: \vspace{-0.2cm}
+\begin{align*}
+    \mathcal{V}_k\paren{\bfv\mid \left\{\bfu_{k'}^\star\right\}_{k'=1}^{k-1}} = \bfv^\top\bm{\Sigma}\bfv - \sum_{k'=1}^{k-1}\lambda_{k'}^\star\paren{\bfv^\top\bfu_{k'}^\star}^2 = \mathcal{U}_k\paren{\bfv\mid \left\{\bfu_{k'}^\star\right\}_{k'=1}^{k-1}}. \\[-15pt]\vspace{-0.1cm}
+\end{align*}
+To this end, we can also show that the set of true eigenvectors $\{\bfu_k^\star\}_{k=1}^K$ is the unique strict Nash Equilibrium defined by the utilities in (\ref{eq:deflation_util}). The proof of Theorem~\ref{theo:nash_eq} is deferred to Appendix~\ref{sec:nash_proof}.
+\begin{theorem}
+    \label{theo:nash_eq}
+    Assume that the covariance matrix $\bm{\Sigma}$ has positive and strictly decreasing eigenvalues $\lambda_1^\star > \dots > \lambda_K^\star > 0$. Then, $\{\bfu_k^\star\}_{k=1}^K$ is the unique strict Nash Equilibrium defined by the utilities in (\ref{eq:deflation_util}) up to sign perturbation, i.e., replacing $\bfu_k^\star$ with $-\bfu_k^\star$.   
+\end{theorem}
+
+\section{Convergence Guarantee for the Parallel Deflation Algorithm}
+\label{sec:conv_guarantee}
+\vspace{-0.2cm}
+We provide a convergence guarantee for the parallel deflation algorithm in Algorithm~\ref{alg:parallel_deflation}. The pivot of the convergence analysis will be to track the dynamics of $\{\bm{\Sigma}_{k,\ell}\}_{k=1}^K$ and $\{\bfv_{k,\ell}\}_{k=1}^K$ as $\ell$ increases. The dynamics of the two sequences from Algorithm~\ref{alg:parallel_deflation} can be compactly represented as:\vspace{-0.2cm}
+\[
+    \bm{\Sigma}_{k,\ell} = \bm{\Sigma} - \sum_{k'=1}^{k-1}\bfv_{k',\ell-1}\bfv_{k',\ell-1}^\top\bm{\Sigma}\bfv_{k',\ell-1}\bfv_{k',\ell-1}^\top;\quad \bfv_{k,\ell} = \texttt{Top1}\paren{\bm{\Sigma}_{k,\ell},\bfv_{k,\ell-1}};\quad \forall \ell\geq k.
+\]
+Here, we embed the number of solver steps $T$ in the property of the abstract local solver $\texttt{Top1}(\cdot)$. Indeed, if $\texttt{Top1}(\cdot)$ returns the exact top eigenvector of the input matrix every time it is called, then we can easily see that $\bfv_{k,\ell} = \bfu_k^\star$ for all $\ell\geq k$. 
+When $\texttt{Top1}(\cdot)$ returns an inexact estimate of the input matrix sequentially, i.e., worker $k$ waits until the top-$(k-1)$ worker no longer improves the estimation of the top-$(k-1)$ eigenvectors, the error is analyzed by \cite{liao2023errorpropagation}. 
+
+Our scenario is further complicated by the continuous improvement of the eigenvector estimates used to deflate the matrix: in each communication round, the $\texttt{Top1}(\cdot)$ function, called by worker $k$, will start at the estimate of the top eigenvector of the deflated matrix in the previous round but will be fitted to the top eigenvector of the deflated matrix in the current round. 
+Our convergence analysis tackles this complicated dynamic by utilizing the following abstraction of the $\texttt{Top1}(\cdot)$ sub-routine.
+\begin{asump}
+    \label{asump:conv_top1}
+    Let $\hat{\bm{\Sigma}}\in\R^{d\times d}$ be a real symmetric matrix. Let $\lambda^\star$ be its eigenvalue with the largest absolute value, and let $\bfu^\star$ be the corresponding eigenvector of $\lambda^\star$. We assume that there exists a real value $\mathcal{F}\paren{\hat{\bm{\Sigma}}} \in (0, 1)$ that depends on $\hat{\bm{\Sigma}}$ such that for any $\bfx_0\in\R^d$, {\rm $\texttt{Top1}(\cdot)$} satisfies:\vspace{-0.2cm}
+    \[
+        \norm{{\normalfont\texttt{Top1}}\paren{\hat{\bm{\Sigma}}, \bfx_0} - \bfu^\star}_2 \leq \mathcal{F}\paren{\hat{\bm{\Sigma}}}\norm{\bfx_0 - \bfu^\star}_2.
+    \]
+\end{asump}\vspace{-0.2cm}
+Assumption~\ref{asump:conv_top1} can be easily guaranteed. as long as the $\texttt{Top1}(\cdot)$ algorithm enjoys a non-asymptotic convergence to the top eigenvector; see the Related Works section above. With Assumption~\ref{asump:conv_top1}, the convergence of Algorithm~\ref{alg:parallel_deflation} is given by the following theorem.
+\begin{theorem}
+    \label{theo:conv_theo}
+    Assume that Assumption~\ref{asump:conv_top1} holds, and let $\mathcal{F}_k = \max_{\ell\geq k}\mathcal{F}\paren{\hat{\Sigma}_{k,\ell}}$. Let $W_{-1}\paren{\cdot}$ be the Lambert-W function in the $-1$ branch\footnote{The Lambert-W function in the $-1$-branch is defined as the inverse of the function $f(x) = xe^x$ when $x \in (-\infty,-1)$.}, and define for $a>0$:
+    \vspace{-0.2cm}
+    \begin{align*}
+        \hat{W}\paren{a} = \begin{cases}
+        -W_{-1}\paren{-a} & \text{ if } a \in (0, e^{-1})\\
+        1 & \text{ if } a \in [e^{-1},\infty)
+    \end{cases}
+    \end{align*}
+    Let $\{m_k\}_{k=0}^K$ be a sequence of numbers denoting the convergence rates of recovering the $K$ eigenvectors, where $m_k = \max\left\{\mathcal{F}_k,\frac{1}{k}+\frac{k-1}{k}m_{k-1}\right\}$ and $m_0=\mathcal{F}_1$ as a dummy starting point.
+    Let $\{s_k\}_{k=1}^n$ be a sequence of integers denoting the starting communication round where the $K$ eigenvectors' error recovery enters the linear convergence phase, respectively. To be more specific, let $s_1 = 1$ and for all $k\in[K-1]$ and $k'\in[k]$:\vspace{-0.2cm}
+    \begin{equation}
+        \label{eq:start_pt}
+        s_{k+1} \geq \max\left\{\frac{\hat{W}\paren{m_{k}\log \sfrac{1}{m_{k}}}}{\log \sfrac{1}{m_{k}}}, \frac{km_{k}+1}{1-m_{k}}\right\} + \frac{\hat{W}\paren{\frac{\lambda_{k+1}^\star - \lambda_{k+2}^\star}{12k\lambda_{k'}^\star}\paren{\log \sfrac{1}{m_{k}}}^2}}{\log \sfrac{1}{m_{k'}}} + s_{k'}.
+    \end{equation}\vspace{-0.2cm}
+    Then, we have that the following holds for all $k\in[K]$
+    \begin{equation}
+        \label{eq:conv_form}
+        \norm{\bfv_{k,\ell}-\bfu_k^\star}_2\leq 6\paren{\ell-s_k+2}m_k^{\ell-s_k+1};\quad\forall \ell\geq s_k - 1.
+    \end{equation}
+\end{theorem}
+In words, Theorem~\ref{theo:conv_theo} says that starting from the $s_k$th communication round, the recovery error of the $k$th eigenvector converges according to a nearly-linear convergence rate given in (\ref{eq:conv_form}). However, the convergence starting point $s_k$ for the $k$th eigenvector must be later than the convergence starting point for the $1,\dots,k-1$th eigenvector for a number of communication rounds. This delay in the convergence starting point is characterized in (\ref{eq:start_pt}). Intuitively, the starting point $s_k$ denotes the index of the communication round where the top-$(k-1)$ eigenvectors have been estimated accurately enough for the $k$th worker to make positive progress.
+
+\textbf{Remark 1.} By the definition that $m_k = \max\left\{\mathcal{F}_k,\frac{1}{k}+\frac{k-1}{k}m_{k-1}\right\}$, one could see that $m_k < 1$ since $\mathcal{F}_k < 1$ for all $k\in[K]$. The convergence rate in (\ref{eq:conv_form}) involves the product of a linear term $\ell - s_k + 2$ and an exponential term $m_k^{\ell-s_k+1}$. When $\ell$ is large enough, $m_k^{\ell-s_k+1}$ decays at a much faster speed than the increase of $\ell - s_k + 2$, thus giving a nearly-linear convergence rate.
+
+\textbf{Remark 2.} Upper bound on the separation between the $s_k$'s. By using the inequality that $W_{-1}(e^{-u-1}) \geq - 1 - \sqrt{2u} - u$ \cite{Chatzigeorgiou_2013}, we could obtain that $\hat{W}(a) \leq \log \sfrac{1}{a} +\sqrt{2(\log \sfrac{1}{a} - 1)} + 1$ when $a\in(0, e^{-1})$. Therefore, we can conclude that $\hat{W} = O(\max\{1, \log\sfrac{1}{a}\})$. Notice that (\ref{eq:start_pt}) requires that $s_{k+1}$, the starting point of the linear convergence for the error of $\bfv_{k+1,\ell}$, must be later than $s_1,\dots,s_k$ for some steps. Using the bound of $\hat{W}(a)$, one could simplify (\ref{eq:start_pt}) to:
+\[
+    s_{k+1} \geq s_k + O\paren{\max\left\{\paren{\log\frac{1}{m_k}}^{-1}\paren{1 + \log \frac{k\lambda_{k}^\star}{\lambda_{k+1}^\star - \lambda_{k+2}^\star}}, \frac{km_{k}+1}{1-m_{k}}\right\}}.
+\]
+This simplification implies that a smaller $m_k$ would cause a smaller decay between $s_k$ and $s_{k+1}$. Since $m_k$ depends on $\mathcal{F}_k$, a smaller $m_k$ can be achieved by doing more local steps in the call to $\texttt{Top1}(\cdot)$. However, since the decay between $s_k$ and $s_{k+1}$ is measured in terms of the communication rounds, doing more local steps also increases the computation time per round in the delayed periods. 
+
+\textbf{Sketch of Proof.} The key challenge in proving Theorem~\ref{theo:conv_theo} lies in handling the dynamic, asynchronous nature of our algorithm. Unlike sequential deflation, where each principal component is computed after the previous ones have converged and stays fixed, our method deals with simultaneous updates of all principal components. This requires careful analysis of how errors propagate and accumulate across different workers. To start, we derive upper bounds of the per-iteration difference between the actual deflated matrix $\bm{\Sigma}_k$ and the ideal deflated matrix $\bm{\Sigma}^*_k$ and the difference between the estimated eigenvector $\bfv_{k,\ell}$ and the ground-truth eigenvector $\bfu_k^*$. Notice that these two upper bounds are inter-dependent. We apply Davis-Kahan $\text{Sin}\Theta$ Theorem \cite{davis1970rotation} to derive the bound between the matrices' top-eigenvectors based on the matrix differences. Next, we carefully choose a convergence starting point $s_k$ for each eigenvector. Construct two simpler two-dimensional sequences $\{B_{k,\ell}\}$ and $\{G_{k,\ell}\}$ starting from $s_k$'s that upper bound these differences. Lastly, we unroll the bounds on $\{B_{k,\ell}\}$ and $\{G_{k,\ell}\}$ to arrive at a closed form upper bound on error of the estimated eigenvector $\bfv_{k,\ell}$. The detailed proof is deferred to Appendix~\ref{sec:conv_proof}.
+
+\section{Experiments}
+\vspace{-0.2cm}
+\begin{figure}
+    \centering
+    \begin{subfigure}{0.32\textwidth}
+        \includegraphics[width=\linewidth]{synthetic_powerlaw_avg.pdf}
+        \caption{}
+        \label{fig:powerlaw}
+    \end{subfigure}
+    \begin{subfigure}{0.32\textwidth}
+        \includegraphics[width=\linewidth]{synthetic_expdecay_avg.pdf}
+        \caption{}
+        \label{fig:expdecay}
+    \end{subfigure}
+    \begin{subfigure}{0.32\textwidth}
+        \includegraphics[width=\linewidth]{mnist_avg.pdf}
+        \caption{}
+        \label{fig:mnist}
+    \end{subfigure}
+    \caption{Comparison of the convergence behavior of parallel deflation, EigenGame-$\alpha$, and EigenGame-$\mu$ in deterministic setting on (a). synthetic dataset with power-law decaying eigenvalues, (b). synthetic dataset with exponentially decaying eigenvalues, and (c). MNIST dataset.}
+    \label{fig:det_exp}
+    \vspace{-0.5cm}
+\end{figure}
+In this section, we experimentally verify the performance of the parallel deflation algorithm.
+
+\textbf{Baseline algorithms.}
+We compared the parallel deflation algorithm with power iteration as the $\texttt{Top1}$ subroutine with the distributed version of EigenGame-$\alpha$ \cite{gemp_2020_eigengame} and EigenGame-$\mu$ \cite{gemp2022eigengame}. 
+EigenGame-$\alpha$ was proposed as a sequential principal component recovery algorithm and can be adapted as a distributed algorithm. 
+Both EigenGame-$\alpha$ and EigenGame-$\mu$ are restricted to the case of one iteration of update per communication round. 
+We modified their algorithm to generalize to multiple iterations of update in Algorithm~\ref{alg:eiggame_alpha_det} and Algorithm~\ref{alg:eiggame_mu_det} in Appendix~\ref{sec:baseline}. As in the implementation of \cite{gemp_2020_eigengame} and \cite{gemp2022eigengame}, we do not project the utility gradient to the unit sphere.
+
+\textbf{Evaluation Metric.} 
+We evaluate the performance of the three algorithms by computing how close the recovered principal component is to the true eigenvector of the covariance matrix. For the set of true principal components $\{\bfu_k^\star\}_{k=1}^K$ and a set of recovered principal component $\{\bfv_k\}_{k=1}^K$, we use the following metric to compute the approximation error\footnote{We choose this metric instead of the Longest Correct Eigenvector Streak \cite{gemp_2020_eigengame} to study the precise dynamic of the recovery error as the number of computations steps increases.}
+\vspace{-0.3cm}
+\begin{equation}
+    \label{eq:metric1}
+    \mathcal{E}\paren{\{\bfu_k^\star\}_{k=1}^K, \{\bfv_k\}_{k=1}^K} = \paren{\frac{1}{K}\sum_{k=1}^K\min_{s\in\{\pm 1\}}\norm{\bfu_k^\star - s\cdot\bfv_k}_2^2}^{\frac{1}{2}}
+\end{equation}
+\vspace{-0.5cm}
+
+\textbf{Deterministic Experiments.}
+For synthetic experiments, we choose the number of features $d = 1000$, which gives the covariance matrices $\bm{\Sigma}\in\R^{1000\times 1000}$. We consider $\bm{\Sigma}$ generated with two different eigenvalue spectra: 
+$i)$ a power-law decaying spectrum $\lambda_k^\star = \frac{1}{\sqrt{k}}$, and 
+$ii)$ an exponential decaying spectrum $\lambda_k^\star = \frac{1}{1.1^k}$. We choose the number of local updates in each communication round $T$ to be $T \in\{1, 5\}$. We ran parallel deflation, EigenGame-$\alpha$, and EigenGame-$\mu$ to recover the top-$30$ eigenvectors ($K=30$). For each setting, we run 10 trials with different random initialization.
+
+Figure~\ref{fig:powerlaw} presents the convergence behavior of the three algorithms with $T\in\{1, 5\}$ on the synthetic matrix with $\lambda_k^\star = \frac{1}{\sqrt{k}}$. Both EigenGame-$\mu$ and parallel deflation demonstrate stable convergence to a low error value under the case of $T = 1$ and $T=5$, with parallel deflation converging slightly slower than EigenGame-$\mu$ in the first 200 total steps, and then arriving at a lower error than EigenGame-$\mu$ in the last 100 total steps. Figure~\ref{fig:expdecay} presents the result on the synthetic matrix with $\lambda_k^\star = \frac{1}{1.1^k}$, with similar conclusions. In both Figure~\ref{fig:powerlaw} and Figure~\ref{fig:expdecay}, the setting of $T=1$ shows a faster convergence than $T=5$. This is because $T=1$ allows more communication in a fixed number of total steps $T\times L$, which keeps the deflated matrices of each local worker to be better updated.
+
+We also use the real-world dataset of MNIST, $\mathbf{Y} \in \mathbb{R}^{60000 \times 784}$ in Figure~\ref{fig:mnist}. We choose $T\in\{1, 5\}$ and aim at recovering the top-$30$ eigenvectors. We observe a similar convergence behavior of the three algorithms as above. For EigenGame-$\alpha$, the case $T=1$ converges even slower than the case $T=5$. We hypothesize that this is because one local iteration is not sufficient for the top eigenvector solvers to provide an accurate enough estimate for the following solvers to make positive progress.
+
+\begin{figure}
+    \centering
+    \begin{subfigure}{0.32\textwidth}
+        \includegraphics[width=\linewidth]{synthetic_powerlaw_sto_avg.pdf}
+        \caption{}
+        \label{fig:sto_synthetic}
+    \end{subfigure}
+    \hspace{0.3cm}
+    \begin{subfigure}{0.32\textwidth}
+        \includegraphics[width=\linewidth]{mnist_sto_avg.pdf}
+        \caption{}
+        \label{fig:sto_mnist}
+    \end{subfigure}
+    \begin{subfigure}{0.32\textwidth}
+        \includegraphics[width=\linewidth]{ImageNet.pdf}
+        \caption{}
+        \label{fig:imagenet}
+    \end{subfigure}
+    \caption{Comparison of the convergence behavior of parallel deflation, EigenGame-$\alpha$, and EigenGame-$\mu$ in stochastic setting on (a). synthetic dataset with power-law decaying eigenvalues, (b). MNIST dataset, and (c) ImageNet dataset.}
+\end{figure}
+
+\textbf{Stochastic Setting.} 
+We generate $\bm{\Sigma}$ with power-law decaying spectrum as in the deterministic experiments. We sample I.I.D. samples from $\mathcal{N}\paren{\bm{0},\bm{\Sigma}}$ and pass the sampled data batches to parallel deflation and EigenGame in a streaming fashion. We use a decaying step size for all three algorithms, and the result is given in Figure~\ref{fig:sto_synthetic}. In this setting, parallel deflation shows a slightly worse performance than the two EigenGame algorithms. We hypothesize that this is because parallel deflation is more sensitive to the step size tuning in the stochastic case. 
+In Figure \ref{fig:sto_mnist}, we plot the performance of parallel deflation and EigenGame in the stochastic setting of the MNIST dataset. Parallel deflation achieves similar performance to EigenGame-$\mu$, with a slightly faster convergence speed in the early phase of the algorithm. 
+
+We also test the performance of parallel deflation on the ImageNet dataset \cite{imagenet2009deng} that contains $n = 1.2$M images of $d = 50176$ pixels. Due to the size of $\mathbf{Y}$, it was not possible in our set up to compute or store the covariance matrix on a single device. We use both parallel deflation and EigenGame-$\mu$ to compute the top-10 eigenvector of the dataset. Since no "ground-truth" principal component is known, we can use an aggregation of the terms $\bfv_k^\top\bm{\Sigma}\bfv_k$ as a metric to evaluate the quality of the solved principal components. To follow the internal hierarchy of the eigenvectors that the leading eigenvectors are free to explore more space and thus are expected to attain a larger $\bfv\top\bm{\Sigma}\bfv$, we penalize terms with larger index with a discounting factor. This result in the following metric:
+\begin{equation}
+    \label{eq:metric2}
+    \mathcal{M}\paren{\left\{\bfv_k\right\}_{k=1}^K} = \sum_{k=1}^{K}\frac{1}{k}\bfv_k^\top\bm{\Sigma}\bfv_k =\frac{1}{n}\sum_{i=1}^n\sum_{k=1}^K\frac{\paren{\bar{\bfy}_i^\top\bfv_k}^2}{k}
+\end{equation}
+Notice that a larger value of $\mathcal{M}\paren{\cdot}$ implies a higher quality of the recovered eigenvectors. Figure~\ref{fig:imagenet} shows that in this large scale dataset, our algorithm can keep up with the performance of the state-of-the-art algorithm EigenGame-$\mu$.
+
+
+\vspace{-0.2cm}
+\section{Conclusion}
+
+We present an algorithmic framework for computing the principal components in a distributed fashion. We introduce additional parallelism by early-starting the computation of the following eigenvectors based on the initial rough estimation of leading principal components and continuously refining the local deflated matrix based on updated estimated principal components. Our framework has a similar game-theoretic formulation as the EigenGame, while enjoying a nice convergence guarantee even in the distributed case. Future work can focus on empirically examining the potential of using other $\texttt{Top1}$ subroutines in our parallel deflation algorithm, such as Oja's rule.
+
+% Reference
+% For natbib users:
+\bibliography{reference}
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\appendix
+\section{Appendix}
+
+\section{Missing Proof from Section~\ref{sec:algorithm}}
+\label{sec:nash_proof}
+\begin{proof}[Proof of Theorem~\ref{theo:nash_eq}]
+    Let $\bfu_1^\star,\dots,\bfu_d^\star$ be the set of eigenvectors of $\bm{\Sigma}$, and $\lambda_1^\star,\dots,\lambda_d^\star$ be the corresponding eigenvalues, potentially with some $\lambda_k = 0$. Recall that in the game formulation of the deflation algorithm, the utility function of the $k$th player is given by
+    \[
+        \mathcal{V}_k\paren{\bfv\mid \left\{\bfv_{k'}\right\}_{k'=1}^{k-1}} = \bfv^\top\bm{\Sigma}\bfv - \sum_{k'=1}^{k-1}\bfv_{k'}^\top\bm{\Sigma}\bfv_{k'}\cdot\paren{\bfv_{k'}^\top\bfv}^2
+    \]
+    and when $\bfv_{k'} = \bfu_{k'}^\star$ for $k'\in[k-1]$, we have
+    \[
+        \mathcal{V}_k\paren{\bfv\mid \left\{\bfu_{k'}^\star\right\}_{k'=1}^{k-1}} = \bfv^\top\bm{\Sigma}\bfv - \sum_{k'=1}^{k-1}\lambda_{k'}^\star\cdot\paren{\bfv_{k'}^\top\bfv}^2
+    \]
+    It should be noted that $\bm{\Sigma}$ has the eigendecomposition $\bm{\Sigma} = \sum_{k'=1}^d\lambda_{k'}^\star\bfu_{k'}^\star\bfu_{k'}^{\star\top}$. Therefore we can rewrite $\bfv^\top\bm{\Sigma}\bfv$ as $\sum_{k'=1}^d\lambda_{k'}^\star\paren{\bfv^\top\bfu_{k'}^\star}^2$.  Thus, the utility becomes
+    \[
+        \mathcal{V}_k\paren{\bfv\mid \left\{\bfu_{k'}^\star\right\}_{k'=1}^{d}} = \sum_{k'=k}^{k-1}\lambda_{k'}^\star\paren{\bfv^\top\bfu_{k'}^\star}^2
+    \]
+    Since $\bfu_1^\star,\dots,\bfu_d^\star$ spans $\R^d$ and are mutually orthogonal, we can write $\bfv = \sum_{j=1}^d\beta_j\bfu_j^\star$. where $\sum_{j=1}^d\beta_j^2 =1$. Then we have
+    \[
+        \mathcal{V}_k\paren{\bfv\mid \left\{\bfu_{k'}^\star\right\}_{k'=1}^{d}} = \sum_{k'=k}^{k-1}\lambda_{k'}^\star\paren{\sum_{j=1}^d\beta_j\bfu_j^{\star\top}\bfu_{k'}^\star}^2 = \sum_{k'=k}^{k-1}\lambda_{k'}^\star\beta_{k'}^2
+    \]
+    Since $\lambda_{k}$'s are strictly decreasing and positive, we must have that the maximum of $\mathcal{V}_k\paren{\bfv\mid \left\{\bfu_{k'}^\star\right\}_{k'=1}^{d}}$ is only attained when $\beta_{k}^2 = 1$, which implies that $\bfv = \pm\bfu_k^\star$ will be the only optimal policies for player $k$.
+    
+    The uniqueness can be shown by induction. To start, we notice that $\mathcal{V}_1$ does not depend on the policy of the other plays. Therefore, the only optimal policy for player 1 is $\bfv_1 = \pm\bfu_1^\star$. This shows the base case. Now, assume that within the top-$(k-1)$ players, the optimal policies are $\bfv_{k'} = \pm\bfu_{k'}^\star$ for $k'\in[k-1]$. By the formulation of the utility functions, these optimal policies are not affected by the policy of player $k,\dots, K$. Moreover, it should be noted that the utility of player $k$ only depends on the top-$(k-1)$ players. Therefore, the optimal policy for player $k$ must be $\bfv_k = \pm\bfu_k^\star$. This finishes the inductive step and completes the proof.
+\end{proof}
+\section{Missing Proof from Section~\ref{sec:conv_guarantee}}
+\label{sec:conv_proof}
+We first introduce a tool that we will utilize in the proof in this section.
+\begin{lemma}[$\sin\Theta$ Theorem \cite{davis1970rotation}]
+    \label{lem:davis-kahan}
+    Let $\bfM^*\in\R^{d\times d}$ and let $\bfM = \bfM^* + \bfH$. Let $\bfa_1^*$ and $\bfa_1$ be the top eigenvectors of $\bfM^*$ and $\bfM$, respectively. Then we have:
+    \[
+        \sin\angle\left\{\bfa_1^*,\bfa_1\right\} \leq \frac{\norm{\bfH}_2}{\min_{j\neq k}\left|\sigma_k^* - \sigma_j\right|}.
+    \]
+\end{lemma}
+\subsection{Proof of Theorem~\ref{theo:conv_theo}}
+Define $\bm{\Sigma}_k^\star = \sum_{k=1}^{d}\lambda_k^\star\bfu_k^\star\bfu_k^{\top\star}$ as the "ground-truth" deflation matrix. Recall that the parallel deflation algorithm executes
+\begin{equation}
+    \label{eq:parallel_deflation}
+    \bm{\Sigma}_{k,\ell} = \bm{\Sigma} - \sum_{k'=1}^{k-1}\bfv_{k',\ell-1}\bfv_{k',\ell-1}^\top\bm{\Sigma}\bfv_{k',\ell-1}\bfv_{k',\ell-1}^\top;\quad \bfv_{k,\ell} = \texttt{Top1}\paren{\bm{\Sigma}_{k,\ell},\bfv_{k,\ell-1}}
+\end{equation}
+Let $\bfu_{k,\ell}$ denote the top eigenvector of $\bm{\Sigma}_{k,\ell}$. In particular, it suffices to show that the quantity $\norm{\bfv_{k,\ell} - \bfu_k^\star}_2^2$ decreases as $\ell$ increases. Combining Assumption~\ref{asump:conv_top1} and the definition that $\calF_k = \max_{\ell\geq k}\calF\paren{\bm{\Sigma}_{k,\ell}}$,we have that
+\begin{equation}
+    \label{eq:theo2.1}
+    \norm{\bfv_{k,\ell} - \bfu_{k,\ell}}_2 \leq \mathcal{F}_k\norm{\bfv_{k,\ell-1} - \bfu_{k,\ell}}_2
+\end{equation}
+We could upper bound $\norm{\bfv_{k,\ell-1} - \bfu_{k,\ell}}_2$ using
+\begin{align*}
+    \norm{\bfv_{k,\ell-1} - \bfu_{k,\ell}}_2 & \leq \norm{\bfv_{k,\ell-1} - \bfu_{k,\ell-1}}_2 + \norm{\bfu_{k,\ell} - \bfu_{k,\ell-1}}_2\\
+    & \leq \norm{\bfv_{k,\ell-1} - \bfu_{k,\ell-1}}_2 +  \norm{\bfu_{k,\ell} - \bfu_k^\star}_2 + \norm{\bfu_{k,\ell-1} - \bfu_k^\star}_2
+\end{align*}
+Combining this upper bound with (\ref{eq:theo2.1}) gives
+\begin{equation}
+    \label{eq:rec_cond_1_raw}
+    \norm{\bfv_{k,\ell} - \bfu_{k,\ell}}_2 \leq \mathcal{F}_k\paren{\norm{\bfv_{k,\ell-1} - \bfu_{k,\ell-1}}_2 +  \norm{\bfu_{k,\ell} - \bfu_k^\star}_2 + \norm{\bfu_{k,\ell-1} - \bfu_k^\star}_2}
+\end{equation}
+Moreover, the triangle inequality implies that
+\begin{equation}
+    \label{eq:rec_cond_2_raw}
+    \norm{\bfv_{k,\ell} - \bfu_{k}^\star}_2 \leq \norm{\bfv_{k,\ell} - \bfu_{k,\ell}}_2 + \norm{\bfu_{k,\ell} - \bfu_k^\star}_2
+\end{equation}
+Now, (\ref{eq:rec_cond_1_raw}) and (\ref{eq:rec_cond_2_raw}) give a pretty good characterization of the propagation of the errors. It remains to characterize $\norm{\bfu_{k,\ell} - \bfu_k^\star}_2$ for each $\ell$, and then we can dive into solving the recurrence. A naive bound would be that $\norm{\bfu_{k,\ell} - \bfu_k^\star}_2 \leq 2$, as $\norm{\bfu_{k,\ell}}_2 = \norm{\bfu_k^\star}_2 = 1$. However, notice that $\bfu_{k,\ell}$ is the top eigenvector of $\bm{\Sigma}_{k,\ell}$ and $\bm{\Sigma}_k^\star$, respective. Thus, we can invoke the Davis-Kahan Theorem to obtain a tighter bound. This property is given by Lemma~\ref{lem:davis-kahan-app}, whose proof is deferred to Appendix~\ref{sec:proof_davis-kahan-app}.
+\begin{lemma}
+    \label{lem:davis-kahan-app}
+    Assume that $1 = \lambda_1^\star > \lambda_2^\star > \dots$. If the following inequality holds for some $c_0 > 1$
+    \begin{equation}
+        \label{eq:davis-kahan-app-cond}
+        \sum_{k'=1}^{k-1}\lambda_{k'}^\star\norm{\bfu_{k'}^\star-\bfv_{k',\ell-1}}_2 \leq \frac{c_0-1}{4c_0}\paren{\lambda_k^\star - \lambda_{k+1}^\star}
+    \end{equation}
+    then we have that
+    \begin{equation}
+        \label{eq:davis-kahan-app-result}
+        \norm{\bfu_{k,\ell} - \bfu_k^\star}_2 \leq \frac{4c_0}{\lambda_k^\star - \lambda_{k+1}^\star}\sum_{k'=1}^{k-1}\lambda_{k'}^\star\norm{\bfu_{k'}^\star-\bfv_{k',\ell-1}}_2
+    \end{equation}
+\end{lemma}
+Now, we are going to use induction to proceed with the proof. Notice that, in order to control $\norm{\bfu_{k,\ell} - \bfu_k^\star}_2$ using Lemma~\ref{lem:davis-kahan-app}, one only need to control the recovery error of all previous eigenvectors $\norm{\bfu_{k'}^\star-\bfv_{k',\ell-1}}_2$, as given in (\ref{eq:davis-kahan-app-cond}). Thus, fix some $k$, we will assume the inductive hypothesis that there exists some $s$ such that for all $\ell\geq s$, we can guarantee (\ref{eq:davis-kahan-app-cond}). For the case of $k=1$, this is obvious, as the left-hand side of (\ref{eq:davis-kahan-app-cond}) is $0$. When $k\geq 1$ and we can gather the conditions as
+\begin{align*}
+    \norm{\bfv_{k,\ell} - \bfu_{k,\ell}}_2 & \leq \mathcal{F}_{k,\ell}\paren{\norm{\bfv_{k,\ell-1} - \bfu_{k,\ell-1}}_2 + \norm{\bfu_{k,\ell} - \bfu_k^\star}_2 + \norm{\bfu_{k,\ell-1} - \bfu_k^\star}_2}\\
+    \norm{\bfu_k^\star - \bfv_{k,\ell}}_2 & \leq \norm{\bfv_{k,\ell} - \bfu_{k,\ell}}_2 + \norm{\bfu_{k,\ell} - \bfu_k^\star}_2\\
+    \norm{\bfu_{k,\ell} - \bfu_k^\star}_2 & \leq \frac{4c_0}{\lambda_k^\star - \lambda_{k+1}^\star}\sum_{k'=1}^{k-1}\lambda_{k'}^\star\norm{\bfu_{k'}^\star-\bfv_{k',\ell-1}}_2;\quad\forall \ell\geq s_k
+\end{align*}
+For simplicity, we let
+\[
+    \norm{\bfv_{k,\ell} - \bfu_{k,\ell}}_2 =: D_{k,\ell};\quad \norm{\bfu_{k,\ell} - \bfu_k^\star}_2 =: B_{k,\ell};\quad \norm{\bfu_{k}^\star-\bfv_{k,\ell}}_2 =: G_{k,\ell}
+\]
+Moreover, we let $\mathcal{C}_k = \frac{4c_0}{\lambda_{k}^\star - \lambda_{k+1}^\star}$. Then the iterates are simplified to
+\begin{align*}
+    D_{k,\ell} & \leq \mathcal{F}_{k}\paren{D_{k,\ell-1} + B_{k,\ell} + B_{k,\ell-1}}\\
+    G_{k,\ell} & \leq D_{k,\ell} + B_{k,\ell}\\
+    B_{k,\ell} & \leq \mathcal{C}_k\sum_{k'=1}^{k-1}\lambda_{k'}^\star G_{k',\ell-1}
+\end{align*}
+where we set $G_{0,\ell} = 0$ for all $\ell$. Then $G_{k,\ell}$ can be written as
+\[
+    G_{k,\ell} \leq \mathcal{F}_k^{\ell-s}D_{k,s} + \sum_{\ell'=s}^{\ell-1}\mathcal{F}_{k}^{\ell-\ell'}\paren{B_{k,\ell'} + B_{k,\ell'-1}} + B_{k,\ell}
+\]
+for any $s \in[\ell]$. Here, the first term can be made small as long as we choose a large enough $\ell$. The third term is the unavoidable error propagation. The second term can cause $G_{k,\ell}$ to grow, and needs a careful analysis. To understand the recurrence between $G_{k,\ell}$ and $B_{k,\ell}$, we use the following lemma
+\begin{lemma}
+    \label{lem:ub_seq_conv}
+    Let $\hat{s}_k$ be given for all $k\in[K]$ such that $1 \leq \hat{s}_1\leq \dots\leq \hat{s}_K$. Let $s_k\in\mathbb{Z}$ be given for all $k\in[K]$ such that $1 = s_0 \leq s_1 \leq \dots \leq s_K$. Consider the sequence $\{B_{k,\ell}\}_{\ell=\hat{s}_k}^\infty$ and $\{G_{k,\ell}\}_{\ell=s_k-1}^\infty$ for all $k\in[K]$ characterized by the following recurrence
+    \begin{equation}
+        \label{eq:base_recur}
+        \begin{aligned}
+            B_{k,\ell} & \leq C_k\sum_{k'=1}^{k-1}\lambda_{k'}^\star G_{k',\ell-1}\\
+            G_{k,\ell} & \leq \mathcal{F}_k^{\ell-s_{k}+1}D_{k,s_k-1} + \sum_{\ell'=s_k-1}^{\ell-1}\mathcal{F}^{\ell-\ell'}_k\paren{B_{k,\ell'} + B_{k,\ell'-1}} + B_{k,\ell}
+        \end{aligned}
+    \end{equation}
+Let $m_k = \max\{\mathcal{F}_{k},\gamma_{k-1}\}$ for all $k\in[K]$ and $m_0 = -1$. Let $\{\gamma\}_{k=-1}^K$ be given such that $\gamma_{-1} = \gamma_0 = 0$ and $\gamma_{k} = \frac{1}{k+1} + \frac{k}{k+1}m_k$ for all $k\in[K]$. Define sequences $\{\hat{B}_{k,\ell}\}_{\ell=\hat{s}_k}^\infty$ and $\{\hat{G}_{k,\ell}\}_{\ell=s_k-1}^\infty$ for all $k\in[K]$ as
+    \begin{equation}
+        \label{eq:bk_gk_surr}
+        \begin{aligned}
+            \hat{B}_{k,\ell} & = \begin{cases}
+                \min\left\{2,m_{k-1}^{\ell-\hat{s}_{k}}\paren{\ell-\hat{s}_{k}+1}\hat{B}_{k,\hat{s}_k}\right\} & \text{ if } \ell >\hat{s}_k\\
+                C_k\sum_{k'=1}^{k-1}\lambda_{k'}^\star\hat{G}_{k',\hat{s}_k-1} & \text{ if } \ell = \hat{s}_k
+            \end{cases}\\
+            \hat{G}_{k,\ell} & = \begin{cases}
+                m_k^{\ell-s_k+1}(\ell-s_k+2)\hat{G}_{k,s_k-1} & \text{ if } \ell \geq s_k\\
+                D_{k,s_k-1} + \hat{B}_{k,s_k - 1} + \hat{B}_{k,s_k - 2} & \text{ if } \ell = s_k - 1
+            \end{cases}
+        \end{aligned}
+    \end{equation}
+Suppose that $\hat{s}_{k+1}\geq s_k$, and $s_k$ satisfies satisfies $m_{k-1}^{s_{k}-\hat{s}_{k}-2}\leq \frac{1}{s_{k} - \hat{s}_{k} - 1}$ and $s_{k}\geq \frac{km_{k-1}}{1-m_{k-1}}+\hat{s}_{k} +2$. Moreover, suppose that $\hat{B}_{k,\hat{s}_k} \leq 2$ for all $k\in[K]$. Then the following two conditions hold
+\begin{enumerate}
+    \item $\hat{B}_{k,\ell}\geq B_{k,\ell}$ for all $\ell\geq \hat{s}_k$
+    \item $\hat{G}_{k,\ell}\geq G_{k,\ell}$ for all $\ell\geq s_k - 1$
+\end{enumerate}
+\end{lemma}
+The proof of Lemma~\ref{lem:ub_seq_conv} is deferred to Appendix~\ref{sec:proof_ub_seq_conv}. Lemma~\ref{lem:ub_seq_conv} implies that under proper condition of $s_k$ and $\hat{s}_k$, we have
+\begin{align*}
+    G_{k,\ell}& \leq \hat{G}_{k,\ell}\\
+    & \leq \max\{\mathcal{F}_k,\gamma_{k-1}\}^{\ell-s_k+1}(\ell-s_k+1)\hat{G}_{k,s_k-1}\\
+    & = \max\{\mathcal{F}_k,\gamma_{k-1}\}^{\ell-s_k+1}(\ell-s_k+1)\paren{D_{k,s_k-1} + \hat{B}_{k,s_k-1} + \hat{B}_{k,s_{k}-2}}
+\end{align*}
+By definition, we have that $D_{k,s_k-1} = \norm{\bfv_{k,s_k-1} - \bfu_{k,s_k-1}}_2\leq 2$. Moreover, the definition in (\ref{eq:bk_gk_surr}) gives that $\hat{B}_{k,s_k-1}\leq 2$ and $\hat{B}_{k,s_k-2}\leq 2$. Therefore, we can conclude that
+\[
+    G_{k,\ell} \leq 6(\ell-s_k+1)\max\{\mathcal{F}_k,\gamma_{k-1}\}^{\ell-s_k+1}
+\]
+Now, we go back to the condition of $s_k$ and $\hat{s}_k$. The requirement of $\{s_k\}_{k=0}^K$ and $\{\hat{s}_k\}_{k=1}^K$ can be gathered below
+\begin{enumerate}
+    \item $1 = s_0 \leq s_1\leq \dots s_K$ and $1 \leq \hat{s}_1 \leq \dots\leq \hat{s}_K$
+    \item $\hat{s}_{k+1}\geq s_k$ and $s_k \geq \frac{km_{k-1}}{1 - m_{k-1}} + \hat{s}_k + 2$
+    \item $m_{k-1}^{s_k} -\hat{s}_k - 2\leq \frac{1}{s_k -\hat{s}_k - 1}$
+    \item $m_{k-1}^{\ell-\hat{s}_k}\paren{\ell-\hat{s}_k+1}\sum_{k'=1}^{k-1}\lambda_{k'}^\star\hat{G}_{k',\hat{s}_k-1}\leq \frac{c_0-1}{4c_0}\paren{\lambda_k^\star - \lambda_{k+1}^\star}$ for all $\ell\geq \hat{s}_k$
+\end{enumerate}
+where the first three conditions are directly required by Lemma~\ref{lem:ub_seq_conv}, and the fourth condition is required because the upper bound on $B_{k,\ell}$ in (\ref{eq:base_recur}) hold only when
+\[
+    \sum_{k'=1}^{k-1}\lambda_{k'}^\star\norm{\bfu_{k'}^\star-\bfv_{k',\ell-1}}_2 \leq \frac{c_0-1}{4c_0}\paren{\lambda_k^\star - \lambda_{k+1}^\star}
+\]
+from Lemma~\ref{lem:davis-kahan-app}. Notice that since $\hat{B}_{k,\hat{s}_k} = C_k\sum_{k'=1}^{k-1}\lambda_{k'}^\star\hat{G}_{k',\hat{s}_k-1}$, enforcing the fourth condition directly implies that $\hat{B}_{k,\hat{s}_k} \leq 2$. Now, we are going to simplify these conditions. A useful tool will be the following lemma, whose proof is provided in Appendix~\ref{sec:proof_lamber_bound}.
+\begin{lemma}
+    \label{lem:lambert_bound}
+    Let $m\in(0,1)$ and $\epsilon\in\R$ be given. Let $g(x) = m^x(x+1)$, and let $W_{-1}\paren{\cdot}$ be the Lambert-W function. Then
+    \begin{enumerate}
+        \item When $\epsilon\geq -\frac{1}{em\log m}$, then any $x \geq 0$ satisfies $g(x)\leq \epsilon$
+        \item When $\epsilon \leq -\frac{1}{em\log m}$, then any $x \geq \frac{1}{\log m}W_{-1}\paren{\epsilon m\log m}-1$ satisfies $g(x)\leq \epsilon$
+    \end{enumerate}
+\end{lemma}
+Notice that \#4 in the conditions above implies that $\norm{\bm{\Sigma}_{k,\ell}-\bm{\Sigma}_k^\star}_F\leq \frac{c_0-1}{c_0}\paren{\lambda_k^\star - \lambda_{k+1}^\star}$ and
+\[
+    B_{k,\hat{s}_k} = \sum_{k'=1}^{k-1}\lambda_{k'}^\star\hat{G}_{k',\hat{s}_k-1} \leq c_0-1
+\]
+Choose $c_0 = 3$ then guarantees that $B_{k,\hat{s}_k}\leq 2$. Now, we aim at simplifying Condition \#4 above. To start, we notice that the term $m_{k-1}^{\ell-\hat{s}_k}\paren{\ell-\hat{s}_k+1}$ achieves global maximum at $\ell-\hat{s}_k = \frac{1}{\log \sfrac{1}{m_{k-1}}}-1$ with value $\frac{1}{\log \sfrac{1}{m_{k-1}}}m_{k-1}^{\frac{1}{\log \sfrac{1}{m_{k-1}}}-1}$. Therefore, it suffices to guarantee that
+\[
+    \sum_{k'=1}^{k-1}\lambda_{k'}^\star\hat{G}_{k',\hat{s}_k-1} \leq -\log m_{k-1}\cdot m_{k-1}^{\frac{1}{\log m_{k-1}}-1}\cdot \frac{1}{6}\paren{\lambda_k^\star - \lambda_{k+1}^\star}
+\]
+
+From Lemma \ref{lem:ub_seq_conv}, we have that for $\ell\geq s_k-1$, $G_{k,\ell}\leq \hat{G}_{k,\ell}$, and
+\[
+    \hat{G}_{k,\ell} = m_k^{\ell-s_k+1}\paren{\ell-s_k+2}\hat{G}_{k,s_k-1}
+\]
+with $\hat{G}_{k,s_k-1}\leq 6$. Therefore, it suffices to guarantee that
+\[
+    \sum_{k'=1}^{k-1}\lambda_{k'}^\star m_{k'}^{\hat{s}_k-s_{k'}+1}\paren{\hat{s}_k-s_{k'}+2}\hat{G}_{k,s_{k'}-1} \leq -\log m_{k-1}\cdot m_{k-1}^{\frac{1}{\log m_{k-1}}-1}\cdot \frac{1}{6}\paren{\lambda_k^\star - \lambda_{k+1}^\star}
+\]
+which would be satisfied if we have
+\[
+    \lambda_{k'}^\star m_{k'}^{\hat{s}_k-s_{k'}+1}\paren{\hat{s}_k-s_{k'}+2}\hat{G}_{k,s_{k'}-1} \leq-\frac{\lambda_k^\star - \lambda_{k+1}^\star}{6(k-1)}\log m_{k-1}\cdot m_{k-1}^{\frac{1}{\log m_{k-1}}-1}
+\]
+Thus, $\hat{s}_k$ must satisfy for all $s_{k'}$
+\begin{equation}
+    \label{eq:s_hat_lb}
+    m_{k'}^{\hat{s}_k-s_{k'}+1}\paren{\hat{s}_k-s_{k'}+2} \leq -\frac{\lambda_k^\star - \lambda_{k+1}^\star}{36\lambda_{k'}^\star(k-1)}\log m_{k-1}\cdot m_{k-1}^{\frac{1}{\log m_{k-1}}-1}
+\end{equation}
+With the help of Lemma \ref{lem:lambert_bound}, Condition \#3 transfers to
+\[
+    s_k \geq \frac{1}{\log m_{k-1}}W_{-1}\paren{m_{k-1}\log m_{k-1}} + \hat{s}_k + 1
+\]
+Similarly, Condition \#4 transfers to
+\[
+    \hat{s}_k \geq \frac{1}{\log m_{k'}}W_{-1}\paren{-\frac{\lambda_k^\star - \lambda_{k+1}^\star}{36\lambda_{k'}^\star(k-1)}\log m_{k-1}\cdot m_{k-1}^{\frac{1}{\log m_{k-1}}-1}m_{k'}\log m_{k'}} + s_{k'} -2
+\]
+which can be guaranteed as long as
+\[
+    \hat{s}_k \geq  \frac{1}{\log m_{k'}}W_{-1}\paren{-\frac{\lambda_k^\star - \lambda_{k+1}^\star}{36k\lambda_{k'}^\star}\paren{\log m_{k-1}}^2\cdot m_{k-1}^{\frac{1}{\log m_{k-1}}}} + s_{k'} -2
+\]
+Gathering all requirements, we have
+\begin{align*}
+    s_k & \geq \max\left\{\frac{1}{\log m_{k-1}}W_{-1}\paren{m_{k-1}\log m_{k-1}}, \frac{(k-1)m_{k-1}+1}{1-m_{k-1}}\right\} + \hat{s}_k + 1\\
+    \hat{s}_k & \geq  \frac{1}{\log m_{k'}}W_{-1}\paren{-\frac{\lambda_k^\star - \lambda_{k+1}^\star}{36k\lambda_{k'}^\star}\paren{\log m_{k-1}}^2\cdot m_{k-1}^{\frac{1}{\log m_{k-1}}}} + s_{k'} -2
+\end{align*}
+Plugging $\hat{s}_k$ into the lower bound of $s_k$ shows that the condition in (\ref{eq:start_pt}) suffice to guarantee that Lemma~\ref{lem:ub_seq_conv} holds. Thus, we can conclude that
+\[
+    \norm{\bfv_{k,\ell} -\bfu_k^\star}_2 = G_{k,\ell} \leq 6\paren{\ell-s_k+2}m_{k}^{\ell-s_k+1}
+\]
+which finishes the proof.
+
+\subsection{Proof of Lemma~\ref{lem:davis-kahan-app}}
+\label{sec:proof_davis-kahan-app}
+Applying the Davis-Kahan Theorem, if we let $\lambda_{k+1,\ell} = \lambda_{\max}\paren{\bm{\Sigma}_{k,\ell}}$, then for all $k,\ell$ such that $\norm{\bm{\Sigma}_k^\star - \bm{\Sigma}_{k,\ell}}_F < \lambda_k^\star - \lambda_{k+1}^\star$, we have
+\[
+    \norm{\bfu_{k,\ell} - \bfu_k^\star}_2 \leq \frac{\norm{\bm{\Sigma}_k^\star - \bm{\Sigma}_{k,\ell}}_F}{\lambda_k^\star -\lambda_{k+1,\ell}}
+\]
+By definition, we have
+\[
+    \bm{\Sigma}_k^\star = \bm{\Sigma} - \sum_{k'=1}^{k-1}\lambda_{k'}^\star\bfu_{k'}^\star\bfu_{k'}^{\star\top};\quad \bm{\Sigma}_{k,\ell} = \bm{\Sigma} - \sum_{k'=1}^{k-1}\paren{\bfv_{k',\ell-1}^\top\bm{\Sigma}\bfv_{k',\ell-1}}\bfv_{k',\ell-1}\bfv_{k',\ell-1}^{\top}
+\]
+Thus, we can write the difference between the two matrices as
+\[
+    \bm{\Sigma}_{k}^\star - \bm{\Sigma}_{k,\ell} = \sum_{k'=1}^{k-1}\paren{\lambda_{k'}^\star - \bfv_{k',\ell-1}^\top\bm{\Sigma}\bfv_{k',\ell-1}}\bfv_{k',\ell-1}\bfv_{k',\ell-1}^\top + \sum_{k'=1}^{k-1}\lambda_{k'}^\star\paren{\bfv_{k',\ell-1}\bfv_{k',\ell-1}^{\top} - \bfu_{k'}^\star\bfu_{k'}^{\star\top}}
+\]
+It is easy to see that for $\bfv_{k',\ell-1}$ and $\bfv_{k'}^\star$ with unit norm,
+\[
+    \norm{\bfv_{k',\ell-1}\bfv_{k',\ell-1}^{\top} - \bfu_{k'}^\star\bfu_{k'}^{\star\top}}_2^2 = 2 - 2\inner{\bfv_{k',\ell-1}}{\bfu_{k'}^\star}^2 \leq \norm{\bfu_{k'}^\star - \bfv_{k',\ell-1}}_2^2
+\]
+Moreover to bound $\left|\lambda_{k'}^\star - \bfv_{k',\ell-1}^\top\bm{\Sigma}\bfv_{k',\ell-1}\right|$, we denote $\bm{\delta} = \bfv_{k',\ell-1} - \bfu_{k'}^\star$, and write
+\[
+     \bfv_{k',\ell-1}^\top\bm{\Sigma}\bfv_{k',\ell-1} = \paren{\bfu_{k'}^\star - \bm{\delta}}^\top\bm{\Sigma}\paren{\bfu_{k'}^\star - \bm{\delta}} = \lambda_{k'}^\star - 2\lambda_{k'}^\star\bm{\delta}^\top\bfu_{k'}^\star + \bm{\delta}^\top\bm{\Sigma}\bm{\delta}
+\]
+Therefore, we have
+\[
+    \left|\lambda_{k'}^\star - \bfv_{k',\ell-1}^\top\bm{\Sigma}\bfv_{k',\ell-1}\right| = \left|-2\lambda_{k'}\bm{\delta}^\top\bfu_{k'}^\star + \bm{\delta}^\top\bm{\Sigma}\bm{\delta}\right| \leq 2\lambda_{k'}^\star\norm{\bfv_{k',\ell-1} - \bfu_{k'}^\star}_2 + \lambda_1^\star\norm{\bfv_{k',\ell-1} - \bfu_{k'}^\star}_2^2
+\]
+This gives
+\[
+    \norm{\bm{\Sigma}_{k}^\star - \bm{\Sigma}_{k,\ell}}_F \leq  \sum_{k'=1}^{k-1}\paren{3\lambda_{k'}^\star\norm{\bfu_{k'}^\star-\bfv_{k',\ell-1}}_2 + \lambda_1^\star\norm{\bfu_{k'}^\star- \bfv_{k',\ell-1}}_2^2}
+\]
+We then need to assume that, for some $c_0 > 1$,
+\[
+    \sum_{k'=1}^{k-1}\lambda_{k'}^\star\norm{\bfu_{k'}^\star-\bfv_{k',\ell-1}}_2 \leq 
+    \frac{c_0-1}{4c_0}\paren{\lambda_k^\star - \lambda_{k+1}^\star}
+\]
+In this scenario, we can conclude that $\norm{\bfu_{k'}^\star-\bfv_{k',\ell-1}}_2\leq\lambda_k^\star$. Combined with the condition that $\lambda_1^\star = 1$, we have
+\[
+    \norm{\bm{\Sigma}_{k}^\star - \bm{\Sigma}_{k,\ell}}_F \leq  4\sum_{k'=1}^{k-1}\lambda_{k'}^\star\norm{\bfu_{k'}^\star-\bfv_{k',\ell-1}}_2 \leq \frac{c_0-1}{c_0}\paren{\lambda_k^\star - \lambda_{k+1}^\star}
+\]
+Moreover, we have
+\[
+    \norm{\bfu_{k,\ell} - \bfu_k^\star}_2 \leq \frac{4}{\lambda_k^\star - \lambda_{k+1,\ell}} \sum_{k'=1}^{k-1}\lambda_{k'}^\star\norm{\bfu_{k'}^\star-\bfv_{k',\ell-1}}_2 \leq \frac{4c_0}{\lambda_k^\star - \lambda_{k+1}^\star}\sum_{k'=1}^{k-1}\lambda_{k'}^\star\norm{\bfu_{k'}^\star-\bfv_{k',\ell-1}}_2
+\]
+where the last inequality follows from $\lambda_{k}^\star - \lambda_{k+1,\ell} \geq \lambda_k^\star - \lambda_{k+1}^\star - \norm{\bm{\Sigma}_{k}^\star - \bm{\Sigma}_{k,\ell}}_F \geq \frac{1}{c_0}\paren{\lambda_k^\star - \lambda_{k+1}^\star}$
+
+\subsection{Proof of Lemma~\ref{lem:ub_seq_conv}}
+\label{sec:proof_ub_seq_conv}
+To start, we will need to prove an auxiliary lemma
+\begin{lemma}
+    \label{lem:Bk_evolve}
+    Let the sequence $\{\hat{B}_{k,\ell}\}_{\ell=s_{k-1}+1}^\infty$ be defined as
+    \[
+        \hat{B}_{k,\ell} = \min\left\{2, m_{k-1}^{\ell-\hat{s}_{k}}\paren{\ell-\hat{s}_{k}+1}\hat{B}_{k,\hat{s}_{k}}\right\}
+    \]
+    with some $\hat{B}_{k,\hat{s}_{k}}\leq 2$ and $m_{k-1}\in(0, 1)$. Then for all $s$ that satisfies $m_{k-1}^{s-\hat{s}_{k}} \leq \frac{1}{s-\hat{s}_{k}+1}$ and $s\geq \frac{km_{k-1}}{1-m_{k-1}} + \hat{s}_{k}$, we have that
+    \[
+        \hat{B}_{k,\ell}\leq \paren{\frac{1}{k} + \frac{k-1}{k}m_{k-1}}^{\ell-s}\hat{B}_{k,s}
+    \]
+\end{lemma}
+\begin{proof}
+    To start, by definition, we can write $\hat{B}_{k,s}$ as
+    \[
+        \hat{B}_{k,s} = \min\left\{2, m_{k-1}^{s-\hat{s}_{k}}\paren{s-\hat{s}_{k}+1}\hat{B}_{k,\hat{s}_{k}}\right\}
+    \]
+    Since $\hat{B}_{k,\hat{s}_{k}}\leq 2$, we have
+    \[
+        m_{k-1}^{s-\hat{s}_{k}}\paren{s-\hat{s}_{k}+1}\hat{B}_{k,\hat{s}_{k}} \leq 2m_{k-1}^{s-\hat{s}_{k}}\paren{s-\hat{s}_{k}+1} \leq 2
+    \]
+    where the last inequality follows from the condition $m_{k-1}^{s-\hat{s}_{k}} \leq \frac{1}{s-\hat{s}_{k}+1}$. Therefore, we can write $\hat{B}_{k,s}$ as
+    \[
+        \hat{B}_{k,s} = m_{k-1}^{s-\hat{s}_{k}}\paren{s-\hat{s}_{k}+1}\hat{B}_{k,\hat{s}_{k}} 
+    \]
+    Recall that for any $\ell\geq s$ we have
+    \[
+        \hat{B}_{k,\ell} = \min\left\{2, m_{k-1}^{\ell-\hat{s}_{k}}\paren{\ell-\hat{s}_{k}+1}\hat{B}_{k,\hat{s}_{k}}\right\}
+    \]
+    Plugging in $\hat{B}_{k,\hat{s}_{k}} = \paren{m_{k-1}^{s-\hat{s}_{k}}\paren{s-\hat{s}_{k}+1}}^{-1}\hat{B}_{k,s}$ we have
+    \begin{align*}
+        \hat{B}_{k,\ell} & \leq m_{k-1}^{\ell-s}\cdot\frac{\ell-\hat{s}_{k}+1}{s-\hat{s}_{k}+1}\cdot\hat{B}_{k,s}\\
+        & \leq m_k^{\ell-s}\paren{\prod_{\ell'=s+1}^{\ell}\frac{\ell'-\hat{s}_{k}+1}{\ell'-\hat{s}_{k}}}\cdot\hat{B}_{k,s}\\
+        & \leq m_k^{\ell-s}\paren{\frac{s-\hat{s}_{k}+1}{s-\hat{s}_{k}}}^{\ell-s}\hat{B}_{k,s}\\
+        & = \paren{m_k\cdot \frac{s-\hat{s}_{k}+1}{s-\hat{s}_{k}}}^{\ell-s}\hat{B}_{k,s}\\
+        & \leq \paren{\frac{1}{k} + \frac{k-1}{k}m_k}^{\ell-s}\hat{B}_{k,s}
+    \end{align*}
+    where the last inequality is because $s\geq \frac{km_k}{1-m_k} + \hat{s}_{k}$ implies that 
+    \[
+        m_k\cdot \frac{s-\hat{s}_{k}+1}{s-\hat{s}_{k}} \leq m_k\cdot \frac{\frac{km_k}{1-m_k} + 1}{\frac{km_k}{1-m_k}} = \frac{(k-1)m_k + 1}{k} = \frac{1}{k} + \frac{k-1}{k}m_k
+    \]
+    This completes the proof.
+\end{proof}
+We will use induction on $k$ to prove the lemma.
+
+\textbf{Base Case: $k=1$.} In this case, by the definition of $\hat{B}_{1,\hat{s}_1}$, we have $\hat{B}_{1,s_1} = 0$. Moreover, by the definition of $\hat{B}_{1,\ell}$ for $\ell\geq s_1$, we have $\hat{B}_{1,\ell} = m_0^{\ell-\hat{s}_k}\paren{\ell-\hat{s}_k+1}\hat{B}_{k,\hat{s}_k} = 0$. Lastly, by the definition of $B_{1,\ell}$, we have $B_{1,\ell} =0$. Therefore, we must have that $\hat{B}_{1,\ell} = 0 = B_{1,\ell}$ for all $\ell\geq \hat{s}_1$. This shows Condition \#1. Using $\hat{B}_{1,\ell} = 0 = B_{1,\ell}$, we can derive that $\hat{G}_{1,\ell} = \mathcal{F}_1^{\ell-s_1+1}D_{1,s_1-1}$, and $G_{1,\ell}= \mathcal{F}_1^{\ell-s_1+1}D_{1,s_1-1}$. This implies that $G_{1,\ell}\leq \hat{G}_{1,\ell}$, and shows Condition \#2. Thus, we have shown that the case $k=1$ holds. 
+
+\textbf{Inductive Step.} Now, we assume that for all $\hat{k}\leq k$, the following holds 
+\begin{enumerate}
+    \item $\hat{B}_{\hat{k},\ell}\geq B_{\hat{k},\ell}$ for all $\ell\geq \hat{s}_{\hat{k}}$
+    \item $\hat{G}_{\hat{k},\ell}\geq G_{\hat{k},\ell}$ for all $\ell\geq s_{\hat{k}} - 1$
+\end{enumerate}
+We wish to show that the above three conditions hold for $\hat{k} = k+1$. We start by showing Condition \#1 for $\hat{k} = k+1$. By Condition \#2 in the inductive hypothesis, we have that $\hat{G}_{\hat{k},\ell}\geq G_{\hat{k},\ell}$ for all $\ell\geq s_{\hat{k}} - 1$. Since {$\hat{s}_{k+1} \geq s_{\hat{k}}$} for all $\hat{k}\leq k$, we have that $\hat{G}_{\hat{k},\ell}\geq G_{\hat{k},\ell}$ for all $\ell \geq\hat{s}_{k+1} - 1$. Therefore, in the case of $\ell = \hat{s}_{k+1}$
+\[
+    B_{k+1,\ell} \leq C_{k+1}\sum_{k'=1}^{k}\lambda_{k'}^\star G_{k',\ell-1} \leq C_{k+1}\sum_{k'=1}^{k}\lambda_{k'}^\star\hat{G}_{k',\ell-1} = \hat{B}_{k,\ell}
+\]
+Next, we show that $\hat{B}_{k+1,\ell}\geq B_{k+1,\ell}$ for all $\ell\geq \hat{s}_{k+1}$. If $\hat{B}_{k+1,\ell}\geq 2$, then we directly have $\hat{B}_{k+1,\ell}\geq B_{k+1,\ell}$ since $B_{k+1,\ell} \leq 2$. Otherwise, suppose $\hat{B}_{k+1,\ell}\leq 2$. Since $\hat{s}_{k+1} \geq s_{k'}$ for all $k'\leq k$, by the definition of $\hat{G}_{k,\ell}$, we have
+\[
+    \hat{G}_{k',\hat{s}_{k+1}-1} = m_{k'}^{\hat{s}_{k+1} - s_{k'}}\paren{\hat{s}_{k+1} - s_{k'}+1}\hat{G}_{k',s_{k'}-1}
+\]
+Based on the definition of $\hat{B}_{k+1,s_k}$, and since $m_k\geq m_{k'}$ for all $k \geq k$, we have that
+\begin{align*}
+    \hat{B}_{k+1,\ell} & = m_k^{\ell-\hat{s}_{k+1}}\paren{\ell-\hat{s}_{k+1}+1}\hat{B}_{k+1,\hat{s}_{k+1}}\\
+    & = m_k^{\ell-\hat{s}_{k+1}}\paren{\ell-\hat{s}_{k+1}+1}C_{k+1}\sum_{k'=1}^k\lambda_{k'}^\star\hat{G}_{k',\hat{s}_{k+1}-1}\\
+    & \geq C_{k+1}\sum_{k'=1}^k\lambda_{k'}^\star m_{k'}^{\ell-\hat{s}_{k+1}}\paren{\ell-\hat{s}_{k+1}+1}\hat{G}_{k',\hat{s}_{k+1}-1}\\
+    & \geq C_{k+1}\sum_{k'=1}^k\lambda_{k'}^\star m_{k'}^{\ell-s_{k'}}\paren{\ell-\hat{s}_{k+1}+1}\paren{s_{k+1} - s_{k'} + 1}\hat{G}_{k',s_{k'}-1}\\
+    & \geq C_{k+1}\sum_{k'=1}^{k}\lambda_{k'}^\star m_{k'}^{\ell-s_{k'}}\paren{\ell-s_{k'}+1}\hat{G}_{k',s_{k'}-1}\\
+    & = C_{k+1}\sum_{k'=1}^k\lambda_{k'}^\star\hat{G}_{k',\ell-1}
+\end{align*}
+where the third to the last inequality is due to $\paren{\ell-\hat{s}_{k+1}+1} + \paren{s_{k+1} - s_{k'} + 1} - 1 = \ell - s_{k'} + 1$, and for all $a\geq 1, b\geq 1$, we will have $ab \geq a + b - 1$. By the inductive hypothesis, we have that $\hat{G}_{k',\ell} \geq G_{k',\ell}$ for all $\ell\geq \hat{s}_{k+1} \geq s_{k'} - 1$. Therefore, it must hold that
+\[
+    \hat{B}_{k+1,\ell} \geq C_{k+1}\sum_{k'=1}^k\lambda_{k'}^\star G_{k',\ell-1} \geq B_{k+1,\ell}
+\]
+This proves Condition \#1 for $\hat{k} = k+1$. Next, we will prove Condition \#2 for $\hat{k} = k+1$. To start, when $\ell = s_{k+1} - 1$, we have
+\[
+    \hat{G}_{k+1,\ell} = D_{k+1,s_{k+1} - 1} + \hat{B}_{k+1,s_{k+1}-1} + \hat{B}_{k+1,s_{k+1}-2}
+\]
+while by (\ref{eq:base_recur}) we have
+\[
+    G_{k+1,\ell}\leq D_{k+1,s_{k+1}-1} + B_{k+1,s_{k+1}-1}
+\]
+Since $\hat{B}_{k+1,s_{k+1}-2} \geq 0$ and $\hat{B}_{k+1,s_{k+1}-1}\geq B_{k+1,s_{k+1}-1}$ as proved above for {$s_{k+1}\geq \hat{s}_{k+1}-2$}, we must have that $\hat{G}_{k+1,\ell}\geq G_{k+1,\ell}$ when $\ell = s_{k+1} - 1$. Next, we show that $\hat{G}_{k+1,\ell}\geq G_{k+1,\ell}$ when $\ell > s_{k+1} - 1$. To start,
+\begin{align*}
+    G_{k+1,\ell} & \leq \mathcal{F}_{k+1}^{\ell-s_{k+1}+1}D_{k+1,s_{k+1}-1} + \sum_{\ell'=s_{k+1}-1}^{\ell-1}\mathcal{F}^{\ell-\ell'}_{k+1}\paren{B_{k+1,\ell'} + B_{k+1,\ell'-1}} + B_{k+1,\ell}\\
+    & \leq  \mathcal{F}_{k+1}^{\ell-s_{k+1}+1}D_{k+1,s_{k+1}-1} + \sum_{\ell'=s_{k+1}-1}^{\ell}\mathcal{F}^{\ell-\ell'}_{k+1}\paren{B_{k+1,\ell'} + B_{k+1,\ell'-1}}\\
+    & \leq  \mathcal{F}_{k+1}^{\ell-s_{k+1}+1}D_{k+1,s_{k+1}-1} + \sum_{\ell'=s_{k+1}-1}^{\ell}\mathcal{F}^{\ell-\ell'}_{k+1}\paren{\hat{B}_{k+1,\ell'} + \hat{B}_{k+1,\ell'-1}}
+\end{align*}
+By definition of $\hat{B}_{k+1,\ell}$, invoking Lemma \ref{lem:Bk_evolve} with $s = s_{k+1}-2$ and $s = s_{k+1}-1$, we have that, as long as $s_{k+1}$ satisfies $m_k^{s_{k+1}-\hat{s}_{k+1}-2}\leq \frac{1}{s_{k+1} - \hat{s}_{k+1} - 1}$ and $s_{k+1}\geq \frac{(k+1)m_{k}}{1-m_{k}}+\hat{s}_{k+1} +2$, it holds that
+\begin{align*}
+    \hat{B}_{k+1,\ell} \leq \gamma_{k}^{\ell-s_{k+1}+2}\hat{B}_{k+1,s_{k+1}-2}\\
+    \hat{B}_{k+1,\ell} \leq \gamma_{k}^{\ell-s_{k+1}+1}\hat{B}_{k+1,s_{k+1}-1}
+\end{align*}
+for all $\ell\geq s_k$. Therefore
+\begin{align*}
+    G_{k+1,\ell} & \leq \mathcal{F}_{k+1}^{\ell-s_{k+1}+1}D_{k+1,s_{k+1}-1} + \sum_{\ell'=s_{k+1}-1}^{\ell}\mathcal{F}^{\ell-\ell'}_{k+1}\paren{\hat{B}_{k+1,\ell'} + \hat{B}_{k+1,\ell'-1}}\\
+    & = \mathcal{F}_{k+1}^{\ell-s_{k+1}+1}D_{k+1,s_{k+1}-1} + \sum_{\ell'=s_{k+1}-1}^{\ell}\mathcal{F}^{\ell-\ell'}_{k+1}\gamma_k^{\ell'-s_{k+1}+1}\paren{\hat{B}_{k+1,s_{k+1}-1} + \hat{B}_{k+1,s_{k+1}-2}}\\
+    & \leq \max\{\mathcal{F}_{k+1},\gamma_{k}\}^{\ell-s_{k+1}+1}\paren{D_{k+1,s_{k+1}-1} + (\ell-s_{k+1}+1)\paren{\hat{B}_{k+1,s_{k+1}-1} + \hat{B}_{k+1,s_{k+1}-2}}}\\
+    & \leq \max\{\mathcal{F}_{k+1},\gamma_{k}\}^{\ell-s_{k+1}+1}(\ell-s_{k+1}+1)\paren{D_{k+1,s_{k+1}-1} + \hat{B}_{k+1,s_{k+1}-1} + \hat{B}_{k+1,s_{k+1}-2}}\\
+    & = \hat{G}_{k+1,\ell}
+\end{align*}
+where in the last equality we use $m_{k+1} = \max\{\mathcal{F}_{k+1},\gamma_{k}\}$ and 
+\[
+    \hat{G}_{k+1,s_{k+1}-1} = D_{k+1,s_{k+1}-1} + \hat{B}_{k+1,s_{k+1}-1} + \hat{B}_{k+1,s_{k+1}-2}
+\]
+This proves Condition \#2 under $\ell > s_{k+1} -1$, which finishes the induction step and completes the proof.
+
+\subsection{Proof of Lemma~\ref{lem:lambert_bound}}
+\label{sec:proof_lamber_bound}
+First, we prove the case $\epsilon\geq -\frac{m}{e\log m}$. Notice that the function $g(x)$ achieves global maximum at $x = \frac{1}{\log\sfrac{1}{m}}-1$ with value $\frac{1}{\log\sfrac{1}{m}}m^{\frac{1}{\log\sfrac{1}{m}}-1}$. Moreover, notice that
+\[
+    \frac{1}{\log\sfrac{1}{m}}m^{\frac{1}{\log\sfrac{1}{m}}-1} = -\frac{m^{\frac{1}{-\log m}}}{m\log m} = -\frac{e^{-\frac{1}{\log m}\cdot\log m}}{m\log m} = -\frac{1}{em\log m} \leq \epsilon
+\]
+Therefore, for all $x\geq 0$ we would have $g(x)\leq \epsilon$. Next, we consider the case $\epsilon\leq -\frac{1}{em\log m}$. In this case, $x \geq \frac{1}{\log m}W_{-1}\paren{\epsilon m\log m}-1$ implies that
+\[
+    (x+1)\log m\leq W_{-1}\paren{\epsilon m\log m}
+\]
+By the monotonicity of $W_{-1}$, we have
+\[
+    (x+1)\log m\cdot e^{(x+1)\log m}\geq \epsilon m\log m
+\]
+which gives $(x+1)e^{x\log m}\leq \epsilon$. Thus, we have $g(x) = (x+1)m^x \leq \epsilon$.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Ablation studies.}
+\label{sec:ablation}
+We conducted additional ablation studies for the parallel deflation algorithms, with the results presented in Figure \ref{fig:ablation_exp}. In Figure~\ref{fig:benefit_parallel}, we conduct additional experiments comparing how different choices of the number of local updates $T$ contribute to the convergence speed. In particular, since in each communication round, the local updates of all workers are done in parallel, $T\times \ell$ would represent the total time elapsed under the ideal scenario of no communication cost. We could see from Figure~\ref{fig:benefit_parallel} that a smaller $T$ results in a faster convergence speed. Remarkably, since we choose $T\times L = 1200$ and aim at recovering 30 eigenvectors, the case where $T= 40$ corresponds to $L =30$, demonstrating the convergence behavior of the sequential deflation algorithm. Figure~\ref{fig:benefit_parallel} thus supports that introducing additional parallelism into the deflation algorithm indeed speeds up the computation process. On the other hand, Figure~\ref{fig:benefit_local} considers the case where the communication cost is the major burden. In this case, we can run the parallel deflation algorithm with a larger number of local updates, hoping to make more progress within one communication round. Indeed, Figure~\ref{fig:benefit_local} shows that a large number of local updates result in a faster convergence within a fixed number of communication rounds on larger datasets.
+
+\begin{figure}
+    \centering
+    \begin{subfigure}{0.32\textwidth}
+        \includegraphics[width=\linewidth]{benefit_parallel.pdf}
+        \caption{}
+        \label{fig:benefit_parallel}
+    \end{subfigure}
+    \hspace{0.3cm}
+    \begin{subfigure}{0.32\textwidth}
+        \includegraphics[width=\linewidth]{benefit_local_iter.pdf}
+        \caption{}
+        \label{fig:benefit_local}
+    \end{subfigure}
+    \caption{Ablation study of the parallel deflation algorithm. (a) shows the benefit of the run-time by increasing the parallelism. (b) shows the benefit of decreasing the communication cost by increasing the number of local iterations.}
+    \label{fig:ablation_exp}
+    \vspace{-0.5cm}
+\end{figure}
+
+\section{Stochastic Parallel Deflation Algorithm}
+In this section, we provide the explicit form of the stochastic version of the parallel deflation algorithm as discussed in Section~\ref{sec:algorithm}. Notice that in this algorithm we choose Hebb's rule as the $\texttt{Top}-1$ subroutine for the convenience of a clearer presentation. However, any subroutine that use $\bm{\Sigma}_{k,\ell}$ only for a matrix-vector multiplication can enjoy a similar efficient implementation.
+\begin{algorithm}[ht!]
+   \caption{Stochastic Parallel Deflation with Hebb's Rule}
+   \label{alg:sto_para_defl}
+    \begin{algorithmic}[1]
+            \Require Batch of data in the $\paren{\ell,t}$th iteration $\hat{\bfY}_{\ell,t}$; \# of eigenvectors (workers) $K$; \# of iterations $T$; global communication rounds $L\geq K$, step size $\eta$.
+            \Ensure Approximate eigenvectors $\left\{\bfv_k\right\}_{k=1}^K$.
+            \For{$k=1,\dots, K$}
+                \State Randomly initialize $\hat{\bfv}_{k,\texttt{init}}$ with unit norm;
+            \EndFor 
+            \For{$\ell=1,\dots, L$}
+                \For{$k =1,\dots, K$}
+                    \If{$k\leq \ell$}
+                        \State \text{Receive $\bfv_{1,\ell-1},\dots,\bfv_{k-1,\ell-1}$}
+                        \State $\bfv_{k,\ell,0} := \bfv_{k,\ell-1}$;
+                        \For{$t = 1,\dots,T$}
+                            \State $\hat{\lambda}_{k',\ell,t} = \|\hat{\bfY}_{\ell,t}\bfv_{k',\ell-1}\|_2^2\;\;\forall k'\in[k-1]$;
+                            \State $\bfg_{k,\ell,t} = \hat{\bfY}_{k,\ell,t}^\top\hat{\bfY}_{k,\ell,t}\bfv_{k,\ell,t-1} - \sum_{k'=1}^{k-1}\hat{\lambda}_{k',\ell,t}\paren{\bfv_{k',\ell-1}^\top\bfv_{k,\ell,t-1}}\cdot\bfv_{k',\ell-1}$
+                            \State $\bfv_{k,\ell,t} := (\bfv_{k,\ell,t-1} - \eta\bfg_{k,t,\ell}) / \norm{\bfv_{k,\ell,t-1} - \eta\bfg_{k,t,\ell}}_2$
+                        \EndFor
+                        \State \text{Broadcast $\bfv_{k,\ell}:=\bfv_{k,\ell,T}$}
+                    \Else
+                        \State $\bfv_{k,\ell} := \hat{\bfv}_{k,\texttt{init}}$;
+                    \EndIf
+                \EndFor
+            \EndFor
+            \State\textbf{return} $\left\{\bfv_{k,L}\right\}_{k=1}^K$
+\end{algorithmic} 
+\end{algorithm}
+
+\section{Baseline Algorithms}
+\label{sec:baseline}
+We provide the generalization of the EigenGame-$\alpha$ \cite{gemp_2020_eigengame} and EigenGame-$\mu$ \cite{gemp2022eigengame} algorithms with multiple iterations of local updates $T\geq 1$ in Algorithm~\ref{alg:eiggame_alpha_det} and Algorithm~\ref{alg:eiggame_mu_det}. In particular, it should be noted that EigenGame-$\alpha$ and EigenGame-$\mu$ use covariance matrices computed on subsets of the data in each iteration, where in our case we assume that the covariance matrix is computed on the whole dataset before the algorithm runs. Moreover, if we set $T= 1$ in both Algorithm~\ref{alg:eiggame_alpha_det} and Algorithm~\ref{alg:eiggame_mu_det}, then we recover the original EigenGame-$\alpha$ and EigenGame-$\mu$ algorithms.
+\begin{algorithm}[ht!]
+   \caption{EigenGame-$\alpha$}
+   \label{alg:eiggame_alpha_det}
+    \begin{algorithmic}[1]
+            \Require $\bm{\Sigma}\in\R^{d\times d}$; \# of eigenvectors (workers) $K$; \# of iterations $T$; global communication rounds $L\geq K$, step size $\eta$.
+            \Ensure Approximate eigenvectors $\left\{\bfv_k\right\}_{k=1}^K$.
+            \For{$k=1,\dots, K$}
+                \State Randomly initialize $\hat{\bfv}_{k,\texttt{init}}$ with unit norm;
+            \EndFor 
+            \For{$\ell=1,\dots, L$}
+                \For{$k =1,\dots, K$}
+                    \If{$k\leq \ell$}
+                        \State \text{Receive $\bfv_{1,\ell-1},\dots,\bfv_{k-1,\ell-1}$}
+                        \State $\bfv_{k,\ell,0} := \bfv_{k,\ell-1}$;
+                        \For{$t = 1,\dots,T$}
+                            \State$\bfg_{k,\ell,t} := \bm{\Sigma}\bfv_{k,\ell,t-1}-\sum_{k'=1}^{k-1}\frac{\bfv_{k',\ell-1}^\top\bm{\Sigma}\bfv_{k,\ell,t-1}}{\bfv_{k',\ell-1}^\top\bm{\Sigma}\bfv_{k',\ell-1}}\cdot \bm{\Sigma}\bfv_{k',\ell-1}$;
+                            \State $\bfv_{k,\ell,t} := (\bfv_{k,\ell,t-1} - \eta\bfg_{k,t,\ell}) / \norm{\bfv_{k,\ell,t-1} - \eta\bfg_{k,t,\ell}}_2$
+                        \EndFor
+                        \State \text{Broadcast $\bfv_{k,\ell}:=\bfv_{k,\ell,T}$}
+                    \Else
+                        \State $\bfv_{k,\ell} := \hat{\bfv}_{k,\texttt{init}}$;
+                    \EndIf
+                \EndFor
+            \EndFor
+            \State\textbf{return} $\left\{\bfv_{k,L}\right\}_{k=1}^K$
+\end{algorithmic} 
+\end{algorithm}
+
+\begin{algorithm}[ht!]
+   \caption{EigenGame-$\mu$}
+   \label{alg:eiggame_mu_det}
+    \begin{algorithmic}[1]
+            \Require $\bm{\Sigma}\in\R^{d\times d}$; \# of eigenvectors (workers) $K$; \# of iterations $T$; global communication rounds $L\geq K$, step size $\eta$.
+            \Ensure Approximate eigenvectors $\left\{\bfv_k\right\}_{k=1}^K$.
+            \For{$k=1,\dots, K$}
+                \State Randomly initialize $\hat{\bfv}_{k,\texttt{init}}$ with unit norm;
+            \EndFor 
+            \For{$\ell=1,\dots, L$}
+                \For{$k =1,\dots, K$}
+                    \If{$k\leq \ell$}
+                        \State \text{Receive $\bfv_{1,\ell-1},\dots,\bfv_{k-1,\ell-1}$}
+                        \State $\bfv_{k,\ell,0} := \bfv_{k,\ell-1}$;
+                        \For{$t = 1,\dots,T$}
+                            \State$\bfg_{k,\ell,t} := \bm{\Sigma}\bfv_{k,\ell,t-1}-\sum_{k'=1}^{k-1}\bfv_{k',\ell-1}^\top\bm{\Sigma}\bfv_{k,\ell,t-1}\cdot \bfv_{k',\ell-1}$;
+                            \State $\bfv_{k,\ell,t} := (\bfv_{k,\ell,t-1} - \eta\bfg_{k,t,\ell}) / \norm{\bfv_{k,\ell,t-1} - \eta\bfg_{k,t,\ell}}_2$
+                        \EndFor
+                        \State \text{Broadcast $\bfv_{k,\ell}:=\bfv_{k,\ell,T}$}
+                    \Else
+                        \State $\bfv_{k,\ell} := \hat{\bfv}_{k,\texttt{init}}$;
+                    \EndIf
+                \EndFor
+            \EndFor
+            \State\textbf{return} $\left\{\bfv_{k,L}\right\}_{k=1}^K$
+\end{algorithmic} 
+\end{algorithm}
+
+\end{document}

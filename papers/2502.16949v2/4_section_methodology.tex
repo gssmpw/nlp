@@ -1,0 +1,197 @@
+\section{Methodology}
+\subsection{Sparse Approach}
+We observe that the embedding extraction operation and its gradient computation is a bottleneck in the training of many translational models (Figure \ref{fig:bottlenecks}). We tackle this by replacing the typical embedding extraction process with Sparse-Dense Matrix Multiplication (SpMM). We form a sparse incidence matrix out of the training triplets so that multiplying it with the embedding matrix would directly generate at least a portion of the scores for each triplet.
+
+The sparse approach unifies the embedding gather operations for entities in forward propagation and scatter operations for gradients in backward propagation.
+This unified framework enables us to leverage high-performance matrix multiplication techniques, such as loop unrolling, cache blocking, tiling, and WARP-level GPU primitives. Additionally, we can apply advanced parallelization methods, including dynamic load balancing across threads and code generation, as well as more efficient SIMD (Single Instruction, Multiple Data) vectorization.
+%allowing us to potentially utilize high-performance matrix multiplication techniques (loop unrolling, cache blocking, tiling, and usage of WARP level primitives in GPU), advanced parallelization methods (dynamic load balancing in threads, code generations), and more efficient SIMD (Single Instruction, Multiple Data) vectorization. 
+
+In the following subsections, we briefly discuss how to perform training in a sparse approach using SpMM instead of regular embedding extraction for several translation-based models. \revise{Both forward and backward propagation of our approach benefit from the efficiency of a high-performance SpMM (proof shown in Appendix \ref{A:backprop}). This concept also extends broadly to various other knowledge graph embedding (KGE) methods as well, including DistMult, ComplEx, and RotateE (detailed formulations are provided in Appendix \ref{A:non_trans}). The sparsity of our formulation and related computational complexity are discussed in Appendix \ref{A:density} and \ref{A:complexity}.}
+
+\subsection{Adjacency Matrix Formulation}
+We analyze the score function of several translation-based models and observe that many models such as TransE, TransR, and TransH take head, tail, and relation - and compute either (a) (head - tail) or (b) (head - tail + relation) expression before applying additional linear projections as needed. 
+For simplicity, we refer to these as `ht' and `hrt' expressions, respectively.
+ Table \ref{table:common-models} lists a few of such models and their corresponding score functions. For some models, the expressions mentioned earlier are apparent, and for others, we need to perform minor algebraic rearrangements. These formulations are listed from subsection \ref{transe_formulation} to \ref{toruse_formulation}.
+\vskip -.1in
+
+\begin{table}[h]
+\centering
+\caption{Translational models with common expressions in score function $f_r(h,t)$}
+\label{table:common-models}
+% \vskip 0.15in
+\begin{center}
+\begin{small}
+\begin{sc}
+\begin{tabular}{cc}
+\toprule
+\textbf{Model}      & \textbf{Scoring Function} \\
+\midrule
+TransE \cite{TransE} & $||\Vec{h} + \Vec{r} - \Vec{t}||$                 \\
+TransH \cite{TransH}   & $||\Vec{h_\perp} + \Vec{d_r} - \Vec{t_\perp}||$                        \\
+TransR \cite{transR}    & $||M_r\Vec{h} + \Vec{r} - M_r\Vec{t}||$                         \\
+TorusE \cite{torusE}  & $||\Vec{h} + \Vec{r} - \Vec{t}||$                   \\
+TransA \cite{transA}   & \tiny{$|\Vec{h} + \Vec{r} - \Vec{t}|^T W_r |\Vec{h} + \Vec{r} - \Vec{t}|$}                        \\
+TransC \cite{lv2018differentiating}     & $||\Vec{h} + \Vec{r} - \Vec{t}||^2_2$                         \\
+TransM \cite{fan2014transition} & $w_r||\Vec{h} + \Vec{r} - \Vec{t}||$                                          \\                        
+\bottomrule
+\end{tabular}
+\end{sc}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table}
+
+\vskip -.1in
+Instead of gathering head, tail, and relations individually from the indices and then computing the {\em ht} and {\em hrt} expressions, we can directly get this result by forming an incidence matrix. The following subsection describes how we can compute {\em ht} and {\em hrt} expressions using sparse-dense matrix multiplication.
+
+\begin{figure*}[t]
+\centering     %%% not \center
+\subfigure[$(\textit{h}-\textit{t})$ Computation. All cells in the highlighted row are zero except h-idx and t-idx. For the highlighted row, h-idx = 5, t-idx = 15, entity-count = 22.]
+% {\label{fig:ht}\includegraphics[width=82mm]
+{\label{fig:ht}\includegraphics[width=0.9\columnwidth]{figures/ht_computation.pdf}}
+\hspace{10pt}
+\subfigure[$(\textit{h}+\textit{r}-\textit{t})$ Computation. All cells in the highlighted row are zero except h-idx, t-idx, and r-idx + entity-count. For the highlighted row, h-idx = 5, t-idx = 15, entity-count = 20, r-idx = 2.]{\label{fig:hrt}\includegraphics[width=1.1\columnwidth]{figures/htr_computation.pdf}}
+
+\caption{Computing common expressions using SpMM. Only the highlighted row is populated for demonstration.}
+\label{fig:htr_ht_computation}
+\end{figure*}
+
+
+\subsubsection{ht or (head - tail) computation}
+\label{sec:ht}
+Let the knowledge graph contain 
+$N$ entities and $M$ triples in the training data, with an embedding size (dimension) denoted by $d$.
+To compute the \emph{ht} expression, we store entity embedding in a dense matrix $\mathbf{E} \in \mathbb{R}^{N\times d}$, where each row stores the embedding of an entity.
+%We store head and tail embeddings in the same dense embedding matrix. 
+We store the training triples in a sparse incidence matrix $\mathbf{A} \in \{-1,0,1\}^{M\times N}$, where the rows represent the training triplets and the columns represent entities. %There will be 0 to (M-1) rows for M training triplets. For N entities, there will be columns 0 to (N-1). 
+For a triplet, the corresponding column of a head or tail index is filled with the coefficient of the head or tail. In the expression head - tail, the coefficient of the head is $+1$ and $-1$ for the tail.  
+This implies that each row of the incidence matrix contains exactly two nonzero entries.
+Once we multiply this incident sparse matrix $\mathbf{A}$ with the embedding matrix $\mathbf{e}$, we get the array of (head - tail) for the corresponding training triplets. Figure \ref{fig:ht} shows an example of this calculation. This computed expression can be used to complete the score calculation.
+
+
+\subsubsection{hrt or (head + relation - tail) computation}
+\label{sec:hrt}
+Evaluating this expression requires accessing two separate dense matrices when entity and relation embeddings are stored individually. We can still compute this expression in a single sparse-dense matrix multiplication if we stack the entity and relations horizontally in the incidence sparse matrix and vertically as an embedding dense matrix.
+
+Let the knowledge graph contain 
+$R$ relations.
+To compute the \emph{hrt} expression with a single SpMM operation, we store the entity and relation embeddings in the same dense matrix $\mathbf{E} \in \mathbb{R}^{(N+R)\times d}$, where the first $N$ row stores the embeddings of entities and the last $R$ rows store the embeddings of relations.
+For this computation, we store the training triples in a sparse incidence matrix $\mathbf{A} \in \{-1,0,1\}^{M\times (N+R)}$, where the rows represent the training triplets and the columns represent entities and relations.
+%For this, we form the sparse matrix by taking rows representing the training triplets similar to ht computation. On the other hand, we take the number of columns (number of entities + number of relations) to indicate the entity (head/tail) or relation index in a given triplet. 
+As before, we place the expressions' coefficients in the corresponding columns ($+1$ for head and relation, $-1$ for tail).  The relation associated with each triple is represented by placing a $+1$ in the corresponding column for that relation.  
+Note that we offset the relation index by the total number of entities in the incidence matrix $\mathbf{A}$. This ensures that, when multiplied, the relation index aligns correctly with the corresponding relation embedding located just below the entity embeddings.
+Finally, we multiply the sparse matrix with the combined dense embedding matrix to get the hrt expression result. Figure \ref{fig:hrt} shows an example of this computation.
+
+The following subsections contain the implementation of four translational models using the sparse approach. Throughout the rest of the paper, we refer to these four implementations collectively as \textbf{SparseTransX}, or \textbf{SpTransX} in short.
+
+% \subsection{Supported Translational Models}
+\subsection{TransE Formulation}
+\label{transe_formulation}
+For triplets ($\Vec{h}$, $\Vec{r}$, $\Vec{t}$), where $\Vec{h}$ is the head entity vector, $\Vec{r}$ is the relation entity vector, and $\Vec{t}$ is the tail entity vector, TransE tries to enforce the following for a training set U:
+\begin{spacing}{0.2}
+\begin{equation} \label{eq1}
+\begin{split}
+    \forall ( \Vec{h}, \Vec{t}, \Vec{r}) \in U, & \\
+     & \Vec{h} + \Vec{r} \approx \Vec{t} \\
+     \implies & \Vec{h} + \Vec{r} - \Vec{t}\approx \Vec{0} \\ \\
+    \end{split}
+\end{equation}
+\end{spacing}
+For TransE, a normalization function (L1 or L2) is typically applied to this expression to get the final score. We can directly obtain this expression using the hrt computation method discussed in subsection \ref{sec:hrt}.
+
+\subsection{TransR Formulation}
+\label{transr_formulation}
+The TransR model applies a linear projection to the head and tail before computing the score. For a projection matrix $M_r$ corresponding to relation $\Vec{r}$, TransR tries to enforce the following translation:
+
+\begin{spacing}{0.2}
+\begin{equation} \label{eq2}
+\begin{split}
+    \forall ( \Vec{h}, \Vec{t}, \Vec{r}) \in U, & \\
+     & M_r\Vec{h} + \Vec{r} \approx M_r\Vec{t} \\
+     \implies & M_r\Vec{h} + \Vec{r} - M_r\Vec{t}\approx \Vec{0} \\
+     \implies & M_r(\Vec{h} - \Vec{t})+ \Vec{r}\approx \Vec{0} \\
+     \\
+    \end{split}
+\end{equation}
+\end{spacing}
+
+After rearrangement, we see that it contains the (head-tail) expression. This can be computed using the ht computation method discussed in subsection \ref{sec:ht}.
+
+\subsection{TransH Formulation}
+\label{transh_formulation}
+TransH (Translating Embeddings on Hyperplanes) extends TransE by allowing each relation to have its hyperplane, addressing the limitation that a single translation vector cannot handle 1-to-N, N-to-1, and N-to-N relations effectively. In TransH, each relation $\Vec{r}$ is associated with a hyperplane characterized by a normal vector $\Vec{w_r}$ and a translation vector $\Vec{d_r}$. The projection of entities onto the hyperplane is then used in the translation. It tries to enforce the following:
+
+
+\begin{spacing}{0.2}
+\begin{equation} \label{eq3}
+\begin{split}
+    \forall ( \Vec{h}, \Vec{t}, \Vec{r}) \in U, & \\
+     & \Vec{h_{\perp}} + \Vec{d_r} \approx \Vec{t_{\perp}} \\
+    \end{split}
+\end{equation}
+\end{spacing}
+
+Where, 
+\begin{spacing}{0.5}
+$$\Vec{h_{\perp}} = \Vec{h} - (\Vec{w_r}^T\cdot \Vec{h})\Vec{w_r}$$
+$$\Vec{t_{\perp}} = \Vec{t} - (\Vec{w_r}^T\cdot \Vec{t})\Vec{w_r}$$
+\end{spacing}
+
+Substituting these values in Equation \ref{eq3}, we find that for every triplet, TransH is trying to enforce:
+
+\begin{spacing}{0.5}
+\begin{equation*}
+\begin{split}
+    & \Vec{h} - (\Vec{w_r}^T\cdot \Vec{h})\Vec{w_r} + \Vec{d_r} \approx \Vec{t} - (\Vec{w_r}^T\cdot \Vec{t})\Vec{w_r}\\
+    \implies & \Vec{h} - (\Vec{w_r}^T\cdot \Vec{h})\Vec{w_r} + \Vec{d_r} - \Vec{t} + (\Vec{w_r}^T\cdot \Vec{t})\Vec{w_r} \approx \Vec{0} \\
+    \implies & \Vec{h} - \Vec{t} + \Vec{d_r} - (\Vec{w_r}^T\cdot \Vec{h})\Vec{w_r} + (\Vec{w_r}^T\cdot \Vec{t})\Vec{w_r} \approx \Vec{0} \\
+    \implies & (\Vec{h} - \Vec{t}) + \Vec{d_r} - \Vec{w_r}^T\cdot(\Vec{h} - \Vec{t})\Vec{w_r} \approx \Vec{0} \\
+    \end{split}
+\end{equation*}
+\end{spacing}
+
+We observe that the final arrangement contains two expressions of ht. This can be computed using the ht computation method discussed in subsection \ref{sec:ht}.
+
+\subsection{TorusE Formulation}
+\label{toruse_formulation}
+The TorusE model is very similar to TransE regarding the score function. It typically uses L1/L2 torus distance instead of regular L1/L2 norm and only works with the fractional components of the embeddings.
+
+Just like TransE, it also tries to enforce the following:
+\begin{spacing}{0.5}
+\begin{equation} \label{eq4}
+\begin{split}
+    \forall ( \Vec{h}, \Vec{t}, \Vec{r}) \in U, & \\
+     & \Vec{h} + \Vec{r} \approx \Vec{t} \\
+     \implies & \Vec{h} + \Vec{r} - \Vec{t}\approx \Vec{0} \\ \\
+    \end{split}
+\end{equation}
+\end{spacing}
+
+We can directly obtain this expression using the hrt computation method discussed in subsection \ref{sec:hrt}.
+
+
+% \todo{Need to discuss a little bit about implementation, tuning, and other systems aspects.}
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.45\textwidth]{figures/fastkg.pdf}
+    \caption{SparseTransX Framework}
+    \label{fig:fastkg}
+    \end{figure}
+    
+\subsection{SparseTransX Framework}
+We develop a general framework for SpTransX model training to enable efficient translation-based model training for large KG datasets. The framework is implemented using PyTorch 2.3 and consists of four modules, which are briefly described below.
+
+\subsubsection{SparseTransX Models}
+This module contains the sparse implementations of the translational models. These implementations are agnostic to the sparse matrix library used underneath. The models have built-in support for streaming embeddings from disc storage when the embeddings are too large to fit in CPU memory. This streaming model support is implemented using PyTorch memory-mapped tensors. Researchers often use Large Language Model (LLM) embeddings such as BERT \cite{devlin-etal-2019-bert}, T5 \cite{colin2020exploring}, or GPT \cite{radford2018improving} to perform knowledge graph completion \cite{wang2022simkgc, kim2020multi} and want to start with pre-trained embeddings that are typically too large to fit on CPU memory. Such training can be performed using this feature of the framework. Finally, this module also has functionalities for calculating scores, predicting links, and classifying entities in addition to the training loop.
+
+\subsubsection{Dataloaders}
+Our framework contains various dataloaders for shared and distributed training. It supports several standard knowledge graph formats, such as TTL, RDF, and CSV. Additionally, it contains a streaming dataset module for datasets that are too large to fit in the memory. When invoked, it creates an SQLite representation of the knowledge graph and stores the entity-index mapping in the database along with the triplets. All dataloaders connect to the sparse model input using a common interface.
+
+\subsubsection{Utilties and Core Functions}
+This module consists of the sparse adjacency matrix builder described in subsection \ref{sec:ht} and \ref{sec:hrt}, an efficient sparse negative sampler, and the matrix multiplier interface.
+
+\subsubsection{Distributed Training}
+This module enables distributed training for SparseTransX using PyTorch DDP (Data Distributed Parallel) and FSDP (Fully Sharded Data Parallel) frameworks.
+
+% a sparse matrix generator, a sparse-dense matrix multiplier (SpMM), and the training functions for the four models. It is flexible, so users can choose any SpMM implementation of their choice as a backend and perform the SpTransX training. We select iSpLib SpMM \cite{hoque2024isplib} for CPU training and DGL g-SpMM \cite{wang2019deep} for GPU training.

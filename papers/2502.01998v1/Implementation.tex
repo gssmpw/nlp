@@ -1,0 +1,243 @@
+\section{Implementation} \label{sec:impl}
+\subsection{View Creation}
+In this section, we provide a detailed description of how Data Guard translates access control policies into data-masking views. We also describe the various optimizations in the generated views that ensure data accesses through data-masking views are performant. 
+
+\subsubsection{Policy Compiler} \label{subsubsec:pc}
+The process of translating data policies into SQL code is referred to as {\em policy compilation}. As shown in Algorithm \ref{alg:policy_compiler}, the policy compiler incrementally constructs a relational algebra plan for a given input relation $\mathcal{R}$ by iterating over a list of matching policies for $\mathcal{R}$ and then converting the plan into SQL text. 
+\begin{algorithm}
+    \caption{Compiling policies into SQL code where $enforce\_policy()$ function creates a relational algebra plan representing the enforcement of a data access policy $p$ 
+    on attribute $\mathcal{A}$ of the input relation $\mathcal{R}$, and $to\_sql()$ function returns the SQL text for a relational algebra plan}
+    \label{alg:policy_compiler}
+    \begin{algorithmic}
+        \STATE \textbf{Input:} Input relation $\mathcal{R}$, a list $\mathcal{L}$ of matching pairs (field path, policy)
+        \STATE \textbf{Output:} SQL string representing a data-masking view
+	    \STATE $plan \gets \mathcal{R}$
+        	\FOR{$(f, p) \in \mathcal{L}$}
+            	\STATE $plan \gets enforce\_policy(plan, f, p)$
+        	\ENDFOR
+        \RETURN $to\_sql(plan)$
+    \end{algorithmic}
+\end{algorithm}
+
+A key step in Algorithm~\ref{alg:policy_compiler} is the call to $enforce\_policy()$ method to update the relational algebra plan. Under the hood, the $enforce\_ \\policy()$ method adds the data-masking operator $mask$ introduced in Section~\ref{subsubsec:masking_operator} to the plan. Thus, the efficiency of the generated plan (and of the resulting view SQL) depends crucially on the implementation of the $mask$ operator. 
+
+We focus on the implementation of the $mask$ operator to perform column-level masking i.e. the data element to be masked is inside an attribute of $\mathcal{R}$. A naive approach to implementing the data-masking operator for a relation-valued attribute is to unnest the attribute, mask the data at a given field path within the attribute and reconstruct the attribute into its original structure. 
+However, this approach produces complex SQL queries for relation-valued attributes, which can be both hard to read and debug especially when involving transformations on deeply nested attributes. 
+We therefore implement a scalar version of the $mask$ operator for column-level masking. Specifically, the operator employs a user-defined function (UDF) \emph{MASK\_FIELD()}, which takes a field path $f$ as an argument and sets the value at the field path to $NULL$. 
+
+Consider a field path $f$ inside an attribute $\mathcal{A}$ of a relation $\mathcal{R}$. We start with an implementation of the column-masking UDF with the following signature: \\
+\emph{MASK\_FIELD($\mathcal{A}$: ANY, $f$: VARCHAR)} \\
+The above UDF performs in-place update on attribute $\mathcal{A}$, instead of a sequence of unnest, transform, 
+and re-construct operations. The return type of the UDF is the same as the data type of $\mathcal{A}$ to ensure the view schema is identical to the underlying table schema.
+The data-masking operator introduced in Equation~\ref{eq:enforcement} can thus be implemented by combining the \emph{MASK\_FIELD()} UDF with the CASE statement in SQL as follows: 
+% \begin{align}
+% CASE & \nonumber \\
+% & WHEN~p.cond~THEN~\mathcal{A} \nonumber \\
+% & ELSE~MASK\_FIELD(\mathcal{A}, f) \nonumber \\
+% END & \nonumber 
+% \end{align}
+\begin{lstlisting} 
+CASE
+    WHEN p.cond THEN A 
+    ELSE MASK_FIELD(A, f)
+END
+\end{lstlisting}
+
+Now suppose we have two field paths $f_1$ and $f_2$, both accessing the same attribute $\mathcal{A}$ with matching policies $p_1$ and $p_2$ respectively.  Algorithm~\ref{alg:policy_compiler} yields the following  
+relational algebra plan:
+
+$mask(mask(\mathcal{R}, p_1, f_1), p_2, f_2)$
+
+which is translated into two consecutive projection operators. Since SQL engines commonly apply the projection merge optimization rule to combine consecutive projections in a plan into a single projection,
+the above plan is translated into the following SQL code:
+\begin{lstlisting} 
+CASE
+    WHEN p2.cond THEN (CASE WHEN p1.cond THEN A ELSE MASK_FIELD(A, f1) END) 
+    ELSE MASK_FIELD((CASE WHEN p1.cond THEN A ELSE MASK_FIELD(A, f1) END) , f2)
+END
+\end{lstlisting}
+In this expression, \emph{MASK\_FIELD()} is called once on $f_2$ and twice on $f_1$. A straightforward analysis shows that for $n$ fields accessing the same attribute $\mathcal{A}$, the number of UDF calls in the generated SQL will equal $2^n - 1$. 
+
+% The above implementation for column masking has a significant limitation. When multiple field paths inside a common relational attribute need to be masked, the  UDF will be recursively invoked multiple times - once for each field path. 
+% Further, most SQL engines apply projection merge optimization rule to combine consecutive projections in a plan into a single projection operation. Thus, every access to an attribute in an upstream projection operation is replaced with an access to the attribute in the immediately downstream projection. Note that the attribute is accessed twice in the each \emph{CASE} expression as shown above, leading to two replacements per projection operation. Therefore, in order to mask $n$ field paths within an attribute, the relational algebra plan produced by Algortihm~\ref{alg:policy_compiler} will include $2^n$ calls to $MASK\_FIELD\_IF$, instead of $n$ UDF calls.
+
+We avoid the exponential number of UDF calls in the view SQL by making the policy condition a parameter of the UDF instead of using the \emph{CASE} expression. This results in the following modified signature for the masking UDF: \\
+\emph{MASK\_FIELD\_IF(cond: BOOLEAN, $\mathcal{A}$: ANY, $f$: VARCHAR)}
+where the UDF only applies data masking when the condition is true and returns the original value of $\mathcal{A}$ otherwise.
+
+With this optimization, the above nested CASE statement is rewritten with two UDF calls ($n$ UDF calls instead of $2^n$ for $n$ enforcements) as:
+\begin{lstlisting} 
+MASK_FIELD_IF(p2.cond, 
+    MASK_FIELD_IF(p1.cond, A, f1), f2)
+\end{lstlisting}
+
+When the policy conditions are the same ($p_1.cond = p_2.cond$), the policy compiler further groups the nested UDF calls into a single UDF call:
+\begin{lstlisting} 
+MASK_FIELD_IF(p1.cond, A, CONCAT(f1, delim, f2))
+\end{lstlisting}
+
+\subsubsection{Consent Bitmaps} \label{subsubsec:bitmap}
+Recall from Section~\ref{subsubsec:policies} that the most common type of data access policies in our system are consent-based, where the policy condition involves checking preferences of data subjects stored in a separate table, referred to as the {\em lookup table}. As described in Section~\ref{subsec:views}, a naive implementation of policy compiler can produce views that join a table containing data subject information with the lookup table using the data subject id as the join key. At LinkedIn, this table stores the consents of more than 1 billion members and any joins against this table result in expensive data shuffles. In Spark for instance, such joins are implemented as Sort Merge Joins since the size of both the tables involved in the join operation are too large to be broadcast using Broadcast Hash Joins. Optimizing the view SQL for fetching attribute values from the lookup table is therefore critical to minimize the cost of adopting views.
+
+In order to address this scalability challenge, we pre-compute a consent bitmap for every consent attribute referenced in a policy definition and leverage statistics associated with each consent to minimize the bitmap size. Specifically, we use a "true bitmap" (bitmap of data subject identifiers whose consent value is true) if minority of users have consent values set to true, and a false bitmap otherwise. Therefore, the number of user ids in each bitmap is at most half of the total number of users. Given that data subject identifiers at LinkedIn are numeric (a scenario we expect to be common), we use the Roaring Bitmap implementation~ \cite{Lemire16} to compute the bitmaps as it achieves superior compression ratios compared to other compression methods. As an example, a Roaring bitmap of 200 million 8-byte integers that represent user ids has a size of around 134MB, which is small enough for the bitmaps to be loaded into memory on the worker nodes in Spark and Trino. In cases where identifiers are non-numeric, we can employ minimal perfect hashing functions~\cite{Belazzougui09} to map keys into consecutive integers and then use Roaring Bitmap on the resulting integers.
+
+These bitmaps are then saved in a storage system like HDFS or cloud storage and are loaded at access time for fast in-memory lookup via a UDF. The bitmap implementation is much cheaper compared to a join-based solution, as we only introduce a small memory overhead for storing bitmaps in each worker's memory. In order to abstract away the storage system implementation details, we wrap the bitmap loading and lookup actions into a BitmapManager interface, thus ensuring that the bitmap solution can be adopted across a range of different storage systems.
+
+To ensure freshness of bitmaps, a bitmap computation job is scheduled periodically to reflect the latest user consents in the generated snapshot. Each snapshot of a bitmap is addressed using a combination of bitmap name and a timestamp when the bitmap was generated. The different snapshots of a bitmap are stored in a time-partitioned folder. The bitmap lookup is wrapped inside a UDF with the following signature: 
+\emph{HAS\_USER\_CONSENT(consents: VARCHAR, user\_id: BIGINT, access\_time: TIMESTAMP)}, 
+where:
+\begin{itemize}
+    \item \emph{consents}: a string to represent a list of consent names, which are used to load corresponding bitmaps into executor memory.
+    \item \emph{user\_id}: the identifier column of the table identifying the data subject whose consents need to be looked up, 
+    \item \emph{access\_time}: the timestamp for determining the specific snapshot of a bitmap to load. This parameter gives users the ability to replay a query at a later time (aka {\em time travel}). By default, the data-masking views use the built-in SQL function ${CURRENT\_TIMESTAMP()}$ for the $access\_time$ parameter. The $access\_time$ parameter ensures that the same snapshot of bitmap is loaded across all the worker nodes for a given query. 
+\end{itemize}
+
+\subsubsection{Masking deduplication} 
+Given the scale of LinkedIn's data warehouse and the diversity of policies that need to be enforced, it is common to find tables in our warehouse containing attributes that are subject to multiple policies. 
+Further, a single policy may apply to multiple attributes within the table. A naive implementation of the policy compiler in Algorithm~\ref{alg:policy_compiler} can result in redundant application of the $MASK\_FIELD\_IF()$ UDF. 
+
+There are two scenarios that can result in redundant masking operations on a field path: 
+\begin{itemize}
+    \item If a nested field needs to be masked based on one or more policy conditions, each of which is applicable to an ancestor, then a masking operation on the nested field is unnecessary.  For example, masking operation on the field path in row 2 of Table~\ref{tab:optimization} is redundant given an identical policy condition applicable to the root path \$. Similarly, the masking on field path in row 4 is redundant given an identical policy condition applicable to its parent in row 3.   
+    \item If a field in a table has two or more applicable policies and the set of consents used in policy $p_1$ is a superset of the set of consents used in a different policy $p_i$, then the masking with policy $p_j$ is unnecessary. For example, rows 5 and 6 of Table~\ref{tab:optimization} show two different policies $p_3$ and $p_4$ applied to the same field path with overlapping consents. It is easy to see that policy condition check in row 6 is redundant and can be eliminated.
+\end{itemize}
+
+\begin{table}[h!]
+    \centering
+    \resizebox{\columnwidth}{!}{
+    \begin{tabular}{|c|c|l|c|c|}
+        \hline
+        \textbf{No} & \textbf{Field Path} & \textbf{Policy condition} & \textbf{Policy} \\ \hline
+        1 & $\$$ & $consent_1$ & $p_1$ \\ \hline
+        2 & $\$.col_2.field_{21}$ & $consent_1$ & $p_1$ \\ \hline
+        3 & $\$.col_3$ & $consent_2$ & $p_2$ \\ \hline
+        4 & $\$.col_3.[item].[?(@.field_{31}='s1')]$  & $consent_2$ & $p_2$ \\ \hline
+        5 & $\$.col_4.[value]$ & $consent_3$ AND $consent_4$ & $p_3$ \\ \hline
+        6 & $\$.col_4.[value]$ & $consent_3$ & $p_4$ \\ \hline
+    \end{tabular}
+    }
+    \caption{Example of maskings with different field paths with applicable policies. Masking operations on field paths in rows 2, 4, and 6 can be pruned without impacting the masking results.}
+    \label{tab:optimization}
+    \vspace{-2em}
+\end{table}
+
+To eliminate such redundant masking operations, we construct a schema tree from a given list of field paths and their applicable policies. 
+A schema tree is one where each node represents an operator of a field path expression defined in Definition~\ref{def:fieldpath} and nodes corresponding to successive operators of a field path expression have a parent-child relationship between them. 
+A node that is a final operator of a field path has an attribute to store the list of all policies applicable to that field path. 
+Figure~\ref{fig:schematree} shows an example schema tree constructed from field paths in Table~\ref{tab:optimization}.
+\begin{figure}[ht]  % 'ht' means here or at the top
+    \vspace{-1em}
+    \begin{subfigure}[b]{0.45\columnwidth}
+     \includegraphics[width=\linewidth]{figures/before_pruning.png}
+     \caption{Before pruning}  % Adding a caption
+         \label{fig:schematree}  % Adding a label for referencing
+     \end{subfigure}
+     \hfill % Optional space between figures
+        \begin{subfigure}[b]{0.45\columnwidth}
+         \includegraphics[width=\linewidth]{figures/after_pruning.png}
+             \caption{After pruning}  % Adding a caption
+                 \label{fig:prunedschematree}  % Adding a label for referencing
+     \end{subfigure}
+     \vspace{-1em}
+     \caption{An example schema tree constructed from field paths defined in Table~\ref{tab:optimization}.}
+     \vspace{-1em}
+ \end{figure}
+
+After constructing the schema tree, we perform a pre-order traversal to prune redundant policies as detailed in Algorithm~\ref{alg:policy_pruning}. The algorithm computes the minimal set of policies required to cover the set of consents of a node that do not overlap with any of its ancestors. This problem can be mapped to the well-known minimum set cover problem, which is an NP-complete problem~\cite{Garey90}. We therefore use a greedy approximation algorithm that chooses policies with largest number of non-overlapping consents first.
+Figure~\ref{fig:prunedschematree} demonstrates the schema tree produced by applying Algorithm~\ref{alg:policy_pruning}. 
+Maskings in rows 1, 3, and 5 are chosen to be retained by the algorithm. 
+
+\begin{algorithm}
+    \caption{Prune redundant policies}
+    \label{alg:policy_pruning}
+    \begin{algorithmic}
+        \STATE \textbf{Input:} A schema tree with root $r$.
+        \STATE \textbf{Output:} A new schema tree with redundant policies pruned.
+        \STATE \textbf{function} \textsc{PrunePolicies}($n$, $C$)
+        \STATE \hspace{1em} $P \gets n.policies$ \hfill \text{//Get node $n$'s policy set}
+        \STATE \hspace{1em} $C_n \gets \emptyset$ \hfill \text{//Initialize node $n$'s consent set}
+        \STATE \hspace{1em} \textbf{for} $p_i \in P$ \textbf{do}
+        \STATE \hspace{2em} $C \gets C_n \cup p_i.consents$ 
+        \STATE \hspace{1em} \textbf{end for}
+        \STATE \hspace{1em} $\Delta \gets C_n \setminus C$ \hfill \text{//consents non-overlapping with $n$'s ancestors}
+        \STATE \hspace{1em} $R \gets \emptyset$ \hfill \text{// Initialize the retained policy set}
+        \STATE \hspace{1em} \textbf{while} $\Delta \neq \emptyset$
+        \STATE \hspace{2em} select $p \in P$ that maximizes $|p.consents \cap \Delta|$
+        \STATE \hspace{2em} $\Delta \gets \Delta \setminus p.consents$
+        \STATE \hspace{2em} $R \gets R \cup \lbrace p \rbrace$
+        \STATE \hspace{2em} $P \gets P \setminus \lbrace p \rbrace$
+        \STATE \hspace{1em} \textbf{end while}
+        \STATE \hspace{1em} $n.policies \gets R$ \hfill \text{//Update node $n$'s policy set}
+        \STATE \hspace{1em} \textbf{for} $c \in n.children$ \textbf{do}
+        \STATE \hspace{2em} \textsc{PrunePolicies}($c$, $C \cup C_n$)
+        \STATE \hspace{1em} \textbf{end for}
+        \STATE \textbf{end function} 
+        \STATE \textsc{PrunePolicies}($r$, $\emptyset$)
+    \end{algorithmic}
+\end{algorithm}
+
+Suppose $col_1$ of $\mathcal{R}$ is labeled as a \emph{user id} column, the resulting data-masking view SQL produced by Algorithm~\ref{alg:policy_compiler} is as follows:
+\begin{lstlisting} 
+SELECT col1, col2, 
+ MASK_FIELD_IF(HAS_USER_CONSENT('consent2', col1, CURRENT_TIMESTAMP()), col3, '$.col3') AS col3,
+ MASK_FIELD_IF(HAS_USER_CONSENT('consent3_consent4', col1, CURRENT_TIMESTAMP()), col4, '$.col4.[value]') AS col4
+FROM R
+WHERE HAS_USER_CONSENT('consent1', col1, CURRENT_TIMESTAMP());
+\end{lstlisting}
+
+\subsubsection{View Maintenance}
+We implement a system for creating and updating of data-masking views across tables in our warehouse. At a high-level, this system performs the following steps: 
+\begin{enumerate} 
+    \item Generates a candidate list of warehouse tables along with a map of field paths to matching policies for each candidate table. This is accomplished by joining: (i) an inventory of warehouse tables, (ii) a metadata table that contains information about policy labels assigned to each field path of a table, and (iii) a table containing policy labels and policy definitions. 
+    \item For each candidate table $T$ computed in the previous step and each candidate purpose $P$:
+    \begin{enumerate}
+    \item the system checks if it needs to create or update a masking view for $T$. Specifically, view update for $T$ is triggered due to: 
+    \begin{itemize}
+        \item schema changes to the underlying tables (e.g. new column additions), 
+        \item changes to policy labels assigned to field paths, or 
+        \item new policy additions or changes to existing policy definitions for purpose $P$.
+    \end{itemize}
+    \item If a view update is deemed necessary, the system invokes Algorithm~\ref{alg:policy_compiler} to generate a new view definition, and 
+    \item registers the updated view definition with the view catalog (a Hive-based~\cite{hive} catalog in our ecosystem). 
+    \end{enumerate}
+\end{enumerate}
+
+To ensure smooth rollout of views and enable rollbacks in case of errors, each data-masking view is versioned according to the semantic versioning scheme~\cite{semver}. 
+End user pipelines are routed to the latest view versions by default. 
+We also provide users with the option to pin their pipelines to specific versions of views and be notified when newer versions of views become available. 
+In this mode, users can test their pipelines against the new view versions before deploying the change to production. 
+Older versions of views are garbage collected periodically to minimize resource consumption due to stale views. 
+
+\subsection{View Consumption}
+At LinkedIn, warehouse users write data processing applications using Apache Spark and Trino as the underlying compute engines. To ensure ease-of-use of data-masking views in user applications, we implemented two important optimizations: (i) dynamic table-to-view routing, and (ii) multi-engine support, each of which will be discussed in detail in this section.
+
+\subsubsection{Dynamic Table-to-View Routing}
+A key design choice of our system was to ensure access control policies are automatically enforced during data accesses by redirecting table accesses to the appropriate data-masking views determined by the purpose of access. 
+This minimizes overhead for existing warehouse users to ensure their accesses remain compliant. 
+Recall from Section~\ref{sec:overview} that the table to view routing at access time is accomplished using a component called {\em ViewShift}. 
+At LinkedIn, we implement this component as a plugin inside existing engine catalog implementations. 
+ViewShift intercepts \emph{loadTable()} API calls to the catalog from applications and returns the corresponding data-masking view instead. The ViewShift plugin exposes the following API: \\
+\emph{ViewIdentifier getView(TableIdentifier tableName, Map\textless{}String, String\textgreater{} contextMap)}\ \\
+where $contextMap$ parameter is query context map that contains attributes such as the purpose of the access (obtained from the identity of the user that submits the query), the optional pinned version of the data masking view, and the environment where the application is running. 
+
+Every invocation of the $getView()$ API is published to a logging system as a log entry containing the contextual information inside the $contextMap$. These logs are consumed by downstream monitoring applications that monitor data accesses across the warehouse. 
+
+%With ViewShift plugin, identical queries to the same table but having different purposes will get redirected to different data masking views. 
+%This behavior is similar to the implementation of runtime polymorphism in Object Oriented Programming (OOP) languages such as Java and C++. 
+%Analogous to the virtual function tables in OOP, the implementation of $getView()$ API uses a view mapping table that maps a warehouse table identifier and a purpose to the corresponding masking view. 
+
+\subsubsection{Multi-engine support}
+In large organizations, it is common for infrastructure teams to support a diversity of data processing systems, each optimized for a specific set of use cases. 
+For instance, Apache Spark is commonly used by data scientists for data exploration, while Trino is commonly used for ad hoc data analysis. 
+There are variances in the SQL dialects supported by each system. Further, each system has a different mechanism and type system to define UDFs. A key requirement that Data Guard needed to address was to ensure that the data masking views are executable across different data processing systems and avoid view duplication by creating engine-specific views. 
+
+To ensure portability of views across engines, we leverage two in-house technologies, which are independently available as open-source projects: (i) a SQL translation tool called \emph{Coral} \cite{coral} that translates SQL between different dialects, and (ii) a framework called \emph{Transport UDF} \cite{transport} to author UDFs that can be executed on multiple engines.
+
+The data-masking views generated by Data Guard are stored in a view catalog that supports the Hive SQL dialect and are translated by Coral to Spark/Trino SQL at access time. Coral uses Apache Calcite~\cite{calcite} under-the-hood to parse SQL from a source dialect into a relational algebra representation, applies transformations to the representation to address variations in the SQL dialect between the source and target systems, and finally converts the relational algebra representation back to the SQL dialect of the target system. 
+
+The Transport framework provides interfaces for common data types supported by each engine (e.g. $int$, $float$, $double$, $boolean$, $string$, $struct$, $array$, and $map$). We provide engine-specific implementations of Transport's interfaces as wrappers over native types supported by the engine and define masking UDFs using Transport's type system. The Transport framework for authoring UDFs provides multiple benefits:
+\begin{itemize}
+    \item Saves development time as developers need to author the UDF only once. 
+    \item Simplifies code maintenance as we have a single source of truth for the UDF logic.
+    \item Ensures UDFs remain performant as Transport accesses native data types directly without needing conversion between different type systems. 
+\end{itemize}

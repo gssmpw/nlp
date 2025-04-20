@@ -1,0 +1,92 @@
+\subsection{Controller-replica communication}
+
+% \subsection{Overview}
+Having alleviated the issue at the frontend, the next bottleneck was identified at the path that forwards the I/O requests to the underlying replicas. Sending the requests to the replica (null storage) drops the performance to approximately 100k read/write IOPS. This practically means that the communication mechanism (plus a negligible routing overhead) imposes a 4x performance penalty.
+
+In the controller, each request issued on the frontend creates a thread that handles it. The implementation takes advantage of Golang channels and their thread-safe mechanisms. The controller manages dual TCP connections to each replica. Each connection uses two threads (send/recv) responsible for data transport, while a common thread (loop) implements a loop function that handles both incoming requests from the frontend and responses from the replicas.
+
+\begin{figure*}[tb]
+    \centering
+    \includegraphics[width=0.92\linewidth]{figures/communication.pdf}
+    \caption{Original vs. modified controller-replica communication implementation.}
+    \label{fig:crcfig}
+\end{figure*}
+
+After some experiments and code analysis, we found that this data path has limited potential. Although it is simple in design and uses most of the Golang features to its advantage, it fails to scale when multiple parallel requests are issued. The full data path is described as follows (Fig. \ref{fig:crcfig}):
+
+\begin{enumerate}
+\item Each request targeting a replica is translated into the appropriate form for controller-replica communication and inserted in the replica's Request Channel. The issuing thread sleeps until it is notified that the request is completed.
+\item The loop function identifies that there is an issued request and reads it from the Request Channel, marks the message with a unique ID, and stores the message in a Golang map (Messages Map). The loop function forwards the message to the Send Channel. 
+\item A send communication thread reads from the Send Channel the request and sends the data over the TCP connection.
+\item From the replica's side a thread receives the data and serves the request. After the replica finishes serving, it sends the response back to the controller.
+\item A receive communication thread receives the response and forwards the response to the Response Channel.
+\item The loop function reads from the Response Channel and identifies the request that matches the received response using the ID as an index to the messages map. It changes any fields needed in the request and marks the request as completed, waking its corresponding thread.
+\item The issuing thread finishes its execution, notifying the frontend about the result.
+\end{enumerate}
+
+We have traced the scalability problem to the use of a single thread running the loop function. This thread is responsible for handling all I/O operations, requests, and replies, creating a bottleneck. While its tasks are lightweight, the high volume of incoming requests and responses overwhelms the system, limiting performance to the capacity of a single thread. However, this implementation is necessary as the whole process is coordinated via a single Golang map (Messages Map). Maps are unable to do concurrent reads/writes, which is why requests and replies have to be processed sequentially (this also avoids locking to get the next available ID). In the default Longhorn implementation, the controller-replica communication performance is adequate because of the frontend bottleneck. Since our ublk-based frontend has significantly raised the number of I/Os that reach the controller, we need a new approach that avoids the single loop function.
+
+Therefore, we have replaced the Messages Map with a simple fixed-size array (Messages Array) that holds a large predetermined number of IDs and a Golang integer channel. The Messages Array is sized equal to the maximum number of in-flight I/O operations we allow. The integer channel is initialized by populating it with the indexes of the Messages Array. These indexes act as unique request tokens. The modified data path now works as follows:
+
+\begin{enumerate}
+\item Each request targeting a replica is translated into the appropriate form for controller-replica communication.
+\item The issuing thread acquires the next available ID from the Available IDs channel and stores the request's data in the Messages Array using the ID as an index. It then forwards the message to the Send Channel, and then sleeps until it is notified that the request is completed.
+\item A send communication thread reads from the Send Channel the request and sends the data over the TCP connection.
+\item From the replica's side a thread receives the data and serves the request. After the replica finishes serving, it sends the response back to the controller.
+\item A receive communication thread receives the response and matches it to the corresponding request using the reply's ID as an index in the Messages Array. It changes any fields needed in the request and marks the request as completed, waking its corresponding thread.
+\item The issuing thread finishes its execution, reinserts the request's ID into the Available IDs channel, and notifies the frontend about the result.
+\end{enumerate}
+
+The Golang channel guarantees that only one thread will acquire each unique ID. Since this ID is used as the index in the Messages Array, there are also no inconsistent read/write operations on the array, as each thread manipulates at most one index.
+
+This approach eliminates the need for a loop function and scales up communication to handle much more incoming I/Os from the frontend. We also increased the number of concurrent connections to each replica from two to six; six was found to be the optimal number in our setup, effectively balancing system resource efficiency while maximizing the performance benefits of the new implementation. Now sending the requests to the replica (null storage) achieves almost double the IOPS (about 200k).
+
+% OLD TEXT
+
+% \section{Controller-Replica communication}
+
+% \subsection{Overview}
+
+% The next layer of the engine is the internal data path that forwards the I/O requests to the underlying replicas. Each request issued on the front-end creates a thread that handles it. The implementation takes advantage of Golang channels and their thread-safe mechanisms. It consists of multiple TCP connections between the controller and each replica. Each connection is monitored with two threads responsible for data transport from both the replica and the controller. The controller serves the requests using one loop function that handles both incoming requests from the frontend and responses from the replicas.
+
+% \subsection{Identifying the problem}
+
+% After some experiments and code analysis, we found that this data path has limited potential. Although the data path is simple and uses most of the Golang features to its advantage, it fails to provide a scalable solution for forwarding requests to the replicas. The full data path is described as follows:
+
+% \begin{enumerate}
+% \item Each issued request is translated into the appropriate form for the controller-replica communication and is inserted in the request's Golang channel. The thread sleeps until it is notified that the request is completed. 
+% \item The loop function identifies that there is an issued request and reads it from the channel, marks the message with a unique ID, and stores the message in a Golang map. Loop function forwards the message to the send channel. 
+% \item A controller connection monitor thread reads from the send channel the request and sends the data over the TCP connection.
+% \item A replica connection monitor thread receives the data and serves the request. After the replica finishes serving, it sends the response back to the controller.
+% \item A controller connection monitor thread receives the response and forwards the response to a response channel.
+% \item The loop function reads from the response channel and identifies the request that matches the received response using the ID as an index to the messages map. It changes any fields needed in the request and marks the request as completed, waking its thread.
+% \item The request thread finishes its execution, notifying the frontend about the result.
+% \end{enumerate}
+% This approach has a fundamental flaw that makes it non-scalable: the use of a single thread running the loop function. This thread is responsible for handling all I/O operations, requests, and replies, creating a bottleneck. While its tasks are lightweight, the high volume of incoming requests and responses overwhelms the system, limiting performance to the capacity of a single thread. 
+
+% This implementation was necessary because of the way the Golang maps work. They are unable to do concurrent W/R, that's why requests and replies had to be processed sequentially. As mentioned before, Longhorn's frontend causes a bottleneck too, so identifying or resolving this bottleneck alone would not matter much. Since in our approach the frontend can perform much better, a new approach that doesn't use a single loop function would boost the system's performance significantly.
+
+% \subsection{Proposed solution}
+
+% In our solution we managed to replace the Golang map with a simple fixed-size array and an ID Golang integer channel. The messages array has a size equal to the maximum number of in-flight I/O operations we want to allow. The ID channel is initialized by populating it with numbers from zero to the size of the messages array minus one. The data path is slightly modified and now works as follows:
+% \begin{enumerate}
+% \item Each issued request is translated into the appropriate form for controller-replica communication. 
+% \item The same thread acquires the next available ID from the channel and stores the request's data in the messages array using the ID as an index. It then forwards the message to the send channel, and the request thread sleeps, waiting to be marked as completed.
+% \item A controller connection monitor thread reads the request from the send channel and sends the data over the TCP connection.
+% \item A replica connection monitor thread receives the data and serves the request. Once the replica finishes serving, it sends the response back to the controller.
+% \item A controller connection monitor thread receives the response and matches it to the corresponding request using the reply's ID as an index in the messages array.
+% \item The thread updates any necessary fields in the request, marks the request as completed, and wakes the waiting thread.
+% \item The request thread finishes its execution, reinserts the request's ID into the ID channel and notifies the frontend about the result.
+% \end{enumerate}
+
+% Using this approach, we eliminate the need for a loop function and scale the solution to handle the incoming I/O from the frontend or the network capabilities of the connections. The Golang channels ensure that only one thread will acquire each channel content , in our case the ID. Since this ID is used as the index in the messages array we ensure that there will be no inconsistent read/write operations on the array, as each thread manipulates at most one index.
+
+% After this change, the number of connections to each replica was increased from two to six. The goal of this adjustment was to enhance the throughput of IOPS from the controller to each replica. Testing the engine with the ublk frontend, configured with six frontend queues, revealed that having six connections per replica is the optimal solution. This configuration effectively balances system resource efficiency while maximizing the performance benefits of the new frontend.
+
+
+% \begin{figure}[htb]
+%     \centering
+%     \includegraphics[width=0.4\textwidth]{photos/CRC_complete.png}
+%     \caption{Controller-Replica communication }
+%     \label{fig:crcfig}
+% \end{figure}

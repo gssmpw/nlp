@@ -1,0 +1,104 @@
+\section{Methodology Overview}
+\label{sec:overview}
+
+\subsection{Threat Model}
+\label{subsec:threat}
+
+We adopt the same threat model as prior works~\cite{li2021cipherleaks,li2022systematic}, where a privileged attacker aims to steal secrets from cryptographic programs running in a confidential VM (e.g., AMD SEV-SNP). The attacker has full system privileges and can read the entire encrypted memory's ciphertext~\cite{li2022systematic}. 
+We also account for single-step attack~\cite{wilke2023sev}, which aids in selecting optimal observation points in the control flow by controlling procedures within confidential VMs and pausing after each instruction.
+While we focus on ciphertext side channels, we assume the confidential VM hardware and internal entities (i.e., guest OS, applications) are trusted. 
+Although registers can leak during kernel context switches~\cite{li2022systematic}, a kernel patch can resolve this, so we consider registers are secure to protect secrets in this context.
+
+\subsection{A Motivating Example}
+\label{subsec:memorywrite}
+
+We revisit the process of compiling a program using LLVM to illustrate how ciphertext side channels are identified.
+\F~\ref{fig:background} presents the Machine Basic Blocks (MBBs) of the code snippet from the function \texttt{ossl\_ec\_scalar\_mul\_ladder}, handled by the register allocation pass in LLVM.
+We simplify the representation of these MBBs by only showing the ciphertext side-channel relevant variables. 
+Additionally, we format the first operand as the source and the second as the destination.
+
+In $bb.73$ of \F~\ref{fig:background}(a), the register $eax$ is allocated to hold the variable $pbit$. 
+Since $pbit$ is not used immediately or in succession, the compiler optimization inserts a memory store to write it back to $stack.28$. 
+Subsequently, the compiler inserts a reload for the spilled variable $pbit$ once it is involved in operations, as shown in $bb.77$ where $pbit$ is reloaded.
+This gives us the first source of ciphertext side-channel occurrence: the \textbf{spilling-reloading mechanism} during compilation generates additional memory writes, resulting in involuntary leakage.
+A similar situation arises in $stack.29$, as demonstrated in $bb.75$ and $bb.76$, where the variable directly holds the secret returned from \texttt{BN\_is\_bit\_set}.
+
+Next, the function \texttt{BN\_constant\_swap} in \F~\ref{fig:background}(b) demonstrates intermediate values being written back to allocated heap areas.
+The compiler directly generates store instructions that point to heap memories, using $(rdi, rcx, 8)$ for $a\rightarrow d[i]$ and $(rdx, rcx, 8)$ for $b\rightarrow d[i]$.
+Naturally, if these data are stored in registers during their lifecycles, the difficulty of the attack will be significantly increased as the attacker can only obtain the observation of final results. 
+Unfortunately, even with the vector registers in Single Instruction Multiple Data (SIMD), big numbers in cryptography software cannot be continuously held. 
+Thus, this gives us the second source of ciphertext side-channel occurrence: the compiler pervasively resorts to using stack and heap memory writes to store intermediate values due to \textbf{insufficient register resources}, thereby resulting in large attack surfaces for secret leakage.
+
+\subsection{Architecture Overview of \tool}
+\label{subsec:workflow}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{Fig_workflow.pdf}
+\caption{Workflow of \tool.}
+\label{fig:workflow}
+\end{figure}
+
+The compiler-aided methodology emerges as a natural and effective solution to defeat ciphertext side-channel attacks.
+\F~\ref{fig:workflow} depicts the workflow of \tool, consisting of two phases: dynamic taint analysis and static rewriting.
+The dynamic taint analysis tracks sensitive memory accesses on the last optimized IR (\S~\ref{subsec:tainting}), while the mitigation phase applies protection at the Machine-IR level using multiple variants.
+Conducting mitigation at this level because: 
+1) As analyzed in \S~\ref{subsec:memorywrite}, backend optimizations like register allocation may inadvertently undermine the efforts of mitigating ciphertext side channels.
+2) The lower Machine-IR level could also support mitigation, although it would require additional efforts such as adapting taint analysis granularity, managing physical register usage, and manually allocating the mask buffer.
+Therefore, ensuring the effectiveness of the mitigation requires fixing the program at \textbf{the LLVM Machine-IR level with the register allocation pass}.
+During mitigation, precise buffer management for random nonces is carried out for all variants (\S~\ref{subsec:buffermanage}).
+Lastly, the patched Machine-IR is subsequently compiled into a hardened binary for deployment.
+Below are descriptions of the three variants.
+
+\begin{packed_itemize}
+    \item Variant 1 employs the \texttt{rdrand} instruction to generate random nonces when encountering sensitive memory stores. It optimizes the compiling process by utilizing a pre-generated nonce buffer (\S~\ref{subsec:datamasking}).
+    
+    \item Variant 2 employs the \texttt{vaesenc} instruction from AES-NI and a shift/rotate-based linear transformation from XorShift128+~\cite{vigna2017further} to fulfill the requirement of generating a random nonce on-the-fly (\S~\ref{subsec:datamasking}).
+    
+    \item Variant 3 seeks to safeguard secrets in sensitive stack areas by retaining them within vector registers, such as SSE registers, throughout their lifecycles (\S~\ref{subsec:registeralloc}).
+\end{packed_itemize}
+
+\noindent \textbf{Application Scope.}
+The main audience for \tool\ is developers looking to deploy cryptographic software on modern TEEs. \tool\ offers security guarantees for existing cryptographic systems used in TEEs, as it relies on widely used hardware instructions for its three variants.
+
+\subsection{Advantages of Compiler-aided Mitigation}
+\label{subsec:advantages}
+
+Opting for a compiler-aided methodology provides several advantages.
+
+\noindent\textbf{In-place Code Insertion.}
+The compiler-aided method repairs the program alongside the compilation process in an integrated and streamlined manner.
+Thus, it ensures the fixed programs maintain their execution flow as much as possible, eliminating the need for frequent jumps to the instrumentation code that affect branch predictions, as seen in the binary instrumentation approach of \ftool.
+
+\noindent\textbf{Smooth Management for Random Nonces.}
+It is feasible to introduce and manage random nonces for the secrets with each memory writing during compilation (all Variants). We denote this method as \textit{software-based probabilistic encryption}. 
+For example, the compiler directly allocates additional stack slots for nonces and links sensitive memory locations to their corresponding nonces through explicit virtual symbols. 
+This approach contrasts with the binary instrumentation method, where allocating extra space for sensitive variables is challenging due to the fixed binary structure.
+
+\noindent\textbf{Flexible Register Allocation.}
+It is a significant advantage for the compiler to preserve secret variables within registers throughout their lifecycles, by leveraging register allocation pass before the final binary is generated (Variant 3).
+We denote this method as \textit{secret-aware register allocation}.
+For the binary instrumentation method, it is difficult to implement this mitigation approach.
+There are some possible solutions, including performing liveness analysis on a fixed binary and preserving register values before allocating them to sensitive variables or reserving a certain number of registers at the beginning of compilation.
+However, these solutions can inevitably lead to large performance degradation.
+
+\noindent\textbf{Accurate Variable Length.}
+Notably, the length of the stack and heap is crucial for subsequent vulnerability mitigation, as it aids in determining the duration for which memory needs to be protected. 
+The compiler-aided approach enables the protection of each memory unit independently.
+Oppositely, the binary instrumentation approach introduces unnecessary protection, focusing on protecting a slice of heap memory, primarily because it can only track explicit memory allocations and deallocations, such as \texttt{malloc}.
+
+\noindent\textbf{Compensatory Dynamic Taint Analysis.}
+Dynamic taint analysis quickly identifies secret variables but sacrifices coverage, as it only tracks sensitive memories in executed paths, leaving untouched paths unprotected. 
+However, the virtual symbols in IR (as shown in \F~\ref{fig:background}) help compensate for this limitation. 
+These virtual symbols, which represent sensitive memories, are initially tainted in executed paths and are recognized across all MBBs of a tainted function during the streamlined compilation process. 
+This approach provides more comprehensive protection compared to binary instrumentation.
+
+\subsection{Technical Challenges}
+\label{subsec:challenges}
+
+While the compiler-aided methodology facilitates the implementation of the three aforementioned variants, it faces several technical challenges. 
+In the context of software-based probabilistic encryption, two random nonce buffers are necessary: one to provide the initial nonce for sensitive variables that require masking (utilized in Variants 1 and 3) and another to store the nonce currently in use (applicable across all variants). 
+This requirement poses challenges in identifying suitable locations for these nonce buffers and establishing reliable references between sensitive variables and their corresponding nonces within these buffers. 
+Furthermore, in the realm of secret-aware register allocation, a critical challenge lies in formulating a strategy for allocating limited registers to tainted stack slots. 
+This includes determining which registers can temporarily accommodate sensitive variables without compromising performance and prioritizing access to these registers for tainted stack slots. 
+We address these technical challenges in the following section.

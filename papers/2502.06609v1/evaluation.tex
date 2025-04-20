@@ -1,0 +1,157 @@
+\section{Evaluation}
+\label{sec:eval}
+
+The evaluation of Sailor answers the following questions: 
+
+\begin{enumerate}
+    \item Sailor's performance: Can Sailor scan the entire ISA specification in Sail and apply the algorithm to detect security-sensitive ISA state in a reasonable time? 
+    \item Vulnerability detection: How can Sailor Analyzer's results be applied to existing or new security-critical systems for detecting architectural vulnerabilities? 
+    \item Validating the Scanner: Does the Scanner correctly capture all ISA-level insights from Sail? 
+\end{enumerate}
+
+\myparagraph{Evaluation setup:} To answer above questions, we ran Sailor on Ubuntu 22.04.5 LTS with Linux v5.15 on a computer equipped with with an AMD EPYC 7642 processor with 48 cores, 256\,GB RAM, and 2\,TB AVAGO MR9461-16i hard drive. We ran Isla on MacOS Monterey v12.7.5
+on a computer equipped with a 2.9 GHz Quad-Core Intel Core i7, and 16\,GB RAM.
+
+\input{cc-frameworks}
+
+\subsection{Sailor's performance}
+The Scanner parses the RISC-V ISA model in Sail, which comprises of 23.5 kLoC (kilo lines of code) and writes the collected insights into CSV files. 
+The Analyzer uses those CSV files as input to execute the algorithm shown in \autoref{fig:algo} and determine for each architectural state whether it is security sensitive. 
+The analysis in Sail was performed on the base ISA \ie{} rv64gc, along with the following extensions: vector, user-interrupts, scalar cryptography ISA extensions. 
+The Scanner parsed 355 instruction definitions and 160 CSRs (including bitfields derived from 62 actual CSRs) from the RISC-V Sail model~\cite{sail-riscv}.  
+For a secure context switch from S-mode to U-mode, 70 of the CSRs/bitfields are classified as security sensitive by the Analyzer. 
+We also applied Sailor on the Sail implementation of the Hypervisor extension~\footnote{This extension is in the process of being upstreamed, but is functional enough to boot up Linux-based system on the generated emulator.}~\cite{sail-hext-git, sail-hext}. 
+The complete execution of the Scanner and the Analyzer takes 6 seconds in both cases. 
+
+\subsection{Vulnerability detection} 
+\label{sec:vuln-det}
+We used the results from the Analyzer 
+to corroborate the context switch implementations in existing systems: Keystone~\cite{keystone}, Komodo~\cite{komodo}, Rivos' Salus~\cite{rivos-salus}, and IBM's ACE~\cite{ibm-ace}, see \autoref{fig:cc-frameworks}. 
+We found three classes of mishandled ISA-state that when exploited, leads to five different types of security vulnerabilities. 
+\autoref{tab:vuln} summarizes these findings. 
+We manually analyzed the context switch code in all the frameworks. 
+We also generated automated tests for Keystone to check whether the security-sensitive ISA-state before and after a context switch is the same.
+
+\input{vulnerabilities}
+\subsubsection{Keystone}
+Keystone \cite{keystone} is a security monitor that enables creating trusted execution environments (TEEs) on the RISC-V platform. 
+Keystone enclaves comprise of a trusted runtime that executes in S-mode and an enclave application that executes in U-mode. An untrusted OS executes in S-mode as usual. 
+
+We analyzed the security domain switch between the enclave and the untrusted OS as a switch from S-mode to S-mode via the security monitor in M-mode. 
+So we query Sailor to produce security sensitive ISA state with both source and target privilege modes as S-mode. 
+We then use those insights to verify that the context switch code in Keystone correctly saves all security sensitive state for the source security domain and similarly restores all security sensitive state for the target security domain. 
+
+Our analysis found several security-sensitive ISA-state that Keystone does not swap during the context switch. 
+
+We found that Keystone \textbf{does not swap the \texttt{senvcfg} CSR}. 
+The \texttt{senvcfg} CSR has a \texttt{FIOM} (Fence of I/O implies fence of Memory) bitfield. 
+The \texttt{FIOM} bit exists to handle emulated I/O for a VM running in U-mode and a hypervisor running in S-mode when paravirtualization is not available. 
+When such a VM has multiple virtual harts, concurrent accesses to the device by the harts translate to concurrent accesses to memory due to the device emulation. 
+However, since the VM is not aware of the device emulation, it might simply execute I/O fences to order accesses to the device. 
+When the \texttt{FIOM} bit is set, these I/O fence instructions lead to memory accesses also being ordered via memory fences. 
+If this bit is used by the trusted runtime in Keystone to emulate a device for the enclave application, any transitions to the untrusted OS can modify and reset this bit. 
+If the trusted runtime transitions to the OS for unrelated reasons, it is unlikely for the runtime to enforce checks on the architectural state that it expects the security monitor to take care of saving and restoring during the context switch. 
+Further, the OS can maliciously slow down an enclave that doesn't use the \texttt{FIOM} feature, by enabling it and requiring any I/O fences that execute inside the enclave application to be paired with memory fences. 
+
+Further, the Floating Point extension (F-extension) in RISC-V is included in a general-purpose core (rv64gc) by default. 
+However, Keystone does not swap the ISA state corresponding to the F-extension, introducing leaks across security domains. 
+This includes the \texttt{fcsr} control and status register (superset of the \texttt{fflags} and \texttt{frm} CSRs) and general-purpose floating point registers \ie{} \texttt{f0}-\texttt{f31}.  
+This opens up the attack surface due to the following potential security vulnerabilities.
+
+The \texttt{fcsr} register has a floating point rounding mode field (\texttt{frm}).
+\textbf{Computational integrity} attacks can be mounted by the untrusted OS by maliciously modifying the \texttt{frm} field (floating point rounding mode) in the \texttt{fcsr}, that leads to varying computation results inside the enclave. 
+Similarly, the general-purpose floating point registers \ie{} \texttt{f0}-\texttt{f31} can also be leveraged to breach the computational integrity of the enclave.
+
+\textbf{Side-channel} and \textbf{covert-channel} attacks can also exploit the F-extension CSRs in RISC-V.
+These attacks can leverage the 
+\texttt{fcsr} register, specifically the \texttt{fflags} field, which records floating-point exceptions like divide-by-zero. Instead of raising traps, the processor updates \texttt{fflags}, requiring software to proactively check for exceptions. 
+These attacks can also leverage the \texttt{frm} field and the \texttt{f0}-\texttt{f31} registers. 
+
+
+
+
+Prior work has already discovered two of the vulnerabilities we describe above (the side-channel and computational integrity attacks through the \texttt{fcsr} register \cite{dtrap-fpu}) and reported them to Keystone \cite{keystone-fpu-issue}. 
+Although Keystone is currently under active development, the authors have neither responded to the report nor introduced a fix in the framework. \footnote{We reproduce the side-channel and computational integrity attacks by prior work \cite{dtrap-fpu} and also provide a proof-of-concept implementation for new side-channel and covert-channel attacks that leverage the \texttt{f0}-\texttt{f31} registers.}
+
+
+\subsubsection{Komodo} 
+Komodo is a verified security monitor to create enclaves~\cite{komodo}. 
+Komodo (initially developed on Arm) has been ported to RISC-V and verified by a framework called Serval~\cite{serval}. 
+It has a model similar to Keystone, with a security domain switch occurring from S-mode to S-mode. 
+
+The Serval framework verifies Komodo for the RISC-V integer, multiplication, and Zicsr extensions. 
+Considering only these extensions, we still found that Komodo does not swap the \textbf{\texttt{senvcfg} CSR}. 
+
+However, we note that the \texttt{senvcfg} CSR was introduced into the RISC-V privileged specification v1.12, which was ratified after the publication of the paper~\cite{serval, riscv-specs}. 
+But if Komodo is deployed on more recent platforms, an adversary can exploit the bug.
+
+This insight shows that it is important to automate detection of security-sensitive ISA-state as it is a process that must keep up with the constantly changing ISA specifications. 
+
+\subsubsection{Rivos' Salus}
+Rivos Salus is a security monitor that executes in the HS-mode on RISC-V and creates confidential VMs that execute in VS-mode. 
+In this case, we analyze the security domain switch between the confidential VM and the untrusted host OS as a switch from VS-mode to VS-mode through the Rivos security monitor in HS-mode. 
+
+We found that Salus correctly swaps all security-sensitive ISA state correctly in the context switch implementation. 
+However, it introduces a potential \textbf{timing channel} vulnerability by not swapping all security-sensitive ISA state during all instances of context switch. 
+For both, vector and floating point extensions, Salus swaps the architectural state only if the state is dirty. 
+This can leak information about the use of extensions inside the confidential VM to the untrusted OS due to varying delay in the context switch. 
+Even though traditionally it is recommended to only switch registers pertaining to such extensions~\cite{context-switch-cost-hotos} if they were used, as a performance optimization, this can hamper security in confidential computing frameworks. 
+Avoiding that requires constant-time context switching, albeit at the cost of performance.
+
+\subsubsection{IBM's ACE}
+IBM's ACE~\cite{ibm-ace} is a framework to create confidential VMs on RISC-V. It implements the RISC-V CoVE specification~\cite{riscv2025cove} and its security monitor runs in M-mode, the untrusted hypervisor in HS-mode and confidential VMs in VS-mode, as \autoref{fig:cc-frameworks} shows. 
+
+We found that IBM's ACE correctly swaps all security-sensitive ISA state correctly in the context switch implementation. 
+However, we found that ACE also swaps ISA-state that is not security sensitive for a switch between HS-mode and VS-mode. 
+For instance, M-mode specific CSRs that are nor accessible to either HS-mode or VS-mode, neither influence execution in these privilege modes. 
+Examples include: \texttt{mtval} and \texttt{mtval2} (that contain exception-specific information). 
+Further, HS-mode CSRs that do not influence execution in VS-mode and are not accessible in VS-mode also do not require to be swapped, specifically when switching from HS-mode to VS-mode.
+Examples include \texttt{htval} and \texttt{htinst}.
+Since security domain context switches are on the critical path and expensive \cite{context-switch-cost, context-switch-cost-hotos}, swapping only security-sensitive ISA-state can help reduce the cost. 
+We recommend optimizing context switch performance by reducing the amount of non security-sensitive ISA-state that is swapped during context switches, over only swapping security-sensitive ISA-extension state when it is in use. 
+\footnote{Since ACE is under active development and has not been tested on real hardware yet, we consider the performance analysis out of scope for this paper.}
+
+
+\subsubsection{ISA extensions}
+\label{sec:isa-ext-discussion}
+While Keystone doesn't claim support for platforms with extensions such as vector (V), user interrupt and exception handling (N), it takes no preventative measures to detect an unsupported platform and halt further execution or disable those extensions. 
+Similarly, IBM's ACE, Rivos Salus and Komodo, also do not take any measures to prevent being incorrectly deployed on unsupported platforms. 
+The task of deploying a system only on suitable platforms is left for the system operators/platform providers to take care of. 
+Adding such checks can add defense-in-depth and proactively prevent exploitation of any security vulnerabilities that stem from architectural extensions not supported by security-critical software like security monitors, especially for platforms like RISC-V that encourage custom extensions. 
+
+Further, it can be beneficial w.r.t. security to adhere to the following practices while designing new ISA extensions.
+ISA-state previously not classified as security-sensitive must not be affected by the extension to be reclassified as security-sensitive. If that is the case, then Sailor needs to be reapplied on the entire ISA specification to correctly determine security-sensitive ISA-state. 
+Newly introduced ISA-state should not be security-sensitive when the extension is disabled. 
+This is important to ensure that privileged software that does not support certain extensions can still correctly execute on the platform by disabling those extensions. 
+
+
+
+
+\subsection{Validating the Scanner} 
+\label{isla-vs-sailor}
+
+
+\myparagraph{Isla and Scanner performance comparison}: We generated Isla traces for the rv64gc ISA. To collect the traces that generate the same amount of insights as the Scanner, Isla takes 53 minutes. Even though the performance evaluation of Scanner has been carried out on a more powerful machine, it is unlikely that generating traces from Isla can be sped up to the same magnitude as generating insights from Sailor (6 seconds). 
+Using the Scanner is beneficial in real-time, (\eg{} in CI/CD pipelines of security monitors under active development) especially if the software evolves with the evolving ISA specifications. 
+Whereas, we can still leverage Isla to corroborate the results of the Scanner offline, which provides an additional confidence in the correctness of the tool. 
+
+\myparagraph{Isla and Scanner insights comparison}: Comparing the output of the Scanner with the output from the Isla traces, the Validator identified one bug in the Scanner. 
+A function call was not added appropriately to the interrupt analysis, ultimately failing to capture a write in the \texttt{mstatus.MIP} bit in the trace of three instructions (store word (\texttt{sw}), store double word (\texttt{sd}), and store conditional (\texttt{sc})). 
+Apart from this bug, we successfully validated the remaining results that the Scanner generates against Isla's traces. 
+
+The Scanner's output must be verified to be a superset of Isla's output. 
+This is because the Scanner captures a union of the footprint of all possible executions of an instruction. 
+Wheread Isla provides the trace for a single instance of the execution.
+For example, \autoref{lst:mret-isla} and \autoref{lst:mret-sup-isla} are two instances of execution of the same instruction, but with different privileges. 
+The trace in \autoref{lst:mret-sup-isla} reports a write to \texttt{mcause}, while the trace in \autoref{lst:mret-isla} does not. 
+The Scanner captures the write to \texttt{mcause} regardless.
+
+Further, the Sail model implementation sometimes groups similar instruction into a single definition (\eg{} \texttt{fadd}, \texttt{fsub}, \texttt{fdiv}, and \texttt{fmul}) and then branches out into different functions. 
+In these cases, we first compute a union of the footprints we capture from the Isla traces for the group of instructions before comparison. 
+
+
+
+
+
+
+

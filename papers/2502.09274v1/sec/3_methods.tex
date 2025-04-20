@@ -1,0 +1,93 @@
+\section{Proposed Approach}
+Our method introduces critical optimizations across three areas: a distinct training and inference scheme for low-resolution range images, advanced augmentation techniques, and an effective post-processing approach for accurately mapping 2D predictions into 3D space.
+\subsection{Pre-processing}
+\label{subsec:preprocessing}
+\PAR{Range-view Projection} A LiDAR point cloud consists of points captured during a single revolution, denoted as \( P = \{p_1, ..., p_n\} \), where each measurement represents a 4D point including the cartesian coordinates \( p_i = \{x_i, y_i, z_i\} \) and intensity \(t_i\). By pre-defining the 2D resolution, assuming \(W\) and \(H\) as the image width and height, we can project the point cloud into a range image, where each row \(v\) and column \(u\) correspond to the elevation and azimuth angles of LiDAR points. The mathematical expression of the spherical projection model is as following:
+\begin{equation} \label{eqn:prediction}
+\begin{bmatrix} u \\ v \end{bmatrix} = 
+\begin{bmatrix} \frac{W}{2}  - \frac{W}{2\pi} arctan(\frac{y}{x}) \\
+ \frac{H}{\Theta_{max}-\Theta_{min}} * (\Theta_{max} - arcsin(\frac{z}{d}))
+\end{bmatrix}
+\end{equation}
+Angular values $\Theta_{max}$ and $\Theta_{min}$ define the upper and lower bound of the LiDAR's vertical field of views and the depth value is calculated by $d = \sqrt{x^2 + y^2 + z^2}$. Note that \(H\) is typically determined by the number of LiDAR sensor beams, while W can be assigned with random value based on the requirements. Similar to the prior studies~\cite{cheng2022cenet, zhao2021fidnet, cortinhal2020salsanext}, we adopt a five-channel input representation (\(x, y, z, t, d\)).
+\PAR{Data Representation} Increasing azimuth resolution can help preserve more details from point clouds, but this comes at the expense of reduced efficiency. Additionally, as illustrated in Fig.~\ref{fig:occupancy}, elevation resolution plays an equally important role in maximizing projection rates. This led us to rethink if a large image width is necessary to mitigate information loss. Inspired by STR~\cite{kong2023rethinking}, we propose an alternative solution: downsampling the point cloud into multiple equal-interval sub-clouds and projecting them into range images with a lower azimuth resolution. During training, we randomly select one range image. For inference, we stack all images along the batch dimension and process them in a single forward pass. We depict the workflow of \coolname{} in Fig.~\ref{fig:overview}. To balance 3D validity and 2D occupancy, assuming $N_{max}$ is the maximum number of partitioning groups for the specific resolution of range images, it is determined by the rule that the average 2D occupancy must not fall below the high-resolution range image in standard mode ($\frac{1}{N_{max}}\sum^{N_{max}}_i Occ_{i} \geq Occ_{high}$). This new design offers three key advantages: \textbf{1)} Enhanced projection rate by increasing both image height and width; \textbf{2)} Reduced memory consumption, enabling deployment on smaller GPUs; \textbf{3)} Preservation of the full field of view, maintaining contextual integrity despite downsampling.
+\begin{figure}[t]
+  \centering
+    \includegraphics[width=1\linewidth]{pics/flares_overview.png}
+    \caption{\textbf{Visual Illustration of \coolname{}}: The full LiDAR point cloud is equally divided and grouped, each projected into a lower-resolution range image. During training, one image and its 2D label are sampled for optimization. For testing, stacked sub-cloud projections are processed simultaneously, and the outputs are fused into 3D predictions using an unsupervised method. $^\star$We provide more details in the supplementary material.}
+    \label{fig:overview}
+    \vspace{-6mm}
+\end{figure}
+
+\subsection{Data Augmentation}
+\label{subsec:da}
+Previous studies~\cite{cheng2022cenet, ando2023rangevit, zhao2021fidnet} have primarily used geometric transformations such as random flipping, translation, and rotation for point cloud augmentation. To further enrich semantic contexts and optimize for the low-resolution range image used in \coolname{}, we introduce two additional augmentation steps:
+\PAR{1) Weighted Paste-Drop+} Class imbalance is a common issue in LiDAR semantic segmentation benchmarks~\cite{behley2019semantickitti, caesar2020nuscenes}, where certain classes are heavily underrepresented. This imbalance is compounded by information loss during point cloud-to-range image conversion, especially when downscaling azimuth resolution. Building upon the Weighted Paste Drop (WPD) approach introduced in MaskRange~\cite{gu2022maskrange}, which pastes pixels from rare classes and drops pixels from abundant classes, we present an enhanced version, WPD+. Unlike the original method, which performs geometric data augmentation identically on both sampled and current frames in 3D space before projection, our approach applies WPD directly in 3D space, which avoids the repeating computation of geometric transformations, and samples multiple frames to improve class balancing. Additionally, we use a small set of synthetic dataset generated in the Carla Simulator~\cite{dosovitskiy2017carla} to further augment rare classes that correspond to small and dynamic objects in the scene. Despite possible domain gaps between datasets, it yields notable accuracy improvements from our experimental results. 
+\PAR{2) Multi-Cloud Fusion} Given the inherent sparsity of LiDAR point clouds, range images often contain a considerable number of empty grids. Prior works have mitigated the issue by interpolating missing pixels from nearest neighbors~\cite{xu2023frnet} or by supplementing occupied pixels from other frames~\cite{kong2023rethinking}. Coming down to the point cloud splitting in \coolname{} mode, the 2D occupancy in the single range image is decreased and it prompts the necessity for some solution. In our empirical study in Fig.~\ref{fig:mcf}, we found that it yields sub-optimal results when training directly on sub-cloud. To address the issue, we propose Multi-Cloud Fusion (MCF), a strategy to increase the 2D occupancy of sub-clouds alongside the setup of \coolname{}. Assuming the point cloud can be divided into a maximum of \(N_{max}\) groups, we randomly pick a group number \(N\) $\in$ \(\{1, 2, ..., N_{max}\}\) and split the full point cloud accordingly. After projecting them into \(N\) range images, we randomly select one \(R \in \mathbb{R}^{H \times W \times 5}\) as the training input. To enhance occupancy, all empty pixels in \(R\) are filled using occupied pixels from remaining \(N-1\) range images. This method maximizes the 2D occupancy in the range image of a sub-cloud while maintaining the structural consistency of the scene. \\
+$^\star$For further technical details of how input data is curated and augmented, please refer to the supplementary material.
+
+
+
+\subsection{Post-Processing}
+\label{sec:post-processing}
+After the augmented image being processed, 2D predictions from the network must be reprojected into 3D space using some post-processing technique. To align with the new inference framework with stacked predictions, we first propose an extension of the standard KNN method~\cite{2019rangenet++}, termed ~\textit{KNN Ensembling}. In the post-processing phase, all sub-clouds are iteratively processed with KNN and votes are ensembled for every point from the full cloud to obtain final predictions. However, we found that the extension still faces the challenge in appropriately weighting contributions of nearest neighbors in 3D coordinates. In addition, the inference time is accumulated due to iterative process. To address the limitation, we propose a novel algorithm called \textit{Nearest Neighbors Range Interpolation (NNRI)}. Its pseudo-code is detailed in Algo.~\ref{algo:NNRA}. \\
+After applying softmax to the network output, we begin by kernelizing 2D predictions and range images using a pre-defined kernel size ($3\times3$ in our experiments). Next, we assign each point's nearest neighbors in 2D space with corresponding 2D coordinates and stack them along the sub-cloud dimension. The relative depth between each point and its neighbors is computed by taking the absolute difference in depth values. To extract valid data for interpolation, a threshold is needed to filter out distant neighbors. According to the prior knowledge~\cite{hu2022pointdensity, lawin2018densityregistation}, using a constant threshold is sub-optimal due to differing point densities in LiDAR data: closer points are more likely to be affected by outliers due to high density, while farther points struggle to find valid neighbors due to sparsity. To fit this underlying geometry, the range value of each point is employed to determine its cut-off value. By normalizing the range using pre-computed mean and standard deviation, the cut-off value is derived from an exponential function, which approximates the relationship between point-sensor distance and density~\cite{liu2024extend}. This approach simplifies computation by avoiding the costly nearest neighbor search in 3D space to calculate exact density values and adaptively assigns a threshold to each point. Once valid nearest neighbors are identified, they are normalized within the range of $[0, 1]$ to compute interpolation weights. Finally, softmax scores of all 3D points are interpolated by the weighted sum of their nearest neighbors. NNRI is designed to effectively mitigate the "many-to-one" issue inherently in range-view methods by leveraging distance-wise local neighborhood information in both 2D and 3D.
+\begin{algorithm}[t]
+	\SetAlgoLined
+    \SetKwInOut{Define}{Define}\SetKwInOut{Input}{Input}\SetKwInOut{Output}{Output}
+    \Define {$N = N_{max}$ sub-clouds.\\
+            The annotation contains $C$ classes}
+    \Input{Range images $R_{ranges}$ with size $N \times H \times W$,\\
+           Softmax scores $I_{scores}$ with size $N\times C \times H \times W$,\\
+           Arrays $R_{all}(p)$ with range values for all points,\\
+           Image coordinates $(u_{all}, v_{all})$ for all points, \\
+           Kernel size $k$, \\
+           Padding $pad$, \\
+           Cut-off factor $\alpha$, \\
+           Mean of all range values $r_{mean}$,\\
+           Standard Deviation of all range values $r_{std}$
+           }
+	\Output{Array $Labels$ with predicted labels for all points.}
+
+
+
+	\BlankLine
+    \begin{algorithmic}[1]
+    
+    \State \textbf{Unfold scores and ranges with $k \times k$ kernel:}
+        \Statex \hspace{1em} $S_s(n,h,w,k) \gets \texttt{unfold}(I_{scores}, k, pad)$
+        \Statex \hspace{1em} $S_r(n,h,w,k) \gets \texttt{unfold}(R_{ranges}, k, pad)$
+    \State \textbf{Extract nearest-neighbors for each point $p$:}
+        \Statex \hspace{1em} $N_s(n,p, k) \gets S_s(n,h,w,k)[..., u_{all}, v_{all}]$
+        \Statex \hspace{1em} $N_r(n,p, k) \gets S_r(n,h,w,k)[..., u_{all}, v_{all}]$
+    
+    \State \textbf{Compute relative depths: }
+        \Statex \hspace{1em} $N_{rel}(n,p,k) \gets ||(N_r(n,p, k) - R_{all}(p)||$
+    \State \textbf{Compute the cut-off value for each point $p$: }
+        \Statex \hspace{1em}  $D(p) = \texttt{exp}(\frac{R(p) - r_{mean}}{r_{std}}) * \alpha$
+     \State \textbf{Filter the valid neighbors and compute weights: }
+        \Statex \hspace{-1em} $N_{valid}(n,p,k) \gets \texttt{clamp}(N_{rel}(n,p, k), \texttt{max} = D(p)$)
+        \Statex \hspace{1em} $W(n, p, k) = 1 - \texttt{Normalize}(N_{valid}(n, p, k))$
+
+    \State \textbf{Weighted Sum for 3D Projection:}
+        \Statex \hspace{1em} $Scores(p) = \sum_{i}^{k^2\times n} W(n,p, k) * N_s(n,p, k)$
+    \Statex \hspace{1em} $Labels = \texttt{argmax}_{c\in C}(Scores(p))$
+    \State \textbf{Return} $Labels$
+    
+    \end{algorithmic}
+    	\caption{Nearest Neighbors Range Interpolation}\label{algo:NNRA}
+\end{algorithm}
+    
+
+\subsection{Network Selection}
+In order to pursue enhancement in the segmentation accuracy while possibly maintaining the high efficiency of range-view-based approaches, we revisited prior works and selected three light-weight CNN-based networks (FIDNet~\cite{zhao2021fidnet}, SalsaNext~\cite{cortinhal2020salsanext} and CENet~\cite{cheng2022cenet}) for integration. To further test the effectiveness across different network architectures, we additionally deploy RangeViT~\cite{ando2023rangevit}, a network composed of a series of Vision Transformer blocks~\cite{dosovitskiy2020image}, in the experimental phase. Original RangeViT uses a trainable KPConv-based 3D projector to get the point-wise predictions. We replace it with our post-processing component to achieve the full integration of our framework and train the model from scratch.
+
+
+
+
+
+
+
+
+
+

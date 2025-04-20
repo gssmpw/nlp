@@ -1,0 +1,146 @@
+\section{GaussRender}
+\label{sec:methods}
+
+
+We present \method{}, a plug-and-play rendering module that enhances 3D occupancy models through efficient, differentiable Gaussian rendering. First, we define 3D-2D consistency and how to enforce it during training (\autoref{sec:methods:losses}).
+We then outline our camera placement strategy (\autoref{sec:methods:camera}) and describe the rendering process, which projects 3D voxels into 2D images using Gaussian splatting (\autoref{sec:methods:gaussian_rendering}).
+Finally, we detail %
+{our} 2D rendering loss (\autoref{sec:methods:l2d_details}).
+
+\subsection{Enforcing 3D-2D consistency}
+\label{sec:methods:losses}
+Vision-to-3D semantic occupancy models \citep{wei2023surroundocc,huang2023tpv,jiang2024symphonies} take a set of $N$ images, $I = \{I_i\}_{i=1}^N$, and predict a 3D semantic grid $O \in [0,1]^{X \times Y \times Z \times C}$, where $C$ is the number of semantic classes and $(X, Y, Z)$ defines the spatial resolution.
+The standard pipeline consists of three steps:
+\begin{itemize}
+    \item \textit{Feature Extraction:} Each image is processed by a backbone network to extract 2D features $F = \{F_i\}_{i=1}^N \in \mathbb{R}^{d_\textit{img}}$, where $d_\textit{img}$ is the feature dimension.
+    \item \textit{3D Lifting:} The features are lifted into a 3D representation (e.g., voxels, tri-planes) using cross- and self-attention mechanisms.
+    \item \textit{Voxel Prediction:} The 3D representation is converted into a voxel grid, and standard losses (e.g., cross-entropy, Lovász, Dice) are computed against the ground truth.
+\end{itemize}
+
+\paragraph{}
+While the standard 3D losses (denoted as \(L_{\text{3D}}\)) ensure overall occupancy alignment {with the ground truth}, they treat each voxel independently and ignore spatial continuity. This limitation can lead to artifacts such as floating voxels or misaligned surfaces \citep{liu2024sparseocc}. To overcome these issues, we introduce a 2D rendering loss, \(L_{\text{2D}}\), which provides additional supervision by comparing rendered views of the predicted occupancy with corresponding ground-truth images. This loss enforces spatial coherence in the 2D projection, thereby penalizing 3D configurations that produce poor renderings. The overall training loss is defined as:
+\begin{equation}
+L = L_{\text{3D}} + \lambda L_{\text{2D}},
+\end{equation}
+where $\lambda \in \mathbb{R}^+$ is a weighting factor for the 2D loss.
+
+In the following subsections, we define \(L_{\text{2D}}\) by addressing two key aspects: (1) the placement of rendering cameras in the scene (\autoref{sec:methods:camera}), and (2) the differentiable rendering of 3D occupancy via Gaussian splatting (\autoref{sec:methods:gaussian_rendering}).
+
+\subsection{Camera Placement Strategy}
+\label{sec:methods:camera}
+\method{} renders from arbitrary camera positions within the scene, rather than being restricted to the original sensor or adjacent frames \citep{pan2024renderocc, huang2024selfocc, sun2024gsrender}. This flexibility allows us to position virtual cameras anywhere in the 3D space.
+\autoref{fig:camera_location} illustrates {how virtual cameras generate complementary constraints (both semantic and depth) to enhance voxel consistency.}
+
+
+
+The placement of these virtual cameras is crucial and depends on the reconstruction objective:
+\begin{itemize}
+    \item \textbf{Visible Voxels:} If the goal is to accurately reconstruct only the visible portions of the scene \citep{tian2023occ3d, li2024sscbench}, the rendering cameras are placed 
+    {at} the original sensor positions{, as illustrated in \autoref{fig:camera_location} (a)}. 
+    This placement ensures that the inferred 3D structure remains consistent with the sensor's view. 
+    In practice, for each batch, we randomly choose one of the provided camera {positions.} %
+    \item \textbf{Holistic 3D Reconstruction:} For complete 3D reconstruction, including occluded regions \citep{wei2023surroundocc}, cameras are positioned more diversely. Exploring different viewpoints provides additional supervision for occluded areas, heavily penalizing aberrant configurations.
+    {In practice, we generate the virtual views with a simple rule: the camera is 
+    {(1) elevated along $z$ axis with respect to its original position, (2) randomly translated in a close range to the ego-vehicle on the $xy$ plane. 
+    }
+    The resulting camera increases the field of view, looking at both visible and occluded parts of the scene (\autoref{fig:camera_location} (b)).}
+\end{itemize}
+
+Additionally, given the importance of bird's-eye view (BeV) understanding in autonomous driving, we systematically include a fixed virtual {orthographic} BeV camera{, illustrated in \autoref{fig:camera_location} (c)}. The BeV camera offers an orthogonal and complementary perspective, ensuring that objects are accurately localized on the ground and further enhancing voxel consistency.
+
+In practice, placing a camera involves specifying its extrinsic and intrinsic parameters, respectively defining the viewing transformation \(W \in \mathbb{R}^{4 \times 4}\) and the projective transformation \(K \in \mathbb{R}^{3 \times 3}\).
+{Our method keeps the intrinsic parameters fixed and only update the extrinsic parameters for each training batch.
+}
+
+\subsection{Gaussian rendering}
+\label{sec:methods:gaussian_rendering}
+
+For each camera, once its position is chosen and its intrinsics and extrinsics are set, we render the 3D occupancy into the corresponding view. Our goal is fast, fully differentiable rendering that supports efficient gradient backpropagation. To meet this need, we adopt a Gaussian splatting approach \cite{kerbl3Dgaussians}, which is significantly faster than traditional ray-casting while preserving differentiability.
+Consequently, we represent each voxel as a Gaussian primitive.
+
+\paragraph{Voxel `Gaussianization'.}
+To derive a Gaussian from a voxel, we emphasize simplicity to avoid degenerate configurations and ease the learning process. In practice, we: (1) \textit{use spherical Gaussians:} represent each voxel as a sphere, which removes the need for orientation parameters; (2) \textit{fix the center:} place each Gaussian at the center of its corresponding voxel, eliminating the need to learn an offset; (3) \textit{fix the scale:} set the scale of each Gaussian based on the voxel dimensions.
+
+Concretely, as illustrated in \autoref{fig:pipeline} (bottom right), for each voxel at position $\mu = (x,y,z)$, we create a simple Gaussian primitive with:  
+\begin{itemize}
+    \item position $\mu$: inherited from voxel grid coordinates.
+    \item scale $S=\textit{Diag}(s)$: {a diagonal matrix defined by a scalar factor $s \in \mathbb{R}$.} %
+    \item semantic `color' logits $c$: taken from the model's final prediction.
+    \item opacity $o$: learned from voxel features (or derived from the logit of the empty semantic class when features are absent).
+    \item rotation $R = I$: set to the identity matrix, as spheres require no orientation. With this choice, the Gaussian covariance matrix becomes $\Sigma_{3D}=S^2$.
+\end{itemize}
+
+\paragraph{Gaussian rendering.}
+To relate the 3D Gaussian representation to the 2D image, we project the 3D covariance matrix \(\Sigma_{3D}\) into the image plane using the camera parameters. The projected covariance is given by:
+\begin{equation}
+    \Sigma_{2D} = J \cdot W \cdot \Sigma_{3D} \cdot W^T \cdot J^T,
+\end{equation}
+
+where \(J\) is the Jacobian of the affine approximation of the projective transformation \(K\) related to the intrinsic parameters (see \cite{kerbl3Dgaussians} for details).
+This 2D covariance defines the shape and spread of each Gaussian in the image, which directly influences the computation of opacity and transmittance in the following rendering step.
+
+{For each pixel $p$ in the 2D projection,} the rendering computes {its semantic value by aggregating contributions from all projected Gaussians.} Specifically, at $p$, the rendered semantic color value $C_p \in [0,1]^\mathcal{C}$ ($\mathcal{C}$ is the number of semantic classes) and the rendered depth $D_p \in \mathbb{R}^{+}$ are given by:
+\begin{equation}
+C_p = \sum_{i=1}^N T_i, \alpha_i, \mathbf{c}_i, \quad D_p = \sum_{i=1}^N T_i, \alpha_i, \mathbf{d}_i,
+\label{eq:color_rendering}
+\end{equation}
+
+where:
+\begin{itemize}
+    \item \(N\) is the {total} number of Gaussians. %
+    \item \(\alpha_i = 1 - \exp(-\sigma_i\,\delta_i)\) is the opacity (or alpha blending factor) for the \(i\)th Gaussian, with \(\sigma_i\) representing its density and \(\delta_i\) the distance traversed along the ray.
+    \item \(T_i = \prod_{j=1}^{i-1} (1-\alpha_j)\) is the accumulated transmittance from all Gaussians closer to the camera, which accounts for occlusions.
+    \item $\mathbf{c}_i {\in [0,1]^\mathcal{C}}$ is the `color' probability of the \(i\)th Gaussian.
+    \item $\mathbf{d}_i {\in \mathbb{R}^+}$ is the distance of the \(i\)th Gaussian to the projected camera.
+\end{itemize}
+
+We apply the same rendering process to both the predicted semantic occupancy and the 3D ground truth. For ground-truth rendering, we render only occupied voxels by assigning them an opacity of 1 (and 0 for empty voxels), while for predictions we use the learned opacities.
+
+This differentiable and efficient rendering pipeline thus translates the 3D occupancy into 2D views, enabling robust pixel-wise supervision to enforce spatial consistency.
+
+\subsection{\texorpdfstring{{$L_{2D}$}}~~rendering loss computation}
+\label{sec:methods:l2d_details}
+
+
+{
+For each virtual camera, note `*', and the associated pixel set $P^*$, we render semantic and depth images $I_{\text{sem}}^* = \{ C_p, p \in P^* \}$ and $ I_{\text{depth}}^*  = \{ D_p, p \in P^* \}$, from the predicted semantic occupancy, following \autoref{eq:color_rendering}. Similarly, we obtain \( \tilde{I}_{\text{sem}}^* \) and \( \tilde{I}_{\text{depth}}^* \) from the ground-truth voxels. 
+}
+
+
+To enforce consistency, we compare each predicted rendering against its ground-truth counterpart from the same viewpoint using the L1 distance:
+
+\begin{equation}
+    L_{\text{depth}}^* = \frac{1}{d_{\text{range}}^*} \, \| I_{\text{depth}}^{*} \text{-} \tilde{I}_{\text{depth}}^{*} \|_1,
+    \,\,\,
+    L_{\text{sem}}^{*} = \| I_{\text{sem}}^{*} \text{-} \tilde{I}_{\text{sem}}^{*} \|_1,
+\end{equation}
+
+where \( d_{\text{range}}^{*} \in \mathbb{R}^{+} \) is a normalization factor based on the maximum depth, ensuring scale consistency across different scenes.
+The per-camera loss is then obtained as the sum of these two terms:
+\begin{equation}
+    L_{\text{2D}}^{*} = L_{\text{depth}}^{*} + L_{\text{sem}}^{*}.
+\end{equation}
+
+{
+Thus, the overall 2D rendering loss for our module is:
+\begin{equation}
+L_{\text{2D}} =  L_{\text{2D}}^{\text{bev}} + L_{\text{2D}}^{\text{cam}}.
+\label{eq:rendering_losses}
+\end{equation}
+where `$\text{bev}$' is the orthographic BeV camera (top-down perspective) crucial for global scene understanding and `$\text{cam}$' is the dynamically generated camera generated following the strategy outlined in \autoref{sec:methods:camera}, which ensures diverse viewpoints and improves generalization.
+}
+
+This loss ensures that the learned 3D occupancy aligns with both depth and semantic projections, improving the consistency between 3D and 2D representations.
+
+
+
+
+
+
+
+
+
+
+
+
+

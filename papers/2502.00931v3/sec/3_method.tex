@@ -1,0 +1,224 @@
+
+
+\section{Methodology}
+\label{sec:method}
+
+
+\begin{figure*}[h]
+    \centering
+    \includegraphics[width=0.9\linewidth]{images/CVL_policy.pdf} 
+    % \vspace{-20pt}
+    \captionsetup{
+    width=\textwidth,
+    font=Smallfont,
+    labelfont=Smallfont,
+    textfont=Smallfont
+    }
+    \caption{A brief illustration of VL Scoring. The pixel-wise open-vocabulary detection results are transferred into the spatial distibution via the Gaussian mixture model regularized by the FOV weighting (the gray arrows in the figure). Then the frontier-based and the instance-based target points will be assigned with VL score based on the distribution \eref{eq:VL}.}
+    \label{fig:CVL}
+    % \vspace{-6pt}
+\end{figure*}
+
+This section presents our VL-Nav pipeline (\fref{fig:pipeline}), which leverages a rolling occupancy grid map, frontier-based and instance-based target points, and curiosity-vision-language (CVL) Scoring Policy to select and publish a navigation goal. This goal is not only aligned with the given prompt but also leads the robot to explore unknown areas more effectively.
+
+
+\subsection{Rolling Occupancy Map: Occupancy Update}
+
+We represent the environment as a 2D occupancy grid \(\mathcal{G}\), where each cell may be free \((0)\), unknown \((-1)\), or occupied \((100)\). Upon receiving new sensor data (a merged obstacle-and-terrain cloud \(\mathcal{P}\)), we update \(\mathcal{G}\) using the following steps:
+
+\begin{enumerate}
+    \item \textbf{Expand if needed.} If any newly observed points lie outside the current map boundaries, expand the grid in place to preserve historical data.
+    \item \textbf{Clear stale obstacles in forward FOV.} For each cell marked occupied within the robot’s forward field of view (FOV), check whether it still corresponds to a point in \(\mathcal{P}\). Any “stale” obstacle cells are re-labeled as free.
+    \item \textbf{Inflate new obstacles.} For each point in \(\mathcal{P}\) within the sensor range \(R\), mark the corresponding cell as occupied, along with a local neighborhood determined by an inflation radius \(r_{\mathrm{inflation}}\).
+    \item \textbf{Raycast unknown cells to free.} Perform line-of-sight raycasting from the robot’s pose \((x_r,y_r,\theta_r)\) across its angular range \(\theta \in [\theta_r - \tfrac{\mathrm{hfov}}{2},\;\theta_r + \tfrac{\mathrm{hfov}}{2}]\). Any unknown cells \((-1)\) intersected by a ray are marked free \((0)\).
+\end{enumerate}
+
+Algorithm~\ref{alg:occupancy} summarizes these main steps, returning the updated grid \(\mathcal{G}\). This occupancy update leverages consistent line-of-sight logic and inflation to support safe navigation.
+
+\begin{algorithm}[h!]
+\caption{Rolling Occupancy Map Update (Key Steps)}
+\label{alg:occupancy}
+\begin{algorithmic}[1]
+\REQUIRE Grid $\mathcal{G}$, merged point cloud $\mathcal{P}$, robot pose $(x_r,y_r,\theta_r)$, inflation radius $r_{\mathrm{inflation}}$, half-FOV $\mathrm{hfov}/2$, sensor range $R$.
+\STATE $\textsc{ExpandIfNeeded}(\mathcal{G}, \mathcal{P})$
+\STATE $\textsc{ClearStaleObstaclesFOV}(\mathcal{G}, \mathcal{P}, (x_r,y_r,\theta_r))$
+\STATE $\textsc{MarkNewObstacles}(\mathcal{G}, \mathcal{P}, r_{\mathrm{inflation}})$
+\STATE $\textsc{PerformRaycasting}(\mathcal{G}, (x_r,y_r,\theta_r), R)$
+\RETURN Updated grid $\mathcal{G}$
+\end{algorithmic}
+\end{algorithm}
+
+
+\subsection{Frontier-based Target Points}
+
+A cell $(m_x,m_y)$ is a \emph{frontier} if it is free, $\mathcal{G}(m_x,m_y)=0$, and at least one neighbor is unknown, $\mathcal{G}(m_x+\Delta x,m_y+\Delta y)=-1$ for some $(\Delta x,\Delta y)$. After every grid update, only cells in the forward wedge are tested:
+
+\begin{equation}\label{eq:frontier}
+\resizebox{0.66\linewidth}{!}{$
+\begin{split}
+\Bigl|\mathrm{Angle}\bigl((m_x,m_y),(x_r,y_r)\bigr) - \theta_r\Bigr|
+\;&\le\; \frac{\mathrm{hfov}}{2}, \\
+\text{and} \quad \|(m_x,m_y) - (x_r,y_r)\|
+\;&\le\; R.
+\end{split}
+$}
+\end{equation}
+
+A breadth-first search (BFS) clusters these frontier cells. Each cluster is represented by either a single centroid (for small clusters) or multiple sampled points (for large clusters) as the frontier-based target points. 
+
+\subsection{Instance-Based Target Points (IBTP)}
+
+A vision-language detector periodically reports \emph{candidate instance centers} in the form $(q_x,\;q_y,\;\text{confidence})$,
+where \(q_x, q_y\) denote the estimated global coordinates for a potential target instance, and \(\text{confidence}\) quantifies how likely this detection is to match the desired instance. If \(\text{confidence is larger than the detection threshold } \tau_{\mathrm{det}}\), the candidate is retained; otherwise, it is discarded as too uncertain. Retained points will be downsampled via a voxel-grid filter if many candidates lie in close proximity.
+
+This \emph{instance-based} approach mimics human behavior when searching for an object: upon glimpsing something that \emph{might} match the target, one naturally moves closer to confirm. VL-Nav likewise does not ignore intermediate detections. Instead, any candidate above a confidence threshold is treated as a valid \emph{goal candidate}, allowing the robot to approach and verify whether it truly is an instance of interest. If the detection turns out to be incorrect, the robot continues exploring via frontiers or other instance cues, producing an accurate and robust strategy for zero-shot navigation toward a target instance.
+
+
+
+
+\subsection{CVL Scoring Policy}
+
+Once frontier centroids and instance-based targets are gathered, the system computes an CVL score for each candidate goal \(\mathbf{g}\). Let \((x_r,y_r)\) be the robot position, \(\theta_r\) the heading, and \(d(\mathbf{x}_r,\mathbf{g})\) the Euclidean distance. The angular offset is
+
+\begin{equation}\label{eq:offset}
+\resizebox{0.58\linewidth}{!}{$
+\Delta\theta
+\;=\;
+\mathrm{Angle}\bigl(\mathbf{g},(x_r,y_r)\bigr)
+\;-\;\theta_r.
+$}
+\end{equation}
+
+
+\paragraph{VL Score:}
+As shown in \fref{fig:CVL}, a \textbf{vision-language} (VL) score \(S_{\mathrm{VL}}(\mathbf{g})\) translates \emph{pixel-wise vision-language features} into a Gaussian-mixture distribution over the robot’s horizontal field of view (FOV). Suppose the open-vocabulary detection model identifies \(K\) \emph{likely directions} or \emph{detection regions}, each parameterized by \(\bigl(\mu_k,\sigma_k,\alpha_k\bigr)\). Here, \(\mu_k\) indicates the mean offset angle within the FOV, \(\sigma_k\) encodes the detection’s angular uncertainty (in our implementation, a fixed constant of \(0.1\) for all detections), and \(\alpha_k\) is a confidence-based weight that captures how important that region is. By accumulating each region’s contribution in a mixture model, \(S_{\mathrm{VL}}(\mathbf{g})\) naturally biases the robot toward goals in the direction of high-confidence detections that match the language prompt.
+
+From a human perspective, this process resembles \emph{observing} different areas that related to the target instance with varying levels of certainty. For instance, if someone is looking for a “red chair” in a large room, they might spot multiple \emph{red silhouettes} at the right side of their vision, plus a clearer view of something red near the center. Although peripheral glimpses (“out of the corner of the eye”) often carry lower confidence, they are not ignored. Instead, we naturally merge these partial observations into a mental sense of “the chair is probably in one of these directions.” The system follows a similar approach, assigning each detection region a Gaussian shape around \(\mu_k\), scaled by \(\sigma_k\) and weighted by \(\alpha_k\). Inspired by VLFM \cite{yokoyama2024vlfm}, we then multiply by \(C(\Delta\theta)\), a ``view confidence'' term that downweights detections with large angular offsets from the central field of view. The VL score is computed as:
+
+\begin{equation}\label{eq:VL}
+\resizebox{0.9\linewidth}{!}{$
+S_{\mathrm{VL}}(\mathbf{g})
+\;=\;
+\sum_{k=1}^{K}
+\alpha_k\;
+\exp\!\Bigl(
+   -\tfrac{1}{2}
+   \Bigl(\tfrac{\Delta\theta - \mu_k}{\sigma_k}\Bigr)^2
+\Bigr)
+\;\cdot\;
+C\bigl(\Delta\theta\bigr),
+$}
+\end{equation}
+
+\begin{equation}\label{eq:C_theta}
+\resizebox{0.48\linewidth}{!}{$
+C(\Delta\theta) = \cos^2\!\biggl(\frac{\Delta\theta}{(\theta_{\mathrm{fov}}/2)} \cdot \frac{\pi}{2}\biggr).
+$}
+\end{equation}
+\paragraph{Curiosity Cues:}
+We add two curiosity terms to guide navigation toward larger unexplored areas and prevent the system from repeatedly selecting faraway goals that offer only a marginal increase in VL score—thus reducing unnecessary back-and-forth movement which is extremely important for the large-scale environments like the hallway and the outdoor environments in our experiments.
+
+\emph{(1) Distance Weighting.} We define
+\begin{equation}\label{eq:dist}
+\resizebox{0.4\linewidth}{!}{$
+S_{\mathrm{dist}}(\mathbf{g})
+\;=\;
+\frac{1}{1 + d(\mathbf{x}_r,\mathbf{g})},
+$}
+\end{equation}
+so that nearer goals receive slightly higher scores. 
+This factor is especially important on a real robot, as shorter travel distances can significantly reduce energy consumption while preventing needless wandering.
+Although the distance term alone does not guarantee an optimal path, it helps prioritize goals that can be reached sooner.
+
+\emph{(2) Unknown-Area Weighting.} We further encourage curiosity-driven exploration by measuring how many unknown cells lie around \(\mathbf{g}\). First, we define the ratio of unknown as:
+\begin{equation}\label{eq:ratio}
+\resizebox{0.50\linewidth}{!}{$
+\mathrm{ratio}(\mathbf{g})
+\;=\;
+\frac{\#(\text{unknown cells})}{\#(\text{total visited cells})},
+$}
+\end{equation}
+where a local BFS radiates outward from \(\mathbf{g}\), counting how many cells are unknown versus how many are reachable (i.e., not blocked by obstacles). Larger \(\mathrm{ratio}(\mathbf{g})\) implies that moving to \(\mathbf{g}\) may reveal significant unknown space and get more information. 
+To translate this raw ratio into a normalized weighting score, we apply an exponential mapping:
+\begin{equation}\label{eq:unknown}
+\resizebox{0.70\linewidth}{!}{$
+S_{\mathrm{unknown}}(\mathbf{g})
+\;=\;
+1 \;-\;
+\exp\!\Bigl(
+   -\,k\,\mathrm{ratio}(\mathbf{g})
+\Bigr),
+$}
+\end{equation}
+where $k$ is  an adjustable parameter that controls how rapidly the score increases from 0 toward 1. 
+
+
+\paragraph{Combined CVL Score:}
+The final scores of frontier-based goals combine these three components:
+\begin{equation}\label{eq:CVL}
+\resizebox{0.91\linewidth}{!}{$
+S_{\mathrm{CVL}}(\mathbf{g})
+\;=\;
+\Bigl(
+   w_{\mathrm{dist}}\;
+   S_{\mathrm{dist}}(\mathbf{g})
+   \;
+   +\;
+   w_{\mathrm{VL}}\;
+   S_{\mathrm{VL}}(\mathbf{g})
+   \;\cdot\;
+   S_{\mathrm{unknown}}(\mathbf{g})
+\Bigr),
+$}
+\end{equation}
+where \(w_{\mathrm{VL}}\) and \(w_{\mathrm{dist}}\) are scalar weights. Note that the VL score is assigned when a point is initially detected, whereas the curiosity terms (distance and unknown-area weighting) are evaluated at goal selection time—when the current distance and unknown ratio can be calculated. For instance-based goals, these curiosity cues are omitted because their primary purpose is verification rather than exploration.
+
+
+
+\subsection{Select \& Publish Goal Point}
+
+After evaluating CVL scores for all instance-based and frontier goals, the system picks the highest-scoring candidate. Algorithm~\ref{alg:goalSelection} sketches the selection process, prioritizing instances first, then frontiers.
+
+\begin{algorithm}[ht]
+\caption{Select and Publish Goal Point}
+\label{alg:goalSelection}
+\begin{algorithmic}[1]
+\REQUIRE Instance points \(\{\mathbf{o}_1,\dots\}\) with \(VL\_score\), frontier points \(\{\mathbf{f}_1,\dots\}\) with \(CVL\_score\), robot position \(\mathbf{r}\), and threshold \(\delta_{\mathrm{reached}}\) for discarding points too close to \(\mathbf{r}\).
+\STATE \(\textit{bestScore} \leftarrow -\infty\)
+\STATE \(\textit{bestGoal} \leftarrow \textsc{null}\)
+\FORALL{instances \(\mathbf{o}_i\)}
+    \IF{\(\|\mathbf{o}_i - \mathbf{r}\| > \delta_{\mathrm{reached}}\)}
+        \STATE \(s \leftarrow \mathbf{o}_i.\textit{VL\_score}\)
+        \IF{\(s > \textit{bestScore}\)}
+            \STATE \(\textit{bestScore} \leftarrow s\)
+            \STATE \(\textit{bestGoal} \leftarrow \mathbf{o}_i\)
+        \ENDIF
+    \ENDIF
+\ENDFOR
+\IF{\(\textit{bestGoal} = \textsc{null}\)}
+    \FORALL{frontiers \(\mathbf{f}_j\)}
+        \IF{\(\|\mathbf{f}_j - \mathbf{r}\| > \delta_{\mathrm{reached}}\)}
+            \STATE \(s \leftarrow \mathbf{f}_j.\textit{CVL\_score}\)
+            \IF{\(s > \textit{bestScore}\)}
+                \STATE \(\textit{bestScore} \leftarrow s\)
+                \STATE \(\textit{bestGoal} \leftarrow \mathbf{f}_j\)
+            \ENDIF
+        \ENDIF
+    \ENDFOR
+\ENDIF
+\IF{\(\textit{bestGoal} \neq \textsc{null}\)}
+    \STATE Publish \(\textit{bestGoal}\) to \texttt{/selected\_goal\_point}
+\ENDIF
+\RETURN
+\end{algorithmic}
+\end{algorithm}
+
+If no candidate exceeds the distance threshold $\delta_{\mathrm{reached}}$, the robot withholds any new goal. Once a goal is published, a global planner updates obstacle polygons and replans a safe route. A local planner refines each global waypoint into short-horizon commands for real-time obstacle avoidance, supporting incremental exploration in unknown environments.
+
+
+
+\subsection{Path Planning with FAR Planner}
+Once an CVL goal is selected, we hand off point-goal path planning to the FAR Planner \cite{yang2022far}, which represents obstacles polygonally and updates a visibility graph in real time. This enables efficient re-planning in partially unknown environments, often outperforming search- or sampling-based methods. A local planner refines FAR Planner’s waypoints into short-horizon velocity commands, ensuring swift reactions to new obstacles and seamless integration with VL-Nav’s zero-shot vision-language objectives.
+
+
+

@@ -1,0 +1,555 @@
+\maketitle
+
+\begin{abstract}
+
+
+
+Quality estimation is omnipresent in machine translation, for both evaluation and generation.
+Unfortunately, quality estimation models are often opaque and computationally expensive, making them impractical to be part of large-scale pipelines.
+In this work, we tackle two connected challenges:
+(1) reducing the cost of quality estimation at scale, and (2) developing an inexpensive uncertainty estimation method for quality estimation.
+To address the latter, we introduce \textit{Instant Confidence COMET}, an uncertainty-aware quality estimation model that matches the performance of previous
+approaches at a fraction of their costs.
+We extend this to \textit{Early-Exit COMET}, a quality estimation model that can compute quality scores and associated confidences already at early model layers, allowing us to early-exit computations and reduce evaluation costs.
+We also apply our model to machine translation reranking.
+We combine \textit{Early-Exit COMET} with an upper confidence bound bandit algorithm to find the best candidate from a large pool without having to run the full evaluation model on all candidates.
+In both cases (evaluation and reranking) our methods reduce the required compute by 50\% with very little degradation in performance.
+\end{abstract}
+
+\section{Introduction}
+\blankfootnote{\hspace{-1em}$^\dagger$Code and models: \href{https://github.com/zouharvi/COMET-early-exit}{github.com/zouharvi/COMET-early-exit}
+}
+
+
+
+Machine Translation (MT) has made significant progress, with state-of-the-art models achieving increasingly high-quality translations \citep{kocmi-etal-2023-findings,kocmi-etal-2024-findings}.
+However, as reliance on automatic translation grows, so does the need for robust evaluation metrics.
+Quality estimation is one such approach, allowing for the automated assessment of translations without the need for reference texts \citep{tamchyna-2021-deploying,freitag-etal-2023-results,freitag-etal-2024-llms}.
+Recently, quality estimation models have also been finding their way into the decoding process \citep{10.1162/tacl_a_00491, finkelstein2024mbrqefinetuningtrainingtime}, in particular for reranking translation candidates \citep{shen-etal-2004-discriminative,freitag-etal-2022-high,cheng2024bayesianoptimizationapproachmachine}.
+
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.9\linewidth]{generated/14-plot_conf_individual.pdf}
+
+    \vspace{-3mm}
+    \caption{Progression of predicted quality estimation score (dark line) and instant confidence estimation (shaded area) along the quality estimation model computation for four examples from the test set. Layer corresponds to compute cost.
+    Red \textcolor{red!80!black}{l}ine stops computation because the confidence is high enough (early-exit).
+    }
+    \vspace{-2mm}
+    \label{fig:14-plot_conf_individual}
+\end{figure}
+
+
+Despite its promise, we identify two challenges that prevent the widespread adoption of existing quality estimation methods.
+First, current methods typically provide a single best-guess quality score, which may be inadequate when uncertainty is high.
+In critical industry applications, such as legal, medical, or diplomatic contexts, misjudging translation quality can have dire consequences and high scores with very low confidence should better be ignored.
+Knowing the certainty of a prediction is important for decision-making, such as deferrals or routing \citep{zhang2025leveraginguncertaintyestimationefficient,farinhas2025translatesmarthardcascaded} or
+for efficient human evaluation, reserving only uncertain examples for human judgment.
+Previous work has used techniques such as Monte Carlo dropout \citep{glushkova-etal-2021-uncertainty-aware} to estimate confidence intervals for quality scores.
+Although promising, these methods require the model to be run multiple times for each input to generate different stochastic predictions, leading to a substantial computational burden. This limits their practical use in large-scale systems.
+On the other hand, direct confidence estimation \citep{zerva-etal-2022-disentangling} requires separate models for the quality score and the confidence score, which carries a factor two overhead.
+
+Second, the increasing size and complexity of quality estimation models makes it computationally expensive to evaluate hundreds of candidates at once \citep{guerreiro-etal-2024-xcomet}, severely limiting the scalability.
+This makes it difficult to use quality estimation in time-sensitive scenarios, where fast evaluations are critical.
+Additionally, the high computational costs restrict the deployment in resource-constrained environments, hindering practical use in large-scale machine translation.
+
+
+
+
+To overcome the first challenge, we propose \textit{Instant Confidence COMET}, a model that jointly predicts translation quality and an associated uncertainty, without increasing the computational cost.
+We demonstrate in \Cref{sec:goal_instant_confidence} that the model can produce accurate confidence scores that strongly correlate with true prediction errors, without affecting the quality estimation performance.
+
+
+We also use the confidence mechanism for our new \textit{Early-Exit COMET}, a model that estimates translation quality already in the earlier layers.
+Examples of how score and confidence predictions develop throughout the layers are shown in \Cref{fig:14-plot_conf_individual}.
+Early-Exit COMET uses the confidence score to determine whether an early prediction suffices or additional evaluation layers are needed.
+In \Cref{sec:goal_earlyexit1} we combine it with a simple threshold-based early-exit algorithm for faster sample-level quality estimation.
+Finally, in \Cref{sec:goal_earlyexit2} we use Early-Exit COMET for machine translation reranking.
+In this task, the machine translation model generates many candidates and the goal is to find the best one with as little compute as possible.
+We combine Early-Exit COMET with an upper confidence bound bandit algorithm for this reranking process and show that it outperforms strong random and logprob-based baselines.
+
+
+
+In addition to our results and code, we release the pre-trained Early-Exit and Instant Confidence quality estimation models publicly.
+
+
+\section{Instant Confidence COMET}
+\label{sec:goal_instant_confidence}
+When a quality estimation model produces an output, such as 85, it is not clear whether this is just the model's best guess or truly an accurate assessment of the quality.
+Having this additional information is important for decision making \citep{zhang2025leveraginguncertaintyestimationefficient,farinhas2025translatesmarthardcascaded}, such as in commercial translation pipelines where high-scoring translations are marked as requiring very little human attention. If the high score is very uncertain, then it would be safer to have a human double-check these translations.
+Similarly, when designing budget-efficient human evaluation pipelines \citep{zouhar2025selectdatapointsefficienthuman}, human labor should be directed to examples where automated metrics are the least confident.
+
+\paragraph{Preliminaries.}
+A quality estimation model is a function $f$ that given a source $s$ and a translation $t$, computes an estimate of the quality:\footnote{
+If a reference translation $r$ is also included in the input, then the quality score is called a reference-based metric.
+}
+\begin{align}
+\widehat{\mathrm{y}} = f(s, t)
+\end{align}
+Quality estimation models are usually trained with the $\mathcal{L}_2$ loss between predicted and human assessments of quality
+\citep{kocmi-etal-2022-findings,kocmi-etal-2024-error,lommel2014multidimensional}.
+\begin{align}
+\mathcal{L}_2(y, f(s, t))
+\end{align}
+
+The COMET model \citep{rei-etal-2020-comet,rei-etal-2022-cometkiwi} is one such quality estimation function $f$.
+The model is based on encoding the source, translation, and potentially also the reference with a multi-layer, multilingual, transformer-based encoder.
+Once the embeddings are computed, they are joined in a regression head that produces the final score.
+
+For epistemic\footnote{\citet{zerva-etal-2022-disentangling} distinguish between epistemic uncertainty, meaning lack of model knowledge, and aleatoric uncertainty, meaning noise in data.} uncertainty estimation, we wish to have a predictor corresponding to a particular quality estimation model $f$ that predicts the magnitude of the individual sample-level error:
+\begin{align}
+\hat{e} = |f(s, t) - y|
+\end{align}
+The negative error then corresponds to confidence or certainty.
+
+
+\subsection{Models}
+
+We first introduce our instant confidence model and then describe two prior approaches for uncertainty-aware quality estimation.
+
+
+\paragraph{Instant Confidence COMET.}
+We propose modifying the quality estimation model to output both a quality estimate and an error estimate at the same time.
+Thus, the model outputs $\langle\hat{y}, \hat{e}\rangle$, and during training we sum two MSE losses with importance of the second determined by hyperparameter $\beta$:
+\begin{align}
+\mathcal{L}_2 (y, \hat{y})+ \beta\cdot
+\mathcal{L}_2 (|y-\hat{y}|, \hat{e})
+\end{align}
+Notably, we do not backpropagate loss through $\hat{y}$ in the second term, only through $\hat{e}$.
+The architecture is illustrated in \Cref{fig:highlevel_lithium}.
+During inference, the model has almost the same computational cost as an unmodified COMET model.
+
+
+
+\paragraph{MC Dropout.}
+\citet{glushkova-etal-2021-uncertainty-aware} elicit 
+confidence scores
+using Monte Carlo (MC) dropout.
+This involves running the quality estimation model multiple times whilst introducing some randomness, in this case random dropout, and measuring the variance across runs in the output.
+The underlying hypothesis is that the model outputs, even with dropout, will be the same for high-confidence samples but different for low-confidence samples.
+While producing strong results, these methods are not practical for real applications because they can require up to $100$ model runs.
+
+\paragraph{DUP.}
+\citet{zerva-etal-2022-disentangling} train a separate secondary model that estimates the error of the original quality estimate. They call this Direct Uncertainty Prediction (DUP).
+We consider two variants.
+In the first, the uncertainty predictor does not know the original model prediction and in the second, as described in the previous work, the prediction is passed to the model.
+Both variants come with a factor two computational overhead.
+In addition, only the first variant is parallelizable because it does not depend on the original model's prediction.
+
+\subsection{Results}
+\label{sec:goal_instant_confidence_results}
+
+We now evaluate the proposed uncertainty-aware quality estimation model and compare it to previous work.
+We reproduce the previous works under the same conditions to have a level playing field for fair comparisons.
+
+\paragraph{Setup.}
+In line with previous works, we use the human-annotated segment-level data from WMT 2019 to 2022 for training \citep{barrault-etal-2019-findings,barrault-etal-2020-findings,akhbardeh-etal-2021-findings-FIXED,kocmi-etal-2022-findings} and reserve WMT 2023 \citep{kocmi-etal-2023-findings} for test set (116k segments across 8 language pairs: De$\leftrightarrow$En, Ja$\leftrightarrow$En, En$\leftrightarrow$Zh, Cs$\rightarrow$Uk, En$\rightarrow$Cs).\footnote{We do not use WMT 2024 \citep{kocmi-etal-2024-findings} due to the new annotation protocol which leads to lower correlations for all metrics.
+}
+We describe the general model technical details in Appendix \Cref{tab:model_details}.
+
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=1\linewidth]{img/highlevel_lithium.pdf}
+    \caption{Architecture for uncertainty-aware quality estimation system based on COMET.}
+    \label{fig:highlevel_lithium}
+\end{figure}
+
+\begin{table}[t]
+\small
+\centering
+\begin{tabular}{l@{\hspace{1mm}}r@{\hspace{1mm}}c@{\hspace{2mm}}c@{}l@{}}
+\toprule
+& \bf Cost$\bm{\downarrow}$ & \bf Human$\bm{\uparrow}$ & \bf Error$\bm{\uparrow}$  \\
+\midrule
+Instant Confidence $\beta{=}0.25$\hspace{-2mm} & 1$\times$ & 0.316 & 0.222 \\
+Instant Confidence $\beta{=}0.5$\hspace{-2mm} & 1$\times$ & 0.309 & 0.224 \\
+Instant Confidence $\beta{=}0.75$\hspace{-2mm} & 1$\times$ & 0.326 & 0.228 & $\bigstar$ \\
+Instant Confidence $\beta{=}1.0$\hspace{-2mm} & 1$\times$ & 0.330 & 0.207 \\
+Instant Confidence $\beta{=}1.5$\hspace{-2mm} & 1$\times$ & 0.325 & 0.200 \\[0.5em]
+No Confidence & 1$\times$ & 0.327 & - \\[0.5em]
+
+MC Dropout (2) & 2$\times$ & 0.210 & 0.201 \\
+MC Dropout (5) & 5$\times$ & 0.247 & 0.267 \\
+MC Dropout (10) & 10$\times$ & 0.262 & 0.301 \\
+MC Dropout (50) & 50$\times$ & 0.279 & 0.328 \\
+MC Dropout (100) & 100$\times$ & 0.281 & 0.333 \\[0.5em]
+MC Dropout$^\dagger$ (2) & 2$\times$ & 0.327 & 0.061 \\
+MC Dropout$^\dagger$ (5) & 5$\times$ & 0.327 & 0.092 \\
+MC Dropout$^\dagger$ (10) & 10$\times$ & 0.327 & 0.115 \\
+MC Dropout$^\dagger$ (50) & 50$\times$ & 0.327 & 0.131 \\
+MC Dropout$^\dagger$ (100) & 100$\times$ & 0.327 & 0.134 \\[0.5em]
+DUP (parallelizable) & 2$\times$ & 0.327 & 0.135 \\  
+DUP (sequential) & 2$\times$ & 0.327 & 0.216 \\
+\bottomrule
+
+\end{tabular}
+\caption{Correlation (Pearson) of model scores with human scores (Human) and correlation of model error predictions (negative confidence) with true error (Error). Higher is better $\uparrow$ and lower is better $\downarrow$. MC Dropout$^\dagger$ uses dropout only for predicting the error and calculates the quality score without dropout.}
+\label{tab:mcdropout}
+\end{table}
+
+
+
+\paragraph{Pointwise confidence is cheap.}
+
+We compare our approach with previous work in \Cref{tab:mcdropout}.
+The $\beta$ hyperparameter allows for trade-off between correlation with human score and confidence correlation with true error.
+For Monte Carlo dropout, as the number of runs is increased, the correlation between the model score variance (model confidence) and the true error increases.
+However, this comes at the very steep cost of having to run the same model with dropout multiple times, which is not feasible in many quality estimation applications.
+Moreover, using dropout during inference hurts the quality estimation performance, because part of the information flow in the network is obscured.
+Increasing the number of runs only partially compensates for this drop; indeed, even with 100 runs, the score correlation remains lower than that obtained with a single run with no dropout (0.281 vs. 0.327).
+
+Upon first glance, the solution appears to be to run Monte Carlo dropout 100 times to obtain a good uncertainty estimate and once without the dropout to also obtain a good quality estimation.
+We show this approach as MC Dropout$^{\dagger}$ in \Cref{tab:mcdropout}.
+However, due to the discrepancy between this model score and the uncertainty measure, the error correlation turns out to be very low, revealing this not to be a viable uncertainty prediction setup.
+
+Lastly, we compare with DUP, which has the original (best) human correlation but still twice the cost of our approach and lower error correlation.
+
+
+Overall, our instant confidence approach is the best in terms of cost and competitive in terms of human and confidence correlations.
+In Appendix \Cref{fig:15c-expected_calibration_error} we see that on average 
+when the quality estimation model has high confidence (low $\hat{e}$) then it is likely to have an accurate prediction (low $|\hat{y}-y|$).
+Notably, the lowest confidence bin corresponds to samples where the quality estimation model is very incorrect ($|\hat{y}-y|>20$).
+
+\section{Early-Exit COMET}
+\label{sec:goal_earlyexit1}
+
+COMET is a computationally expensive evaluation method. The $24$ transformer layers of the model are costly to compute. The idea of Early-Exit COMET is to use the embeddings from earlier layers to predict the final COMET score in advance. In addition, each layer predicts the error between its score estimate and the full COMET score. In this way, if the model has a confident estimate of the full COMET score after a few layers, then the evaluation can \emph{early-exit} and save on compute costs.
+
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=1\linewidth]{img/highlevel_earlyexit.pdf}
+    \caption{Architecture for confidence-aware (with respect to last layer) early-exit quality estimation system based on COMET.}
+    \label{fig:highlevel_earlyexit}
+\end{figure}
+
+
+\subsection{Early-Exit COMET with Self-Confidence}
+\label{sec:earlyexit_model}
+
+We make two architectural changes to COMET to enable confidence-aware early-exit:
+(1) predictions at each layer instead of just after the final layer, and
+(2) self-confidence predictions that predict the error with respect to the final layer COMET score.\footnote{This is distinct from Instant Confidence COMET, where the predicted error was with respect to human scores.}
+Importantly, we do not attempt to predict the error with respect to human scores because we wish to stop if we are confident that the final layer would also not produce a very different output.
+
+Let $\mathrm{L}_i$ be the embedding after layer $i$, and let $\mathrm{R}$ be the regressor head on top of the final layer.
+The final model prediction is then:
+\begin{align}
+\hat{y} = \mathrm{R}(\mathrm{L}_{|\mathrm{L}|}).
+\end{align}
+We wish to predict approximate scores $\hat{y}_i$ after each layer $i$.
+Therefore, instead of training the evaluation model with the standard loss function,
+\begin{gather}
+\mathcal{L}_2 \left(y, \mathrm{R}(\mathrm{L_\mathrm{|L|})} \right),
+\end{gather}
+we apply the same regressor head to each layer and calculate the cumulative loss:
+\begin{align}
+\sum_{i=1}^{|\mathrm{L}|} \mathcal{L}_2 \left(y, \mathrm{R}(\mathrm{L_i}) \right).
+\end{align}
+
+To incorporate confidence predictions, we also increase the output dimensionality of the regressor head to two ($\mathrm{R}_{\mathrm{y}}$ and $\mathrm{R}_{\mathrm{e}}$).
+The second output is used to estimate how far the (early) prediction is from the final prediction.
+We refer to this as \textit{self-confidence}.
+This gives an additional loss term for each layer:
+\begin{align}
+\mathcal{L}_2 \left(|\mathrm{R}_{y}(\mathrm{L}_i)-\mathrm{R}_{y}(\mathrm{L_\mathrm{|L|}})|\, , \,\mathrm{R}_{e}(\mathrm{L_i})\right).
+\end{align}
+The architecture is illustrated in \Cref{fig:highlevel_earlyexit}.
+
+
+
+
+\begin{table}[t]
+\newcolumntype{V}{>{\raggedleft\arraybackslash}p{6.8mm}}
+\newcolumntype{Z}{>{\raggedleft\arraybackslash}p{8.3mm}}
+\small
+\setlength{\tabcolsep}{3pt}
+\centering
+
+\resizebox{\linewidth}{!}{
+\begin{tabular}{llVVVVVVVZ}
+\parbox[t]{2mm}{\multirow{11}{*}{\rotatebox[origin=c]{90}{\bf Layer}}}
+& \multicolumn{7}{c}{\bf \color{green!40!black} Layers} 
+& \multicolumn{2}{r}{\bf \color{purple!80!black} Human} \\
+\input{generated/10-eval_oxygen.tex}
+\end{tabular}
+}
+
+\vspace{-2mm}
+Early-Exit COMET
+
+\vspace{-1mm}
+
+\resizebox{\linewidth}{!}{
+\begin{tabular}{llVVVVVVVZ}
+\parbox[t]{2mm}{\multirow{11}{*}{\rotatebox[origin=c]{90}{\bf Layer}}}\\
+\input{generated/10-eval_helium2hydrogen.tex}
+\end{tabular}
+}
+
+\vspace{-2mm}
+Baseline COMET
+
+\caption{Pearson correlations between intermediate layer outputs (green) and between intermediate layer outputs and humans (purple) for supervised Early-Exit as described in \Cref{sec:earlyexit_model} (left) and unsupervised Early-Exit based on standard COMET (right). See Appendix \Cref{10-eval_all_big} for detailed version.}
+\label{10-eval_oxygen_hydrogen}
+
+\vspace{-3mm}
+\end{table}
+
+\subsection{Results}
+
+We now discuss our findings with Early-Exit COMET.
+We use the same experimental setup as in \Cref{sec:goal_instant_confidence}.
+
+\paragraph{Early layer scores.}
+To measure the quality of the early layer scores, we calculate correlations with the final layer scores, as well as with human evaluations.
+For comparison, we include the baseline COMET model, applying the final layer regressor to the intermediate embeddings to get intermediate scores.
+In \Cref{10-eval_oxygen_hydrogen} we show that earlier layer scores of baseline COMET do not correlate strongly with final layer scores or with human judgments. 
+However, with direct supervision at each layer, we see much better results for Early-Exit COMET.
+At layer 5 we already see a correlation score of $0.65$ with the final layer and $0.207$ with human scores. By layer $13$, the correlation with human scores is $0.278$, comparable to the final layer.
+We include a version of Early-Exit COMET with separate regression heads for each layer in Appendix \Cref{10-eval_all_big}, but we do not observe any improvements.
+
+
+To measure the quality of the self-confidence error predictions, we plot the average predicted error versus the true error in Appendix \Cref{fig:13-plot_conf}. We also include correlation scores for selected layers showing the correlation between the predicted and true errors, e.g., $0.44$ for layer $9$ scores.
+This enables early-exit decision making, which we introduce in the next section.
+
+
+\subsection{Deciding When to Early-Exit}
+\label{sec:faster_segment_qe}
+
+
+In some cases, the Early-Exit COMET model is already close to the final assessment after a few layers (top row in \Cref{fig:14-plot_conf_individual}).
+In these cases, we do not need to continue the computation if we are confident that the final outcome will be very close.
+The per-layer confidences can inform this decision.
+
+In \Cref{alg:threshold_algorithm}, we outline a simple heuristic that stops the Early-Exit COMET computation when the error prediction is low enough.
+To evaluate this algorithm, we compare it with two baselines that do not use the confidence scores: (1) Constant-Exit (Appendix, \Cref{alg:constant_algorithm}) stops at a constant, pre-defined layer; and (2) Variance-Exit (Appendix, \Cref{alg:variance_algorithm}) stops when the variance of three consecutive predictions is under a chosen threshold.
+
+\begin{figure}[t]
+{
+\small
+\hrule
+\vspace{1mm}
+\textbf{Inputs}: Source $s$, translation $t$, threshold $\tau$ \\
+\textbf{Output}: Quality estimate $\hat{y}$ 
+\vspace{1mm}
+\hrule
+\vspace{1mm}
+\begin{algorithmic}[1]
+
+\State Compute $L_0(s, t)$
+\For{$i \in 1\ldots |L|$}
+    \State {Compute }$L_i(s,t)$ from $L_{i-1}(s,t)$ \Comment{next layer}
+    \State $\hat{y}_i, \hat{e}_i \gets R(L_i)$ \Comment{apply regressor head}
+    \State \textbf{if} \, $\hat{e}_i < \tau$ \, \textbf{then return} $\hat{y}_i$
+    \Comment{early-exit}
+\EndFor
+\State \Return  $\hat{y}_{|L|}$ 
+\end{algorithmic}
+}
+\vspace{1mm}
+\hrule
+\vspace{1mm}
+
+\captionof{algorithm}{Confidence-Exit with Early-Exit COMET.}
+\label{alg:threshold_algorithm}
+\vspace{-2mm}
+\end{figure}
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{generated/20-early_exit_alg_last.pdf}
+
+    \vspace{-3.2mm}
+    \includegraphics[width=\linewidth]{generated/20-early_exit_alg_hum.pdf}
+
+    \vspace{-2mm}
+    \caption{
+    Quality estimation correlation with last layer (final prediction, top) and with human scores (bottom) for heuristic-based early-exit COMET.
+    }
+    \label{fig:20-early_exit_alg}
+    \vspace{-2mm}
+\end{figure}
+
+
+\paragraph{Results.}
+
+\Cref{fig:20-early_exit_alg} shows the performance of \Cref{alg:threshold_algorithm} versus the baselines. We plot the correlation with final layer scores and human judgments for different budgets (total computation costs). The cost is relative to calculating the full COMET score for all inputs ($100\%$).
+We vary the algorithm thresholds to explore different budgets.
+
+We see that the confidence-based early-exit algorithm outperforms variance-exit and constant-exit.
+This shows that the confidence outputs at early layers are crucial for enabling early-exit.
+With only half of the compute, we see only a small performance drop from the full to half compute: ($0.309{\rightarrow}0.292$) for human scores.
+
+
+
+
+
+\input{alg/bandit_alg}
+
+\begin{figure*}[t]
+    \centering
+    Beam-Search\\
+    \includegraphics[width=0.49\linewidth]{generated/52-bandit_win_rate_beam.pdf}
+    \hfill
+    \includegraphics[width=0.49\linewidth]{generated/52-bandit_avg_score_beam.pdf}
+    
+    Sampling\\
+    \includegraphics[width=0.49\linewidth]{generated/52-bandit_win_rate_sample.pdf}
+    \hfill
+    \includegraphics[width=0.49\linewidth]{generated/52-bandit_avg_score_sample.pdf}
+
+    \vspace{-2mm}
+    \caption{Quality of the candidates returned by the Upper Confidence Bound bandit. Quality is measured in terms of the average final candidate score and the proportion to top-1 candidates selected. We plot these measures for various evaluation budgets. Cost (or budget) is given relative to calculating the full COMET scores for all candidates ($100\%$).
+    See results in tabular form in Appendix \Cref{tab:bandit}.
+    }
+    \vspace{-2mm}
+    \label{fig:bandit}
+\end{figure*}
+
+
+\section{Early-Exit COMET for Reranking}
+\label{sec:goal_earlyexit2}
+
+In addition to enhancing the speed of quality estimation, the early-exit model can be applied to reranking. 
+In this setup, a machine translation model generates a set of candidate translations, $\mathcal{C}$, for a source sentence, and
+the objective of reranking is to identify the best candidate from $\mathcal{C}$.
+
+Reranking with quality estimation has been shown to improve translation quality \citep{freitag-etal-2022-high} and, as one might expect, the larger the initial pool of candidates, the higher the final translation quality \citep{vernikos-popescu-belis-2024-dont}.
+However, running a quality estimation model on a large number of candidates, e.g. $|\mathcal{C}| > 100$, can be prohibitively expensive. 
+
+
+To lower these compute costs, we turn to Early-Exit COMET and rely on its accurate early-layer predictions to make reranking more efficient.
+The idea is to calculate more accurate (and more expensive) scores only for the most promising candidates based on the less expensive early-layer scores.
+
+Each early-exit output, $\hat{y}_1, \hat{y}_2, \ldots, \hat{y}_{|L|}$, has an associated runtime cost: $\mathrm{cost}(\hat{y}_i)$. For Early-Exit COMET, we can take $\mathrm{cost}(\hat{y}_i) = i$ since each layer has the same computation cost.
+Note that costs are not additive; for example, once the layer $3$ score is calculated, all later layers can use the layer $3$ embeddings. So for $i>3$, we will now only accumulate the additional cost of $\mathrm{cost}(\hat{y}_{i}) - \mathrm{cost}(\hat{y}_{3})$.
+
+Ultimately, we must select a final candidate
+and our goal is to strike a balance between the total computation cost and finding the candidate with the highest $\hat{y}_{|L|}$ score.
+
+
+
+
+
+
+
+\subsection{Upper Confidence Bound Bandit}
+In the multi-armed bandit problem, a decision-maker must repeatedly choose between several actions, ``arms'', with unknown reward distributions.
+The goal is to maximize the cumulative reward earned over time by balancing exploration (trying out different arms to learn their rewards) and exploitation (choosing the arm believed to be the best), which can be done with the upper confidence bound bandit \citep{auer2002using}.
+The algorithm computes an upper confidence bound for the estimated reward for each arm, selecting the arm with the highest bound in each round.
+This approach encourages the algorithm to explore less-pulled arms (with larger error estimates) while exploiting those with higher estimated rewards.
+
+In our context, the ``arms'' are the translation candidates $\mathcal{C}$, and pulling an arm corresponds to calculating an additional quality estimation model layer.
+Since the predictions improve with more layers (\Cref{10-eval_oxygen_hydrogen}), each ``pull'' of the ``arm'' improves our estimate of the reward for the given candidate.
+For each candidate, we always consider the reward of the highest layer explored thus far and its associated confidence score.
+The computation budget determines the number of pulls available. When the budget runs out, we pick the candidate with the highest reward estimate, ignoring the associated confidence scores. 
+A more precise formulation is provided in \Cref{alg:ucb_algorithm}.
+The $\gamma$ controls the balance between exploration and exploitation. We use $\gamma=1$ for most experiments, but an ablation study can be found in \Cref{sec:bandit_ablations}.
+
+\paragraph{Setup.}
+To evaluate our upper confidence bound bandit with Early-Exit COMET, we again use the WMT 2023 test set \citep{kocmi-etal-2023-findings}, including 8 language pairs\footnote{Due to the large size, we use a random subset of the test data with $2000$ source examples for each language pair.}. We generate translation candidates using NLLB \citep{nllb2022}, with 200 candidates per segment. We generate candidates via multinomial sampling (across the whole vocabulary) and via beam search separately and report results for both.
+
+
+\paragraph{Baselines.}
+We compare against a \textit{Random} baseline, where we select a random subset of candidates, calculate the full COMET scores for this subset and select the candidate with the highest score. The size of the subset is proportional to the budget.
+In addition to the random baseline, we also show results for two baselines based on the log probability scores (logprobs) of the translation model (NLLB).
+In contrast to the random baseline, we select the subset based on the logprobs of the candidate tokens. We take the highest-scoring candidates in terms of the average logprob score (\textit{LogProb Avg}) or the sum of logprob scores (\textit{LogProb Sum}), and calculate the full COMET scores for this subset.
+
+
+
+
+
+\subsection{Results}
+
+\Cref{fig:bandit} shows the quality of the bandit output as we increase the evaluation budget.
+We plot both the average score of the final candidates and the rate at which the top-1 (best full COMET score) candidate is selected. 
+
+Surprisingly, the logprob-based baselines underperform the random baseline 
+in almost all settings, in both metrics, and for all budgets.
+We hypothesize that this is due to lower diversity in the subset of candidates selected. 
+In contrast, the bandit outperforms the random baseline in almost all scenarios and for all budgets. In particular, with $60\%$ of the compute budget, there is almost no drop in the average translation quality.
+This indicates both that the Early-Exit COMET scores and error predictions are valuable and that the upper confidence bound bandit is able to make efficient use of these estimates.
+
+For more detailed results on the upper confidence bound bandit, please see the ablation studies in \Cref{sec:bandit_ablations}.
+
+\section{Related Work}
+
+We now position our contributions in relation to other works on uncertainty-aware quality estimation, faster inference, and reranking.
+
+
+\paragraph{Model uncertainty.}
+Quantifying uncertainty in learned automated machine translation metrics was first proposed by \citet{glushkova-etal-2021-uncertainty-aware}, who use the variance from ensembles or Monte Carlo dropout as a measure of uncertainty.
+A different approach by \citet{zerva-etal-2022-disentangling} introduces a secondary confidence estimation model to complement the original quality estimation model.\footnote{
+They also propose an approach whereby one model predicts both quantities, similar to our instant confidence.
+See \Cref{sec:fail_hts} documenting our attempts at replicating this model.
+}
+Instead, we optimize a single model that produces two scores: a quality estimate and a measure of uncertainty.
+We optimize this model jointly in each training step, optionally optimizing for predictions at each layer and optionally with respect to the last layer's prediction.
+Finally, we note that the focus of \citet{zerva-etal-2022-disentangling} is on analyzing the source of uncertainty, while our focus is on using uncertainty to make quality estimation more reliable and efficient.
+
+\paragraph{Faster quality estimation.}
+Multiple previous works investigated improving the efficiency of calculating trained metrics.
+For large scales, \citet{rei-etal-2022-searching} use length-batching to speed up inference.
+At the same time, they statically prune the quality estimation model, which is similar to our constant-exit approach.
+\citet{cheng2024bayesianoptimizationapproachmachine} use a smaller baseline language model rather than the default XLM-Roberta for COMET.
+\citet{zouhar-etal-2024-pitfalls} find that simply quantizing the model to half precision has almost no effect on the final quality estimation performance while halving the compute costs.
+\citet{gowda-etal-2023-cometoid,gowda-etal-2024-pymarian} port COMET to a faster inference engine for massive speed gains.
+Finally, \citet{larionov2024xcometlitebridginggapefficiency} explore pruning, distillation, and quantization for a very large quality estimation model, xCOMET \citep{guerreiro-etal-2024-xcomet}.
+All of these approaches are orthogonal to our method
+and could be used in combination.
+
+\paragraph{Early-Exit.}
+Previous works have proposed methods to stop computation at a particular Transformer block layer \citep{bertpatience}, but these methods are largely applicable to classification tasks.
+\citet{xin-etal-2021-berxit} propose \textit{learning-to-exit}, which we loosely follow in our work.
+However, instead of predicting a probability of success, we predict the absolute error of the model, which is directly interpretable.
+
+\paragraph{Reranking.}
+Reranking improves translation quality \citep{freitag-etal-2022-high}, but scoring large candidate sets is computationally expensive. One common approach is minimum Bayes risk (MBR) decoding \citep[MBR;][]{eikema-aziz-2020-map}, which selects the translation candidate with the lowest expected risk. Recent work has made MBR more efficient \citep{cheng-vlachos-2023-faster,deguchi-etal-2024-centroid,trabelsi2024efficientminimumbayesrisk,vamvas-sennrich-2024-linear}, including methods that pre-select candidates with cheaper, noisier scoring functions \citep{fernandes-etal-2022-quality, eikema-aziz-2022-sampling}.
+
+Other approaches improve efficiency through token-level reranking \citep{singhal-etal-2023-eel} or by framing reranking as a Bayesian Optimization problem, where a cheaper scoring model assists in identifying high-quality candidates before applying the more expensive scoring model \citep{cheng2024bayesianoptimizationapproachmachine}.
+
+
+
+\section{Conclusion}
+
+We introduced three approaches to improve the efficiency of quality estimation.
+Our instant confidence Early-Exit COMET achieves comparable performance to Monte Carlo dropout methods while drastically lowering computational overhead.
+Combining our model with a simple early-exit strategy, we can compute comparable quality estimation scores without having to compute the full quality estimation model.
+Finally, combining Early-Exit COMET with an upper confidence bound bandit, we speed up candidate reranking for machine translation by a factor of almost $2$ with negligible impact on translation quality.
+
+\paragraph{Recommendations.}
+Based on our findings, we offer the following practical advice:
+\begin{itemize}[topsep=0mm]
+\item When quality estimation is part of a more complex decision process, we recommend using instant confidence-aware COMET to provide additional information on the credibility of decisions.
+\item For very large-scale quality estimation use cases with limited compute budget, we recommend Early-Exit COMET with Confidence-Exit.
+\item For reranking with very large candidate pools, we recommend the upper confidence bound bandit to reduce the number of scored candidates.
+\end{itemize}
+
+
+
+\paragraph{Future work.}
+Reranking can also be combined with beam search to improve quality at generation time. Future work could apply our ideas to improve reranking efficiency for model generation. 
+Moreover, in \Cref{sec:goal_partial} we describe a prototype of Partial COMET, a quality estimation model that is able to robustly evaluate incomplete generations.
+This can be used to prune incomplete candidates, thus saving unnecessary computation of the very expensive generative model.
+
+
+\section*{Limitations}
+
+Regarding the results in \Cref{tab:mcdropout}, it is possible that there is a causal trade-off between the two correlation scores, the correlation with human scores and the correlation with the true error.
+For example, it could be easier to predict the confidence of a model that performs worse.
+However, making stronger claims would require a more thorough mathematical treatment, which is outside of the focus of this work.
+
+
+\section*{Ethics Statement}
+Data used in this paper was collected by previous works.
+The authors foresee no ethical problems.
+
+\section*{Acknowledgments}
+
+We thank the EAMT committee for sponsoring this research. 
+We thank the Vector Stiftung for supporting Béni Egressy's work.
+Part of this work received support from the European Union’s Horizon research and
+innovation programme under grant agreement No 101135798, project Meetween (My Personal AI Mediator for Virtual MEETtings BetWEEN People).

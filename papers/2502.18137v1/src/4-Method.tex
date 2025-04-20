@@ -1,0 +1,227 @@
+\begin{figure*}[!th]
+    \centering
+    \includegraphics[width=0.99\textwidth]{figs/overview.pdf}
+    \vspace{-.75em}
+    \caption{Workflow of \our.}
+    \vspace{-1.2em}
+    \label{fig:overview}
+\end{figure*}
+
+
+\section{\our} \vspace{-.25em}
+\our contains a two-stage online filter to implement sparse FlashAttention. First, as shown in \texttt{Step1} and \texttt{Step2} in Fig.~\ref{fig:overview}, we design a fast and accurate method to predict the sparse block in the attention map, thereby skipping the corresponding products of $Q_iK_j^\top$ and $\widetilde{P}_{ij} V_j$. Second, as shown in \texttt{Step3} in Fig.~\ref{fig:overview}, we design a sparse online softmax method to further skip the products of $\widetilde{P}_{ij} V_j$.
+
+
+
+\begin{figure}[!h]
+    \centering
+    \vspace{-.1em}
+    \includegraphics[width=0.49\textwidth]{figs/qk_heatmaps.pdf}
+    \vspace{-2em}
+    \caption{Exemplary patterns of the query and key in the attention of various models.}
+    \vspace{-1em}
+    \label{fig:qk_heatmap}
+\end{figure}
+\subsection{Sparse FlashAttention}  \label{sec:sparse_flashattn}
+\vspace{-.25em}
+\our adopts the tiling strategy of FlashAttention~\cite{dao2023flashattention}, and skip computing the blocks that are filtered out. Consider an attention operation $S = Q K^\top/\sqrt{d},~P = \sigma(S),~O = P V$, where $\sigma(S)_{ij} = \exp(S_{ij})/\sum_{k} \exp(S_{ik})$ is the softmax operation.
+Let $N$ be the sequence length and $d$ be the dimensionality of each head; the matrices $Q$, $K$, and $V$ each have dimensions $N \times d$, while the matrix $S$ and $P$ is $N \times N$. 
+FlashAttention proposes to tile $Q$, $K$, and $V$ from the token dimension into blocks $\{Q_i\}, \{K_i\}, \{V_i\}$ with block sizes $b_q$, $b_{k}$, $b_{k}$, respectively. Then, it uses online softmax~\cite{milakov2018online} to progressively compute each block of $O$, i.e., $O_i$:
+\begin{align}
+ S_{ij} = Q_i K_j^\top / \sqrt{d},~~(m_{ij}, \widetilde P_{ij}) = \tilde\sigma(m_{i,j-1}, S_{ij}), \notag \\
+ l_{ij} = \exp(m_{i,j-1}-m_{ij}) l_{i,j-1} + \mathrm{rowsum}(\widetilde P_{ij}), \notag \\
+ O_{ij}=\diag{\exp(m_{i,j-1}-m_{ij})} O_{i,j-1} + \widetilde P_{ij} V_j  \label{equ:flashsoftmax}
+\end{align}
+where $m_{ij}$ and $l_{ij}$ are $b_q \times 1$ vectors, which are initialized to $- \infty$ and $0$ respectively. The $\tilde \sigma()$ is an operator similar to softmax.: $m_{ij} = \max\{m_{i,j-1}, \mathrm{rowmax}(S_{ij})\},~\widetilde P_{i,j}=\exp(S_{ij}-m_{ij})$.
+Finally, the output $O_i$ can be computed by $O_i = \mathrm{diag}(l_{ij})^{-1} O_{ij}$.
+
+Implementing sparse FlashAttention is intuitive. By \emph{skipping} certain block matrix multiplications of $Q_i K_j^\top$ and $\widetilde{P}_{ij} V_j$, we can accelerate the attention computation.
+We formulate sparse attention based on FlashAttention in the following definitions. 
+
+\begin{definition}[Block Masks]
+    Let $M_{g}$ and $M_{pv}$ be binary masks of dimensions $\lceil N/b_q \rceil \times \lceil N/b_k \rceil$, where each value is either 0 or 1. These masks determine which computations are skipped in the sparse attention mechanism.
+\end{definition}
+    
+\begin{definition}[Sparse FlashAttention]
+    The computation rules for sparse FlashAttention based on the masks are defined as follows:
+    \begin{equation}
+        Q_i K_j^\top, \widetilde{P}_{ij} V_j \mathrm{~~are~ skipped~ if~~ } M_{g}[i,j] = 0.
+    \end{equation}
+    \begin{equation}
+        \widetilde{P}_{ij} V_j \mathrm{ ~~is~ skipped~ if~~ } M_{pv}[i,j] = 0.
+    \end{equation}
+\end{definition}
+
+
+
+
+
+\begin{algorithm*}[t!]
+    \small
+    \caption{Implementation of \our.}
+    \label{alg:our} 
+    \begin{algorithmic}[1]
+    \STATE {\bfseries Input:} {Matrices $Q(\text{FP16}), K(\text{FP16}), V(\text{FP16}) \in \mathbb{R}^{N \times d}$, block size $b_q, b_{kv}$, count of GPU Warps \jt{$c_w$}, hyper-parameters \jt{$\tau, \theta,$ and $\lambda$}.}
+
+    \STATE Divide $Q$ to $T_m = {N}/{b_q}$ blocks $\{Q_i\}$; divide $K$, $V$ to $T_n = {N}/{b_{kv}}$ blocks $\{K_i\}$ and $\{V_i\}$.
+
+    \STATE $\hat Q_i, \hat K_j, \delta_Q, \delta_K = \mathrm{Quant}(Q_i, K_j)$ ;  \annotate{// per-block quantization in SageAttention.}
+
+    \STATE \jt{$q = \{q_i\} = \{\mean (Q_i, \mathrm{axis}=0)\}$ ;~~ $k = \{k_j\} = \{\mean (K_j, \mathrm{axis}=0)\}$ ;}
+
+    \STATE \jt{$\hat S=qk^\top ;~~ s_{qi} = \mathrm{CosSim}(Q_i) ;~~ s_{kj} = \mathrm{CosSim}(K_j) ;~~  \hat S[:,j] = - \infty, ~\mathrm{If}~ s_{kj} < \theta ;$}
+    
+    \STATE \jt{$\hat P[i] = \mathrm{Softmax}(\hat S[i])$ ;~~ $M[i,:] = \mathrm{TopCdf}(\hat P[i], \tau)$ ;}
+    ~~\jt{$M[i,:] = 1, ~\mathrm{If}~ s_{qi} < \theta$ ;~~ $M[:,j] = 1, ~\mathrm{If}~ s_{kj} < \theta$ ;}
+
+    \FOR {$i=1$ {\bfseries to} $T_m$} 
+        
+        \STATE Load $\hat Q_i$ and $\delta_Q[i]$ into a SM ;
+
+        \FOR {$\textbf{j}$ in [1, $T_n$]} 
+
+            \IF {\jt{$M[i,j] != 0$}}
+            \label{alg:condition1}  
+
+                \STATE Load $\hat K_j$, $\hat V_j$, and $\delta_K[j]$ into the SM ;
+
+                \STATE $S_{ij} = \mathrm{Matmul}(\hat Q_i, \hat K_j^T) \times \delta_Q \times \delta_K$ ;  \annotate{// dequantization of SageAttention.}
+
+                \STATE $m_\mathrm{local} = \mathrm{rowmax}(S_{ij}) ;~~ m_{ij} = \mathrm{max}(m_{i,j-1}, m_\mathrm{local})$ ;~~ $ \widetilde P_{ij} = \mathrm{exp}(S_{ij} - m_{ij})$ ;~~ $l_{ij} = e^{m_{i,j-1}-m_{ij}} + \mathrm{rowsum}(\widetilde P_{ij})$ ;
+    
+                \STATE \jt{$i_w = \mathrm{range}(c_w)$ ;~~ $I_w = [\frac{i_w*b_q}{c_w}:\frac{(i_w+1)*b_q}{c_w}]$ ;}
+
+                \IF {\jt{$\max(m_\text{local}[I_w] - m_{ij}[I_w]) < \lambda$} }  \label{alg:condition2}
+
+                    \STATE \jt{$O_{ij}[I_w] = \mathrm{diag}(e^{m_{i,j-1}[I_w]-m_{ij}[I_w]})^{-1} O_{i,j-1}[I_w] +$ $\mathrm{Matmul}(\widetilde P_{ij}[I_w], V_j)$ ; \annotate{// Paralleled by $c_w$ warps.}}
+                \ENDIF
+            \ENDIF
+        \ENDFOR
+        \STATE $O_i = \mathrm{diag}(l_{i,T_n})^{-1} O_{i,T_n}$ ;~~~ Write $O_i$ ;
+    \ENDFOR
+    \STATE \textbf{return} $O = \{O_i\}$ ;
+    \end{algorithmic}
+    \vspace{-.2em}
+\end{algorithm*}
+\subsection{Selective Token Compression for Sparse Prediction}  \label{sec:stage1}
+\underline{Key idea.} 
+Although attention maps vary across models, we observe that various models exhibit a common trait: 
+Most closer tokens in the query and key matrices of the attention show high similarity (See Fig.~\ref{fig:qk_heatmap}). Consequently, for blocks composed of highly similar tokens, we can consolidate these tokens into a single representative token for the block. Based on this observation, we propose a pattern-free online prediction method for identifying sparse blocks in $P$ to skip some computation of $Q_iK_j^\top$ and $\widetilde{P}_{ij} V_j$ during the FlashAttention process. Specifically, we first compress blocks \uline{exhibiting high self-similarity} within \(Q\) and \(K\) into tokens. Then, we swiftly compute a compressed attention map \(\hat P\) using the compressed \(Q\) and \(K\). Finally, we selectively compute \(\{Q_iK_j^\top, \widetilde{P}_{ij} V_j\}\) for those pairs \((i, j)\) where \(\{\hat P[i,j]\}\) accumulates a high score in the compressed attention map.
+Importantly, compressing only the token blocks with high self-similarity is crucial, as omitting computations for non-self-similar blocks can result in the loss of critical information. This will be confirmed in Sec.~\ref{sec:exp} and~\ref{app:self-sim-judge}. 
+
+
+\noindent \underline{Prediction.} 
+As shown in \texttt{Step1} in Fig.~\ref{fig:overview}, we first compute a mean cosine similarity across tokens for each block of $Q$ and $K$. Next, we compress each block into a single token by calculating a mean across tokens. Then, we compute a compressed $QK^\top$ using the compressed \(Q\) and \(K\). Finally, to prevent interference from non-self-similar blocks, i.e., the block similarity less than a hyper-parameter $\theta$, we set the corresponding values in \(S\) to \(-\infty\), and then obtain a compressed attention map through softmax. This algorithm can be expressed as:
+{
+\begin{align*}
+    q = \{q_i\} = \{\mean& (Q_i, \mathrm{axis}=0)\} \notag \\
+    k = \{k_j\} = \{\mean& (K_j, \mathrm{axis}=0)\}   \\ 
+    s_{qi} = \mathrm{CosSim}(Q_i),~ &s_{kj} = \mathrm{CosSim}(K_j)\\
+    \hat S[i] = q_ik^\top ; ~~~ \hat S[:,j] &= - \infty, ~\mathrm{If}~ s_{kj} < \theta \\
+    % \hat S[i,:] = - \infty, ~\mathrm{If}~ s_{qi} < \theta;~~~&  
+    \hat P[i] = \mathrm{Softmax}&(\hat S[i])
+\end{align*}
+}
+where $Q_i \in \mathbb{R}^{b_q\times d}, q_i \in \mathbb{R}^{1\times d}, K_j \in \mathbb{R}^{b_k\times d},  k_j \in \mathbb{R}^{1\times d}$ and $\mathrm{CosSim}(X) = \frac{XX^\top}{|\max(XX^\top)|}$ measures the cosine-similarity within a block.
+
+For each row of $\hat P$, i.e., $\hat P[i]$, we select the positions of the top values whose cumulative sum reaches \(\tau \cdot \sum \hat P[i]\), where \(\tau\) is a hyper-parameter. These positions are set to 1 in \(M_{g}[i,:]\), while all other positions are set to 0.
+\begin{align} 
+    M_{g}[i,:]  = &\mathrm{TopCdf}(\hat P[i], \tau)   
+\end{align}
+where the $\mathrm{TopCdf}(\hat P[i], \tau)$ can be formulated as follows.
+\definecolor{codeblue}{rgb}{0,0,0.5}
+\definecolor{codeblue2}{rgb}{0,0,1}
+\lstset{
+  backgroundcolor=\color{white},
+  basicstyle=\fontsize{7.36pt}{7.36pt}\ttfamily\selectfont,
+  columns=fixed,
+  breaklines=true,
+  captionpos=b,
+  commentstyle=\fontsize{7.36pt}{7.36pt}\color{codeblue},
+  keywordstyle=\fontsize{7.36pt}{7.36pt}\color{codeblue2},
+    emph={mask},
+    emphstyle={\color[RGB]{10,190,20}},
+}
+\begin{lstlisting}[language=python]
+def Top_Cdf(P[i], tau):
+    sorted_P, idx = torch.sort(P[i], descending=True)
+    cusum_P = torch.cumsum(sorted_P, dim=0)
+    mask = cusum_P <= tau * P[i].sum()
+    M_i = torch.zeros_like(mask)
+    M_i[idx] = mask
+    return M_i
+\end{lstlisting}
+
+Finally, we need to ensure that calculations involving non-self-similar blocks of $Q$ or $K$ are not omitted. Therefore, we set all values in the rows of \(M_{g}\) corresponding to not self-similar blocks of \(Q\) to 1, and all values in the columns of \(M_{g}\) corresponding to non-self-similar blocks of \(K\) to 1. 
+\begin{align}
+    M_{g}[i,:] = 1, ~\mathrm{If}~ s_{qi} < \theta ;~~~M_{g}[:,j] = 1, ~\mathrm{If}~ s_{kj} < \theta 
+\end{align}
+\subsection{Masking of the First Stage} 
+\noindent \underline{Masking.} The $M_{g}$ can be applied in FlashAttention directly to saving some computation. In the inner loop of FlashAttention, i.e., during computing attention between a $Q_i$ and $\{K_j\}, \{V_j\}$, we can skip \{$Q_iK_j^\top$, $\widetilde{P}_{ij} V_j$\} when $M_{g}[i,j] = 0$.
+\begin{align}
+    \mathrm{Skip}~ Q_iK_j^\top ~\mathrm{and}~ \widetilde{P}_{ij} V_j,&~~\mathrm{If}~ M_{g}[i,j] = 0 
+\end{align}
+\subsection{Sparse Warp Online Softmax}  \label{sec:stage2}
+\underline{Key idea.} We can further identify the small enough values in the attention map during the online softmax process. If all values in $\widetilde{P}_{ij}$ are close enough to zero, the $\widetilde{P}_{ij} V_j$ will be negligible and can be omitted.
+
+To identify which $\widetilde{P}_{ij} =\exp(S_{ij}- m_{i,j})$ (See Sec.~\ref{sec:sparse_flashattn}) contains values small enough to be omitted, we note that in every inner loop of FlashAttention, the $O_{ij}$ will be scaled by $\exp(m_{i, j-1}-m_{ij})$ and then plus the $\widetilde P_{ij} V_j$:
+\begin{align*}
+    m_\text{local} =& \mathrm{rowmax}(S_{ij}), ~~m_{ij} = \max\{m_{i, j-1}, m_\text{local}\} \notag \\
+    O_{ij}=& \diag{\exp(m_{i, j-1}-m_{ij})} O_{i, j-1} + \widetilde P_{ij} V_j
+\end{align*}
+If $\mathrm{rowmax}(S_{ij}) < m_{ij}$, then $m_{ij} = m_{i,j-1}$. 
+Consequently, $O_{ij} = O_{i,j-1} + \widetilde P_{ij} V_j$. 
+Furthermore, if $\mathrm{rowmax}(S_{ij}) \ll m_{ij}$ holds ture, then all values in $\widetilde P_{ij} = \exp(S_{ij} - m_{ij})$ are close to 0. This results in all values in $\widetilde P_{ij} V_j$ being close to 0. This condition implies that $\widetilde P_{ij} V_j$ is negligible when $\mathrm{rowmax}(S_{ij})$ is significantly smaller than \(m_{ij}\):
+\begin{align}
+    \notag
+    O_{ij} \approx O_{i,j-1}, \quad \text{if } \max \left( \exp(S_{ij} - m_{ij}) \right) \to 0 \\  \notag
+    \max \left( \exp(S_{ij} - m_{ij}) \right) \to 0 \Leftrightarrow
+    \max(m_\text{local} - m_{ij}) < \lambda
+\end{align}
+The above equivalence is satisfied when $\lambda$ is small enough.
+
+Therefore, based on the analysis above, we propose a simple yet effective sparse method to further skip the $\widetilde P_{ij} V_j$ computation. 
+Specifically, in the inner loop of FlashAttention, the $S_{ij}$ will be split by $c_w$ GPU warps to \{$S_{ij}[\frac{i_w*b_q}{c_w}:\frac{(i_w+1)*b_q}{c_w}, :]$\}, where $i_w$ is the index of the GPU warp. Let $I_w = [\frac{i_w*b_q}{c_w}:\frac{(i_w+1)*b_q}{c_w}]$.
+If $\max(m_\text{local}[I_w] - m_{ij}[I_w]) < \lambda$, where $\lambda$ is small enough, then $O_{ij}[I_w] \approx O_{i,j-1}[I_w]$, and we will skip the computation of $\widetilde P_{ij}[I_w] V_j$ which is used to update $O_{ij}[I_w]$. 
+
+
+\subsection{Combined with SageAttention}
+To further accelerate our implementation of sparse attention, we integrate our method into SageAttention~\cite{2024sageattention}, which proposes a quantized method for accelerating attention. Since quantization operations and sparse operations are orthogonal, sparse computation can be directly applied to SageAttention. 
+The complete algorithm is shown in Algorithm~\ref{alg:our}.
+Specifically, first, we need to add one judgment at the beginning of the inner loop of SageAttention (Line 10 in Algorithm~\ref{alg:our}) to decide whether to skip the whole inner loop once.
+Second, we add another judgment before the updating of $O_{ij}$ in the inner loop of SageAttention (Line 15 in Algorithm~\ref{alg:our}) to decide whether to skip the computation of $\widetilde P_{ij} V_j$. 
+Moreover, to minimize the attention map prediction overhead, we implement the prediction using CUDA and adopt some kernel fusion techniques.
+
+\subsection{Hyper-parameters Determination for Model Layer}  \label{sec:hyper-para}
+Based on the method description in Sec.~\ref{sec:stage1} and~\ref{sec:stage2}, our method incorporates three hyper-parameters: $\tau \in (0,1)$, $\theta \in (-1,1)$, and $\lambda<0$. 
+The parameter determination process for each attention layer in any model is straightforward. We aim to identify a set of hyperparameters that not only maximize attention sparsity but also constrain the attention error across five different model inputs. To evaluate attention accuracy, we employ a strict error metric, the Relative L1 distance, defined as \(L1 = \sum |O - O'| / \sum |O|\). The process begins by setting two L1 error thresholds $l_1$ and $l_2$, e.g., $l_1=0.05, l_2=0.06$. 
+We first conduct a grid search for \(\tau\) and \(\theta\) to identify the optimal pair that maximizes sparsity while ensuring \(L1 < l_1\). Subsequently, we perform another grid search for \(\lambda\) to find the optimal value that further maximizes sparsity while maintaining \(L1 < l_2\).
+
+\begin{figure}[!h]
+    \centering
+    \vspace{-1em}
+    \includegraphics[width=\linewidth]{figs/reorder_curve/curve.pdf}
+    \vspace{-2.1em}
+    \caption{Illustration of different token permutation methods in $1\times 6 \times 6$ space, with block size of 4.}
+    \vspace{-1em}
+    \label{fig:hilbertcurve}
+\end{figure}
+
+\subsection{HilbertCurve Permutation}
+\label{sec:hilbert} 
+\underline{Key idea.} Improving sparsity while maintaining accuracy is a key challenge in enhancing the performance of sparse attention. In our algorithm, increasing the self-similarity of key and query blocks can reduce the number of non-self-similar blocks.
+This allows more blocks to participate in $\mathrm{TopCdf}$ selection, thereby improving sparsity. 
+Since attention is computationally invariant to token permutations, the problem reduces to \uline{finding a permutation that enhances the similarity of adjacent tokens.}
+
+Image and video models benefit from strong priors: adjacent pixels are likely to be similar.
+To better leverage this prior, we propose the HilbertCurve permutation, given 3D visual tokens $Q, K, V \in \mathbb{R}^{T\times H \times W \times d}$,
+We use the Hilbert Curve to fill the 3D space and then flatten tokens along the curve into shape $\mathbb{R}^{L \times d}, L = T \times H \times W$. 
+Fig.~\ref{fig:hilbertcurve} illustrates an example of $1\times 6\times 6$ visual tokens flatten by row-major order and HilbertCurve.
+The Hilbert Curve preserves locality effectively, traversing the entire 3D space without crossing rows or columns, thereby increasing the similarity of adjacent tokens and the sparsity of attention.
+
+
+
+
+
+
+

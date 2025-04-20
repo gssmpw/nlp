@@ -1,0 +1,39 @@
+\section{\systemname: Architecture Overview}
+\label{sec:overview}
+
+
+
+\begin{figure*}[!t]
+  \centering
+  \includegraphics[width=1.0\textwidth]{figures/armada_system_diagram.pdf}
+  \vspace{-0.25in}
+  \caption{\systemname system diagram. \textbf{A.} Graph data is partitioned using \partitioning (Section~\ref{sec:partitioning}) and then \textbf{B.} stored on disk in the storage layer. \textbf{C.} A disaggregated mini batch preparation layer loads graph partitions into memory and prepares mini batches for workers in the compute layer. \textbf{D.} The compute workers process these mini batches on GPUs and periodically synchronize dense model parameters.}
+  \label{fig:system_diagram}
+\end{figure*}
+
+
+
+Armada addresses the aforementioned challenges of large-scale distributed GNN training (Section~\ref{sec:prelim}) by introducing a min-edge-cut partitioning algorithm (\partitioning) and by employing a disaggregated architecture (Figure~\ref{fig:system_diagram}). Concretely, Armada consists of four components; we next discuss the responsibilities of each during training, before describing \partitioning in Section~\ref{sec:partitioning} and optimizations to reduce communication across the architecture in Section~\ref{sec:implementation}. 
+
+
+
+\newparagraph{\partitioning Partitioning Layer}
+Given an input graph (stored on disk) in the form of an edge list and a set of features for each node, Armada partitions the nodes into a set of $p$ partitions using \textit{\partitioning}. \partitioning returns a label for each node specifying its partition, and saves this information to disk.
+
+
+
+\newparagraph{Storage Layer}
+The storage layer in Armada can store the partitioned graph using a variety of common backends (e.g., AWS S3, EBS, HDFS). We store the feature vectors for each node in a partition sequentially and group the graph edges into buckets: For a pair of node partitions $(i, j)$, edge bucket $(i, j)$ contains all edges from nodes in $i$ to nodes in $j$. All edges in each bucket are then stored sequentially as a list. This format allows sets of partitions and the edges between them to be accessed using only sequential file reads/writes. 
+
+
+
+\newparagraph{Mini Batch Preparation Layer}
+Armada uses a distributed set of workers running on cheap CPU-only machines to prepare mini batches for training.
+Each worker reads a set of partitions (and the edges between them) from the storage layer into memory. The specific partition assignment for each machine is made by a designated worker, called the \textit{coordinator}, according to a \textit{randomized algorithm} (Section~\ref{sec:implementation}). After loading their assigned partitions, workers construct batches for training. Armada supports both 1) local construction, where machines prepare batches using only the data in their own CPU memory, leading to zero communication across machines, and 2) distributed construction, where multi-hop neighborhoods are sampled across the whole graph in the aggregate CPU memory of the layer. To minimize communication between workers in the latter setting, Armada relies on the min-edge-cut partitioning returned by \partitioning and supports replicating high degree nodes on each worker (Section~\ref{sec:implementation}). Once batches are prepared, each worker pushes them to a specified (when configuring Armada) worker in the compute layer. To minimize the data transferred to the compute workers for each batch, Armada uses \textit{mini batch grouping}---batches destined for different GPUs on the same machine are grouped together for transmission to enable greater data compression (Section~\ref{sec:implementation}).
+
+Because the mini batch preparation layer is disaggregated, the number of workers can be chosen independently from the other layers in Armada. In particular, for workloads bottlenecked by mini batch preparation, Armada can allocate enough CPU resources to ensure that all compute workers (GPUs) remain saturated with computation. Additionally, for massive graphs, Armada can rely on the storage layer for primary graph storage, rather than on the CPU memory of the batch preparation (or compute) layer, providing the option for lower cost, memory-efficient training deployments.
+
+
+
+\newparagraph{Compute Layer}
+Armada's compute layer consists of a set of machines with attached GPU(s) and is responsible for model computation. Compute workers listen for mini batches from specified worker(s) in the mini batch preparation layer and then perform the GNN forward/backward pass on received batches in parallel. To minimize the amount of data sent for each mini batch, compute workers in Armada also maintain a \textit{feature cache} of frequently accessed features in their local CPU memory (Section~\ref{sec:implementation}). GNN model parameters are replicated across GPUs and model gradients are synchronized before each parameter update. If applicable, gradients for learnable feature vectors are transferred to the CPU memory of the compute worker and then sent back to the corresponding batch worker so it can update its partitions in memory.

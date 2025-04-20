@@ -1,0 +1,108 @@
+\section{Method} \label{section: method}
+
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=\textwidth]{figures/overview.pdf}
+    \caption{Overview of \ours and cross-token prefetching framework. (a) \textbf{\ours}  formulates the attention history as a spatiotemporal sequence, and predicts the attention at the next step with a pre-trained model. To enhance efficiency, the attention history is updated in a compressed form at each decoding step. (b) \textbf{The cross-token prefetching framework} asynchronously evaluates critical tokens and fetches KV for the next token during the LLM inference, thereby accelerating the decoding stage.}
+    \label{fig:prefetch_overview}  
+\end{figure*}
+
+
+In this section, we introduce \ours, the first learning-based method for identifying critical tokens, along with the cross-token prefetch framework for improved cache management. We begin with the problem formulation for attention prediction in Section~\ref{section:formulation}, followed by a description of our novel \ours in Section~\ref{sec:attention_predictor}. Finally, Section~\ref{section: prefetch} presents a cross-token prefetch framework that efficiently hides both evaluation and cache loading latencies.
+
+\subsection{Problem Formulation}
+\label{section:formulation}
+
+In the language model decoding stage, we denote $\mathbf{Q}_t \in \mathbb{R}^{1 \times d}$, $\mathbf{K} \in \mathbb{R}^{t \times d}$ as the query tensor and key tensor used for generate token $t$, respectively. Specifically, we denote \( \mathbf{K}_i \in \mathbb{R}^{1 \times d} \), where \( i \in \{1, 2, \dots, t\} \), as the key tensor for token \( i \), and \( \mathbf{K} = \mathbf{K}_{1:t} \) as the complete key tensor. The attention at step $t$ is calculated as:
+\begin{equation}
+    A_t=\text{Softmax}\left(\frac{1}{\sqrt{d}} \mathbf{Q}_t \mathbf{K}^\top \right), A_t \in \mathbb{R}^{1 \times t}. 
+\end{equation}
+
+
+The sparsity-based KV cache compression seeks to find a subset of keys with budget $B$ that preserves the most important attention values.
+Specifically, the set of selectable key positions is $\Gamma=\{\{\mathbf{p}\}=\left\{p_i\right\}_{i=1}^B|p_i\in\{ 1,2,\ldots,t\} ,p_i\neq p_j,\forall i,j=1,2,\ldots,B\}$. 
+We define the \textbf{attention recovery rate} as:
+\begin{equation}
+\label{eq:attention_recovery_score}
+R_{rec} = \frac{\sum_{i=0}^{B}{A_{t, p_i}}}{||A_t||_1},
+\end{equation}
+which reflects the amount of information preserved after compression. A higher recovery rate $R_{rec}$ indicates less information loss caused by KV cache compression.
+Therefore, the goal of KV cache compression can be formulated as finding the positions $\mathbf{p}$ that maximize $R_{rec}$, i.e.,
+\begin{equation}
+\label{eq:find_p}
+\underset{\mathbf{p} \in \Gamma }{\max} \,R_{rec}. 
+\end{equation}
+
+To determine the positions $\mathbf{p}$, existing methods typically employ heuristic approaches to score the attention at step $t$, represented as $S_t \in \mathbb{R}^{1 \times t}$, and then select the top $B$ positions. 
+For example, the well-known method H2O~\citep{zhang2023h2o} accumulates historical attention scores, where $S_t = \sum_{n=1}^{t-1}{A_n}$. 
+In this paper, we predict the attention of step $t$ as $\hat{A_t}$ and use it as $S_t$.
+
+After identifying the critical token positions $\mathbf{p}$, the attention is computed sparsely $A^\text{sparse} = \text{Softmax}\left(\frac{1}{\sqrt{d}} \mathbf{Q} {\mathbf{K}^{\text{sparse}}}^\top \right)$, with selected keys $\mathbf{K}^{\text{sparse}} = \text{concate}\{\mathbf{K}_{p_i}\}$.
+
+
+\subsection{\ours: A Spatiotemporal Predictor}
+\label{sec:attention_predictor}
+
+\textbf{Prediction formulation.} We formulate the attention history $A_H \in \mathbb{R}^{t\times t}$ as a spatiotemporal sequence.
+The first dimension of $A_H$ corresponds to the time series over the decoding steps,
+while the second dimension represents a sparse series over different keys.
+We then train a model to predict the attention for step $t$ as $\hat{A}_{t+1} = F(A_H)$, where $F(\cdot)$ denotes the model function.
+For efficiency, we limit the time steps of $A_H$ using a hyperparameter $H$, so that the input to the predictor is $A_H \in \mathbb{R}^{H \times t}$.
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=0.8\textwidth]{figures/prefetch_timeline.pdf}
+    \caption{Timeline of our proposed cross-token prefetching. By asynchronously loading the critical KV cache for the next token, our framework hides the token evaluation and transfer latency, accelerating the decoding stage of LLM inference.}
+    \label{fig:prefetch_timeline}
+\end{figure*}
+
+
+\textbf{Model design.} To capture spatiotemporal features, we use a convolutional neural network (CNN) composed of two 2D convolution layers followed by a 1D convolution layer. 
+The 2D convolutions capture spatiotemporal features at multiple scales, while the 1D convolution focuses on the time dimension, extracting temporal patterns across time steps. By replacing the fully connected layer with a 1D convolution kernel, the model adapts to the increasing spatial dimension, without data segmentation or training multiple models.
+Compared to an auto-regressive LSTM~\citep{graves2012lstm}, the CNN is more lightweight and offers faster predictions, maintaining a prediction time shorter than the single-token inference latency. Additionally, when compared to an MLP~\citep{rumelhart1986MLP} on time-series dimension, the CNN is more effective at capturing spatial features, which improves prediction accuracy. 
+
+
+\textbf{Training strategy.} Our model is both data-efficient and generalizable.
+We train the model only on a small subset of attention data, specifically approximately 3\% extracted from the dataset. The model performance on the entire dataset shows our model effectively captures the patterns (see Section \ref{sec:exp_main}). 
+Additionally, due to the temporal characteristics of attention inherent in the LLM, a single model can generalize well across various datasets. For example, our model trained on LongBench also performs well on the GSM8K dataset, highlighting the generalization capability of \ours.
+
+
+
+\textbf{Block-wise attention compression.}
+To speed up prediction, we apply attention compression before computation. 
+By taking advantage of the
+attention's locality,
+\ours predict attention and identify critical tokens in blocks. Inspired by~\citet{tang2024quest}, we use the maximum attention value in each block as its representative.
+Specifically, max-pooling is applied on $A$ with a kernel size equal to the block size $b$, as $A_t^{comp} = Maxpooling(A_t,b)$, reducing prediction computation to roughly $\frac{1}{b}$. 
+
+\textbf{Distribution error calibration.}
+Due to the sparsity of attention computation, the distribution of attention history $A_H$ used for prediction may deviate from the distribution of dense attention. This deviation tends to accumulate over decoding, particularly as the output length increases. To mitigate this issue and enhance prediction accuracy, we introduce a distribution error calibration technique to correct these deviations. Specifically, we calculate and store the full attention score every $M$ steps, effectively balancing accuracy with computational efficiency.
+
+\textbf{Overall process.}
+As shown in \autoref{fig:prefetch_overview} and Algorithm \ref{alg:predict}, \ours prepares an attention history queue in the prefilling stage, and predicts attention during the decoding stage. First, the $A_t$ from the LLM is compressed to $A_t^{comp}$ using block-wise attention compression. Next, $A_H$ is updated with $A_t^{comp}$. The next step attention $\hat{A}_{t+1}$ is then predicted with the pretrained model. From $\hat{A}_{t+1}$, the top-K positions are selected with a budget of $B/b$, since $\hat{A}_{t+1}$ is in compressed form. Finally, the indices are expanded with $b$ to obtain the final critical token positions
+$\mathbf{p}$.
+
+\begin{algorithm}[ht!]
+   \caption{Identify Critical Tokens}
+   \label{alg:predict}
+   
+    \textbf{Input}: Attention scores $A_t$, Attention history $A_H$, Block size $b$, KV budget $B$
+    \\
+    \textbf{Output}: Critical KV token positions $\mathbf{p}$
+    
+    \begin{algorithmic}[1]
+    \STATE Pad $A_t$ to the nearest multiple of $b$ with zero
+    \STATE $A_t^{comp} \gets \text{MaxPooling}(A_t, b)$
+    \STATE $A_H \gets \text{Update}(A_h, A_t^{comp})$
+    \STATE $\hat{A}_{t+1} \gets \text{Prediction model}(A_H)$
+    \STATE $\text{Positions} \gets \text{Top-K}(\hat{A}_{t+1}, B / b)$
+    \STATE $\mathbf{p} \gets \text{Expand}(\text{Positions}, b)$ \\
+    \textbf{Return} positions $\mathbf{p} $
+    \end{algorithmic}
+\end{algorithm}
+
+
+\subsection{KV Cache Cross-token Prefetching} \label{section: prefetch}
+
+To address the increased memory cost of longer contexts, current LLM systems offload the KV cache to the CPU, but I/O transfer latency becomes the new significant bottleneck in inference. KV cache prefetching offers a solution by asynchronously loading important cache portions in advance, hiding retrieval time. We introduce the cross-token KV cache prefetching framework, which differs from the cross-layer method in Infinigen \citep{lee2024infinigen} by leveraging longer transfer times and enhancing data integration. 
+Specifically, our implementation involves a prefetching process for each layer. As illustrated in Figure \ref{fig:prefetch_overview}, during the prefill phase, the computed KV cache is completely offloaded to the CPU without compression. Then, \ours forecasts the critical token indices $\mathbf{p}$ for the next step. The framework then prefetches the KV cache with $\mathbf{p}$ for the next step onto the GPU. Concurrently, the GPU processes inference for other layers, so the maximum time available for prediction and cache loading corresponds to the inference time per token. Subsequently, the GPU utilizes the query for the next step along with the prefetched partial KV cache to calculate the sparse attention. The attention history is then updated with the newly computed attention scores. The timeline of cross-token prefetching can be seen in \autoref{fig:prefetch_timeline}.
+

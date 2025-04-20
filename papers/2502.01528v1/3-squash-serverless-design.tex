@@ -1,0 +1,107 @@
+\section{SQUASH Serverless Design}
+\label{s:3-serverless}
+
+\input{figs/insert-architecture-figure}
+
+\textbf{SQUASH} is deployed on commodity Function-As-A-Service (FaaS) platforms. 
+Whilst our solution is cloud provider-agnostic, we present our design using AWS services, in particular AWS Lambda due to its best-in-class performance \cite{Rifai2021, ServerlessSurvey2022}. 
+Equivalent solutions can readily be built on other cloud platforms. The high-level SQUASH architecture is shown in Figure \ref{fig:squash-overall-architecture}.
+ 
+
+\subsection{SQUASH Run-Time Entities}
+The run-time (i.e., query-time) system splits the attributed vector search task over three key components. %: \textit{Coordinator}, \textit{QueryAllocator} and \textit{QueryProcessor}.
+% which are responsible for parsing user input, performing attribute filtering/cluster selection, and the partition-level vector search, respectively.
+The first is the Coordinator (\textbf{CO}), which is the hub of SQUASH. It parses user input, initiates the FaaS invocation tree, and returns consolidated results. The next component, the QueryAllocator (\textbf{QA}), operates in a query-parallel fashion. Each QA begins by synchronously launching a set of child QA instances.
+It determines its own role in the invocation tree (see Section \ref{sss:4-tree-launch}, i.e., branch or leaf), and how many child instances it should launch, based on the size and depth of the tree. It launches each of its child FaaS instances on a separate thread, and then continues with its own processing tasks. 
+These consist of the attribute filtering and partition selection procedures described earlier. 
+For settings involving multiple queries, it batches together the relevant queries for each partition, builds the required FaaS payloads, and synchronously launches a set of QueryProcessor (\textbf{QP}) instances, one per partition visited, each on a separate thread. 
+% Once QP responses are received, the QA merges the results to obtain the global top-$k$ results for its query set, and consolidates its results with those received from its child QA instances, before returning them to its parent QA (or the CO). 
+Once QP responses are received, the QA merges the results to obtain the global top-$k$ results for its query set, and returns them to its parent QA (or the CO), together with any results it received from child QAs. 
+The QP component performs the per-partition processing. Having received query metadata (possibly for many queries) from its calling QA, it performs the low-bit OSQ pruning and fine-grained distance calculation steps, as well as the optional post-refinement stage. It then packages the final top-$k$ results for its query set and returns them to its parent QA instance. 
+
+
+\subsection{Data Retention Exploitation (DRE)}
+
+FaaS-based solutions can benefit greatly from `warm starts' (i.e., where a previously used function container/execution environment can be re-used for a subsequent execution), due to the reduced invocation latency it provides. However, existing data-intensive FaaS systems do not distinguish between warm and cold starts in their processing logic, often leading to significant repetition of I/O operations (e.g., fetching data from external storage). We introduce Data Retention Exploitation (\textbf{DRE}) to enable subsequent invocations to entirely avoid external I/O associated with reading OSQ index files, significantly improving performance and reducing costs as shown in Figure \ref{fig:dre-benefits}.
+
+\input{figs/insert-dre-benefits}
+
+ 
+% We further exploit the use of warm containers by using 
+DRE utilizes `singleton classes' to store key data (e.g., vector and attribute indexes) in global areas which are retained across cloud function invocations due to container re-use. AWS Lambda function executions have an initialization (\textsc{Init}) phase, during which any static code (defined outside the `handler' entry point) is invoked.
+% Any static code is executed in the \texttt{INIT} phase. 
+Each QA/QP instantiates a singleton object (a class which allows only a single instance to exist) as static code. When the QA/QP handler functions are invoked (\textsc{Invoke} phase), before downloading their data from object storage, they first check if the relevant data is already held in the singleton object. If so, and the dataset details match, the fetch request is avoided and the global data is re-used. Otherwise the file is downloaded from storage, and its data items placed in the singleton object, so that further invocations reaching the same runtime container can reuse it. In the case of the QP, the existence of a differently named function for each data partition (\textit{squash-processor-0, squash-processor-1 etc.}) means a QP instance can safely re-use partition-level index data read into memory in a previous invocation, as it is sure to relate to the same partition. 
+
+
+Separately, we also developed an optional lightweight \textit{result} caching solution which saves results from earlier queries and avoids re-processing repeated requests. % requests which have previously been answered. 
+This is an additional feature for real-world use cases, where a subset of queries may have recurring patterns. We disable this feature by default and use it only for a specific subset of experiments described in Section \ref{ss:7-caching}.
+
+
+\subsection{Tree-based FaaS Invocation}
+
+\input{algos/squash-algo-lambda-launch}
+
+\label{sss:4-tree-launch}
+In a naïve parallel FaaS solution, the CO would sequentially invoke all the required QAs. 
+However, not only could this require the CO to consecutively perform hundreds of threaded invocations, but it could also lead to a bottleneck at the CO, as all results would need to be returned to this single function instance. 
+Instead, we present a \textbf{tree-based multi-level invocation structure}, which offloads most of the invocation/response gathering workload to the allocators themselves. 
+We launch multiple levels of QAs, each of which is responsible for invoking and gathering results from all QAs in the sub-tree rooted below itself. 
+This is similar to the invocation structure for a fully serverless DNN inference mechanism \cite{Oakley2024FSDInference}, but 1) our scheme is based on synchronous invocation, thus enabling bi-directional data flow via request/response payloads, without an intermediate storage/synchronization layer, and 2) our design targets and is evaluated with significantly higher parallelism levels. 
+Our invocation scheme is illustrated in Figure \ref{fig:squash-lambda-invocation} and Algorithm \ref{alg:squash-lambda-launch}. 
+We categorize nodes as being one of three types; CO (tree root), \textit{internal} QA (all levels below the root but above the leaves) and \textit{leaf} QA (which invoke no children). 
+This approach can flexibly scale to hundreds or thousands of concurrent instances, while requiring only a small number of invocations by each function, reducing the risk of I/O bottlenecks at highly connected source nodes.
+We parameterize the solution by a `branching factor' $F$ (how many QAs a node should invoke) and the maximum number of levels $l_{max}$. 
+The algorithm begins with the CO ($id = -1$, $l = 0$). It defines a `jump size' $J_S$, indicating the ID gaps it should leave between consecutive children at the next level. 
+This maintains the property that for two nodes invoked by the same parent, with IDs $x_i$ and $x_{i+J_S}$, the sub-tree rooted at node $x$ contains all IDs y such that $x_i < y < x_{i+J_S}$. 
+% This ensures that each node knows which child IDs it should expect information to be returned from.
+This enables each node to know the child IDs to expect information to be returned from.
+Upon invocation, each QA runs Algorithm \ref{alg:squash-lambda-launch} to determine which child QA (if any) it needs to invoke, before building the required payloads and performing the FaaS invocation requests. This scheme can result in the rapid launch of hundreds of parallel QAs (and hence thousands of QPs), while avoiding response gathering bottlenecks at single functions. 
+% The solution also enables the coordinator to take on the role of an allocator (avoiding additional QA invocation time/costs), if the query volume is low.
+
+\input{figs/insert-lambda-invoc-figure}
+% \input{algos/squash-algo-lambda-launch}
+
+
+\subsection{Task Interleaving for Multi-Query Optimization}
+The QA can perform task interleaving to increase utilization while waiting for child QPs to return results. This enables an effective overlap of `communication' (i.e., waiting for child QPs to return results via synchronous response payloads) with computation, in multi-query workloads.
+While synchronous invocation would normally be blocking, we instead invoke QAs/QPs via background threads, freeing up the calling FaaS instance for other work. In particular,
+% we prepare query metadata (e.g., attribute filtering, partition centroid-query similarity ranking and selection) 
+we perform attribute filtering and partition selection 
+whilst waiting for QP responses from the previous query/batch. We then capture the per-partition results from QPs, and perform the required merge sort to produce global results. 
+% (these steps form the `reduce' phase in Figure \ref{fig:squash-pipeline}). 
+This process (\textit{prepare}, then loop: \{\textit{invoke, prepare, reduce}\}) can be repeated for multiple successive queries/batches as required. 
+
+
+\subsection{Cost Model for Serverless Vector Search}
+\label{s:5-squash-cost-model}
+
+In this section, we formalize the cost model of SQUASH. 
+It should be noted that while we henceforth refer to AWS terminology and pricing models, the design principles are cloud-provider agnostic. %, and similar pricing models apply to other cloud platforms. 
+A detailed model is important due to the cost-to-performance tradeoffs of serverless, and to show the viability of SQUASH when compared with alternative serverless vector search solutions.
+While previous work~\cite{Muller2020Lambada, Oakley2024FSDInference} has evaluated the costs of serverless object storage-based exchange operators and ML inference, ours is the first to focus on highly parallel vector search.
+The cost model is comprised of three main components; AWS Lambda compute costs, S3 (object storage) retrieval costs and EFS (file system) read costs.
+\begin{gather}
+    C_{Total} = C_{\lambda} + C_{S3} + C_{EFS} \label{eq-cost-total}\\
+    C_{\lambda} = C_{Invoc} + C_{Run}\label{eq-cost-lambda}\\
+    C_{Invoc} = (N_{QA} + N_{QP} + 1)\cdot C_{\lambda(Inv)}\label{eq-cost-lambda-invoc}\\
+    C_{Run} = (M_{QA}\sum_{i=1}^{N_{QA}}T_{A_i} + M_{QP}\sum_{i=1}^{N_{QP}}T_{P_i} + M_{CO}T_{CO}) \cdot C_{\lambda(Run)}\label{eq-cost-lambda-run}
+\end{gather}
+% Lambda compute costs are made up of two components, namely invocation and runtime. 
+
+In Equations \ref{eq-cost-lambda-invoc} and \ref{eq-cost-lambda-run}, $N_{QA}$ and $N_{QP}$ are the number of QAs and QPs respectively (the CO is the extra 1). 
+This is multiplied by $C_{\lambda(Inv)}$, the static cost per Lambda invocation. 
+$M_{QA}$, $M_{QP}$ and $M_{CO}$ reflect the memory (in MB) assigned to QAs, QPs and the CO, respectively. 
+At present on AWS Lambda, $128 \leq M_X \leq 10240$. 
+We sum the per-allocator/processor runtimes $T_{QA_{i}}$ and $T_{QP_{i}}$, as well as the coordinator runtime $T_{CO}$, and multiply by the respective memory allocations to obtain the total number of MB-seconds utilized by SQUASH. This total is multiplied by $C_{\lambda\text(Run)}$, the cost per MB-second of Lambda runtime\footnote{https://aws.amazon.com/lambda/pricing}. %\cite{FN-AWS-Lambda-Pricing}. 
+Since AWS Lambda vCPU allocation is proportional to the amount of memory, this introduces an inherent cost-to-performance trade-off \footnote{https://docs.aws.amazon.com/lambda/latest/operatorguide/computing-power.html}. %\cite{FN-AWS-Lambda-Memory-Compute}.
+\begin{gather}
+    C_{S3} = LC_{S3(Get)}\label{eq-cost-s3}\\
+    C_{EFS} = (SR_{Size})C_{EFS(Byte)}\label{eq-cost-efs}
+\end{gather}
+
+
+We utilize two different storage solutions for SQUASH, to maximize performance while reducing costs. 
+Specifically, we use object storage (AWS S3) for the OSQ index files for QA/QPs (e.g., quantized vectors/attributes, quantization boundary values, low-bit OSQ index), while we use a cloud-based network file system (AWS EFS) for the full-precision vectors.
+We used object storage for the OSQ index files as these reads are (comparatively) large, and S3 does not charge based on the quantity of data transferred to AWS Lambda.
+We utilized EFS for the full-precision vectors due to its sub-millisecond random read latencies. While large/frequent reads from EFS can be expensive, we incur low costs due to the low re-ranking requirements of OSQ.
+In Equations \ref{eq-cost-s3} and \ref{eq-cost-efs}, $L$ corresponds to the number of GET requests performed, $S$ reflects the number of random reads performed, while $R_{Size}$ indicates the size of a single full-precision vector on disk. $C_{S3(Get)}$ and $C_{EFS(Byte)}$ are the costs per S3 GET request and EFS byte read via Elastic Throughput reads, respectively. Note that for SQUASH and all baselines, we only consider costs incurred by querying, rather than ongoing storage.

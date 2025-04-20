@@ -1,0 +1,236 @@
+
+
+\section{Method}
+\label{chap4/sec:method}
+The method jointly trains two models, in a similar fashion to Sec.~\ref{chap0/sec:deep learning-watermarking}.
+The generator creates a watermark signal that is added to the input audio. 
+The detector outputs local detection logits.
+The training optimizes two concurrent classes of objectives: minimizing the perceptual distortion between original and watermarked audios and maximizing the watermark detection. 
+To improve robustness to modifications of the signal and localization, we include a collection of train time augmentations.
+At inference time, the logits precisely localize watermarked segments allowing for detection of AI-generated content.
+Optionally, short binary identifiers may be added on top of the detection to attribute a watermarked audio to a version of the model while keeping a single detector.
+
+
+\begin{figure}[b]
+    \centering
+    \includegraphics[width=0.75\linewidth, clip, trim={0.2 1.8in 1.2in 0}]{chapter-4/figs/method.pdf}
+    \caption{Generator-detector training pipeline.}
+    \label{chap4/fig:method}
+\end{figure}
+
+\begin{figure}[b!]
+    \centering
+    \includegraphics[width=0.65\linewidth, clip, trim={0 0 0 0}]{chapter-4/figs/watermarking_example.pdf}
+    \caption{
+    (Top) A speech signal ({\color{darkgray} gray}) where the watermark is present between 5 and 7.5 seconds ({\color{orange} orange}, magnified by 5).
+    (Bottom) The output of the detector for every time step. 
+    An {\color{orange!50} orange} background color indicates the presence of the watermark.
+    }
+    \label{chap4/fig:loc_quali}
+\end{figure}
+
+
+
+
+
+\subsection{Training pipeline} 
+\autoref{chap4/fig:method} illustrates the joint training of the generator and the detector.
+It consists of four critical stages:
+\begin{enumerate}[label=(\roman*), itemsep=2pt, topsep=2pt, leftmargin=20pt]
+    \item The watermark generator takes as input a waveform $s \in \mathbb{R}^T$ and outputs a watermark waveform $\wm \in \mathbb{R}^T$ of the same dimensionality, where $T$ is the number of samples in the  signal. The watermarked audio is then $s_w = s+\wm$.
+    \item To enable sample-level localization, we adopt an augmentation strategy focused on watermark masking with silences and other original audios. This is achieved by 
+    randomly selecting $k$ starting points and altering the next $T/2k$ samples from $s_w$ in one of 4 ways: revert to the original audio (\ie, $s_w(t)=s(t)$) with probability 0.4; replacing with zeros (\ie, $s_w(t)=0$) with probability 0.2; or substituting with a different audio signal from the same batch (\ie, $s_w(t) = s'(t)$) with probability 0.2, or not modifying the sample at all with probability 0.2.
+    \item The second class of augmentation ensures the robustness against audio editing. 
+    One of the following signal alterations is applied: 
+    bandpass filter, boost audio, duck audio, echo, highpass filter, lowpass filter, pink noise, gaussian noise, slower, smooth, resample (full details in Sec.~\ref{chap4/sec:training-details}). 
+    The parameters of those augmentations are fixed to aggressive values to enforce maximal robustness and the
+    probability of sampling a given augmentation is proportional to the inverse of its evaluation detection accuracy.
+    We implemented these augmentations in a differentiable way when possible, and otherwise (\eg, MP3 compression) with the straight-through estimator~\citep{yin2019understanding} that allows the gradients to back-propagate to the generator.
+    \item 
+    Detector $D$ processes the original and the watermarked signals, outputting for each a soft decision at every time step, meaning $D(s) \in [0, 1]^T$.
+    \autoref{chap4/fig:loc_quali}
+    illustrates that the detector's outputs
+    are at one only when the watermark is present.
+\end{enumerate}
+
+
+
+
+
+
+
+
+
+\subsection{Losses} 
+
+Our setup includes multiple perceptual losses and a localization loss. 
+We balance them during training by scaling their gradients as done by~\citet{defossez2022high}.
+
+
+\subsubsection*{Perceptual losses} 
+
+Perceptual losses enforce the watermark imperceptibility to the human ear.
+These include an $\ell_1$ loss on the watermark signal, a multi-scale Mel spectrogram loss~\citep{gritsenko2020spectral}, and discriminative losses based on adversarial networks that operate on multi-scale short-term-Fourier-transform spectrograms. 
+\citet{defossez2022high} use this combination of losses for training the EnCodec model for audio compression. 
+
+\paragraph*{\ploss.}\label{chap4/app:loudness}
+We notably introduce a loss specific for watermarking -- called time-frequency loudness loss -- which operates entirely in the waveform domain. 
+It accounts for auditory masking, a psycho-acoustic property of the auditory system exploited in the early days of watermarking~\citep{blockrep1-Kirovski2003}: the ear fails at perceiving sounds occurring at the same time and at the same frequency range~\citep{book:audio}.
+
+\ploss\ is calculated as follows. 
+First, the input signal $s$ is divided into $B$ signals based on non-overlapping frequency bands $s_0, \dots, s_{B-1}$. 
+Every signal is then segmented using a window of size $W$, with an overlap amount denoted by $r$.
+This procedure is applied to both the original audio signal \(s\) and the embedded watermark \(\wm\). 
+As a result, we obtain segments of the signal and watermark in time-frequency dimensions, denoted as \(s_b^{w}\) and \(\wm_b^{w}\) respectively.
+For every time-frequency window we compute the loudness difference:
+\begin{equation}\label{chap4/eq:loudness_diff}
+    l_b^w = \mathrm{Loudness}(\wm_b^w) - \mathrm{Loudness}(s_b^w).
+\end{equation}
+The loudness is estimated using ITU-R BS.1770-4 recommendations~\citep{loudness}\footnote{
+    Our loudness implementation is a simplified version of the torchaudio~\citep{yang2021torchaudio} one.
+}.
+$l_b^w$ quantifies the discrepancy in loudness between the watermark and the original signal within a specific time window $w$, and a particular frequency band $b$.
+The final loss is a weighted sum of the loudness differences using softmax function:
+\begin{equation}\label{chap4/eq:perceptual_loss}
+    \mathcal{L}_{loud} = \sum_{b, w} \left(\mathrm{softmax}(l)_b^w * l_b^w\right).
+\end{equation}
+The softmax prevents the model from targeting excessively low loudness where the watermark is already inaudible. 
+
+
+
+
+\subsubsection*{Masked sample-level detection loss}
+
+A localization loss ensures that the detection of watermarked audio is done at the level of individual samples. 
+For each time step $t$, we compute the binary cross entropy (BCE) between the detector's output $D(s)_t$ and the ground truth label (0 for non-watermarked, 1 for watermarked).
+There are two possibilities for the aggregation of sample-level losses.
+When no localization augmentation is applied, the loss is averaged over both the original and watermarked audio.
+Otherwise, $s_w$ contains both types of segments so the loss is computed only on $s_w$.
+This avoids creating an imbalance between watermarked and original data. 
+Overall, this reads:
+\begin{equation}\label{chap4/eq:loc_loss}
+    \mathcal{L}_{loc}
+    = \frac{1}{T} \sum_{t=1}^{T} \mathrm{BCE}(D(s')_t, y_t),
+\end{equation}
+where $s'$ might be $s$ or $s_w$, and where time step labels $y_t$ are set to 1 if they are watermarked, and 0 otherwise. 
+
+
+
+
+
+
+
+
+
+\subsection{Networks architectures}
+
+
+\begin{figure}[b!]
+    \centering
+    \includegraphics[width=1.0\linewidth, clip, trim={0 1.6in 0.8in 0}]{chapter-4/figs/archs.pdf}
+    \caption{
+        Architectures. 
+        The \emph{generator} is made of an encoder and a decoder both derived from EnCodec, with optional message embeddings. 
+        The encoder includes convolutional blocks and an LSTM, while the decoder mirrors this structure with transposed convolutions.
+        The \emph{detector} is made of an encoder and a transpose convolution, followed by a linear layer that returns sample-wise logits. 
+        Optionally, multiple linear layers can return k-bit messages.
+    }
+    \label{chap4/fig:archs}
+\end{figure}
+
+The watermark generator is composed of an encoder and a decoder, both incorporating elements from EnCodec~\citep{defossez2022high}. 
+The encoder applies a 1D convolution with 32 channels and a kernel size of 7, followed by four convolutional blocks. Each of these blocks includes a residual unit and down-sampling layer, which uses convolution with stride $S$ and kernel size $K = 2S$.
+The residual unit has two kernel-3 convolutions with a skip-connection, doubling channels during down-sampling. The encoder concludes with a two-layer LSTM and a final 1D convolution with a kernel size of 7 and 128 channels. 
+Strides $S$ values are (2, 4, 5, 8) and the nonlinear activation in residual units is the Exponential Linear Unit (ELU). 
+The decoder mirrors the encoder but uses transposed convolutions instead, with strides in reverse order.
+
+The detector comprises an encoder, a transposed convolution and a linear layer. 
+The encoder shares the generator's architecture (but with different weights). 
+The transposed convolution has $h$ output channels and upsamples the activation map to the original audio resolution (resulting in an activation map of shape $(t, h)$). 
+The linear layer reduces the $h$ dimensions to two, and a softmax function finally gives sample-wise logits.
+
+
+
+
+
+
+
+\subsection{Multi-bit watermarking}
+
+We extend the method to support multi-bit watermarking, which allows for attribution of audio to a specific model version.
+\emph{At generation}, we add a message processing layer in the middle of the generator.
+It takes the activation map in $\R ^{h, t'}$ and a binary message $m\in \{0,1\} ^{b}$ and outputs a new activation map to be added to the original one.
+We embed $m$ into $ e = \sum_{i=0..b-1}{E_{2i + m_i} \in \R^h}$, where $E\in \R^{2b, h}$ is a learnable embedding layer.
+$e$ is then repeated $t$ times along the temporal axis to match the activation map size ($t,h$).
+\emph{At detection}, we add $b$ linear layers at the very end of the detector. 
+Each of them outputs a soft value for each bit of the message at the sample-level.
+Therefore, the detector outputs a tensor of shape $\R^{t, 1+b}$ (1 for the detection, $b$ for the message).
+
+\emph{At training}, we add a decoding loss $\mathcal{L}_{dec}$ to the localization loss $\mathcal{L}_{loc}$.
+This loss $\mathcal{L}_{dec}$ averages the BCE between the original message and the detector's outputs over all parts where the watermark is present.
+
+
+
+
+
+\subsection{Detection, localization and attribution}
+At inference, we may use the generator and detector for:
+\begin{itemize}
+\item \emph{Detection}: To determine if the audio is watermarked or not. 
+To achieve this, we use the average detector's output over the entire audio and flag it if the score exceeds a threshold (default: 0.5).
+\item \emph{Localization}: To precisely identify where the watermark is present. We utilize the sample-wise detector's output and mark a time step as watermarked if the score surpasses a threshold (default: 0.5).
+\item \emph{Attribution}: To identify the model version that produced the audio, enabling differentiation between users or APIs with a single detector. 
+The detector's first output gives the detection score and the remaining $k$ outputs are used for attribution. 
+This is done by computing the average message over detected samples and returning the identifier with the smallest Hamming distance.
+\end{itemize}
+
+
+
+
+
+
+
+
+\subsection{Training details}\label{chap4/sec:training-details}
+
+Our watermark generator and detector are trained on a 4.5K hours subset from the VoxPopuli~\citep{voxpopuli-WangRLWTHWPD20} dataset.
+We use a sampling rate of 16~kHz and one-second samples, so $T=16000$ in our training.
+A full training requires 600k steps, with Adam, a learning rate of $10^{-4}$, and a batch size of 32.
+For the drop augmentation, we use $k=5$ windows of $0.1$ sec. $h$ is set to 32, and the number of additional bits $b$ to 16 (note that $h$ needs to be higher than $b$, for example $h=8$ is enough in the zero-bit case). 
+For the audio 
+The perceptual losses are balanced and weighted as follows: $\lambda_{\ell_1} = 0.1$, $\lambda_{msspec} = 2.0$, $\lambda_{adv} = 4.0$, $\lambda_{loud} = 10.0$. 
+The localization and watermarking losses are weighted by $\lambda_{loc} = 10.0$ and $\lambda_{dec} = 1.0$ respectively.
+
+Here are the details of each audio editing augmentation; 
+(T) refers to training time and (E) to evaluation time, \ie, parameters used for Tab.~\ref{chap4/tab:wm_robustness}:
+\begin{itemize}[leftmargin=2em]
+    \item \emph{Bandpass Filter:} Combines highpass and lowpass filtering to allow a specific frequency band to pass through.
+    (T) fixed between 300Hz and 8000Hz; (E) fixed between 500Hz and 5000Hz.
+    \item \emph{Highpass Filter:} Uses a highpass filter on the input audio to cut frequencies below a certain threshold.
+    (T) fixed at 500Hz; (E) fixed at 1500Hz.
+    \item \emph{Lowpass Filter:} Applies a lowpass filter to the input audio, cutting frequencies above a cutoff frequency.
+    (T) fixed at 5000Hz; (E) fixed at 500Hz.
+    \item \emph{Speed:} Changes the speed of the audio by a factor close to 1. 
+    (T) random between 0.9 and 1.1; (E) fixed at 1.25.
+    \item \emph{Resample:} Upsamples to intermediate sample rate and then downsamples the audio back to its original rate without changing its shape.
+    (T) and (E) 32kHz.
+    \item \emph{Boost Audio:} Amplifies the audio by multiplying by a factor.
+    (T) factor fixed at 1.2; (E) fixed at 10.
+    \item \emph{Duck Audio:} Reduces the volume of the audio by a multiplying factor.
+    (T) factor fixed at 0.8; (E) fixed at 0.1.
+    \item \emph{Echo:} Applies an echo effect to the audio, adding a delay and less loud copy of the original.
+    (T) random delay between 0.1 and 0.5 seconds, random volume between 0.1 and 0.5; (E) fixed delay of 0.5 seconds, fixed volume of 0.5.
+    \item \emph{Pink Noise:} Adds pink noise for a background noise effect.
+    (T) standard deviation fixed at 0.01; (E) fixed at 0.1.
+    \item \emph{White Noise:} Adds gaussian noise to the waveform.
+    (T) standard deviation fixed at 0.001; (E) fixed at 0.05.
+    \item \emph{Smooth:} Smooths the audio signal using a moving average filter with a variable window size.
+    (T) window size random between 2 and 10; (E) fixed at 40.
+    \item \emph{AAC:} Encodes the audio in AAC format.
+    (T) bitrate of 128kbps; (E) bitrate of 64kbps.
+    \item \emph{MP3:} Encodes the audio in MP3 format.
+    (T) bitrate of 128kbps; (E) bitrate of 32kbps.
+    \item \emph{EnCodec:} Resamples at 24kHz, encodes the audio with EnCodec with $nq=16$ (16 streams of tokens), and resamples it back to 16kHz.
+\end{itemize}
+Implementation is done with the \texttt{julius} python library. 
+For all edits except EnCodec compression, evaluation with parameters in the training range would be almost perfect.

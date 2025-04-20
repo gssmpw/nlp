@@ -1,0 +1,330 @@
+\vspace{-1ex}
+\section{Design of \sys}
+\label{sec:design}
+\vspace{-.5ex}
+
+\subsection{Overview}
+\label{sec:design:overview}
+\heiner{provide brief summary and tie. e.g. In the previous section, we showed that existing KVS suffer from X. We now present..}
+
+Based on the motivation presented in the previous section, we design and implement an RDMA-RPC network that aims to minimize computation tasks on memory nodes, consequently enhancing the system throughput. 
+This section presents the design of \sys, a scalable RDMA RPC-based disaggregated KVS that tackles the performance limitations of existing RDMA RPC and one-sided RDMA-based schemes. 
+%Our primary approach involves offloading the computation of index lookup to the compute node, thereby alleviating the CPU burden on the memory node. 
+To accomplish this design objective, we decouple the index of \sys into two components: 1) a computation-heavy component running on compute nodes, and 2) a memory-heavy component running on memory nodes.
+In particular, DMPH provides an opportunity for this decoupling. By carefully examining the DMPH's read and insertion operations, we observe that the final step consistently is directly retrieving the value from a specific memory location, while all the previous steps are employed to determine that location.
+Contrary to DMPH, other hash tables necessitate retrieving the key from the hashed location by key probing and comparison, and only when the key matches the search key, the value can be returned. 
+The distinctive process of DMPH motivates us to store all values in the memory-heavy components because they can be read without extra computation. And the steps to determine the location of the value can be placed in the compute-heavy component running on the compute nodes.
+
+\sys requires only a single round trip for data requests while supporting a large number of concurrent compute nodes's requests. In contrast to other RDMA RPC-based approaches~\cite{fasst,herd}, \sys substantially reduces CPU resources required on the memory node.
+In the following, we elaborate on the components maintained in the compute pool and memory pool of \sys.
+
+\begin{figure}[t]
+    \centering
+    %\captionsetup{font=small}
+    \begin{minipage}[b]{0.9\linewidth}
+        \includegraphics[width=\linewidth]{Figures/overview.pdf}
+        \vspace{-3.5ex}
+    \end{minipage}
+    \vspace{-1ex}
+    \caption{\sys overview}
+    \vspace{-3.ex}
+    \label{fig:overview}
+\end{figure}
+
+
+Fig.~\ref{fig:overview} depicts the overall structure of \sys, which leverages a shared-nothing architecture~\cite{tutorial} for separating data into different shards with consistent hashing~\cite{consistentHashing}. 
+The compute pool comprises multiple compute shards, each accommodating several compute nodes.
+Note that the configuration for the number of shards and the number of compute nodes depends on the memory budget in compute nodes and the whole size of the datasets. 
+For each shard, an index is built based on the keys of the shard, and the returned values of the index represent the memory locations that store the corresponding data associated with the keys. 
+The index is decoupled into the compute-heavy and memory-heavy components.  
+Each compute node is allocated a memory budget for caching the compute-heavy component, including the bucket locator and the seeds. The default setting is there are 64 million keys in a shard, and the memory overhead on each compute node is less than 50MB (\S\ref{sec:eval:mem}). This is considered a small overhead because recent one-sided RDMA solutions cost over 300 MB on each compute node for index caching and other purposes~\cite{rolex,xtore}. 
+All compute nodes in the same shard will connect to the memory node with RDMA RPC for data operations and one-sided RDMA for new bucket locator fetching after index resizing -- the details will be explained in \S\ref{sec:design:resizing}.
+Each shard consists of one memory node, which contains the most updated bucket seeds, overflowed cache, DMPH buckets, and KV data in the shard. 
+The DMPH buckets store the data addresses in the KV data memory space of the keys in the shard. The latest bucket seeds are maintained to ensure the consistency of data insertion. Additionally, the overflowed cache for KV pairs is used to temporarily hold the pair of the new key and the address, which cannot be inserted into DMPH buckets without the need for hash table resizing. We leverage a hash table to work as the overflowed cache in \sys.
+\red{The KV data in each shard is replicated to two other shards, serving as replicas with checkpoints. These two replica shards can be chosen as the two successive shards in the consistent hashing ring. Each key's primary replica shard is referred to as the \textit{primary shard} of the key. Each shard is identified by a \texttt{uuid}. We assume there is a \textit{service layer} in front of the compute nodes responsible for only forwarding data requests to one of the compute nodes in the primary shard based on the key's hash value in the consistent hashing ring. 
+After the memory node in the primary shard completes a data update operation, it forwards the update to its replica shards. To ensure load balance among compute nodes within a shard, the service layer maintains a counter for each shard and distributes requests to the compute nodes in a round-robin fashion.}
+
+\begin{figure}[t]
+    \centering
+    \begin{minipage}[b]{0.9\linewidth}
+        \includegraphics[width=\linewidth]{Figures/layout.pdf}
+    \end{minipage}
+    \vspace{-1.ex}
+    \caption{The data layout in a DMPH bucket.}
+    \label{fig:layout}
+    \vspace{-3.5ex}
+\end{figure}
+
+
+\begin{figure*}[!t]
+\centering
+    %\vspace{-2ex}
+    \subfigure[\texttt{Get} operation.]{
+        \label{fig:op:lookup}
+        \includegraphics[width=0.335\textwidth]{Figures/lookup.pdf}}
+        \hspace{-1.2ex}
+    \subfigure[\texttt{Insert} operation.]{
+        \label{fig:op:insert}
+        \includegraphics[width=0.329\textwidth]{Figures/insert.pdf}}
+        \hspace{-1.2ex}
+    \subfigure[\texttt{Update} and \texttt{Delete} operation.]{
+        \label{fig:op:update}
+        \includegraphics[width=0.32\textwidth]{Figures/update.pdf}}
+\vspace{-3ex}
+\caption{Data operation protocols in \sys.}
+\vspace{-2.5ex}
+\label{fig:op}
+\end{figure*}
+
+\vspace{-.5ex}
+\subsection{Decoupled DMPH index}
+\label{sec:design:table}
+In this section, we explain the detailed data structure and its components maintained in the compute node and the memory node. 
+We reuse the design of Ludo hashing as introduced in \S\ref{sec:background}. There are two candidate buckets for each key, and the bucket locator runs 
+%both two hash functions of a cuckoo hash table~\cite{cuckoo} and 
+a data structure called Othello~\cite{othello} to determine which bucket the value of the search key is stored in. 
+%Within the MPH workflow outlined in section~\ref{sec:background}, Othello arrays play a crucial role in selecting the hash functions' outputs from $hash_A$ and $hash_B$ that correspond to the bucket number of the queried key. This implementation aligns with the "power of two choices" principle in the MPH scheme~\cite{twochoices}, which is employed to optimize memory utilization.
+Each Ludo bucket contains one seed and four slots. By computing a hash value with the search key and the seed, the key is mapped to an exact slot of the bucket without colliding with other keys within the same bucket. The value stored in the slot represents the key's data address and is utilized to retrieve the corresponding data.
+%and we will compute another hash function of the queried key, coupled with the seed in the bucket, to identify the specific slot that contains the targeted key's data address.
+
+We decouple the entire data structure of Ludo hashing into two components. The compute-heavy component running on each compute node stores both the bucket locator and the seeds for all DMPH buckets. 
+This component completes all computations related to finding the location that stores the value of the search key and costs only $3.76n$ bits -- $2.33n$ bits for the bucket locator and $1.43n$ bits for the seeds, where $n$ refers to the number of KV pairs in a shard.
+%Within the compute node, we store both Othello arrays and seeds for all MPH buckets. Consequently, the main computation involved in key lookup can be totally offloaded to the compute node.
+Within the memory node, the memory-heavy component consists of all DMPH buckets that store the data addresses for all keys in the shard. Assuming the load factor of the DMPH table is set to $\epsilon$ with a default value of 0.95, the number of DMPH buckets will be $n/(4\cdot\epsilon)$ as each bucket accommodates four slots. 
+The detailed layout for each DMPH bucket is illustrated in Fig.~\ref{fig:layout}, and each bucket is 32-Byte long with four packed slots. 
+There are four fields in each slot: cache bit (1 bit), fingerprint (6 bits), length (9 bits), and data address (48 bits). 
+%Note that the fingerprint is only used for updating the table and read requests do not need to check it. 
+The cache bit serves as an indicator to identify whether another key(s) share the same slot, with its index stored in the overflowed cache. 
+Meanwhile, the 6-bit fingerprint is only utilized during the index update process to verify if the KV data referenced by the address in this slot corresponds to the search key or not. This fingerprint check is exclusively applied during data write requests, and any false positives do not impact the final result. This is because a comprehensive recheck of the full key occurs after accessing the actual KV data block on the compute node side.
+Note that read requests do not need to check the fingerprint. 
+The address signifies the starting offsets of the KV block, while the length indicates the byte length of the entire KV block in the underlying KV data area.
+In the underlying data area, the KV block is compactly stored with four fields. The initial two numbers, each occupying 8 bytes, denote the length of the key and the subsequent value field.
+
+The overflowed cache accommodates the key-address pair that cannot be inserted into the mapped DMPH bucket without modifying the bucket locator or resizing the entire hash table.
+
+For an estimation, if $\epsilon=0.95$, the component at the compute node contributes to only 5.5\% of the total memory size of the index while the component at the memory node accounts for the larger portion of 94.5\%.
+
+\vspace{-1.5ex}
+\subsection{\sys operations and protocols}
+\label{subsec:design:operation}
+
+%To deliver high concurrent performance, we decouple the MPH table structure into the compute pool and the memory pool to fully use the RNIC of the memory node.  Based on the decoupled indexing structure explained in~\ref{subsec:design:table}, we also take apart the MPH algorithm to assign only the memory nodes with minimal computation tasks with the RPC primitives. 
+This subsection presents the data operations and the corresponding protocol of \sys, including the data \texttt{Get}, \texttt{Insert}, \texttt{Update}, and \texttt{Delete} operations, as shown in Fig.~\ref{fig:op}.
+\vspace{-1.ex}
+\subsubsection{Data Get operation.}
+As shown in Fig.~\ref{fig:op:lookup}, the compute node maintains the bucket locator (two Othello arrays $A$ and $B$) and the seed array $s$. Meanwhile, the memory node maintains the DMPH buckets that store KV addresses and the KV data in a disjoint memory area. 
+When there is a data \texttt{Get} request for key $k$, the compute node will \ding{182} compute the bucket index from the bucket locator by looking up two bits on the two arrays, respectively. 
+%$b_0$ or $b_1$, which is indicated by the exclusive OR result of the two bits from Othello arrays with the index of $hash_A$ and $hash_B$. 
+Assuming the bucket index that stores the queried key is $ind\_bucket$, the compute node will then proceed to \ding{183} compute the slot number within the bucket with the hash function and the seed $s[ind\_bucket]$. 
+At this point, the compute node \ding{184} gets both the bucket index and slot index in the MPH buckets, and it \ding{185} posts them to memory nodes with RDMA\_SEND in the opaque fields. 
+After the memory node gets the message and parses the index numbers of the bucket and slot, $ind\_bucket$ and $ind\_slot$, it will \ding{186} go directly to the MPH buckets to access the exact slot without any extra computation. 
+Then, the memory node \ding{187} gets the data offset in the underlying KV data area from the last 48-bit field of the slot. At last, \ding{188} the KV data will be read back and returned to the initiating compute node for full key check. 
+\red{For example, when a compute node requests data for key 5, it computes the bucket index 10 and slot index 0 based on the bucket locator and the locally stored seeds. Then, the pair of indices (10,0) is sent to the memory node. The data index stored in the indicated slot of the memory node is read, and the corresponding data block is returned. Lastly, the compute node checks the cache bit and a full key to see if the Makeup\texttt{Get} is needed.}
+
+There could be some KV pairs that are temporarily inserted into the overflowed cache during the updates and reconstruction of the index. %overflowed or overflow?
+%During resizing, the KV pairs inserted into the overflowed cache may share the slot with the key inserted during MPH table construction. Consequently, the data returned to the compute node might not correspond to the queried key, and the index of the queried key is stored in the overflowed cache. This is one of the weaknesses of MPH, which will return a random value for alien keys.
+In this circumstance, the compute node is tasked with checking the cache bit, ensuring that the returned full key aligns with the queried one. If the key does not match the requested one, and the cache bit in the slot is set to 1, the compute node will initiate another \texttt{Get} makeup request with the $ind\_slot$ specified as -1, signaling the memory node that the returned key does not match the requested key.
+While it is possible to offload the full key comparison task to the memory node, saving one round trip, this approach introduces computation overheads on the limited remote core resources. To make the common case easy, we opt to assign the full key check task to compute nodes.
+
+
+
+\textbf{Makeup \texttt{Get} request.}
+When the KV data returned to the compute node does not match the requested key, there are two reasons: (1) The requested key is kept in the overflowed cache. The KV pair is inserted after the DPMH table is constructed, and the hashed slot is occupied by another key. 
+(2) The requested key is in another slot of the hashed bucket. This case results from changing the order of keys based on the new seed within the bucket when the inserted key can fit into the current DMPH table (detailed in Section~\ref{sec:design:insert}). 
+Due to the above two situations, the compute node will send the makeup \texttt{Get} request with the $ind\_slot$ as -1 to the memory node.
+The memory node will search the overflowed cache first; if there is a cached item matching the full key of the requested key, it will read the data and return it to the compute node. 
+If not, it will read out all the KV blocks referred by the hashed bucket (at most four) and compare the keys until it finds the requested key. 
+Additionally, the new seed will be returned back to the compute node if the key is found in another slot, and the compute node will update the copied seeds array for this bucket locally.
+
+\vspace{-1.5ex}
+\subsubsection{Data Insert operation.}
+\label{sec:design:insert}
+The main idea of implementing the data \texttt{Insert} operation of \sys is to determine if we can insert the key into the index without significant changes to the current bucket locator.
+If an \texttt{Insert} operation only requires changing the value in one DMPH bucket, \sys can make this change directly. 
+However, if a \texttt{Insert} operation will cause the index to resize, which usually happens after a number of insertions, \sys needs to ensure the correctness of the \texttt{Insert} operation and following lookups during index resizing. 
+%; if not, we will cache them briefly for further insertion when resizing.
+As shown in Fig.~\ref{fig:op:insert}, like \texttt{Get} operation, the compute node will get $ind\_bucket$ and $ind\_slot$ from the bucket locator and the seeds through multiple hashing computations. Different from \texttt{Get}, the RPC message posted to QP should include the full key. 
+Thus, the memory node can parse the $ind\_bucket$, $ind\_slot$, and the key from the message and execute the following steps. 
+\ding{182} the memory node will write the data into the underlying data area, then it can get the data length and the address (offset in the data area) for indexing. 
+After the memory node composes the value from the corresponding slot with the cache bit (set to zero by default), fingerprint, length as well as address, it \ding{183} will try to insert it in the DMPH table. 
+%\red{For example, provided a compute node inserts the KV pair (5,4) and computes the bucket index as 10 and the slot index as 0. Then, the compute node sends the tuple (5,4,10,0) to the responsible memory node. The memory node checks if the first slot (indicated by index 0) of the 10th bucket is empty. If it is, the data block will be written to the data area first, and the composite index in the slot will be filled.}
+
+We discuss the rest of \texttt{Insert} in three cases:
+
+$\bullet$ \textbf{\texttt{Insert} without bucket locator and seed change.} 
+The memory node checks the slot indicated by $ind\_bucket$ and $ind\_slot$. If the length field is empty (length is 0), signifying there is no key associated with this slot, the memory node inserts the composed slot value (Fig.~\ref{fig:layout}) into this location and returns \texttt{SUCCESS} to the compute node. Conversely, if the length is non-zero, indicating that an existing key is using this slot, the memory node proceeds to check the fingerprint and compares the full key to determine if the original key in this slot matches the inserted key. If they match, the insertion is resolved and treated as an \texttt{Update} operation. The fingerprint can prevent the memory node from reading the full key in the KV data area if they are not the same.
+
+
+$\bullet$ \textbf{\texttt{Insert} with seed changes but the bucket locator remains the same.}
+If the key associated with the targeted slot does not match the newly inserted one, an examination is made to determine if there is another available slot within this bucket. Assuming there are only three keys in this bucket, and the slot indicated by $ind\_slot$ is already occupied by a different key, the memory node endeavors to find a new seed that accommodates all four keys in the bucket without causing collisions, thereby preserving perfect hashing policy in this bucket.
+The other three keys are read from the underlying KV data area, and the memory node employs a brute-force approach to identify a new seed for perfect hashing within this bucket. Importantly, the bucket locator does not need to change because all four keys remain in the same bucket. Subsequently, the updated seed for this bucket is returned to the compute node, which then propagates this modification to other compute nodes in the same shard. 
+
+\iffalse
+\begin{algorithm}[t]
+    %\hspace{\algorithmicindent}
+    \label{algorithm:insert}
+    \caption{Data Insert Operation in Memory node}
+    \LinesNumbered
+    \SetAlgoNlRelativeSize{-1}
+    \SetNlSty{textbf}{}{:}
+    \textbf{DMPH\_Table} buckets []\\\textbf{Seed\_Array} seeds []\\
+    \textbf{Hash\_Func} slot\_locator, hash\_fp\\
+    
+    \SetKwFunction{FMain}{Insert\_Callback\_Func}
+    \SetKwProg{Fn}{Function}{:}{}
+    \Fn{\FMain{key, val, ind\_bkt}}{
+    %\KwOut{Insert operation status}
+    lock (ind\_bkt)\;
+    ind\_slot = slot\_locator (key, seeds[ind\_bkt])\;
+    slot\_value = bucket [ind\_bkt][ind\_slot]\;
+    \uIf{slot\_value.fingerprint == hash\_fp (key)}{
+        \uIf{key == read\_key\_from\_kv\_blocks ()}{
+        \tcp{The mapped slot holds the same key }
+        resolve\_to\_data\_update()\;
+        unlock(ind\_bkt); return\;
+    }\textbf{end}\\}
+    \textbf{end}\\
+    write kv block into data area\;
+    keys [] = read four keys from kv blocks with ind\_bkt\;
+    \uIf{slot\_value.length == 0}{
+        \tcp{ Insert kv pair without seed change}
+        compose kv slot into DMPH table\;
+    }
+    \uElseIf{there is an available slot for inserted key}{
+    seeds [ind\_bkt] = search new seed for the bucket\;
+    adjust keys order in the DMPH table\;   
+    }
+    \uElse{
+    \tcp{The bucket is full with other keys}
+    insert kv index into the overflow cache\;
+    }
+    %\tcp{Handle other conditions}
+    %\tcp{Slot hashing locator with seed}
+    \textbf{end}\\
+    unlock (ind\_bkt)\;
+    }
+    \textbf{End}\\
+    %\vspace{-1ex}
+\end{algorithm}
+\fi
+
+
+$\bullet$ \textbf{Insert data to overflowed cache.}
+When all four slots within the bucket are occupied, and the memory node is unable to find an empty slot for the inserted key, the pair of the key and the KV block address will be \ding{184} placed in the overflowed cache. Also, the cache bit in the conflicted DMPH slot will be set to 1 to indicate at least one key in the overflowed cache sharing the same hash slot. 
+Instead, when the number of KV pairs in the overflowed cache reaches a predefined threshold, the memory node initiates the index resizing process to accommodate more KV pairs in a new DMPH table.
+
+
+%We summarize the whole process of data insertion on the memory node side, as shown in Algorithm 1. 
+The data insertion process on each memory node works as follows. 
+At first, the memory node will lock the data operations on the targeted bucket
+%(line 5) 
+to prevent the potential data operations on this bucket. 
+The inserted key might have been stored in the DMPH table before. Thus, the memory node will check if the insert request can be resolved to a data update operation by comparing the fingerprint and the underlying full key. %(line 8-13) 
+Then, the memory node first writes the KV block to the underlying data area %(line 14) 
+and processes the data insert request based on the stored bucket keys 
+%(line 15) 
+into the mentioned three cases. %(lines 16-23). 
+Finally, the memory node unlocks the bucket after it finishes the data insert operation.  
+Note that the data insert request tuple sent by the compute node consists of the KV pair and $ind\_bucket$, not including $ind\_slot$. 
+The reason is that the memory node keeps the most update seeds array in the shard and can use the seeds to do the hash computation as the slot locator. 
+Also, the bucket locator is not maintained in the memory node, and the data insert operation will not modify it after the DMPH table is constructed every time.
+%Since there is only one memory node in each data shard, the seeds array maintained on it is the 
+This choice is made because modifying the bucket locator requires changing seeds for keys in at least two buckets, leading to more computational overhead. 
+%Consequently, we refrain from attempting to modify the bucket locator before the DMPH table resizing (details in Section~\ref{sec:design:resizing}).
+
+\vspace{-2.ex}
+\subsubsection{Data Update and Delete operations.}
+For data update and deletion, the compute node also acquires the $ind\_bucket$ and $ind\_slot$ from the bucket locator and the seeds array. Like the \texttt{Insert} operation, the compute node transmits the full key to the memory node.
+As illustrated in Fig.~\ref{fig:op:update}, the memory node directly accesses the address of the KV data from the DMPH bucket and verifies whether the requested key matches the underlying data. Once the memory node confirms the key, for \texttt{Delete}, it marks the length of the slot value as zero and returns the corresponding status. In the case of \texttt{Update}, it writes the new data to the underlying data area. 
+If the cache bit is set to 1 and the keys differ, the memory node will go to the overflowed cache to get the data address.
+%\red{For example, a compute node updates the value of key 5 to 3. It packs and sends the KV pair, bucket index, and slot index as the tuple (5,3,10,1) using RPC. The memory node reads the index value from the DMPH and updates the value in the underlying data block to 3. The index value in DMPH remains the same. However, If the key check fails, the memory node will check the overflow cache to see if the index for key 5 is there.}
+
+% For revision
+%%Note that for all of \texttt{Insert}, \texttt{Update}, and \texttt{Delete} operations, the memory node will lock the targeted bucket to guarantee the consistency of the data operations.
+
+\vspace{-.5ex}
+\subsubsection{\red{Concurrency control.}}
+\label{sec:design:concurrency}
+\red{Each bucket in the DMPH table within the memory node has a mutex lock. Prior to executing any \texttt{Insert}, \texttt{Update}, or \texttt{Delete} operation, the relevant bucket is locked, blocking any access to its indices. Subsequently, the operation is executed and the lock is released. During the lock period, all other operations targeting this bucket are buffered and only processed once the lock is released.}
+
+
+
+\begin{figure}[!t]
+    \centering
+    %\captionsetup{font=small}
+    \begin{minipage}[b]{0.95\linewidth}
+        \includegraphics[width=\linewidth]{Figures/extendible.pdf}
+        \vspace{-5ex}
+    \end{minipage}
+    \caption{\red{Extendible hashing in \sys.}}
+    \vspace{-4ex}
+    \label{fig:design:extendible}
+\end{figure}
+
+
+\vspace{-1.ex}
+\subsection{Index resizing}
+\label{sec:design:resizing}
+\red{When the number of KV pairs in the overflowed cache surpasses a predefined threshold, index resizing and reconstruction become necessary to accommodate the KV pairs into a new hash table. This resizing process introduces two challenges: (1) managing data operation requests during resizing and (2) efficiently coordinating the compute node and memory node to transfer the bucket locator and seeds.}
+
+
+\red{To support data requests on runtime while index resizing, 
+\red{we apply extendible hashing~\cite{race,dash} to allocate a new DMPH table to accommodate more keys' indices, and a \textit{directory index} is used to identify the multiple DMPH tables, which is an additional hash layer as shown in Fig.~\ref{fig:design:extendible}.}
+This approach reduces the number of keys that need to be moved during index resizing and shortens the resizing duration.
+Compute nodes maintain the bucket locator and seeds array for each single hash table, while memory nodes store the most update seeds array and DMPH tables, as well as local depth array~\cite{dash,race}.}
+
+
+
+%%%%%%%%%%%%%%% COORDINATION %%%%%%%%%%%%%%%%
+
+
+\red{In each shard, we have two size thresholds for overflowed cache; One is for slowing down insertions, $s_{slow}$. The memory node reaching this threshold will enter the index resizing process. The other threshold is the size when the memory node stops any following insertions $s_{stop}$ even if the index resizing is not finished and $s_{stop}>s_{slow}$. 
+We set $s_{slow}$ as the load factor of the DMPH table becomes 97\%, or the overflowed cache is filled with half of the size. $s_{slow}$ is set when the overflowed cache is filled with over 90\% space.}
+
+
+\red{As shown in Fig.~\ref{fig:resize}, when \ding{182} the overflowed cache size reaches $s_{slow}$ after an \texttt{Insert} request from a compute node, \ding{183} the memory node will return the status \texttt{PRE\_RESIZE} to the compute node, and the compute node will create a new connection manager for preparing and listening to build a one-sided RDMA connection with the memory node. 
+The memory node will return \texttt{PRE\_RESIZE} to the data requests for all compute nodes in this shard and count up the number of compute nodes that got the information. After all the compute nodes get it or the overflowed cache size reaches $s_{stop}$, The memory node will build the one-sided RDMA connection (RC) with all compute nodes.
+The registered memory area in the memory node consists of five fields: (1) The value of the first eight bytes $N_{cNode}$ indicates the number of compute nodes in this shard, but it is set to zero at the beginning to indicate that the new index has not been completely reconstructed. After it finishes, the value will be set to the number of compute nodes in this shard; (2) the second value of the following eight bytes $len$ refers to the total length of the newly written bucket locator arrays and seeds array; (3) $Global_d$ refers Global depth~\cite{dash} value in current extendible hashing; (4) newly computed seeds array; and (5) bucket locator arrays $A$ and $B$.}
+
+\red{On the compute node, once a connection is established with the memory node, it continuously sends RDMA\_READ requests to retrieve the first two values $N_{cNode}$ and $len$ in the registered memory of the memory node. If $N_{cNode}$ is greater than zero, that means the bucket locator arrays and the seeds array have been successfully constructed and written into the memory area. \ding{184} The compute node then issues another RDMA\_READ requests to fetch all the subsequent $len$ data. Additionally, an atomic primitive of fetch-and-add \texttt{FAA} is executed to decrement $N_{cNode}$ by one, signifying the completion of a compute node fetching the new index data.}
+
+
+\begin{figure}[!t]
+    \centering
+    \includegraphics[width=0.93\linewidth]{Figures/resize.pdf}
+    \vspace{-2.ex}
+    \caption{Index resizing in \sys.}
+  \vspace{-4ex}
+    \label{fig:resize}
+\end{figure}
+
+
+\red{Before the new bucket locator and seeds array is constructed, upon receiving an \texttt{Insert} or \texttt{Delete} request, the memory node returns a \texttt{FALSE} status to compute nodes. Then, the memory node caches the \texttt{Insert}/\texttt{Delete} requests and implements them later after the index data moves to the new DMPH table. 
+For \texttt{Get} and \texttt{Update} requests, the memory node will continue serving it on the stale DMPH table. The reason is that no new data insertion would be implemented during resizing, and the keys' $ind\_bucket$ and $ind\_slot$ will not change.}
+
+
+\red{Once all compute nodes have obtained the new bucket locator arrays and seeds, $N_{cNode}$ in the memory node becomes zero. The memory node detects this change through periodic checks at a frequency of 2 times a second. It proceeds to discard the bucket locator arrays to free up memory space, as they will remain unchanged until the next MPH resizing. 
+The memory node will also delete all moved keys in the stale DMPH table by marking the length field as 0.
+Then, the reliable connections with all the compute nodes will be terminated by the memory node, and all the compute nodes shift to use both the DMPH tables with the extendible hashing for processing data requests.}
+
+\red{Note that all hash table-based disaggregated KVS require enlargement and shrinking capacity at runtime. The computation time for the extendible hashing layer is the same for \sys and prior works~\cite{race,dash,farm}. In Section~\ref{sec:eval:resizing}, we will show the influence on \sys throughput during index resizing.}
+
+%\vspace{-3ex}
+\subsection{Analysis}
+\label{subsec:design:analysis}
+In this section, we provide the theoretical analysis of the time complexity of the various data operations, as well as the estimation of the memory cost in both compute nodes and memory nodes.
+
+\noindent\textbf{Time complexity.}
+For \texttt{Get} operations, each compute node is tasked with determining locations of the DMPH bucket and slot that stores the address of the requested KV. 
+This involves two hash computations, namely $hash_A(k)$ and $hash_B(k)$, to access two bits in the bucket locator arrays. Subsequently, an additional hash computation with the bucket seed is performed to locate the specific slot. Then, the memory node can access the slot without further computation and proceed to read data from the referenced KV block.
+\red{By default, we use a (2,4)-Cuckoo hash table~\cite{cuckoo} as a fallback table if no seeds can perfectly hash the four elements. In the worst case, accessing the Cuckoo hash table requires two additional hash computations and at most 8 key checks, resulting in a time complexity of O(1) for operations involving the Cuckoo hash table. Therefore, the worst case complexity remains O(1).}
+For both the compute node and the memory node, the data \texttt{Get} operation incurs a small constant time. This time complexity extends to data update and data removal operations.
+
+The only difference in \texttt{Insert} lies in the potential time overhead incurred in finding a new seed for the keys in the bucket. To address this, we have set a maximum number of trying times to 256 (8-bit seed). The reason is that we have not encountered a scenario in which no seed can be found within [0, 255] to separate those four keys without collision. We also have a fallback table (storing the key and the KV block address) to deal with rare cases when a group of keys appears that cannot be distributed into distinct slots by MPH. Statistically, we have observed no buckets that cannot be perfectly hashed with a seed length of 8. Therefore, the time cost associated with data insertion is also constant.
+
+\noindent\textbf{Memory usage.}
+In compute nodes, the memory usage is allocated to the bucket locator and bucket seeds. According to Ludo~\cite{ludo}, the bucket locator arrays consume 2.33 bits per key. The 8-bit seed is shared among four keys in a bucket. Assuming there are $n$ KV pairs in a shard, with a load factor of $\epsilon$ for the MPH table, the memory cost in a compute node is calculated as $(2.33+2/\epsilon)n$ bits.
+
+In addition to the underlying KV data, memory nodes allocate memory to encompass the latest bucket seeds, DMPH buckets, and the overflowed cache. Each bucket incurs a cost of 32 bytes, and the cache item contains the full key size and the data address. Given a cache size of $m$ and a cache item size of $c$ bits, the overall space budget (in bits) for indexing in a memory node is $66n/\epsilon+m\cdot c$.
+
+

@@ -1,0 +1,435 @@
+\section{Implementation Details} \label{app:baseline}
+\subsection{Behavior Cloning}
+The Behavior Cloning methods used in both the execution guidance of WPT and JSRL-BC are the same. We use a four-layer convolutional neural network~\cite{lecun1995convolutional} with kernel depth [32, 64, 128, 256] following a three-layer MLPs with  LayerNorm~\cite{ba2016layer} after all linear layers.  
+
+We list the used encoder and actor architectures for reference. 
+\begin{lstlisting}[language=Python]
+class Encoder(nn.Module):
+  def __init__(self, obs_shape):
+    super().__init__()
+    assert obs_shape == (9, 64, 64), f'obs_shape is {(obs_shape)}, but expect (9, 64, 64)' # inputs shape
+
+    self.repr_dim = (32 * 8) * 2 * 2
+    _input_channel = 9
+        
+    self.convnet = nn.Sequential(
+      nn.Conv2d(_input_channel, 32, 4, stride=2), # [B, 32, 31, 31]
+        nn.ELU(),
+        nn.Conv2d(32, 32*2, 4, stride=2), #[B, 64, 14, 14]
+        nn.ELU(),
+        nn.Conv2d(32*2, 32*4, 4, stride=2), #[B, 128, 6, 6]
+        nn.ELU(),
+        nn.Conv2d(32*4, 32*8, 4, stride=2), #[B, 256, 2, 2]
+        nn.ELU())
+      self.apply(utils.weight_init)
+
+    def forward(self, obs):
+      B, C, H, W = obs.shape
+    
+      obs = obs / 255.0 - 0.5
+      h = self.convnet(obs)
+      # reshape to [B, -1]
+      h = h.view(B, -1)
+      return h
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python]
+class Actor(nn.Module):
+  def __init__(self, repr_dim, action_shape, feature_dim=50, hidden_dim=1024):
+    super().__init__()
+    self.trunk = nn.Sequential(nn.Linear(repr_dim, feature_dim),
+                               nn.LayerNorm(feature_dim), nn.Tanh())
+
+    self.policy = nn.Sequential(nn.Linear(feature_dim, hidden_dim),
+                                nn.LayerNorm(hidden_dim), nn.ELU(),
+                                nn.Linear(hidden_dim, hidden_dim),
+                                nn.LayerNorm(hidden_dim), nn.ELU(),
+                                nn.Linear(hidden_dim, action_shape[0]))
+
+    self.apply(utils.weight_init)
+
+  def forward(self, obs, std):
+    h = self.trunk(obs)
+    reutrn self.policy(h)
+\end{lstlisting}
+
+
+\subsection{JSRL+BC}
+Jump-start RL~\cite{uchendu2023jump} is proposed as an offline-to-online RL method. It includes two policies, a prior policy $\pi_{\theta_1}(a|s)$ and a behavior policy $\pi_{\theta_2}(a|s)$, where the prior policy is trained via offline RL methods and the behavior policy is updated during the online learning stage. However, offline RL requires the offline dataset to include rewards for the target task. To extract behavior policy from the offline dataset, we use the BC agent described above as the prior policy. During online training, in each episode, we randomly sample the rollout horizon $h$ of the prior policy from a pre-defined array \verb|np.arange(0, 101, 10)|. We then execute the prior policy for $h$ steps and switch to the behavior policy until the end of an episode. 
+
+\subsection{ExPLORe}
+For the ExPLORe baseline, we follow the original training code ~\footnote{Source code of ExPLORe \href{https://github.com/facebookresearch/ExPLORe}{https://github.com/facebookresearch/ExPLORe}}. We sweep over several design choices: i) kernel size of the linear layer used in the RND and reward models: [256 (default), 512]; ii) initial temperature value: [0.1 (default), 1.0]; iii) whether to use LayerNorm Layer (no by default); iv) learning rate: [1e-4, 3e-4 (default)]. However, we fail to obtain satisfactory performance. There are several potential reasons: i) the parameters used in the ExPLORe paper are tuned specifically to their setting, where manipulation tasks and near-expert trajectories are used; ii) the coefficient term of the RND value needs to be tuned carefully for different tasks and the reward should also be properly normalized.
+
+To achieve reasonable performance and eliminate the performance gap caused by implementation-level details, we make the following modifications: i) we replace the RND module with ensembles to calculate uncertainty; ii) the reward function share the latent space with actor and critic. 
+
+
+\section{More Ablation Study}
+We include per-task results used in~\cref{experiment:abaltion} in~\cref{fig:ablation_per_task}. 
+
+\begin{figure*}[ht] 
+\label{fig:ablation_per_task}
+\centering
+\includegraphics[width=0.6\textwidth]{fig/ablation_role.pdf}
+\vskip -0.1in
+\caption{Ablation study of the role of each component.}
+\end{figure*}
+
+We further compare results using uncertainty-based rewards as suggested in~\cite{li2023accelerating} compared with our expectation guidance. Instead of using UCB for reward labels, we use Optimistic Thompson Sampling (OTS)~\cite{hu2023optimistic}, which is less sensitive w.r.t the selection of hyperparameters. As shown in~\cref{fig:ablation_ots}, our method outperforms the variant using OTS on Assembly and Stick Pull by a large margin, showing the effectiveness of using execution guidance.
+
+\begin{figure*}[ht] 
+\label{fig:ablation_ots}
+\centering
+\includegraphics[width=0.8\textwidth]{fig/ablation_ots.pdf}
+\vskip -0.1in
+\caption{Ablation study of using uncertainty-based reward labeling.}
+\end{figure*}
+
+\clearpage
+\section{Algorithm} \label{app:algo}
+The full algorithm is described in \cref{alg:wpt}.
+
+\begin{algorithm}[H]
+\caption{Generalist World Model Pre-Training for Efficient RL}\label{alg:wpt}
+\begin{algorithmic}
+\REQUIRE Non-curated offline data $\mathcal{D}_{\text{off}}$, Online data $\mathcal{D}_{\text{on}} \gets \emptyset$, Retrieval data $\mathcal{D}_{\text{retrieval}} \gets \emptyset$
+
+~~~~~~~~~~~~~World model $f_\theta, q_\theta, p_\theta, d_\theta$
+
+~~~~~~~~~~~~~Policy $\pi_{\phi_{\text{RL}}}$, $\pi_{\phi_\text{BC}}$, Value function $v_\phi$ and Reward $r_\xi$.
+% \REQUIRE Pre-train steps K, Fine-tune episodes N, gradient step per episode M.
+\STATE
+\STATE {\color{vibrantblue} \emph{// Task-Agnostic World Model Pre-Training}}
+\FOR{num. pre-train steps} 
+    \STATE Randomly sample mini-batch $\mathcal{B_{\text{off}}}: \{ o_t, a_t, o_{t+1}\}_{t=0}^T$ from $\mathcal{D}_{\text{off}}$.
+    \STATE Update world model $f_\theta, q_\theta, p_\theta, d_\theta$ by minimizing \cref{eq:wm objective} on sampled batch $\mathcal{B}$.
+\ENDFOR
+
+\STATE \STATE {\color{vibrantblue} \emph{// Task-Specific Training}}
+\STATE {\color{vibrantorange} \emph{// Experience Retrieval}}
+\STATE Collect one initial observation $o^0_{\text{on}}$ from the environment.
+\STATE Compute the visual similarity between $o_{\text{on}}$ and initial observations of trajectories $o_{\text{off}}$ in $\mathcal{D}_{\text{off}}$ using~\cref{eq:retrieval}.
+\STATE Select R trajectories according to~\cref{eq:retrieval} and fill $\mathcal{D}_{\text{retrieval}}$.
+\STATE \STATE {\color{vibrantorange} \emph{// Behavior Cloning Policy Training}}
+\FOR{num. bc updates}
+    \STATE Randomly sample mini-batch $\mathcal{B_{\text{retrieval}}}: \{o_i, a_i\}_{i=0}^N$ from $\mathcal{D}_{\text{retrieval}}$.
+    \STATE Update $\pi_{\phi_\text{BC}}$ by minimizing $-\frac{1}{N} \sum_{i=0}^N \log \pi_{\phi_\text{BC}}(a_t|o_t)$.
+\ENDFOR
+\STATE \STATE {\color{vibrantorange} \emph{// Task-Specific RL Fine-Tuning}}
+
+\FOR{num. episodes} 
+    \STATE {\color{vibrantpurple} \emph{// Collect Data}}
+    \STATE Decide whether to use $\pi_{\phi_{\text{BC}}}$ according to the predefined schedule.
+    \IF {Select $\pi_{\phi_{\text{BC}}}$}
+        \STATE Randomly select the starting time step $k$ and the rollout horizon $H$.
+    \ENDIF
+    \STATE 
+    $t \leftarrow 0$
+    \WHILE{ $t \leq$ episode length}
+        \STATE $a_t = \pi_{\phi_{BC}} (a_t|o_t)$ if {Use $\pi_{\phi_{\text{BC}}}$ and $ k \leq t \leq H$} else $a_t = \pi_{\phi_{RL}} (a_t|o_t)$.
+        \STATE Interact the environment with $a_t$. Store $\{o_t, a_t, r_t, o_{t+1}\}$ to $\mathcal{D}_{\text{on}}$.
+        \STATE $t \leftarrow t+1$
+    \ENDWHILE
+    
+    \STATE \STATE {\color{vibrantpurple} \emph{// Update Models}}
+    \FOR{num. grad steps}
+        \STATE Randomly sample mini-batch $\mathcal{B}_{\text{on}}: \{ o_t, a_t, r_t, o_{t+1}\}_{t=0}^T$ from $\mathcal{D}_{on}$ and $\mathcal{B}_{\text{retrieval}}: \{ o_t, a_t, r_t, o_{t+1}\}_{t=0}^T$ from $\mathcal{D}_{\text{retrieval}}$.
+        \STATE Update world model $f_\theta, q_\theta, p_\theta, d_\theta$ by minimizing \cref{eq:wm objective} on sampled batch $\{ \mathcal{B_{\text{on}}, \mathcal{B}_{\text{retrieval}}}\}$.
+        \STATE Update $r_\xi$ by minimizing $-\frac{1}{N} \sum_{i=0}^N \log p_\xi(r_t|s_t)$ on $\mathcal{B_{\text{on}}}$. ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~{\color{vibrantblue}$\vartriangleleft$ \emph{$s_t = [h_t,z_t]$}}
+
+        \STATE {\color{vibrantpurple} \emph{// Update policy and value function}}
+        \STATE Generate imaginary trajectories $\tilde{\tau} = \{s_t, a_t, s_{t+1}\}_{t=0}^T$ by rolling out $h_\theta, p_\theta$ with policy $\pi_{\phi_{\text{RL}}}$.
+        \STATE Update policy $\pi_{\phi_{\text{RL}}}$ and value function $v_\phi$ with \cref{eq:actor}.
+    \ENDFOR
+\ENDFOR
+
+\end{algorithmic}
+\end{algorithm}
+
+%%%%%%%%%%% Full results %%%%%%%%
+\clearpage
+\section{Full Results}
+\label{app:full_results}
+In~\cref{tab:result_mw1} and~\cref{tab:result_mw2}, we list the success rate of 50 Meta-World benchmark tasks with pixel inputs. In~\cref{tab:result_dmc}, we list the episodic return of DMControl of 22 tasks. We compare WPT at 150k samples with two widely used baselines Dreamer v3 and DrQ v2 at both 150k samples and 1M samples. We mark the best result with a bold front at 150k samples and use underlining to mark the highest score overall.
+
+\subsection{Meta-World Benchmark}
+
+\captionsetup{skip=2pt}
+% \newcolumntype{Y}{>{\centering\arraybackslash}X}
+\begin{table*}[ht]
+    \caption{Success rate of Meta-World benchmark with pixel inputs.}
+    \label{tab:result_mw1}
+    \centering
+    % \footnotesize
+    \small
+    % \setlength\tabcolsep{5pt}
+    \begin{tabularx}{\textwidth}{cYY|YYY}
+        \specialrule{1pt}{1pt}{2.5pt}
+        Tasks & \makecell{Dreamer v3 \\ @ \textcolor{vibrantblue}{\textbf{1M}}} & \makecell{DrQ v2\\ @ \textcolor{vibrantblue}{\textbf{1M}}} &  \makecell{Dreamer v3 \\ @ \textcolor{vibrantred}{\textbf{150k}}}  & \makecell{DrQ v2 \\  @ \textcolor{vibrantred}{\textbf{150k}}} & \makecell{WPT (ours) \\  @ \textcolor{vibrantred}{\textbf{150k}}} \\
+        \specialrule{1pt}{1pt}{2.5pt}
+        Assembly  & 0.0 & 0.0 & 0.0 & 0.0 & \underline{\textbf{0.2}} \\
+        \midrule
+        Basketball  & 0.0 & \underline{0.97} & 0.0 & 0.0 & \textbf{0.4} \\
+        \midrule
+        Bin Picking & 0.0 & \underline{0.93} & 0.0 & 0.33 & \textbf{0.8} \\
+        \midrule
+        Box Close & 0.13 & \underline{0.9} & 0.0 & 0.0 & \underline{\textbf{0.9}} \\
+        \midrule
+        Button Press  & \underline{1.0} & 0.7 & 0.47 & 0.13 & \textbf{0.9} \\
+        \midrule
+        \makecell{Button Press \\ Topdown}  & \underline{1.0} & \underline{1.0} & 0.33 & 0.17 & \underline{\textbf{1.0}} \\
+        \midrule
+        \makecell{Button Press \\ Topdown Wall}  & \underline{1.0} & \underline{1.0} & 0.73 & 0.63 & \underline{\textbf{1.0}} \\
+        \midrule
+        \makecell{Button Press Wall}  & \underline{1.0} & \underline{1.0} & 0.93 & 0.77 & \underline{\textbf{1.0}} \\
+        \midrule
+        Coffee Button  & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 \\
+        \midrule
+        Coffee Pull  & 0.6 & \underline{0.8} & 0.0 & \textbf{0.6} & \textbf{0.6} \\
+        \midrule
+        Coffee Push  & 0.67 & \underline{0.77} & 0.13 & 0.2 & \textbf{0.7} \\
+        \midrule
+        Dial Turn  & \underline{0.67} & 0.43 & 0.13 & 0.17 & \underline{\textbf{0.67}} \\
+        \midrule
+        Disassemble  & 0.0 & 0.0 & 0.0 & 0.0 & 0.0 \\
+        \midrule
+        Door Close  & - & - & - & - & 1.0 \\
+        \midrule
+        Door Lock  & \underline{1.0} & 0.93 & 0.6 & \textbf{0.97} & 0.9 \\
+        \midrule
+        Door Open  & \underline{1.0} & 0.97 & 0.0 & 0.0 & 0\textbf{.8} \\
+        \midrule
+        Door Unlock  &  1.0 & 1.0 & \underline{\textbf{1.0}} & 0.63 & 0.8 \\
+        \midrule
+        Drawer Close  & 0.93 & 1.0 & 0.93 & \underline{\textbf{1.0}} & 0.9 \\
+        \midrule
+        Drawer Open  & 0.67 & 0.33 & 0.13 & 0.33 & \underline{\textbf{1.0}} \\
+        \midrule
+        Faucet Open  & 1.0 & 1.0 & 0.47 & 0.33 & \underline{\textbf{1.0}} \\
+        \midrule
+        Faucet Close  & 0.87 & 1.0 & \underline{\textbf{1.0}} & \underline{\textbf{1.0}} & 0.8 \\
+        \midrule
+        Hammer  & 1.0 & 1.0 & 0.07 & 0.4 & \underline{\textbf{1.0}} \\
+        \midrule
+        Hand Insert  & 0.07 & \underline{0.57} & 0.0 & 0.1 & \textbf{0.4} \\
+        \midrule
+        Handle Press Side  & 1.0 & 1.0 & 1.0 & 1.0 & \underline{\textbf{1.0}} \\
+        \midrule
+        Handle Press  & 1.0 & 1.0 & 0.93 & 0.97 & \underline{\textbf{1.0}} \\
+        \midrule
+        Handle Pull Side  & 0.67 & 1.0 & 0.67 & 0.6 & \underline{\textbf{1.0}} \\
+        \midrule
+        Handle Pull  & 0.67 & 0.6 & 0.33 & 0.6 & \underline{\textbf{1.0}} \\
+        \midrule
+        Lever Pull  & 0.73 & \underline{0.83} & 0.0 & 0.33 & \textbf{0.8} \\
+        \specialrule{1pt}{1pt}{2.5pt}
+        
+        More results in the next page, see~\cref{tab:result_mw2} \\
+        % \textbf{WPT (ours)} & \textbf{\checked} & \textbf{\checked} & \textbf{\checked} & \textbf{\checked} & \textbf{\checked} \\
+        \specialrule{1pt}{1pt}{2pt}
+    \end{tabularx}
+\end{table*}
+
+
+\captionsetup{skip=2pt}
+% \newcolumntype{Y}{>{\centering\arraybackslash}X}
+\begin{table*}[ht]
+    \caption{Success rate of Meta-World benchmark with pixel inputs (Cont.).}
+    \label{tab:result_mw2}
+    \centering
+    % \footnotesize
+    \small
+    % \setlength\tabcolsep{5pt}
+    \begin{tabularx}{\textwidth}{cYY|YYY}
+        \specialrule{1pt}{1pt}{2.5pt}
+        Tasks  & \makecell{Dreamer v3 \\ @ \textcolor{vibrantblue}{\textbf{1M}}} & \makecell{DrQ v2\\ @ \textcolor{vibrantblue}{\textbf{1M}}} &  \makecell{Dreamer v3 \\  @ \textcolor{vibrantred}{\textbf{150k}}}  & \makecell{DrQ v2 \\  @ \textcolor{vibrantred}{\textbf{150k}}} & \makecell{WPT (ours) \\  @ \textcolor{vibrantred}{\textbf{150k}}} \\
+        \specialrule{1pt}{1pt}{2.5pt}
+        
+        Peg Insert Side  & 1.0 & 1.0 & 0.0 & 0.27 & \underline{\textbf{1.0}}\\
+        \midrule
+        Peg Unplug Side  & \underline{0.93} & 0.9 & 0.53 & 0.5 & \textbf{0.8} \\
+        \midrule
+        \makecell{Pick Out of Hole}  & 0.0 & 0.27 & 0.0 & 0.0 & \underline{\textbf{0.3}} \\
+        \midrule
+        \makecell{Pick Place Wall}  & 0.2 & 0.17 & 0.0 & 0.0 & \underline{\textbf{0.5}} \\
+        \midrule
+        Pick Place & \underline{0.67} & \underline{0.67} & 0.0 & 0.0 & \textbf{0.2} \\
+        \midrule
+        \makecell{Plate Slide \\ Back Side}  & 1.0 & 1.0 & 0.93 & 1.0 & \underline{\textbf{1.0}} \\
+        \midrule
+        Plate Slide Back  & 1.0 & 1.0 & 0.8 & 0.97 & \underline{\textbf{1.0}} \\
+        \midrule
+        Plate Slide Side  & \underline{1.0} & 0.9 & \textbf{0.73} & 0.5 & 0.5 \\
+        \midrule
+        Plate Slide  & 1.0 & 1.0 & 0.93 & 1.0 & \underline{\textbf{1.0}} \\
+        \midrule
+        Push Back  & \underline{0.33} & \underline{0.33} & 0.0 & 0.0 & \textbf{0.2} \\
+        \midrule
+        Push Wall  & 0.33 & 0.57 & 0.0 & 0.0 & \underline{\textbf{0.9}} \\
+        \midrule
+        Push  & 0.26 & \underline{0.93} & 0.0 & 0.13 & \textbf{0.7} \\
+        \midrule
+        Reach  & \underline{0.87} & 0.73 & \textbf{0.67} & 0.43 & 0.3 \\
+        \midrule
+        Reach Wall  & \underline{1.0} & 0.87 & 0.53 & 0.7 & \textbf{0.9} \\
+        \midrule
+        Shelf Place  & 0.4 & 0.43 & 0.0 & 0.0 & \underline{\textbf{0.87}} \\
+        \midrule
+        Soccer  & 0.6 & 0.3 & 0.13 & 0.13 & \underline{\textbf{0.67}} \\
+        \midrule
+        Stick Push  & 0.0 & 0.07 & 0.0 & 0.0 & \underline{\textbf{0.4}} \\
+        \midrule
+        Stick Pull  & 0.0 & 0.33 & 0.0 & 0.0 & \underline{\textbf{0.67}} \\
+        \midrule
+        Sweep Into  & 0.87 & \underline{1.0} & 0.0 & 0.87 & \textbf{0.9} \\
+        \midrule
+        Sweep  & 0.0 & \underline{0.73} & 0.0 & 0.3 & \textbf{0.6} \\
+        \midrule
+        Window Close  & 1.0 & 1.0 & 0.93 & \underline{\textbf{1.0}} & 0.8 \\
+        \midrule
+        Window Open  & 1.0 & 0.97 & 0.6 & \underline{\textbf{1.0}} & 0.9 \\
+
+        \specialrule{1pt}{1pt}{2.5pt}
+        \textbf{Mean}   & \underline{0.900} & 0.753 & 0.360 & 0.442 & \textbf{0.750} \\
+        \midrule
+        \textbf{Medium}  & 0.870 & \underline{0.900} & 0.130 & 0.330 & \textbf{0.800} \\
+        \specialrule{1pt}{1pt}{2pt}
+    \end{tabularx}
+\end{table*}
+
+
+
+\clearpage
+\subsection{DMControl Benchmark}
+
+
+\captionsetup{skip=2pt}
+% \newcolumntype{Y}{>{\centering\arraybackslash}X}
+\begin{table*}[ht]
+    \caption{Episodic return of DMControl benchmark with pixel inputs.}
+    \label{tab:result_dmc}
+    \centering
+    % \footnotesize
+    % \small
+    % \setlength\tabcolsep{5pt}
+    \begin{tabularx}{\textwidth}{cYY|YYY}
+        \specialrule{1pt}{1pt}{2.5pt}
+        Tasks  & \makecell{Dreamer v3 \\ @ \textcolor{vibrantblue}{\textbf{500k}}} & \makecell{DrQ v2\\ @ \textcolor{vibrantblue}{\textbf{500k}}} &  \makecell{Dreamer v3 \\  @ \textcolor{vibrantred}{\textbf{150k}}}  & \makecell{DrQ v2 \\  @ \textcolor{vibrantred}{\textbf{150k}}} & \makecell{WPT (ours) \\  @ \textcolor{vibrantred}{\textbf{150k}}} \\
+        \specialrule{1pt}{1pt}{2.5pt}
+        CartPole Balance &  994.3 &  992.3 & 955.8 & 983.3 & \underline{\textbf{995.0}} \\
+        \midrule
+        Acrobot Swingup  & \underline{222.1} & 30.3 & \textbf{85.2} & 20.8 & 50.3 \\
+        \midrule
+        Acrobot Swingup Sparse  & 2.5 & 1.17 & 1.7 & 1.5 & \underline{\textbf{26.9}} \\
+        \midrule
+        Acrobot Swingup Hard  & -0.2 & 0.3 & 2.0 & 0.4 & \underline{\textbf{10.7}} \\
+        \midrule
+        Walker Stand  & 965.7 & 947.6 & 946.2 & 742.9 & \underline{\textbf{969.4}} \\
+        \midrule
+        Walker Walk  & 949.2 & 797.8 & 808.9 & 280.1 & \underline{\textbf{959.1}} \\
+        \midrule
+        Walker Run  & 616.6 & 299.3 & 224.4 & 143.0 & \underline{\textbf{728.0}} \\
+        \midrule
+        Walker Backflip  & 293.6 & 96.7 & 128.2 & 91.7 & \underline{\textbf{306.0}} \\
+        \midrule
+        Walker Walk Backward  & \underline{942.9}  & 744.3 & 625.9 & 470.9 & \textbf{863.6} \\
+        \midrule
+        Walker Walk Hard  & -2.1 & -9.5 & -4.7 & -17.1 & \underline{\textbf{878.3}} \\
+        \midrule
+        Walker Run Backward  & \underline{363.8} & 246.0 & 229.4 & 167.4 & \textbf{349.3} \\
+        \midrule
+        Cheetah Run  & \underline{843.7} & 338.1 & \textbf{621.4} & 251.2 & 526.1 \\
+        \midrule
+        Cheetah Run Front  & \underline{473.8} & 202.4 & 143.1 & 108.4 & \textbf{360.5} \\
+        \midrule
+        Cheetah Run Back  & \underline{657.4} & 294.4 & 407.6 & 171.2 & \textbf{446.0} \\
+        \midrule
+        Cheetah Run Backwards  & \underline{693.8} & 384.3 & \textbf{626.6} & 335.6 & 542.2 \\
+        \midrule
+        Cheetah Jump  & 597.0 & 535.6 & 200.8 & 251.8 & \underline{\textbf{634.1}} \\
+        \midrule
+        Quadruped Walk  & 369.3 & 258.1 & 145.2 & 76.5 & \underline{\textbf{933.6}} \\
+        \midrule
+        Quadruped Stand  & 746.0 & 442.2 & 227.2 & 318.9 & \underline{\textbf{936.4}} \\
+        \midrule
+        Quadruped Run  & 328.1 & 296.5 & 183.0 & 102.8 & \underline{\textbf{802.5}} \\
+        \midrule
+        Quadruped Jump  & 689.6 & 478.3 & 168.3 & 190.5 & \underline{\textbf{813.5}} \\
+        \midrule
+        Quadruped Roll  & 663.9 & 446.0 & 207.9 & 126.2 & \underline{\textbf{970.8}} \\
+        \midrule
+        Quadruped Roll Fast  & 508.8 & 366.9 & 124.8 & 164.7 & \underline{\textbf{782.0}} \\
+        \specialrule{1pt}{1pt}{2.5pt}
+        \textbf{Mean}   & 541.81 & 372.23 & 320.86 & 226.49 & \underline{\textbf{631.10}} \\
+        \midrule
+        \textbf{Medium}   & 606.8 & 318.70 & 204.35 & 166.05 &\underline{\textbf{755.0}} \\
+        \specialrule{1pt}{1pt}{2pt}
+    \end{tabularx}
+\end{table*}
+
+%%%%%%%%%%% Full results Ends %%%%%%%%%
+
+
+%%%%%%%%%% Hyperparameters %%%%%%%%%%%5
+\clearpage
+\section{Hyperparameters} \label{app:hyperparameters}
+In this section, we list important hyperparameters used in WPT.
+
+\begin{table*}[ht]
+\centering
+\caption{Hyperparameters used in WPT.}
+\begin{tabular}{lllll}
+\cline{1-2}
+\textbf{Hyperparameter}                    & \textbf{Value}  \\ \cline{1-2} 
+\textbf{Pre-training} & \\
+Stacked images & 1 \\
+Pretrain steps & 200,000 \\
+Batch size & 16 \\
+Sequence length & 64 \\
+Replay buffer capacity &  Unlimited \\
+Replay sampling strategy & Uniform \\
+RSSM \\
+~~ Hidden dimension & 12288 \\
+~~ Deterministic dimension &  1536 \\
+~~ Stochastic dimension & 32 * 96 \\
+~~ Block number & 8 \\
+~~ Layer Norm & True \\
+CNN channels & [96, 192, 384, 768] \\
+Activation function & SiLU \\
+Optimizer \\
+~~ Optimizer & Adam \\
+~~ Learning rate & 1e-4 \\
+~~ Weight decay & 1e-6 \\
+~~ Eps & 1e-5 \\
+~~ Gradient clip & 100 \\
+\cline{1-2}
+\textbf{Fine-tuning} \\
+Warm-up frames & 15000 \\
+Execution Guidance Schedule & linear(1,0,50000) for DMControl \\
+                            & linear(1,0,1,150000) for Meta-Wolrd \\
+Action repeat & 2 \\
+Offline data mix ratio & 0.25 \\
+Discount & 0.99 \\
+Discount lambda & 0.95 \\
+MLPs & [512, 512, 512] \\
+MLPs activation & SiLU \\
+Actor critic learning rate & 8e-5 \\
+Actor entropy coef & 1e-4 \\
+Target critic update fraction & 0.02 \\
+Imagine horizon & 16 \\
+
+\cline{1-2}
+\end{tabular}
+
+\label{tab:hyperparameter}
+\end{table*}
+
+
+\section{Task Visualization}
+
+\begin{figure}[H]
+\label{app:task_visualization}
+\centering
+\small
+\includegraphics[width=0.85\textwidth]{fig/task_visualization.pdf}
+\caption{Visualization of tasks from DMControl and Meta-World used in our paper.}
+\end{figure}

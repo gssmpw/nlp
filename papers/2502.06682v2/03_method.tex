@@ -1,0 +1,156 @@
+\begin{figure}
+\centering
+\includegraphics[width=1.0\linewidth]{figs/pipeline.pdf}
+\vspace{-6mm}
+\caption{
+\label{fig:pipeline}
+\small \textbf{Illustration of \ours's conditioned generative model and training process.} We propose a two-stage training procedure. The first stage maximizes the generation capability by conditioning solely on object locations (using real single-agent target data), while the second stage grounds the generation on the ego-car's perspective to match semantics and layouts (using simulated CAV data). Additionally, we introduce a discriminator to adapt simulated CAV features to the real target domain, 
+making the trained model readily applicable to the target domain after the second stage. 
+}
+\vspace{-5mm}
+\end{figure}
+
+\section{Transfer Your Perspective (\ours)}
+
+\label{sec:method}
+In this paper, we introduce a new research direction to advance collaborative autonomous driving (CAV): \emph{generating LiDAR point clouds from different perspectives within the same scene as the ego agent}, aiming to reduce the tedious efforts of collecting data for CAV. We begin by defining the proposed problem in \cref{sec:setup}. In \cref{sec:input}, we discuss the representations of the inputs, including point clouds and semantic information. \cref{sec:typ} outlines the pipeline developed to address this problem. Finally, in \cref{sec:adapt}, we demonstrate how this capability can be applied to datasets that only have labeled ego agents, \eg, Waymo Open Dataset (WOD)~\citep{sun2020waymo}.
+
+
+ 
+\subsection{Problem Setup}
+\label{sec:setup}
+Given the perception data $\vx_e$ from an \textbf{e}go agent, we aim to build a model $P(\vx_r|\vx_e)$ to generate new perception data $\vx_r$ seen from a different \textbf{r}eference location and perspective within a communication range. Here, $\vx$ represents a LiDAR point cloud. This task presents several challenges, including potential information gaps between the two views, the need for alignment within the commonly perceivable area, and ensuring realism in the generated data, as discussed in \cref{sec:intro}.
+
+
+ 
+To address these challenges, we extend the original problem by incorporating semantic information, such as object bounding boxes, represented as $P(\vx_r|\vx_e, \vy_r)$. We assume the availability of this information around the ego agent, denoted by $\vy_e$. For example, most of the existing single-agent datasets provide object labels. 
+This semantic information can be easily translated and edited to become $\vy_r$ by tools like traffic re-players~\citep{gulino2024waymax}, making it a key to bridge the information gap between the ego and reference views, enabling the reference agent to ``see'' those objects and surfaces beyond the ego’s view---a core concept in CAV. %
+Additionally, by aligning generated point clouds with object locations, this extension facilitates our goal of scaling up CAV development.
+In essence, the generated $(\vx_r, \vy_r)$ pairs can be used flexibly alongside $(\vx_e, \vy_e)$ in various CAV applications, like directly using them to train collaborative perception algorithms.
+ 
+In the following sections, we describe how $\vx$ and $\vy$ are encoded, followed by our approach to tackling the problem.
+
+\subsection{Representations and Embeddings}
+\label{sec:input}
+
+\nbf{LiDAR} There are multiple ways to represent point clouds in continuous 3D space, such as coordinates (\ie, x, y, and z)~\citep{qi2017pointnet,qi2017pointnet++,shi2019pointrcnn}, range images~\citep{qi2017pointnet, wu2018squeezeseg, milioto2019rangenet++}, and voxelization~\citep{maturana2015voxnet,lang2019pointpillars,yan2018second,zhou2018voxelnet}. To better align with spatial control from object locations, we follow \citep{xiong2023ultralidar} to voxelize point clouds using a pre-defined grid and record voxel occupancy. \citep{xiong2023ultralidar} also highlights that this representation can naturally handle varying point densities and only minimally impacts LiDAR generation, with some precision trade-offs during voxelization. In short, we represent a point cloud by $\vx \in \sR^{H \times W \times C}$. 
+
+To avoid the computational cost of 3D convolutions, we convert $\vx$ into Bird’s-Eye-View (BEV) images by treating the height dimension (\ie, $C$) as feature channels for 2D convolutions. This approach has been widely adopted in self-driving perception \citep{chen2017multi,zhang2018efficient,xiong2023learning}, allowing the use of 2D image-based model architectures and algorithms.
+
+\nbf{Semantic information} Given that the point clouds are represented as BEV images, it is also intuitive to represent object locations in BEV. We create binary object maps by considering only the x and y coordinates of 3D bounding boxes, resulting in $\vy \in \sR^{H \times W \times 1}$. (We could further extend it by including category information.)
+
+\nbf{Feature embedding} Following the literature~\citep{rombach2022high}, we encode input tensors using a Vector Quantized-Variational Autoencoder (VQ-VAE)~\citep{van2017neural}, comprising an encoder $E$, a quantization function $Q$ for feature vectors on spatial grids, and a decoder $G$. Formally, we obtain $\vx^f=E_x(\vx) \in \sR^{h \times w \times c_x}$ by the encoder, map each $c_x$-dimensional vector to a learnable code to obtain $\vx^z=Q_x(\vx^f) \in \sR^{h \times w \times c_x}$, and generate outputs using the decoder $\hat{\vx}=G_x(\vx^z) \in \sR^{H \times W \times C}$, where $h$ and $w$ are spatial resolutions of the feature map down-sampled from $H$ and $W$, and $c_x$ is the number of channels. 
+
+The VQ-VAE model is trained end-to-end by minimizing:
+\begin{equation}
+    \Ls_{\text{vq}} = \Ls_{\text{rec}} + \lVert\text{sg}[E_x(\vx)] - \vx^z\rVert^2_2 + \lVert\text{sg}[\vx^z] - E_x(\vx)\rVert^2_2,
+\label{eq:vqvae}
+\end{equation}
+where {sg[$\cdot$]} and $\Ls_{\text{rec}}$ denote the stop-gradient operation and the reconstruction loss, respectively.
+As our point cloud representation is binary occupancy $\vx \in \{0, 1\}^{H\times W\times C}$, binary cross-entropy is a natural choice for $\Ls_{\text{rec}}$. However, due to the sparsity of point clouds, this results in an imbalanced loss. To address this, we adopt the Focal Loss (FL)~\citep{ross2017focal}:
+\begin{equation}
+    \ell_{\text{FL}}(\vx_i, \hat{\vx_i})=\left\{
+    \begin{array}{ll}
+        -(1-\hat{\vx_i})^{\gamma}\log(\hat{\vx_i}) & \text{if } \vx_i=1 \\
+        -\hat{\vx_i}^{\gamma}\log(1-\hat{\vx_i}) & \text{otherwise}, \\
+    \end{array} 
+    \right.
+\label{eq:focal}
+\end{equation}
+\begin{equation}
+    \Ls_{\text{rec}} =\sum_{i=0}^{M}\ell_{\text{FL}}(\vx_i, \hat{\vx_i}),
+\label{eq:rec}
+\end{equation}
+where $i$ is the voxel index and $M$ is the number of voxels.
+
+For object locations $\vy$, we use the same approach to train a separate VQ-VAE model $E_y$, $Q_y$, and $G_y$. In the subsequent subsections, we use $\vx^f \in \sR^{h \times w \times c_x}$ and $\vy^f \in \sR^{h \times w \times c_y}$ as feature embeddings for learning a latent diffusion model.
+
+\subsection{Transfer Your Perspective by Generation}
+\label{sec:typ}
+
+We model the distribution $P(\vx_r|\vx_e, \vy_r)$ defined in \cref{sec:setup} by a conditioned generative model and \emph{train it in two stages}. We assume access to $(\vx_r, \vx_e, \vy_r)$ tuples as training data. We detail the training data preparation in \cref{sec:adapt} and \cref{sec:exp}.
+ 
+In the first stage, we aim to maximize the generation capability by providing minimal conditions, \ie, only bounding boxes, without further constraints on the scene. This encourages the model to produce $P(\vx|\vy)$ with high flexibility. Second, building on this model, we incorporate the ego agent's point cloud as an additional cue and ground the generation process on it to ensure semantic and layout consistency between the generated and ego agent's point clouds. 
+Put together, this two-stage training procedure enables the learned $P(\vx_r|\vx_e, \vy_r)$ model to generate perception data at areas beyond the commonly visible regions between two views. 
+The model and training process is illustrated in \cref{fig:pipeline}.
+
+
+
+More importantly, this approach enables us to leverage existing labeled single-agent datasets such as KITTI~\citep{geiger2012kitti}, NuScenes~\cite{caesar2020nuscenes}, and Waymo Open Dataset (WOD)~\citep{sun2020waymo}, since the first-stage training only requires ego-centric LiDAR point clouds and their corresponding semantic information (see \cref{sec:adapt}). The $(\vx_e, \vx_r)$ data pairs seen from the ego and the reference agents are needed only in the second stage.
+
+In the following, we elaborate on each training stage.
+
+\nbf{Stage 1: Generation with semantic information}
+The goal of this stage is to equip the model with strong generation capabilities of point clouds given spatial conditions, preparing it for the next stage. As discussed in \cref{sec:input}, the point clouds and object locations are embedded by VQ-VAEs~\citep{van2017neural}, denoted as $\vx^f=E_x(\vx) \in \sR^{h \times w \times c_x}$ and $\vy^f=E_x(\vy) \in \sR^{h \times w \times c_y}$. The image-like feature maps allow us to adopt existing generation algorithms for 2D images~\citep{dhariwal2021diffusion,ho2020denoising,kingma2021variational}. In this paper, we apply one of the most popular generative models, the Latent Diffusion Model (LDM)~\citep{rombach2022high}, for conditioned generation $P(\vx|\vy)$. LDM seeks to model a data distribution by iteratively denoising variables that are initially sampled from a Gaussian. The objective is:
+\begin{equation}
+    \Ls_{\text{LDM}} = \sE_{\vx^f, \vy^f, \epsilon \sim \gN(0,1), t}\left[\left\|\epsilon-\epsilon_\theta\left(\vx^f_t, \vy^f, t\right)\right\|_2^2\right],
+\label{eq:ldm}
+\end{equation}
+where, $\epsilon_\theta$ is a UNet~\citep{ronneberger2015u} backbone and $t$ is the timestamp.
+
+ 
+\nbf{Stage 2: Generation for new perspectives} In this stage, we aim to ground the generation of point clouds by incorporating the ego agent's perception. To retain the generation capability from stage 1, we freeze the learned $P(\vx|\vy)$ 
+and introduce a learnable lightweight control module to inject additional cues, following T2I-Adapter~\citep{mou2024t2i}, as shown in \cref{fig:pipeline}. 
+
+Formally, let $\vx_{e'}$ denote 
+the \emph{translated} and \emph{rotated} ego-agent's point cloud centered around the reference location and aligned with the reference orientation, as shown in \cref{fig:pipeline}; $\vx_{e'}^f=E_x(\vx_{e'}) \in \sR^{h \times w \times c_x}$ is the corresponding embedding. 
+Let $F_{AD}$ denote the learnable control module, which takes $\vx_{e'}^f$ as input and outputs 
+\begin{equation}
+    \rmF_c = F_{AD}(\vx_{e'}^f),\label{eq:T2I-adapter}
+\end{equation}
+where $\rmF_{c}=\{\rmF_c^1, \rmF_c^2, \rmF_c^3, \rmF_c^4\}$ matches the size of the  
+multi-scale features $\rmF_{enc}=\{\rmF_{enc}^1, \rmF_{enc}^2, \rmF_{enc}^3, \rmF_{enc}^4\}$ extracted from the frozen encoder of the UNet 
+$\epsilon_\theta$. With these ingredients, T2I-Adapter influences the generation process by 
+\begin{equation}
+    {\rmF}_{enc}^{i} \leftarrow \rmF_{enc}^{i} + \rmF_{c}^{i},\ i\in \{1,2,3,4\},
+\label{eq:t2i}
+\end{equation}
+which injects $\vx_{e'}^f$ embedding into each of the denoising steps. The second-stage objective for learning $F_{AD}$ is:
+\begin{equation}
+    \resizebox{0.91\hsize}{!}{$\Ls_{\text{LDM}} = \sE_{\vx_r^f, \vy_r^f, \vx_{e'}^f, \epsilon \sim \gN(0,1), t}\left[\left\|\epsilon-\epsilon_\theta\left(\vx^f_{r, t}, \vy^f, \vx_{e'}^f, t\right)\right\|_2^2\right]$},
+\label{eq:ldm2}
+\end{equation}
+where the encoder of $\epsilon_\theta$ is modified as defined in \cref{eq:t2i}.
+
+ 
+
+
+\subsection{From Single Agent to Collaborative Datasets}
+\label{sec:adapt}
+There are many publicly accessible large-scale real-world autonomous driving datasets for ego-centric 3D perception, like WOD~\citep{sun2020waymo}, NuScenes~\citep{caesar2020nuscenes}, KITTI-360~\citep{liao2022kitti360}, and PandaSet \citep{xiao2021pandaset}, whereas much fewer datasets exist for CAV due to the challenges in data collection as discussed in \cref{sec:intro}.
+
+This limitation inspired a bold idea: \emph{Can we transfer the generation capability learned from paired CAV data to these existing labeled single-agent datasets?} Achieving this would scale up CAV datasets substantially, offering immense benefits to the research community. However, this goal is challenging due to domain gaps between datasets, such as variations in LiDAR sensors, point cloud densities, data patterns, and data collection environments. Below, we describe our approach to addressing these challenges.
+
+\nbf{Problem setup} Our target domain is a single-agent dataset, while the source domain consists of paired perception and semantic information from ego and reference perspectives, denoted as $(\vx_r, \vx_e, \vy_r)$. We demonstrate that we can transfer knowledge from a simulated CAV dataset (e.g., OPV2V~\cite{xu2022opv2v}) to a real-world ego-centric dataset (e.g., WOD~\citep{sun2020waymo}).
+
+\nbf{Two-Stage training is the key} As described in \cref{sec:typ}, we decompose the generative training into two stages: first learning $P(\vx|\vy)$, followed by $P(\vx_r|\vx_e, \vy_r)$. The second stage keeps $P(\vx|\vy)$ frozen by adding an adapter. This strategy enables us to use target domain data in the first stage. The resulting $P(\vx|\vy)$ would generate target-like point clouds.
+
+\nbf{Minimizing domain gaps} 
+In the first stage, we have learned VQ-VAE encoder-decoders and $P(\vx|\vy)$ in the target domain (single-agent). 
+In the second stage, we bring in CAV data to guide the generation on how to condition on ego-agent's perception. 
+To minimize the gap of $\vx^f$ between two domains---\emph{$\vx^f$ is what the generative model is optimized to generate}---we adopt a GAN-style discriminator~\citep{lim2017geometric,goodfellow2014generative,ganin2016domain,tzeng2017adversarial}. 
+Specifically, we aim to make feature embeddings extracted from the source data and the target data indistinguishable; namely, to confuse a discriminator $D$ trained to differentiate them.
+We freeze all parameters of the target domain's encoder $E_{tgt}$, codebook $Q_{tgt}$, and decoder $G_{tgt}$ in the VQ-VAE. For the source domain, we initialize its $E_{src}$ and $G_{src}$ by $E_{tgt}$ and $G_{tgt}$ while \emph{reusing the frozen codebook $Q_{tgt}$}. We then learn the discriminator $D$ and the source domain's encoder $E_{src}$ and decoder $G_{src}$ in an interleaving fashion by minimizing the following objective functions: 
+\begin{equation}
+\begin{split}  \text{For $D$: \hspace{2pt}}\Ls_D=\hspace{11pt}&\sE_{\vx \sim P_{tgt}}\left[\text{max}(0, 1 - D(E_{tgt}(\vx)))\right] \\
+    + &\sE_{\vx \sim P_{src}}\left[\text{max}(0, 1 
+ + D(E_{src}(\vx)))\right];
+\end{split}
+\label{eq:hinge}
+\end{equation}
+\begin{align}
+\text{For VQ-VAE:\hspace{5pt}} & \Ls_{\text{vq}} = \Ls_{\text{rec}} + \Ls_{src} + \lVert\text{sg}[\vx^z] - E_{src}(\vx)\rVert^2_2,
+\label{eq:vqvae2}\\
+& \text{where\hspace{5pt}} \Ls_{src} = - \sE_{\vx \sim P_{src}}D(E_{src}(\vx)).
+\end{align}
+The other terms in \cref{eq:vqvae2} follow those in \cref{eq:vqvae}, where for $\vx \sim P_{src}$, $\hat{\vx}=G_{src} \circ Q_{tgt} \circ E_{src}(\vx)$ in $\Ls_{rec}$ . 
+We note that $\Ls_D$ takes in two streams of data (\ie, source and target) and is defined by the Hinge Loss~\citep{lim2017geometric} on $\vx^f$; $\Ls_{\text{vq}}$ takes in only the source CAV data. We also note that embeddings for object locations does not require adaptation. 
+
+After this adaptation step, we proceed into the second stage of generative training, where we drop the discriminator and train the control module defined in \cref{eq:T2I-adapter} by minimizing \cref{eq:ldm2}. The feature embeddings are produced by $E_{src}$ on top of $(\vx_r, \vx_e, \vy_r) \sim P_{src}$.
+
+
+\nbf{Enhancement in target domains} With the discriminator and adversarial training,
+we reduce the gap between source and target domain data, successfully adapting \ours to the single-agent dataset, as shown in \cref{exp:colwaymo}. To further improve the conditioned generation quality in the target domain, a further fine-tuning stage in it is desired. However, \emph{how can we do so without having reference agents' point clouds in the target domain?} Here, we propose two simple solutions.
+
+Recall that in training $P(\vx_r|\vx_e, \vy_r)$ using the source CAV data, point clouds show up in both the input as conditions and the outputs as supervisions. In other words, the domain gap exists on both sides, and we aim to reduce it by further fine-tuning \emph{using the target single-agent dataset}.
+First, to enhance the output generation in the target domain, we set ego's point clouds to empty, \ie, $\vx_e={0}^{H \times W \times C}$ for $(\vx_r, \vy_r) \sim P_{tgt}$. Then, to enable adaptation on inputs, we apply self-training~\citep{pan2023towards,zou2018unsupervised,zoph2020rethinking,lee2013pseudo}, randomly sampling a reference location in the scene to generate pseudo-point clouds for fine-tuning, \ie, $(\hat{\vx_r}, \vx_e, \vy_r)$ for $(\vx_e, \vy_r) \sim P_{tgt}$. We use the above target domain data and the source domain data to jointly fine-tune the control module (\cf \cref{sec:typ}, \cref{eq:t2i}, and \cref{eq:ldm2}) further. Empirical results in~\cref{exp:colwaymo} show the effectiveness of the proposed solution in turning single-agent datasets into collaborative datasets for CAV development.

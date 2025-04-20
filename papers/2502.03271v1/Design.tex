@@ -1,0 +1,597 @@
+\subsection{Detection Scope}
+
+
+We target the \bug arising from the pointer type conversions and specify the type conversion behavior to be implemented with \texttt{as} and \texttt{transmute} operations, representing the most fundamental ways to conduct type conversion in Rust. 
+In particular,
+\TN focuses on the three most prevalent bug types mentioned in~\autoref{sec:ty-bug}.
+We do not consider the type conversion performed on non-pointer types, so the bugs such as integer overflow~\cite{rs-2024-0338, rs-2024-0016} arising from downcast are excluded.
+Errors arising from foreign function interfaces~\cite{FFI} are also out of scope, as addressing them would require developing a system that is compatible with other programming languages' compilers.
+
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{Figure/SystemDesign.pdf}
+\vspace{-10pt}
+\caption{\label{fig:architecture} An overview of \TN.}
+\label{architecture}
+\end{figure}
+
+
+\section{\TN}
+\label{sec:design}
+
+
+
+
+To facilitate the detection of \bugs, we design and implement a static analysis tool called \TN. 
+This tool consists of two main components: \Tyanalyzer and \Bugdetector (see \autoref{architecture}). 
+% 
+{
+Given the Rust code, \tyanalyzer first utilizes the compiler to translate the source code into the MIR. It then performs \analysisone and \analysistwo to construct \pcg. The \pcg includes  the type conversion pairs and  the pointer alias graph. Besides, trait bounds are provided to \bugdetector for generic type resolution.}
+% 
+Given the type conversion pairs, \bugdetector first performs the type conversion check with three different patterns to capture the invalid type pointer,
+Then, the access check is run to determine whether the invalid type pointer can be accessed through the alias graph.
+{
+Finally, \bugdetector verifies if there are any developer-enforced checks implemented to handle the invalid type pointer.
+%
+If no, \TN produces a bug report with the problematic type conversion highlighted}. 
+
+\subsection{Property Graph Constructor}\label{compone}
+{
+The goal of \tyanalyzer is to collect the required information and then integrate them into the \pcg, which can accelerate the interprocedural analysis of \bugdetector.
+%
+In addition to the results of \analysisone (\autoref{tyconvanalysis}) and \analysistwo (\autoref{aliasanalysis}),
+each function is associated with its return types, assisting in finding the type constructor functions.
+%
+For example, 
+given a function \texttt{new\_as\_slice},
+% \xz{is this an example? or you only deal with this one function? This is an example}
+it calls the type constructor function \texttt{new} and passes the constructed type to the function \texttt{as\_slice} as \texttt{src\_ty}.
+To obtain \texttt{new} function, we match \texttt{src\_ty} with the return types of other functions in our \pcg, which could find all potential type constructors.
+%
+After that, we can further analyze the type conversion across the functions.
+%
+In addition to return types, the function including \texttt{unsafe} code will be marked for analysis in \bugdetector.
+}
+
+
+
+
+\begin{algorithm}[t]
+\caption{\texttt{get\_trait\_bounds()}}\label{genanalysis}
+\footnotesize
+\SetKwFunction{callerbounds}{caller\_bounds}
+\SetKwFunction{gettraitbnd}{get\_bnd\_by\_sig}
+\SetKwFunction{gettypebnd}{get\_type\_bnd}
+\SetKwFunction{getlocalimpls}{get\_local\_impls}
+\SetKwFunction{selfty}{self\_ty}
+\SetKwFunction{insert}{insert}
+\SetKwFunction{intersect}{intersect}
+\SetKwFunction{new}{new}
+\SetKwFunction{hassupertrait}{has\_supertraits}
+\SetKwFunction{isvisible}{is\_visible}
+\SetKwInOut{Input}{Input}
+\SetKwInOut{Output}{Output}
+
+\SetAlgoLined
+
+\Input{$fn$, $trait\_map$, $visible$}
+\Output{$trait\_bounds$}
+
+$trait\_bounds$ $\leftarrow$ HashSet::\new{};
+
+\ForEach{$trait\_bnd \in fn.\gettraitbnd{}$}{
+    \If{$trait\_bnd \in trait\_map$}{
+        $trait\_bounds$.\insert{$trait\_bnd$};
+    }
+    \Else {
+        \If{$trait\_bnd.\hassupertrait{} \&\&  visible$}{
+            \tcp{call get\_trait\_bounds() on supertraits again}
+        }
+        \Else{
+            $trait\_bounds$.\insert{$trait\_bnd$};
+        }
+    }
+}
+
+return $trait\_bounds$;
+\end{algorithm}
+
+
+
+
+
+
+\subsubsection{\Analysisone} \label{tyconvanalysis}
+%
+The \analysisone has three steps,
+{namely, analyzing if type conversion includes any generic type, determining if generic type is converted across functions, and resolving the dependencies to collect the trait bounds on generic types}.
+In the first step, \tyanalyzer directly keeps the concrete type pair if no generic type is included.
+It starts with visiting the MIR's statements \cite{statement} and finding the ones of type conversion.
+%
+Rust's MIR is a simplified version of the Abstract Syntax Tree (AST) used for optimization.
+It consists of statements and terminators \cite{terminator}. Statements represent intermediate operations such as assignments and variable initialization, and terminators define control flow decisions such as conditions or function calls.
+%
+In the statement of type conversion (\texttt{src\_ty}, \texttt{dst\_ty}), 
+if both \texttt{src\_ty} and \texttt{dst\_ty} are the concrete types, \tyanalyzer will keep the type pair directly.
+%
+If one of the (\texttt{src\_ty}, \texttt{dst\_ty}) is a generic type, \tyanalyzer will move on to the second step, which is visibility analysis.
+
+
+\vspace{0.05in}
+\noindent{\bf Visibility Analysis.}
+{
+The visibility of a function decides how external users can call the function.
+%
+In Rust, functions and methods are both blocks of reusable code.
+% Further analysis is required for the method.
+The difference between a function and a method is that the method is associated with a particular type or defined within a trait.
+%
+It is typically called using the \texttt{"."} operator on the type instance.
+%
+If the generic type conversion occurs in the method, we should determine whether the associated types can only be initialized by type constructor functions.
+In such cases, we analyze the visibility of all associated types and recursively traverse the types fields if it is a \texttt{struct} type.
+%
+The visibility result represents if the type can be initialized by external users or limited by constructor functions.
+%
+If visible, trait bound analysis will be conducted to collect the type constraints for the generic type.
+}
+\looseness=-1
+
+\vspace{0.05in}
+\noindent{\bf Trait Bound Analysis.} 
+{
+We collect a set of traits from standard libraries, which are implemented by all primitive types in Rust, indicating the potential concrete types to replace generic types (see~\autoref{genanalysis}).
+%
+We also extract certain traits from external libraries used to prevent type confusion bugs, helping to reduce false alarms in bug detection.
+%
+For example, the trait \texttt{plain}\cite{plain} is always used to ensure that the memory layout is stable and initialized.
+%
+As we have confirmed the specific types implementing these traits (\texttt{trait\_map}), we utilize them as the endpoint of the traversal, effectively tackling the issue of implicit dependencies.
+%
+For each trait bound, \tyanalyzer first checks whether the trait is defined in the trait set.
+If not defined, \tyanalyzer then checks whether the trait has dependencies (\texttt{has\_supertraits()}).
+The output of this step also generates the type conversion pairs including generic type and associated with the trait bounds.
+}
+
+\subsubsection{Pointer Alias Analysis} \label{aliasanalysis}
+\Analysistwo is used to construct an alias graph, which helps us determine the relation between pointers and how the pointer can be accessed (see \autoref{aliasgraph}).
+The analysis is performed in MIR for semantic information~\cite{MIR}, e.g., whether a value is moved or borrowed and if the value is dead.
+%
+The nodes in the alias graph are collected from the \texttt{Local} in the MIR, which refers to the "variables and temporary values in the scope of function"~\cite{Local}. 
+%
+The edges between the nodes are updated when the MIR statement is in the forms of \texttt{StorageDead} and \texttt{Assign} form, where \texttt{Rvalue} is assigned to \texttt{Lvalue}. %(see \autoref{forms}) {to do}.
+Based on the kinds of \texttt{Rvalue} appearing in the statement of \texttt{Assign}, pointers have different alias relationships.
+
+\begin{equation} \label{assign}
+    \begin{aligned}
+        \text{a} &= \text{Ref(b)} \\
+                     &= \text{RawPtr(b)} \\
+                     &= \text{Cast::(PtrToPtr, Operand(b))} \\
+                     &= \text{Cast::(Transmute, Operand(b))}
+    \end{aligned}
+\end{equation}
+
+In \autoref{assign},
+when the kind of \texttt{Rvalue} is \texttt{Ref} or \texttt{RawPtr}, which means a new reference or raw pointer \texttt{a} is created and points to the same memory location as \texttt{b}.
+%
+If the kind of \texttt{Rvalue} is \texttt{Cast}, especially on the pointers, \texttt{a} also points to the same location as \texttt{b}.
+In our alias graph, we will create the edge from \texttt{a} to \texttt{b} to represent the alias relationship, where they are both \texttt{local}.
+%
+However, we disconnect the edge from \texttt{a} to \texttt{b} when the kind of \texttt{Operand} in \texttt{Cast} is \texttt{Move}.
+The operand of \texttt{Move} means that the ownership of \texttt{b} is transferred to \texttt{a}, and \texttt{b} will no longer be accessible, so we disconnect the edge.
+In addition to the statement in the \texttt{Assign} form, we also disconnect the edge in the form of \texttt{StorageDead}. 
+Given \texttt{StorageDead(a)}, it is used to mark that the ownership of \texttt{a} is transferred and all pointers of \texttt{a} become invalid.
+Therefore, we delete all edges created from \texttt{a} in our alias graph.
+%
+\begin{equation} \label{function}
+    \text{a} = \text{Call(Fn, args<Operand(b)>, ..)}
+\end{equation}
+
+
+
+
+\begin{algorithm}[t]
+\caption{\texttt{get\_alias\_graph()}}\label{aliasgraph}
+\footnotesize
+\SetKwFunction{Call}{Call}
+\SetKwFunction{id}{id}
+\SetKwFunction{push}{push}
+\SetKwFunction{isderef}{is\_deref}
+\SetKwFunction{lplace}{\lplace}
+\SetKwFunction{newst}{new\_statement}
+\SetKwFunction{newtm}{new\_terminator}
+\SetKwFunction{newtg}{new\_taint\_graph}
+\SetKwFunction{as}{As}
+\SetKwFunction{tm}{Transmute}
+\SetKwFunction{containsunsafe}{contains\_unsafe}
+\SetKwFunction{declaredsafe}{declared\_as\_safe}
+\SetKwFunction{getop}{get\_operand}
+\SetKwFunction{getHIR}{get\_HIR}
+\SetKwFunction{getMIR}{get\_MIR}
+\SetKwInOut{Input}{Input}
+\SetKwInOut{Output}{Output}
+\SetAlgoLined
+
+\Input{$fn$}
+\Output{$alias\_graph$}
+\ForEach{$st \in fn.statements$}{
+    \If{$st \in Assign$}{
+        ($lval$, $rval$) $\leftarrow$ ($st.lvalue()$, $st.rvalue()$);
+
+        $op$ $\leftarrow$ $rval$.\getop{};
+        
+        $kind$ $\leftarrow$ $st.rvalue().kind()$;
+        
+        \If{$kind \in Ref | RawPtr | Cast::PtrToPtr | Transmute$}{
+            // insert $rval$.\id{} to alias\_graph[$lval$.\id{}]
+            
+            \If{$op == Move$}{
+                // delete $rval$.\id{} from alias\_graph[$lval$.\id{}]
+            }   
+        }
+    }
+    \ElseIf{$st \in StorageDead$}{
+        $rval$ $\leftarrow$ $st.rvalue()$;
+        
+        // delete all elements from alias\_graph[$rval.\id{}$]
+    }
+}
+\ForEach{$tm \in fn.terminators$}{
+    $kind$ $\leftarrow$ $tm.kind()$;
+    
+    \If{$kind == \Call{func, args, dest}$}{
+        \ForEach{$arg \in args$}{
+            // insert arg.\id{} to alias\_graph[dest.\id{}];
+
+            $op$ $\leftarrow$ $arg$.\getop{};
+
+            \If{$op == Move$}{
+                // delete $arg$.\id{} from alias\_graph[dest.\id{}]
+            }
+        }
+    }
+}
+
+return $alias\_graph$
+\end{algorithm}
+
+
+
+
+
+
+{\autoref{function} presents a function call in MIR, where \texttt{args} works as a list of arguments that are passed to the function and \texttt{a} holds the return value}.
+For each argument in \texttt{args}, we create the edge from \texttt{a} to \texttt{b}, but disconnect the edge if the operand on the argument is \texttt{Move}.
+%
+{In \bugdetector, the connection of \texttt{a} and \texttt{b} in the alias graph is leveraged to perform interprocedural alias analysis}.
+%
+, the \textit{alias\_graph} is constructed as a directed graph where the edge always starts from the \texttt{local} in \texttt{lvalue} to the one in \texttt{rvalue}.
+inal{
+When identifying pointer aliasing, we will check whether two nodes have common descendents in \textit{alias\_graph}.
+Finding the common descendent represents that one alias of the \texttt{src\_ty}'s pointer is aliased with the \texttt{dst\_ty}'s pointer,
+then \bugdetector will collect all descendants while traversing the graph with breadth-first search~\cite{Breadthf77online} from two nodes, then find whether there is an intersection between two sets of descendants.
+}
+
+
+
+
+\subsection{Bug Detector} \label{compthree}
+{
+Bug detector focuses on the marked functions in \pcg (with \texttt{unsafe})}, capturing \bugs in three steps. 
+%
+First, given the pairs of type sets generated by \analysisone, \checkone is performed to find the invalid type pointer following three kinds of bug patterns.
+%
+Second, \checktwo is used to find the alias of the invalid type pointer
+based on \analysistwo.
+Based on the alias graph, it checks if the pointer is accessed in the function or accessible to the caller function. 
+%
+Third, verifying the absence of \tc helps reduce the false alarms of bugs.
+%
+{All three steps are combined with interprocedural analysis based on \pcg}.
+
+
+
+
+
+
+
+
+\begin{table*}[t]
+\centering
+\caption{\Checkone{s}.}
+\begin{threeparttable}
+\footnotesize
+\begin{tabular}{c l l l} 
+ \toprule
+ Bug Type & Con $\rightarrow$ Con$^\ddagger$ & Con $\rightarrow$ Gen  & Gen $\rightarrow$ Con \\ %[0.5ex] 
+ \midrule
+ {Type I} &
+ 
+ \thead[l]{
+ \textbf{Input}: \textit{src\_ty}, \textit{dst\_ty} \\ 
+ \textbf{If} \textit{src\_ty}.align \% \textit{dst\_ty}.align != 0 \\ 
+ ~ ~ ~ ~ mark
+ } &
+ 
+ \thead[l]{
+ \textbf{Input}: \textit{src\_ty}, \textit{ty\_set} \\
+ \textbf{If} \textit{ty\_set}.is\_empty() \\ 
+ ~ ~ ~ ~ mark \\
+ \textbf{Else} \\
+ ~ ~ ~ ~ replace \textit{dst\_ty} with each in \textit{ty\_set} \\
+ ~ ~ ~ ~ run again in (Con $\rightarrow$ Con)} &
+
+  \thead[l]{
+ \textbf{Input}: \textit{dst\_ty}, \textit{ty\_set} \\
+ \textbf{If} \textit{ty\_set}.is\_empty() \& \textit{dst\_ty}.align != 1 \\
+ ~ ~ ~ ~ mark \\ 
+ \textbf{Else If} ty\_set.not\_empty() \\ 
+ ~ ~ ~ ~ replace \textit{src\_ty} with each in ty\_set \\
+ ~ ~ ~ ~ run again in (Con $\rightarrow$ Con)} \\
+ \hline
+ {Type II} &
+ 
+ \thead[l]{
+ \textbf{Input}: \textit{src\_ty}, \textit{dst\_ty} \\
+ \textbf{If \textit{src\_ty}} $\rightarrow$ \textit{unstable\_ty} \\
+ ~ ~ ~ ~ \textbf{If \textit{dst\_ty}} $\rightarrow$  (\textit{stable\_ty} | \textit{unstable\_ty}') \\
+ ~ ~ ~ ~ ~ ~ ~ ~ mark
+ } &
+ 
+ \thead[l]{
+ \textbf{Input}: \textit{src\_ty}, \textit{ty\_set} \\
+ \textbf{If} \textit{ty\_set}.is\_empty() \\
+ ~ ~ ~ ~ \textbf{If \textit{src\_ty}} $\rightarrow$ \textit{unstable\_ty} \\
+ ~ ~ ~ ~ ~ ~ ~ ~ mark \\
+ \textbf{Else} \\
+ ~ ~ ~ ~ replace \textit{dst\_ty} with each in \textit{ty\_set} \\
+ ~ ~ ~ ~ run again in (Con $\rightarrow$ Con)} &
+
+  \thead[l]{
+ \textbf{Input}: \textit{dst\_ty}, \textit{ty\_set} \\
+ \textbf{If} \textit{ty\_set}.is\_empty() \\
+ ~ ~ ~ ~ \textbf{If \textit{dst\_ty}} $\rightarrow$ (\textit{stable\_ty} | \textit{unstable\_ty}') \\
+ ~ ~ ~ ~ ~ ~ ~ ~ mark \\
+ \textbf{Else} \\
+ ~ ~ ~ ~ replace \textit{src\_ty} with each in \textit{ty\_set} \\
+ ~ ~ ~ ~ run again in (Con $\rightarrow$ Con)
+ } \\
+ \hline
+ Type III &
+ 
+ \thead[l]{
+ \textbf{Input}: \textit{src\_ty}, \textit{dst\_ty} \\
+ \textbf{if \textit{src\_ty}} $\rightarrow$ \textit{weak\_ty} \\
+ ~ ~ ~ ~ \textbf{If \textit{dst\_ty}} $\rightarrow$ \textit{strict\_ty} \\
+ ~ ~ ~ ~ ~ ~ ~ ~ mark \\
+ \textbf{Else If \textit{src\_ty}} $\rightarrow$ \textit{strict\_ty} \\
+ ~ ~ ~ ~ \textbf{If \textit{dst\_ty}} $\rightarrow$ \textit{mut weak\_ty}  \\
+ ~ ~ ~ ~ ~ ~ ~ ~ mark } &
+ 
+ \thead[l]{
+ \textbf{Input}: \textit{src\_ty}, \textit{ty\_set} \\
+ \textbf{If} \textit{ty\_set}.is\_empty() \\
+ ~ ~ ~ ~ \textbf{If \textit{src\_ty}} $\rightarrow$ \textit{weak\_ty} \\
+ ~ ~ ~ ~ ~ ~ ~ ~ mark \\
+ \textbf{Else If \textit{src\_ty}} $\rightarrow$ \textit{strict\_ty}
+  \&\& \textit{mut dst\_ty} \\
+ ~ ~ ~ ~ ~ ~ ~ ~ mark \\
+ \textbf{Else} \\
+ ~ ~ ~ ~ replace \textit{dst\_ty} with each in ty\_set \\
+ ~ ~ ~ ~ \textbf{If (s,d)$^\star$} $\rightarrow$ (\textit{weak\_ty}, \textit{strict\_ty}) \\
+ ~ ~ ~ ~ ~ ~ ~ ~ mark \\
+ ~ ~ ~ ~ \textbf{Else If (s,d)} $\rightarrow$ (\textit{strict\_ty}, \textit{mut weak\_ty}) \\
+ ~ ~ ~ ~ ~ ~ ~ ~ mark } &
+ 
+ \thead[l]{
+ \textbf{Input}: \textit{dst\_ty}, \textit{ty\_set} \\
+ \textbf{If} \textit{ty\_set}.is\_empty() \\
+ ~ ~ ~ ~ \textbf{If \textit{dst\_ty}} $\rightarrow$ \textit{strict\_ty} \\
+ ~ ~ ~ ~ ~ ~ ~ ~ mark \\
+ ~ ~ ~ ~ \textbf{Else If \textit{dst\_ty}} $\rightarrow$ \textit{weak\_ty} \&\& \textit{mut dst\_ty} \\
+ ~ ~ ~ ~ ~ ~ ~ ~ mark \\
+ \textbf{Else} \\
+ ~ ~ ~ ~ replace \textit{src\_ty} with each in \textit{ty\_set} \\
+ ~ ~ ~ ~ \textbf{If (s,d)} $\rightarrow$ (\textit{weak\_ty}, \textit{strict\_ty}) \\
+ ~ ~ ~ ~ ~ ~ ~ ~ mark \\
+ ~ ~ ~ ~ \textbf{Else If (s,d)} $\rightarrow$ (\textit{strict\_ty}, \textit{mut weak\_ty}) \\
+ ~ ~ ~ ~ ~ ~ ~ ~ mark } \\
+
+ \bottomrule
+\end{tabular}
+\begin{tablenotes}
+    \footnotesize
+    \item $^\ddagger$ Con: concrete type; Gen: generic type; $^\star$ (s,d): (\textit{src\_ty}, \textit{dst\_ty}).
+\end{tablenotes}
+\end{threeparttable}
+\label{bugdetectors}
+\end{table*}
+
+
+
+
+
+
+
+
+
+
+
+
+\subsubsection{Type Conversion Check}
+We categorize the type conversion (\textit{src\_ty}, \textit{dst\_ty})into three possible scenarios: (Con $\rightarrow$ Con), (Con $\rightarrow$ Gen), and (Gen $\rightarrow$ Con).
+% 
+The conversion between (Gen $\rightarrow$ Gen) is excluded since we observe that such a conversion would be rejected by the \texttt{TypeId} check\cite{TypeIdin2:online}. The check strictly requires two types sharing the same layout.
+%
+{When generic type conversion errors are identified, the trait bounds linked to the generic type are  mapped to the \textit{ty\_set}, which has been verified to implement these traits in \tyanalyzer.}
+%
+The detection logic for each bug type and each scenario is shown in \autoref{bugdetectors}. 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+\vspace{0.05in}
+\noindent{\bf \Bdone (Type I).}
+Misalignment detector can easily compute the alignments to identify the bugs; however, it is not possible to predict the alignment of generic types that depend on runtime input. To solve the challenge, we will use \textit{ty\_set} to simulate the input to generic types.
+
+\noindent\emph{Bug Definition.}
+When \textit{src\_ty}'s alignment is not a multiple of \textit{dst\_ty}'s alignment, it will create a misaligned pointer. 
+
+% definition: pointed of from_ty and to_ty
+\noindent\emph{Type Conversion.}
+In the scenario of (Con $\rightarrow$ Con), \bdone directly locates the type conversion by computing the violation of alignment requirements (i.e., \texttt{\textit{src\_ty}.align \% \textit{dst\_ty}.align != 0}), and then we will mark the \textit{dst\_ty}'s pointer as an invalid type pointer.
+% 
+In the scenario of (Con $\rightarrow$ Gen), we need to traverse all candidate types in \textit{ty\_set} to ensure each type obeys the alignment requirements. If any candidate type violates the requirement, we mark it as an invalid pointer. When \textit{ty\_set} is empty, it means that the generic type can be initialized with arbitrary types since no trait bounds are found. In this case, we will also mark \textit{dst\_ty}'s pointer as an invalid pointer.
+%
+In the scenario of (Gen $\rightarrow$ Con), the detector follows the same logic as in (Con $\rightarrow$ Gen) to mark the invalid pointer. The difference is that \textit{dst\_ty} can not be aligned to only one byte even when the \textit{ty\_set} is empty. The reason is that any memory address can be a multiple of one where the misaligned pointer will not be created.
+%
+In some cases, \bdone may fail since the types are imported from external packages. To solve the challenge, we heuristically extract the information from the symbol names of types based on the cases we have studied (e.g., extract \texttt{u8} from \texttt{external::u8\_bytes}).
+%
+Since we only run our tool on the machine of 64-bit architecture; however, some type's alignment is platform-specific, where the value changes based on different architectures.
+Take \texttt{usize} and \texttt{isize} for example, on a 32-bit target, they are aligned to 4 bytes while on a 64-bit target, they are aligned to 8 bytes.
+In \Bdone, we will consider different alignment values for these types in the type conversion.
+%
+
+
+\vspace{0.05in}
+\noindent{\bf \Bdtwo  (Type II).}
+To detect the inconsistent layout bug, we define two type sets: \textit{unstable\_ty} and \textit{stable\_ty}. 
+\textit{unstable\_ty} represents the type that can change the memory layout at runtime (e.g., \texttt{struct}, \texttt{union}, trait object), where the compiler preserves the rights to insert padding bytes or reorder the fields. Another type set \textit{stable\_ty} consists of scalar types (e.g., bool, char, integers). \Bdtwo will perform further analysis on the representation of types (e.g., \texttt{repr(Rust)}, \texttt{repr(transparent)}, \texttt{repr(C)}). 
+Any type conversion in \textit{unstable\_ty} set or across \textit{unstable\_ty} and \textit{stable\_ty} sets would be recognized as a problematic type conversion and create an invalid type pointer. In addition, we need to combine with \textit{ty\_set} to extend the scenarios of generic type conversion.
+
+
+
+\noindent\emph{Bug Definition.}
+When the layout of \textit{src\_ty} is not stable and inconsistent to \textit{dst\_ty}, it will create an invalid type pointer. 
+
+\noindent\emph{Type Conversion.} 
+If the detector finds the conversion happens in (\textit{unstable\_ty} $\rightarrow$ \textit{stable\_ty}), it will mark the \textit{dst\_ty}'s pointer as an invalid type pointer since the padding bytes can be exposed when we accessed them as a scalar type.
+The second pattern is (\textit{unstable\_ty} $\rightarrow$ \textit{unstable\_ty}), \bdtwo will further check if they follow the same Application Binary Interface (ABI)~\cite{unsoundcollectiontransmute}, which determines if \textit{src\_ty} and \textit{dst\_ty} share same layout based on their symbol name of type. If they have different type symbol names, \textit{dst\_ty}'s pointer will also be marked as an invalid type pointer.
+In the scenarios of (Con $\rightarrow$ Gen) and (Gen $\rightarrow$ Con), they follow the same logic to check when the arbitrary types or the limited types in \textit{ty\_set} could make the type conversion match the two patterns above. 
+%
+
+
+\vspace{0.05in}
+\noindent{\bf \Bdthree (Type III).}
+In order to find the bug efficiently, we define two type sets based on the scope of values: \textit{weak\_ty} and \textit{strict\_ty}.
+\textit{weak\_ty} represents the type that has a weak constraint on its bit pattern, such as integer and float type. In contrast, \textit{strict\_ty} means a strong limitation on the bit pattern, such as bool, string, and character.
+If the type is found to be a composite type, which has multiple fields, \bdthree will analyze each field and define it as \textit{strict\_ty} if one of the fields is included in \textit{strict\_ty}.
+The type conversion between \textit{weak\_ty} and \textit{strict\_ty} can create a type with an invalid bit pattern.
+
+\noindent\emph{Bug Definition.} 
+There are two patterns of conversion that can create an invalid type: 
+1) \textit{src\_ty} belongs to \textit{weak\_ty} while \textit{dst\_ty} belongs to \textit{strict\_ty}. 
+2) \textit{src\_ty} and \textit{dst\_ty} are in \textit{strict\_ty} and \textit{weak\_ty}, while \textit{dst\_ty}'s pointer is mutable.
+In these two types of conversions, an invalid type pointer can be created.
+
+
+
+\noindent\emph{Type Conversion.} 
+If the detector finds the conversion in (\textit{weak\_ty} $\rightarrow$ \textit{strict\_ty}), it will mark the \textit{dst\_ty}'s pointer as an invalid type pointer since the bit pattern of \textit{src\_ty} could be invalid for \textit{dst\_ty}.
+%
+When the conversion is found in (\textit{strict\_ty} $\rightarrow$ \textit{weak\_ty}), \bdthree will take a further analysis on whether the \textit{dst\_ty} is mutable since changing the bit pattern of \textit{dst\_ty} can also make \textit{src\_ty} invalid.
+%
+In the scenarios of (Con $\rightarrow$ Gen) and (Gen $\rightarrow$ Con), the detector follows the same logic
+to check whether the type conversion is performed between \textit{weak\_ty} and \textit{strict\_ty} with mutability analysis.
+%
+\looseness=-1
+
+
+
+
+
+
+
+
+\subsubsection{Access Check}
+\label{accesscheck}
+
+\Checktwo is performed to analyze how the invalid type pointer captured by \Checkone can be accessed.
+The analysis can be separated into two steps:
+1) check whether the pointer is accessed in the function,
+and 2) analyze whether the pointer is accessible for the caller function.
+%
+As the first step, to check whether \textit{dst\_ty}'s pointer is accessed in the function, we focus on the dereference in statements and the unsafe function calls in the terminators of the MIR.
+% \xz{did you explain MIR/HIR?}
+%
+For statements, we check whether \textit{dst\_ty}'s pointer is aliased with the dereferenced pointer.
+%
+For unsafe function calls, we collect a list of unsafe functions that are widely used in the core libraries of Rust, such as \texttt{ptr::read/copy}, \texttt{ptr::as\_ref}, and \texttt{slice::from\_raw\_parts}, {which requires the pointer refers to an aligned, consecutively initialized type.
+%
+The access list for \bdthree also includes other APIs such as \texttt{str::from\_utf8\_unchecked} or \texttt{CStr::from\_ptr}.
+%
+These functions require types to be encoded with the specific bit patterns}.
+%
+\Checktwo will verify whether the pointer passed in these unsafe functions is aliased with the \textit{dst\_ty}'s pointer.
+\looseness=-1
+
+In the second step, to check whether \textit{dst\_ty}'s pointer is accessible for the caller function, we analyze whether the \textit{dst\_ty}'s is aliased with the return type only when the return type is a reference.
+%
+When the return type is a raw pointer, accessing it requires the \texttt{unsafe} block since Rust does not guarantee the safety of the raw pointer.
+%
+Since using \texttt{unsafe} highlights the responsibility for the bugs and we only consider the function that performs the problematic type conversion to be the culprit of bugs, we will set up the requirement for the return type to be a reference in the second step.
+%
+% For details on finding a pointer alias based on \textit{alias\_graph}, we inal{have described them in \autoref{aliasanalysis}}.
+%
+%
+After \checktwo ensures that the pointer of invalid \textit{dst\_ty} can be accessed, the bug report will be generated as the output of \bugdetector.
+
+\subsubsection{\TC Analysis}
+\label{sec:manualtypecheck}
+{\TC is usually used by the developers to prevent type confusion bugs manually. Through examining these checks, we can confirm that the developer has handled the type conversion errors, further reducing the false alarms of \TN{}.
+%
+We categorize them into two scenarios: \textit{Pre Type Check} and \textit{Post Type Check}, where the check inserted before and after type conversions, respectively.} 
+
+
+{We summarize various patterns of developer-enforced checks that address type confusion bugs individually.
+First, the pre type checks used to prevent misalignment bugs include calling \texttt{align\_of} and \texttt{alloc}, which are used to check and assign memory layout before the type conversion. 
+%
+There is also a post type check that the developer uses to safely load the misaligned type e.g., \texttt{read\_unaligned}. 
+%
+Second, for the inconsistent layout bug, pre type check is used to guarantee the memory is completely initialized. 
+%
+The typical patterns include using \texttt{size\_of} to restrict the size at run-time.
+%
+For example, if the struct contains two fields of \texttt{u32} types, developers can check if the size of the struct type is 8 bytes, further ensuring that no padding bytes are inserted.
+%
+The post type checks such as \texttt{ptr::write}, which can be used to access the uninitialized memory, will also be detected before \TN raises the alarms for the bugs.
+Detecting developer-enforced checks for scope mismatch bugs is challenging because developers often use runtime value comparisons.}
+
+
+
+
+
+
+\subsubsection{Integration of Interprocedural Analysis}
+{
+Interprocedural analysis plays an essential role in confirming the presence of the type confusion bug. In this section, we describe how it is incorporated into \bugdetector.}
+
+\vspace{0.05in}
+\noindent{\bf Type Conversion Check.}
+{We can use it to identify type conversions between functions. For instance, consider (Con $\rightarrow$ Con), where we notice an unsafe type casting from a \texttt{u8} pointer to a \texttt{u16}. According to our misalignment bug criteria, this should trigger an alert. Nevertheless, through interprocedural analysis, we identify a type conversion from a \texttt{u16} pointer back to \texttt{u8} in the caller function. As a result, the \texttt{src\_ty} should be \texttt{u16} and properly aligned to two bytes, which means that there is no any misalignment. Considering another case with generic type (Gen $\rightarrow$ Con) and type conversion being detected in a method, we leverage \pcg to identify the type constructor function and analyze the type conversion pairs in the method.}
+
+\vspace{0.05in}
+\noindent{\bf Access Check.}
+{Given that the type may not be accessible within the current function, we also examine the callee functions, such as a raw pointer dereference. Additionally, we gather certain \texttt{unsafe} standard library functions, which involve type access, accelerating the verification of type access.}
+
+\vspace{0.05in}
+\noindent{\bf \TC Analysis.}
+{\TC could also exist in external functions. In other words, it can be implemented in callers, type constructors, or callees. Thus, \TN must analyze all reachable functions to locate the related type checks.}

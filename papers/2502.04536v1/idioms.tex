@@ -1,0 +1,959 @@
+
+\documentclass[letterpaper,twocolumn,10pt]{article}
+\usepackage{usenix-2020-09}
+
+\usepackage{tikz}
+\usepackage{amsmath}
+
+\usepackage{subcaption}
+\usepackage{booktabs}
+\usepackage{caption}
+\usepackage{multirow}
+\usepackage{tcolorbox}
+\usepackage{xspace}
+\usepackage{listings}
+\definecolor{dkgreen}{rgb}{0,0.5,0}
+\definecolor{lessdkgreen}{rgb}{0,0.6,0}
+\definecolor{dkred}{rgb}{0.5,0,0}
+\definecolor{gray}{rgb}{0.5,0.5,0.5}
+
+\lstdefinestyle{cstyle}{
+language=c,
+basicstyle=\ttfamily\bfseries\scriptsize,
+  morekeywords={virtualinvoke},
+  keywordstyle=\color{blue},
+  ndkeywordstyle=\color{red},
+  commentstyle=\color{dkred},
+  stringstyle=\color{dkgreen},
+  numbers=left,
+  breaklines=true,
+  numberstyle=\ttfamily\footnotesize\color{gray},
+  stepnumber=1,
+  numbersep=2pt,
+  numberstyle=\tiny,
+  backgroundcolor=\color{white},
+  tabsize=4,
+  showspaces=false,
+  showstringspaces=false,
+  xleftmargin=.23in,
+  captionpos=b,
+  escapeinside={$}{$},
+  print
+}
+\lstdefinestyle{cinlinestyle}{
+language=c,
+basicstyle=\ttfamily\bfseries\footnotesize,
+  morekeywords={virtualinvoke},
+  keywordstyle=\color{blue},
+  ndkeywordstyle=\color{red},
+  commentstyle=\color{dkred},
+  stringstyle=\color{dkgreen},
+  escapeinside={$}{$},
+  print
+}
+
+\newcommand\cinline[1]{{\lstinline[style=cinlinestyle]@#1@}}
+
+\newcommand{\realtype}{\textsc{realtype}\xspace}
+\newcommand{\idioms}{\textsc{idioms}\xspace}
+\newcommand{\exebench}{\textsc{exebench}\xspace}
+
+
+\begin{document}
+
+\date{}
+
+\title{Idioms: Neural Decompilation With Joint Code and Type Prediction}
+
+\author{
+{\rm Luke Dramko}\\
+Carnegie Mellon University\\
+lukedram@cs.cmu.edu
+\and
+{\rm Claire Le Goues}\\
+Carnegie Mellon University\\
+clegoues@cs.cmu.edu
+\and
+{\rm Edward J. Schwartz}\\
+Carnegie Mellon University Software Engineering Institute\\
+eschwartz@cert.org
+} %
+
+\maketitle
+
+\begin{abstract}
+Decompilers are important tools for reverse engineers that help them analyze software at a higher level of abstraction than assembly.
+Unfortunately, because compilation is lossy, deterministic decompilers produce code that is missing many of the details that make source code readable in the first place, like variable names and types.
+Neural decompilers, on the other hand, offer the ability to statistically fill in these details.
+Existing work in neural decompilation, however, suffers from substantial drawbacks that limits its ability to handle real code: it is unable to handle user-defined composite types, which are essential to fully specifying many functions' semantics, or require test cases.
+In this work, we introduce a new training process to finetune any LLM into a neural decompiler capable of generating the appropriate user-defined types alongside the decompilation.
+We introduce a new dataset, \realtype, that includes substantially more complicated and realistic types than existing neural decompilation benchmarks.
+Motivated by the intuition that different parts of data structures can be operated upon by different parts of the program, we show that interprocedural context can help improve neural decompilers' ability to handle user-defined types.
+We show that our training process yields state-of-the-art results in neural decompilation.
+We also publicly release the \idioms series of finetuned neural decompilation models in support of open science.
+In summary, we identify the need for joint code and type prediction, show that it is a hard problem, and take the first steps towards solving it.
+\end{abstract}
+
+
+\section{Introduction}
+\label{sec:introduction}
+
+Decompilation---the reconstruction of a source code representation from an
+executable program---is useful for a variety of security tasks, including malware analysis,
+vulnerability research, and fixing legacy software for which the original source
+code is unavailable.
+Unfortunately, because the compilation process loses many programmer-assistive abstractions, such as variable names, types, and comments,
+the code produced by traditional deterministic compilers is often difficult to read and understand.
+
+To address these problems, researchers have been applying machine learning,
+which offers the possibility to guess or predict such missing abstractions
+\emph{statistically} based on the surrounding context.
+Recent work restricts itself to recover predefined abstractions, such as variable names~\cite{dire,direct,varbert}, function names~\cite{nero,symlm,kim2023transformer}, variable types~\cite{lehmann2022finding,osprey,tygr}, or several abstractions at once~\cite{dirty,hext5,resym}. 
+While promising, there are numerous issues with decompiled code~\cite{dramko2024taxonomy} and maintaining a model for each one is infeasible.
+
+More recently, researchers have leveraged large language models (LLMs) to recover the original source code, rather than specific abstractions, which we call \emph{neural decompilation}~\cite{nova,degpt,llm4decompile}.
+Neural decompilation is appealing because, in theory, it can statistically recover any type of abstraction that is missing or distorted.
+In some cases, it can greatly outperform traditional, deterministic decompilers.
+
+For example, Figure~\ref{fig:intro_original} shows a function that initializes a time structure.
+Figure~\ref{fig:intro_decompiled} shows the same function, but after having been compiled and decompiled with the industry-standard Hex-Rays decompiler.
+Notice that the decompiled code is missing meaningful names, and the time structure is misrepresented as an array of integers.
+In contrast, Figure~\ref{fig:intro_llm4decompile} shows the prediction of LLM4Decompile~\cite{llm4decompile}, a leading state-of-the-art neural decompiler.
+Although LLM4Decompile did not recover meaningful names in this instance, it did predict that the function's last argument was likely a structure, and the decompiled code is easier to read.
+
+\begin{figure*}[tb]
+  \begin{subfigure}[t]{0.49\textwidth}
+  \begin{lstlisting}[style=cstyle,basicstyle=\ttfamily\bfseries\scriptsize]
+  struct rtc_time {
+      int tm_year;
+      int tm_mon;
+      int tm_mday;
+      int tm_hour;
+      int tm_min;
+      int tm_sec;
+  };
+  
+  void real_time_2_tm(int year, int mon, int mday, int hour, int min, int sec, struct rtc_time *tm) {
+   tm->tm_year = year - (1900);
+   tm->tm_mon = mon;
+   tm->tm_mday = mday;
+   tm->tm_hour = hour;
+   tm->tm_min = min;
+   tm->tm_sec = sec;
+  }
+  \end{lstlisting}
+  \caption{A function which initializes a structure describing a date and time.\label{fig:intro_original}}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}[t]{0.49\textwidth}
+  \begin{lstlisting}[style=cstyle,basicstyle=\ttfamily\bfseries\scriptsize]
+  _DWORD * func0(int a1, int a2, int a3, int a4, int a5, int a6, _DWORD *a7) {
+      _DWORD *result; // rax
+  
+      a7[5] = a1 - 1900;
+      a7[4] = a2;
+      a7[3] = a3;
+      a7[2] = a4;
+      a7[1] = a5;
+      result = a7;
+      *a7 = a6;
+      return result;
+  }
+  \end{lstlisting}
+  \caption{Figure~\ref{fig:intro_original}, which as been compiled, then decompiled. The decompiled version is missing details like names and types, which makes it harder to read.\label{fig:intro_decompiled}}
+  \end{subfigure}
+  
+  \begin{subfigure}[b]{0.49\textwidth}
+  \begin{lstlisting}[style=cstyle,basicstyle=\ttfamily\bfseries\scriptsize]
+  void func0(int a, int b, int c, int d, int e, int f, struct_t *s) {
+      s->a = a - 1900;
+      s->b = b;
+      s->c = c;
+      s->d = d;
+      s->e = e;
+      s->f = f;
+  }
+  \end{lstlisting}
+  \caption{Figure~\ref{fig:intro_original}, having been compiled, decompiled and run through LLM4Decompile-Ref~\cite{llm4decompile}.
+  While the predicted code represents the same sequence of operations as \ref{fig:intro_original}, it is difficult to know if the prediction is correct without knowing the types of the fields used and how they're arranged within the type \cinline{struct_t}.
+  LLM4Decompile's solution is \emph{underspecified}; the definition of the type \cinline{struct_t} is necessary to fully define the semantics of the function.\label{fig:intro_llm4decompile}}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}[b]{0.49\textwidth}
+  \begin{lstlisting}[style=cstyle,basicstyle=\ttfamily\bfseries\scriptsize]
+  struct date_t {
+      int year;
+      int month;
+      int day;
+      int hour;
+      int min;
+      int sec; 
+  };
+  
+  void set_date(int year, int month, int day, int hour, int min, int sec, struct date_t *date) {
+      date->year = year - 1900;
+      date->month = month;
+      date->day = day;
+      date->hour = hour;
+      date->min = min;
+      date->sec = sec;
+  }
+  \end{lstlisting}
+  \caption{Figure \ref{fig:intro_original}, having been compiled, decompiled, and run through the \idioms version of LLM4Decompile we introduce in this work using our training process.
+  Unlike Figure~\ref{fig:intro_llm4decompile}, the \idioms model jointly predicts the necessary type definitions along with the function.\label{fig:intro_idioms}}
+  \end{subfigure}
+  
+  \caption{A function with a user-defined type and different decompilations of it.}
+  \end{figure*}
+
+Although it may be an improvement over deterministic decompilers, the output of neural decompilers is still far from ideal.
+A security practitioner can glance at the original source code (Figure~\ref{fig:intro_original}) and immediately know that the function is time-related by looking at the names (\cinline{real_time_2_tm}) or output type (\cinline{struct rtc_time}).  In contrast, the neural-decompiled code (Figure~\ref{fig:intro_llm4decompile}) contains no obvious clues that the function manipulates times.
+More problematically, 
+studies have shown that reverse engineers often work across multiple levels of abstraction~\cite{votipka2020observational} such as assembly code and decompiled code.
+To map between abstraction levels, it is necessary to know the memory layout of the data structures used in decompiled code. 
+Although we can tell from the figure that \cinline{struct_t} is a structure, a reverse engineer does not know the memory layout \emph{because there is no type definition at all}.
+The lack of type definitions causes problems for code analysis as well.
+As is, the code in Figure~\ref{fig:intro_llm4decompile} is not well-defined without a definition of \cinline{struct_t}; 
+it cannot be analyzed by static analysis tools, and cannot even be compiled.
+
+This limitation is significant.
+As we discuss in Section~\ref{sec:dataset_generation} (Table~\ref{tab:dataset_complexity}), user-defined types (UDTs), such as structs, are widespread in real code.
+However, existing neural decompilers are not designed to  predict the definitions of UDTs.
+This problem is largely masked because the benchmarks that existing neural decompilers are evaluated on feature very few UDTs, if any at all.
+
+
+In this work, we address these shortcomings by proposing a novel method for training neural decompilers that more effectively reconstructs user-defined type definitions alongside reconstructed code.  
+Figure~\ref{fig:intro_idioms} shows the output of our approach, which we call \idioms, since it recovers idiomatic code.
+Notice that \idioms predicts the type definition of the output structure, \cinline{struct date_t}, as well as the names of the fields within it.
+
+There are two key insights behind our approach:
+
+\paragraph{Insight 1: Code and types should be predicted jointly.}
+The code and function definitions must be predicted \emph{jointly}---in coordination with one another---so that the applications of the type in the code (e.g., the field names) are consistent with the definition.
+The alternative approach---predicting code and types independently---is problematic because an independent type recovery tool is unaware of the neural decompiler's prediction, and so it may produce field names that do not match those in the prediction.
+For example,  one might wonder if it is possible to use a neural decompiler like LLM4Decompile alongside a separate existing type recovery tool~\cite{dirty,tygr,resym}, but this will not help solve the issue in Figure~\ref{fig:intro_llm4decompile}.
+Suppose a type prediction tool was used to generate the following type definition:%
+\begin{lstlisting}[style=cstyle,basicstyle=\ttfamily\bfseries\scriptsize,numbers=none]
+struct s {int u; int v; int w; int x; int y; int z;};
+\end{lstlisting}
+This does not help someone interpret Figure~\ref{fig:intro_llm4decompile} because the field names do not match those in Figure~\ref{fig:intro_llm4decompile}, despite having the correct memory layout.
+Because type definitions must be consistently applied throughout code, we argue that the code and types must be predicted jointly, in a coordinated fashion.
+Field names relate a type definition to its use and application in its associated code.
+
+\paragraph{Insight 2: Scattered evidence for UDT reconstruction necessitates consideration of broad context.} 
+A key reason it is difficult to predict UDT definitions is the \emph{scattered evidence} problem: in general, only a subset of a UDT's fields are accessed within any given function~\cite{dramko2024taxonomy}.
+This motivates us to consider the broader context of a function's call graph to provide additional evidence for UDT reconstruction in model training and prediction.
+We train a series of models where we provide additional context in the form of functions that are close in the call graph, which we term \emph{neighboring} functions.
+By nature, a function's callees and callers process the input, output, and some internal values associated with a function, and may offer additional clues as to the types of those values.
+In turn, the types of values within those callees and callers may be informed by their neighbors.
+
+Based on these insights, we
+introduce a new training strategy and associated family of \idioms models, that (a) jointly predict code and type definitions, enabling consistent type application, and (b) leverage neighboring functions in the call graph to provide necessary additional context for UDT reconstruction.  
+Like LLM4Decompile-Ref~\cite{llm4decompile}, we use the output of deterministic decompilers as input to our model(s), allowing us to take advantage of the decades of work in deterministic decompilation and reduce the difficulty of the model's task.
+Unlike LLM4Decompile, we train our \idioms family of models to predict the complete definitions of all UDTs used by a function along with the definitions of those functions.
+Decompiled code is the only input required to our trained models; unlike other existing work~\cite{slade}, for example, our approach does not require test cases, which are typically unavailable in reverse engineering scenarios.
+
+Our experiments show that neurally decompiling functions containing UDTs is more challenging than decompiling those without, even when controlling for function size.
+These findings generalize across a variety of model sizes and architectures. 
+We show that our approach and family of models achieve state-of-the art neural decompilation results (even on code without UDTs in the most challenging existing benchmark). 
+We also demonstrate that neighboring context substantially improves UDT composition prediction---the types and order of all fields, recursively---by up to 63\%, with larger models benefiting more.
+
+In summary, we contribute
+\begin{itemize}
+\item A new dataset, \realtype, containing 154,301 training functions and 2,862 evaluation functions with real UDTs.
+We extract complete definitions of all UDTs for all functions in \realtype by parsing preprocessed original source code.
+\item A training procedure to jointly predict user-defined types and code in neural decompilation.
+\item A state-of-the-art family of neural decompilation models, which we call the \idioms family of models.
+\item Experimental results showing the difficulty of UDT type prediction, the ability of our neighboring-context training strategy to improve the prediction of UDTs and the generalizability of both across a wide variety of model architectures and sizes.
+\end{itemize}
+
+In the interest of open science, we release the code used to build the datasets, train and evaluate the models, as well as our dataset, \realtype, all \idioms models, and other models we train in our experiments for comparison.\footnote{Code can be found at \url{https://github.com/squaresLab/idioms}; models and datasets can be found at \url{https://zenodo.org/records/14797017}.}
+
+\section{Approach}
+\label{sec:methodology}
+
+\begin{figure*}
+\includegraphics[width=\textwidth]{figures/approach.pdf}
+\caption{Our high-level approach. We use our dataset, \realtype, to finetune causal language models into \idioms models then evaluate them.\label{fig:approach}}
+\end{figure*}
+
+Figure~\ref{fig:approach} overviews our approach.  
+Neural decompilation generally entails \emph{training} machine learning models to predict the original source code for some target function of interest from some deterministically derived representation of the binary (left-hand-side of Figure~\ref{fig:approach}).
+Our \idioms models are trained to operate on the output of a deterministic decompiler, and to predict the original source code definition of a target function, along with a list of user-defined types in that function.  
+Section~\ref{sec:modeling} details the modeling approach, which entails finetuning pretrained causal language models, using call graphs to select context to inform predictions. 
+
+Training models in this way requires suitable example input and output data.
+Existing datasets for neural decompilation have two key limitations: (1) a lack of variables with UDTs and their definitions, and (2) they are organized at the function level, meaning there is insufficient information available to build a call graph.
+We build a new dataset, \realtype, that includes these features, that we describe in Section~\ref{sec:dataset_generation}.
+
+Using this data, we train a family of causal language models to predict the original code associated definitions of user-defined types.
+Section~\ref{sec:training_details} describes training details. 
+
+Once trained, models are used to predict the original code and UDT definitions for a given decompiled function (right-hand-side of Figure~\ref{fig:approach}).
+For evaluation purposes, this must be performed on data not included in the training dataset.
+We discuss evaluation in more detail in Section~\ref{sec:experimental_design}.
+
+\subsection{Modeling}
+\label{sec:modeling}
+
+\begin{figure*}
+\includegraphics[width=\textwidth]{figures/context_organization.pdf}
+\caption{Organization of the sequences used to train the models. \idioms models use neighboring context, which places decompiled functions starting from a target function in the context window following a breadth-first search of the call graph. In the figure, A is the target function. Function context is used in some experiments to compare with \idioms.\label{fig:context_organization}}
+\end{figure*}
+
+\paragraph{Model architecture and finetuning.}
+State-of-the-art language models are neural networks, machine learning models that encode information in terms of real numbers called parameters.
+Models learn via training on typically large quantities of data; the goal of training is to learn parameter values that minimize the error entailed in the model's prediction (using a process called backpropagation).
+To partially overcome the challenges of sufficient training data for a particular task, a model can be \emph{pretrained} on data for a related task, and then \emph{finetuned} on a much smaller quantity of data relevant to the actual target task.
+This has been widely shown to be more effective than training a model for the target task alone on smaller quantities of data.  
+The approach we take for neural decompilation follows this paradigm by finetuning causal language models pretrained on code.
+Causal language models process token sequences.
+Figure~\ref{fig:context_organization} illustrates the overall organization of the sequence provided to our model.
+
+In a supervised context like this, where the task is to learn to predict an output
+(original code + UDT definitions) from an input sequence (decompiled code), the
+input and output are concatenated into a single sequence, where the input
+precedes the output.
+We delimit the two with a \emph{separator token} which indicates that the input is complete.
+At evaluation time, or during use in practice, the input and the separator token
+are used to prompt the model to generate the output (the rest of the sequence).
+
+\paragraph{Jointly predicting code and types}
+ 
+On the ``output'' side of the context is the definition of the function and user defined types used within it from the original source code; in Figure~\ref{fig:context_organization}, this is everything to the right of the \scalebox{1.5}{$\bullet$}.
+Importantly, code and type definitions are part of the same sequence.
+Causal language models use the entire preceding sequence to predict the next token in the sequence.
+This means the names of the fields as used in the prediction, as well as how they are used, are available when the model is generating the type definitions.
+This allows type definitions to be generated jointly with the decompiled code.
+
+\paragraph{Neighboring context}
+\idioms models use neighboring decompiled context to help address the scattered evidence problem for UDT composition.
+In Figure~\ref{fig:context_organization}, the decompiled context is to the left of the \scalebox{1.5}{$\bullet$}.
+It is arranged such that the target decompiled code is placed first, and the callees and callers of the target function are placed after it.
+Then their callees and callers are placed if they haven't been already added to the context, and so forth.
+This breadth-first order is not arbitrary.
+Intuitively, the model must relate the information it learns from the neighboring context to inform the prediction of variable types in the target function.
+That information can only be related if there's an unbroken trace from the source of the information to the target function.
+Additionally, due to practical resource constraints, models can only handle sequences up to a certain length, meaning that choices must be made on what context to put within the available space.
+The BFS order means the context can be cut off arbitrarily on the right side to fit context-length constraints while maintaining the property of having an unbroken trace back to the target function.
+All of this context is followed by a special name-indicator token and tokens of the decompiled target function's name in the decompiled code.
+
+Figure~\ref{fig:context_organization} also shows function-level context, which is used by all existing prior work on neural decompilation~\cite{llm4decompile,nova,slade,katz2018,coda,cao2022boosting,hosseinibeyond}, though sometimes due to architectural differences on some older models the decompiled code and original code are actually separate sequences.
+Function-level context consists of only the target decompiled function.
+We demonstrate the value of neighboring context experimentally (Section~\ref{sec:results}) by comparing with models built using only function-level context.
+
+
+\subsection{Dataset}
+\label{sec:dataset_generation}
+
+Machine learning requires training data, and our model architecture and overall goals impose two
+requirements on a training dataset.  
+First, it should contain code with user-defined types representative of those
+found in the real world.
+Second, we must be able to construct/use interprocedural call graphs of
+the compiled binaries. 
+Existing neural decompilation datasets like \exebench~\cite{exebench} and \textsc{Humaneval-Decompile}~\cite{llm4decompile} do not meet these requirements; they provide only function context, and have fewer and simpler UDTs than real-world code, if any. We examine this in detail in Section~\ref{sec:rq2-results}. 
+We therefore construct a novel dataset, \realtype, that meets these requirements.
+
+\paragraph{Mining functions with UDTs.}
+To build \realtype, we cloned and compiled majority-C-language repositories from GitHub using the GitHub Cloner and Compiler (GHCC) tool~\cite{ghcc}.
+The tool executes standard build configuration scripts, executes standard build scripts like Makefiles, and extracts any resulting ELF-format binary files, then archives the repository if it is under 100 MB in size.
+Among the ELF files are object (\cinline{.o}) files.
+Including object files increases the amount of data available because not all projects build completely.
+However, it also means that for projects that do build completely, the same function is present at least twice: once in the object file, and once in the complete binary (executable or library).
+We filter out all object files for which the functions in that object file appear in another ELF-format binary from that repository.
+We adapt dataset preprocessing scripts from the DIRTY~\cite{dirty} replication package to interface
+with the Hex-Rays decompiler to decompile each binary.
+We filter out PLT stubs, then canonicalize the function names for functions in the binary to \cinline{funcX}, where X is an integer, a standard canonicalization scheme~\cite{hext5,nova,llm4decompile}.
+
+To collect the original code and the types used in it (our output data), we modified GHCC to run \cinline{gcc}'s preprocessor, inhibiting the generation of linemarkers (\cinline{gcc -E -P}), and collecting any resulting generated text files.
+To ensure that the original code and binary code represent exactly the same version, we use the repository archives created in the previous step.
+We parsed the preprocessed code, tracking \cinline{typedef} aliases and recording the definitions of UDTs.
+We store all types in a python object model representing the C type system built on top of DIRTY's~\cite{dirty} type system, allowing fine-grained programmatic analysis of types.
+The types we collect reflect the expressive power of C types, including UDTs
+nested arbitrarily deep and typed function pointers.
+
+Next, we extract and textually canonicalize each function.
+To do this, we traverse the function's AST and record all type descriptors (e.g. at variable declarations, typecasts, and the function's return type).
+We de-alias each name by searching the previously created \cinline{typedef} alias chains to locate the original form of each name, then replace the names in the function's text with the standard name.
+For instance, \cinline{int32} and \cinline{_int32_t} each becomes simply \cinline{int}.
+\footnote{The C standard specifies the minimum size of each type, but not the
+maximum, so technically \cinline{int} is ambiguous---hence the reason for the
+alternative integer type names in the first place. We performed all experiments
+on the same platform, x86\_64 linux with gcc, so this was not an issue in our
+case. We chose C keywords for ease of use, but an alternative convention that
+more explicitly describes the size of each type would also work, so long as it
+is consistent. It is the myriad of equivalent but different naming conventions
+that is the key issue.}
+We do this to provide a standard form for each type. 
+This makes results easier to evaluate and reduces the ambiguity in the conceptual mapping between the memory representation of each type and its syntactic form that the neural decompiler must learn.
+We store the canonicalized form of each function along with the type of each variable in the function.
+
+With the decompiled and original code prepared, we matched preprocessed functions with decompiled functions and organize them by the binary in which they occur.
+We do this so as not to leak information during training; a reverse engineer will attempt to analyze one or more binaries at once, without access to the original source.
+Within each binary, we compute and store the call graph between functions in that binary.
+
+\paragraph{Deduplication.}
+\emph{Data leakage} is a key risk in machine learning.  
+Machine learning models tend to ``memorize'' examples in the training dataset;
+evaluating a model on examples in the training set leads to inflated,
+unrealistic results.
+Thus, an important dataset preparation step is to check that training and evaluation sets are disjoint.
+As we discuss in Section~\ref{sec:limitations} the risk of data leakage via
+pretraining is relatively low for neural decompilation. However, the risk of data
+leakage during finetuning on this constructed dataset remains, because
+duplicates on GitHub are common~\cite{spinellis2020dataset}.
+
+To mitigate this risk, we deduplicate the dataset aggressively, so that we can
+confidently split the dataset into training and testing splits that we expect
+to be disjoint. Our approach is two-fold:
+\begin{itemize}
+\item Minhashing~\cite{minhashing}: This deduplication technique, originally developed for deduplicating webpages, clusters similar text files, and has recently become popular in deduplicating code datasets~\cite{TheStack,ThePile} due to its robustness.
+Exact-match deduplication is insufficient because many copies of popular projects represent different past versions of that project or contain small modifications.
+We treat all C files in a repository as a ``document'' (the order is arbitrary due to shingling) and treat the resulting clusters of repositories as duplicates.
+We select the repository from each which produced the most data.
+Sometimes some duplicates will fail to build, perhaps due to modifications made to build scripts.
+\item By-project splitting: we ensure that all data from a given repository ends up in entirely either the train, validation, or test set and is not spread across those sets.
+This is because the model can memorize project-specific details and conventions, including UDTs, and apply them at test time, greatly inflating results.
+Indeed, Xiong et al.~\cite{hext5} find that not performing by-project splitting in variable name prediction for decompiled code inflates results by 200-300\%.
+\end{itemize}
+Using both strategies substantially increases their efficacy.
+Using by-project splitting without minhash deduplication means that a duplicate of a project in the training set could end up in the test set.
+By-project splitting is required to ensure that project-specific details aren't leaked across set boundaries even when duplicates are not present.
+
+\begin{table*}
+    \caption{Complexity in Evaluation Datasets\label{tab:dataset_complexity}}
+    \centering
+    \begin{tabular}{lrrr}
+    \toprule
+    {} & \textsc{Humaneval-decompile}~\cite{llm4decompile} & \exebench~\cite{exebench} (\texttt{test\_real}) & \realtype (ours) \\
+    \midrule
+    Lines of code (mean) & 15.2 & 13.9 & 14.2 \\
+    Variables with a UDT (\%) & 0 & 0.5 & 26.4 \\
+    Functions with a UDT (\%) &  0 & 1.9 & 53.4 \\
+    Recursive UDT field count (mean) & N/A & 2.2 & 17.6\\
+    Type-tree complexity (mean) & 1.4 & 1.5 & 16.2 \\
+    UDT Type-tree complexity (mean) & N/A & 4.2 & 57.3 \\
+    \bottomrule
+    \end{tabular}
+    \caption*{In this context, a UDT is a user-defined type, specifically a \cinline{struct} or \cinline{union}. Our dataset is extracted from real code on GitHub, while \textsc{humaneval-decompile} is based on programming challenge problems. \exebench is also extracted from real code on GitHub, but the dataset construction process biases it against UDTs.  Each primitive type is a leaf node in a type-tree and each other modifier is an internal node. The complexity measure is the total number of nodes: \cinline{int} has complexity 1, \cinline{int *} has complexity 2, and \cinline{struct s\{int x; int y;\};} has complexity 3.}
+    \end{table*}
+
+\paragraph{\realtype characteristics.}
+After deduplication, our dataset contained 154,301 training functions, 540 validation functions, and 2,322 test functions.
+We refer to this dataset as the \realtype dataset.
+\realtype has substantially more user-defined types than existing benchmarks.
+Table~\ref{tab:dataset_complexity} compares \realtype with two popular benchmarks used to evaluate the state-of-the-art models LLM4Decompile~\cite{llm4decompile} and Nova+~\cite{nova}.
+They contain very few, if any, user-defined types, and those that are present are unrealistically simple.
+
+\subsection{Training Details}
+\label{sec:training_details}
+
+To show the generalizability of our training approach, we finetune \idioms models from five pretrained model architectures and sizes:
+\begin{itemize}
+\item CodeQwen2.5~\cite{qwen}, 0.5 billion parameter version
+\item LLM4Decompile~\cite{llm4decompile}, 1.3 billion parameter version
+\item CodeGemma~\cite{codegemma}, 2 billion parameter version
+\item CodeGemma~\cite{codegemma}, 7 billion parameter version
+\item CodeLlama~\cite{codellama}, 7 billion parameter version.
+\end{itemize}
+We use the common convention in machine learning to attach \cinline{-Xb} to the name of each model, where \cinline{X} is the number of parameters in that model, in billions, e.g. \cinline{codellama-7b}.
+
+For models under 1 billion parameters in size (CodeQwen2.5-0.5b), we perform
+traditional finetuning.
+For models above 1 billion parameters in size, finetuning becomes
+computationally prohibitive; we therefore leverage recent research using
+adapters and quantization (QLoRA~\cite{qlora} adapters), allowing for a
+high-fidelity approximation of full finetuning at a fraction of the
+computational cost and VRAM consumption.
+
+When training on the full compilable partition of the \exebench dataset (for comparison with \realtype), we trained CodeQwen for 8 epochs, the 1-2 billion parameter models for two epochs, and the largest models for 1 epoch.
+We find that the larger models need less finetuning before they converge; they are inherently more capable.
+Simultaneously, larger models are more expensive to finetune.
+Uniquely among the models we use, LLM4Decompile has been pretrained on decompiled code, though it was trained on code decompiled with Ghidra rather than Hex-Rays.
+We train all models with a cosine learning rate scheduler~\cite{loshchilov2016sgdr} starting from a learning rate of $5\times 10^{-5}$.
+We use a batch size of 64.
+
+To mitigate overfitting concerns, on the 8-epoch experiments, we use standard machine learning procedure and evaluate after each epoch on the validation set. The best performing version of the model is used for the final evaluation on the test set.
+
+For our function-context models, we configure the context window---the maximum amount of tokens the model will process at once---to be up to 2048 tokens, 1024 of which is reserved for the original code tokens and UDT definitions.
+We configure the context window size for \idioms models with neighboring context to be up to 4096 tokens, 3072 of which is the decompiled function and neighboring context and 1024 of which is reserved for the original code and UDTs.
+
+
+\section{Experimental Design}
+\label{sec:experimental_design}
+
+Our experiments are designed to answer three research questions:
+
+\textbf{RQ1}: \emph{How effectively do neural decompilation models, including \idioms, predict code and UDTs, and how does performance relate to model and dataset size?}
+We examine the overall performance of \idioms and neural decompilation models in general and how scaling up the process impacts that performance.
+
+\textbf{RQ2}: \emph{To what extent, if any, do UDTs increase the complexity of neural decompilation?}
+Existing work is evaluated on benchmarks that contain limited UDTs.
+But as we have discussed previously, predicting UDTs is valuable, and UDTs are commonplace in real code.
+Do UDTs impose additional challenge for neural decompilers, and if so, how much?
+
+\textbf{RQ3}: \emph{How does adding neighboring context affect the quality of neural decompilers?}
+The scattered evidence problem tells us that the evidence needed to understand UDTs may be spread throughout different functions of the program.
+Does providing neighboring context help the model predict UDTs more effectively, and if so, by how much?
+
+\subsection{Datasets and Baselines}
+\label{sec:datasets_and_baselines}
+
+The experimental configurations entail two datasets: \realtype (our new dataset),
+and \exebench~\cite{exebench}. 
+\exebench is the most challenging existing benchmark used to evaluate existing work.
+It features code extracted from GitHub, along with definitions for external symbols associated with some functions.
+Most of the definitions are synthetic and automatically generated by the authors.
+They do not feature the full definitions of UDTs, however.
+Many have a single field named \cinline{dummy}, marking it as a placeholder value.
+A minority of the examples, about 15.4\% of the overall dataset, have unit test cases that the authors automatically generated.
+The test and validation sets are selected out of those 15.4\% of the functions for which tests could be generated (hence the bias illustrated in Table~\ref{tab:dataset_complexity}).
+
+Our primary baseline is an unmodified existing state-of-the-art model, LLM4Decompile~\cite{llm4decompile}, which we evaluate on \exebench~\cite{exebench}.
+Note that originally, LLM4Decompile was trained on code decompiled by Ghidra rather than Hex-Rays.
+For the purposes of baseline results, we re-decompile the \exebench test set using Ghidra and use this as input to the LLM4Decompile model; evaluating it directly on Hex-Rays data would represent a covariate shift that would hurt LLM4Decompile's performance.
+Later, we also finetune LLM4Decompile on Hex-Rays data as part of our main experiments.
+
+We do not compare against two other pieces of notable recent work in neural decompilation: SLaDe~\cite{slade} and Nova+~\cite{nova}.
+SLaDe achieves very strong results for a very small model size.
+However, by design, SLaDe uses the test cases bundled with \exebench for each function during prediction to decide which is correct.
+Unfortunately, this is unrealistic in practice, because the source code was used to create the test cases, which of course defeats the purpose of a decompiler.
+Even with the source code available, the authors of \exebench~\cite{exebench} were only able to generate tests for 15.4\% of the dataset.
+
+Nova+~\cite{nova} is a neural decompiler that uses assembly code as input rather than decompiled C.
+Nova expects the assembly to be highly processed and regularized before being fed into the model.
+Because the work is under review, their preprocessing script is unavailable.
+Attempting to decompile without the preprocessing script introduces a covariate shift for the model, and it produced very poor results.  We look forward to testing Nova+ when it is released.
+
+General purpose LLM chatbots like ChatGPT have been shown to be poor neural decompilers~\cite{slade,llm4decompile,nova}, especially for their immense size, likely because they are trained on vastly more ``normal'' source code and little decompiled code.
+
+\subsection{Metrics}
+\label{sec:metrics}
+
+Ideally, a perfect neural decompilation exactly matches the original source code.  In practice, we want a neural decompiler to (1) preserve the execution semantics, and (2) 
+restructure the names, types, and code to be more readable and idiomatic, or written in a style that mimics a human developer's.
+In comparison with deterministic decompilation, the former means that a good neural decompiler should be no worse than a deterministic one, and the latter means it must add value beyond what a deterministic decompiler can provide.
+We use a suite of metrics to measure a neural decompiler's efficacy on both fronts, comparing to the original source code as the gold standard.
+
+\paragraph{Semantic preservation.}
+There is no easy way to check the semantic equivalence of the neural decompiler's prediction because program equivalence is undecidable.
+Instead, we use two complementary proxies: one complete, but unsound; the other sound, but incomplete:
+\begin{itemize}
+  \item \textbf{Unit test accuracy}: whether the neural decompiler's prediction passes all available unit tests. \exebench includes unit tests with each example
+  in the test set, intended to evaluate semantic fidelity of decompiled code. 
+Tests are complete but unsound, but still a useful (if optimistic) proxy for correctness.
+\emph{(Metric name: passes exebench tests)}
+
+\item \textbf{Static, dependency-based equivalence.}
+To address the limitations of unit testing and assess correctness for \realtype (which lacks unit tests), we use static, dependency-based equivalence checking, comparing against the original source code as ground truth.
+We use features of the \textsc{codealign} analysis framework~\cite{codealign} to extract control and dataflow dependencies between operations and determine if the resulting dependency graphs are isomorphic.
+Intuitively, isomorphic dependency graphs mean that the programs execute the same sequence of operations in the same partial order, while ignoring variable names.\footnote{We say partial order because the order of some statements can be swapped without affecting semantics. For instance, \cinline{x++; y++;} and \cinline{y++; x++;} are functionally equivalent.}
+Doing so is a sound approximation of equivalence~\cite{yang1989detecting}, subject to two limitations: type compatibility and side effects.
+We also report the fraction of the neural decompiler's predictions for which the prediction is isomorphic (matches the ground truth), and for which all variable types match.
+\emph{(Metric names: dependency-based equivalence, dependency-based equivalence + typechecks.)}
+\end{itemize}
+
+\paragraph{Code improvements.}
+It is also important to quantify how the neural decompiler has improved the code by adding abstractions like accurate variable names and types.
+A challenge in evaluating variable name accuracy is determining which variables in the prediction correspond to those in the original source.
+The prediction may break up expressions into smaller subexpressions, with results stored in intermediate variables, or vice versa.
+This means that, except for function parameters, it can be ambiguous how to programmatically map between variables in the original and the decompiled versions of a function to compare their names and types.
+To address this challenge, we identify the operations that map to one another in the previously-computed isomorphic maps computed for dependency-based equivalence.
+With this mapping, we compare variables' names and types.
+\emph{(Metric names: variable name accuracy, variable type accuracy)}
+
+If code has the same dependency structure as the original, that means it represents the algorithm expressed in the binary in terms of the same operations in the same partial order.
+In other words, the structure of the predicted code mimics that of the original code.
+Dependency-based equivalence thus also serves as a measure of how often the neural decompiler recovers the structure of the original code.
+
+\paragraph{UDT accuracy.}
+One of the key challenges with decompiling real C code is reconstructing user-defined types.
+One novelty of the \idioms approach is that it predicts UDTs alongside the code, and thus we measure accuracy on UDTs separately. 
+UDTs are often named, as are their fields.
+Perfectly predicting the name of a UDT and each of its constituent fields is a challenging task.
+We therefore also look at partial metrics that decompose accuracy on UDT predictions.
+Namely, knowing type composition, and accurately predicting it   
+--- that is, the type of fields it has and the order in which those fields occur --- can still be helpful to a reverse engineer.
+We therefore report the fraction of UDTs for which the composition matches (which ignores field names).
+When computing our sound equivalence metric ``dependency-based equivalence + typechecks'' we use UDT composition to determine if all UDT variables typecheck rather than requiring that UDT names match as well.
+\emph{(Metric names: variable UDT names + composition accuracy, variable UDT composition accuracy)}
+\vspace{8pt}
+
+In summary, unit test accuracy is an upper bound on the rate at which neural decompilers preserve semantics, while dependency-based equivalence + typechecking forms an approximate lower bound.
+Variable name accuracy, the three type accuracy measures (variable type accuracy, variable UDT names + composition accuracy, variable UDT composition accuracy), and the fraction of the decompiled examples that have the same dependency structure as the original, quantify the improvements that neural decompilers make to the code.
+
+
+\subsection{Experimental Methodology}
+\label{sec:experiment_methodology}
+
+To answer our research questions, we train and evaluate each of the five base models described in Section~\ref{sec:training_details} under four   conditions.  
+The primary evaluation of our proposed \idioms approach is \textbf{neighbors-realtype (idioms)}: Models are trained and evaluated on the \realtype dataset, using neighboring functions identified by call graph traversal as context.
+
+
+The other three conditions are designed to provide causal comparisons by differing one factor at a time, enabling assessment of the role of dataset composition and size, and \idioms design features:
+\begin{itemize}
+\item \textbf{exebench}: Training and evaluating on \exebench
+\item \textbf{parity-exebench}: Training and evaluating on a subsample of \exebench that is the same size as \realtype.
+\item \textbf{functions-realtype}: Training and evaluating on \realtype, but using only the decompiled function as context, as existing work does.
+\item and finally, \textbf{neighbors-realtype} represents the full \idioms setup.
+\end{itemize}
+
+The first set of conditions mirrors using existing state-of-the-art training practices on the most challenging existing benchmark used in neural decompilation research, \exebench~\cite{exebench}.  Experimental conditions \textbf{exebench}  and \textbf{parity-exebench} differ in dataset size; \textbf{parity-exebench} and \textbf{functions-realtype}, the dataset used; and \textbf{functions-realtype} and \textbf{neighbors-realtype}, the type of context provided.  We train/evaluate all models under all conditions to assess generalizability to model sizes.
+Notably, only \textbf{neighbors-realtype} uses neighbors-context; the other three experimental settings all use function-only context.
+
+For the configurations that use \exebench dataset, we used the compilable partition of \exebench for which deterministic decompilation succeeded.
+For consistency, we process the dataset in the same way as we did ours in Section~\ref{sec:dataset_generation}, with a few exceptions dictated by the information available.
+In particular, we compiled each function individually rather than each project/repository together, since the dataset is not organized by project and there is no project-specific build information.
+We also made use of the function-specific dependencies (\cinline{typedef}s, function declarations, and type definitions) provided in the dataset rather than running the preprocessor on an entire project at once.
+
+Thus, for the \textbf{exebench} setting, we trained on the full compilable train set for which deterministic decompilation succeeded, which consists of  2,383,839 functions.
+\exebench is substantially larger than \realtype, which consists of 154,301 functions, and machine learning model performance generally increases with training set size, so to control for this, we randomly subsampled \exebench to create a smaller training set of the same size.
+Then, we trained each model on this subset for the 
+\textbf{parity-exebench} setting.
+
+For \textbf{exebench} and \textbf{parity-exebench}, we evaluate only on the ``real'' subpartition of \exebench's test set.
+As described in Section~\ref{sec:datasets_and_baselines}, the ``synth'' partition contains unrealistic synthetic dependencies, including user-defined types.
+Further, the authors of SLaDe find that the ``synth'' subpartition is substantially easier to predict than the ``real'', with all techniques scoring at least 20\% higher (in absolute terms) on ``synth'' alone as compared to ``synth'' and ``real'' together.
+(Real alone is not evaluated.)
+We also exclude from the \exebench test case evaluations any examples where the provided oracle solution and dependencies don't compile, or fail at least one test.
+This makes up about 16\% of the overall \texttt{test\_real} partition.
+The authors of SLaDe~\cite{slade} find that about 44\% of oracle solutions across both real and synth partitions fail.
+
+To evaluate the role of dataset type and quality on UDT and neural decompilation effectiveness, we compare models trained only on \realtype, but without additional context.   This is the \textbf{functions-realtype} experiment, which uses only the decompiled form of a function to predict the original form of a function and its user-defined types.
+Comparing this setting to the \textbf{neighbors-realtype} experiment allows an assessment of the value of neighboring context in neural decompilation.
+
+\subsection{Dataset and Prediction Processing}
+
+We perform a small amount of necessary filtering on the evaluation datasets.
+DIRTY's~\cite{dirty} decompilation scripts fail on about 16\% of the \exebench \texttt{test\_real} set; we are forced to filter these out because otherwise we have no input to provide to the model.
+Following LLM4Decompile~\cite{llm4decompile}, we do not evaluate on any examples for which the decompiled function does not fit within the model's context window.
+This filters out about 3\% of each test set.
+The ``neighbors'' experiments have expanded context windows; for a fair evaluation, we ensure that they are evaluated on the same subset of the test set as the corresponding ``functions'' model.
+
+In our experiments, all models are trained to predict the decompiled code first, followed by any user-defined types used in the function or in other user-defined types.
+Especially with the \textbf{realtype} experiments, the model's predictions often include degenerate text~\cite{holtzman2019curious}, usually type definitions following some kind of repeating pattern.
+Degenerate text is a common issue in even large and powerful language models, and its causes are not well understood.
+We find that degenerate text can occur even when the prediction of the function's text is correct, and also even when the definitions of the UDTs of the functions are present and correct.
+(The correct UDTs, without observed exception, immediately follow the predicted function definition; degenerate ones follow the correct ones.)
+We hypothesize that the degenerate text is at least partially a result of the extreme difficulty of the task: in general, as we discuss in Section~\ref{sec:introduction}, it is difficult if not impossible to fully predict a user-defined type from a single function that does not use all of its fields.
+Because the decompiled code, especially in the \textbf{realtype-functions} experiments, is \emph{not} predictive of all UDTs, the model learns simply to generate some arbitrary UDT definitions after generating the function text and any function definitions it can figure out.
+The fact that the effect is less pronounced in the \textbf{exebench} experiments supports this view.
+
+Fortunately, the degenerate text affects the evaluation very little.
+Type accuracy is computed for each variable; if no variable uses a degenerate UDT, it is simply ignored.
+
+\begin{table}[!ht]
+\caption{LLM4Decompile~\cite{llm4decompile} Baseline\label{tab:baseline}}
+\begin{tabular}{lrr}
+\toprule
+ & LLM4Decompile \\
+\midrule
+dependency-based equivalence & 20.85 \\
+dependency-based equivalence & \multirow{2}{*}{14.15} \\ 
+\multicolumn{1}{c}{+ typechecks} & \\
+variable name accuracy & 13.44 \\
+variable type accuracy & 43.39 \\
+var UDT names + composition acc & 0.00 \\
+var UDT composition accuracy & 0.00 \\
+passes \exebench tests & 39.23 \\
+\bottomrule
+\end{tabular}
+\caption*{All values are percentages. UDT accuracy is 0\% by construction because LLM4Decompile does not generate UDTs.}
+\end{table}
+
+\section{Results}
+\label{sec:results}
+
+To calibrate expectations about model performance, we provide baseline results of LLM4Decompile~\cite{llm4decompile} on \exebench in Table~\ref{tab:baseline}.
+UDT accuracy is 0\% because LLM4Decompile does not natively generate UDT definitions.
+The authors of LLM4Decompile only evaluate their assembly-based models, LLM4Decompile-End on \exebench, not their decompilation-based models, LLM4Decompile-Ref.
+They report a unit test passing rate of 17.86\%, but it's important to note that LLM4Decompile-Ref is more powerful, and there are several experimental conditions that differ, so this number is not directly comparable with the last row of Table~\ref{tab:baseline}. This is why we provide a baseline.
+
+The results of our four main experiments---\textbf{exebench}, \textbf{parity-exebench}, \textbf{functions-realtype} and \textbf{neighbors-realtype}---are shown in Figure~\ref{fig:main_results}.
+Each column represents an experiment, and the columns are arranged such that each experiment differs by exactly one experimental setting from the one next to it.
+Between the first and second it is dataset size (2,383,839 vs. 154,301 training functions), between the second and third it is the dataset type (\exebench vs. \realtype), and the third and fourth differ in the amount of context provided (decompiled function only vs. decompiled function and neighboring functions). 
+The last column thus corresponds to the primary experiment, \textbf{neighbors-realtype}, which uses the full \idioms approach.
+Note that there is high variance in UDT metrics for the two \exebench-based experiments because there very few UDTs in the \texttt{test\_real} subset of \exebench.
+
+
+\begin{figure*}
+\begin{subtable}{1.0\textwidth}
+\centering
+\caption{CodeQwen2.5-0.5b\label{tab:qwen_0.5b}}
+\begin{tabular}{lrr|rr}
+\toprule
+&exebench&parity-exebench&functions-realtype&neighbors-realtype (\idioms)\\
+\midrule
+dependency-based equivalence & 30.62 & 25.96 & 16.21 & 15.55\\
+dependency-based equiv+typechecks & 20.37 & 16.96 & 7.11 & 7.17\\
+variable name accuracy & 18.76 & 15.23 & 13.85 & 13.63\\
+variable type accuracy & 54.42 & 45.64 & 32.94 & 30.40\\
+variable UDT names+composition acc& 11.11 & 6.90 & 3.16 & 3.69\\
+variable UDT composition accuracy & 37.04 & 10.34 & 6.03 & 6.36\\
+passes \exebench tests & 44.43 & 32.09 & -- & --\\
+\bottomrule
+\end{tabular}
+\end{subtable}
+
+\begin{subtable}{1.0\textwidth}
+\centering
+\caption{LLM4Decompile-1.3b-v2\label{tab:llm4decompile_1.3b}}
+\begin{tabular}{lrr|rr}
+\toprule
+&exebench&parity-exebench&functions-realtype&neighbors-realtype (\idioms)\\
+\midrule
+dependency-based equivalence & 31.87 & 29.08 & 17.95 & 17.28\\
+dependency-based equiv+typechecks & 23.29 & 19.79 & 8.45 & 8.30\\
+variable name accuracy & 19.16 & 17.22 & 16.14 & 16.88\\
+variable type accuracy & 54.90 & 49.59 & 36.08 & 35.34\\
+variable UDT names+composition acc& 13.79 & 12.00 & 3.78 & 4.60\\
+variable UDT composition accuracy & 41.38 & 28.00 & 9.96 & 11.09\\
+passes \exebench tests & 49.11 & 41.33 & -- & -- \\
+\bottomrule
+\end{tabular}
+\end{subtable}
+
+\begin{subtable}{1.0\textwidth}
+\centering
+\caption{Codegemma-2b\label{tab:codegemma_2b}}
+\begin{tabular}{lrr|rr}
+\toprule
+&exebench&parity-exebench&functions-realtype&neighbors-realtype (\idioms)\\
+\midrule
+dependency-based equivalence & 30.89 & 29.00 & 16.97 & 18.12\\
+dependency-based equiv+typechecks & 21.54 & 21.09 & 8.49 & 8.61\\
+variable name accuracy & 19.45 & 16.95 & 15.73 & 17.56\\
+variable type accuracy & 55.60 & 50.62 & 36.08 & 35.42\\
+variable UDT names+composition acc & 24.14 & 24.14 & 3.77 & 4.86\\
+variable UDT composition accuracy & 55.17 & 41.38 & 7.40 & 11.53\\
+passes \exebench tests & 48.32 & 41.29 & -- & -- \\
+\bottomrule
+\end{tabular}
+\end{subtable}
+
+\begin{subtable}{1.0\textwidth}
+\centering
+\caption{Codegemma-7b\label{tab:codegemma_7b}}
+\begin{tabular}{lrr|rr}
+\toprule
+&exebench&parity-exebench&functions-realtype&neighbors-realtype (\idioms)\\
+\midrule
+dependency-based equivalence & 33.70 & 31.35 & 18.06 & 18.25\\
+dependency-based equiv+typechecks& 23.93 & 22.09 & 7.09 & 8.31\\
+variable name accuracy & 20.61 & 18.20 & 16.28 & 19.09\\
+variable type accuracy & 58.18 & 53.19 & 36.36 & 37.92\\
+variable UDT names+composition acc & 20.69 & 17.24 & 4.04 & 5.72\\
+variable UDT composition accuracy & 34.48 & 44.83 & 9.23 & 15.06\\
+passes \exebench tests & 54.43 & 47.42 & -- & -- \\
+\bottomrule
+\end{tabular}
+\end{subtable}
+
+\begin{subtable}{1.0\textwidth}
+\centering
+\caption{Codellama-7b\label{tab:codellama_7b}}
+\begin{tabular}{lrr|rr}
+\toprule
+&exebench&parity-exebench&functions-realtype&neighbors-realtype (\idioms)\\
+\midrule
+dependency-based equivalence & 32.72 & 29.15 & 17.76 & 18.40\\
+dependency-based equiv+typechecks & 22.22 & 19.99 & 9.06 & 7.99\\
+variable name accuracy & 19.31 & 18.04 & 17.20 & 19.26\\
+variable type accuracy & 55.81 & 53.86 & 36.45 & 37.73\\
+variable UDT names+composition acc & 20.69 & 25.93 & 4.07 & 5.52\\
+variable UDT composition accuracy & 41.38 & 48.15 & 10.03 & 14.10\\
+passes \exebench tests & 48.35 & 42.01 & -- & -- \\
+\bottomrule
+\end{tabular}
+\end{subtable}
+
+\caption{Main results. All values are percentages; higher is better. Adjacent columns differ in one experimental condition. \label{fig:main_results}}
+
+\end{figure*}
+
+
+\subsection{RQ1: Model Performance and Trends}
+
+In general, in machine learning, model performance scales with dataset size and parameter counts, but performance gains are usually logarithmic in training set size; doubling either does not lead to a doubling in scores.
+We see this as well across all of our data.
+For instance, CodeQwen2.5-0.5b, our smallest model, produces dependency-equivalent code 30.65\% on \exebench.
+Meanwhile, CodeGemma-7b scores 33.70, a percent increase of about 10\% despite being 14 times larger.
+We also see this in terms of scaling the dataset.
+Columns 1 and 2 illustrate this.
+Column 1 represents a size increase of over 15 times but the gains in the same metric are only 6-11\%.
+The gains on both counts are relatively modest, which may be attributable in the latter case to the fact that the models are pretrained on C code, which means they possess some inherent reasoning ability about C (or, more precisely, they model a good distribution of C code).
+
+\idioms (column 4) follows a similar trend albeit on a more difficult dataset (see RQ2). 
+CodeQwen2.5's dependency-based equivalence score is 15.55\%, though this drops to 7.17\% when type correctness is also factored in.
+Meanwhile, the two 7-billion parameter models, CodeGemma-7b and CodeLlama-7b score only 18.25, 8.31 and 18.40, 7.99, respectively.
+However, the scores UDT composition matches increase much more rapidly with model size.
+(We discuss this further in RQ3.)
+The best \idioms model recovers UDT compositions over 15.06\% of the time.
+Considering the mean size of UDTs (Table~\ref{tab:dataset_complexity}), and the fact that all UDTs must recursively have identical compositions, this is an impressive feat.
+
+\begin{tcolorbox}[width=\columnwidth,
+  boxsep=0pt,
+  left=4pt,
+  right=7pt,
+  top=7pt,
+  arc=4pt,
+  boxrule=1pt,
+  toprule=1pt,
+  colback=white
+  ]%
+Answer to \textbf{RQ1}: Larger models and training sets increase performance modestly across all model types, including \idioms. The best \idioms models are able to achieve dependency-based equivalence scores of over 18\% and UDT composition scores of over 15\% on real code and types.
+\end{tcolorbox}
+
+\subsection{RQ2: The Challenge of Real-World Code with UDTs}
+\label{sec:rq2-results}
+The second and third columns compare datasets of the same size and with similarly sized functions (Table~\ref{tab:dataset_complexity}) but the third column represents our dataset, \realtype, which has far more UDTs.
+This change causes a substantial decrease in performance on all metrics except variable name accuracy.
+For dependency-based equivalence (row 1 on each of Tables~\ref{tab:qwen_0.5b}-\ref{tab:codellama_7b}), the drop is 38-42\%, relative to performance on \exebench.
+The drop is even steeper when type correctness is factored in (row 2): around 55\%-68\%.
+These data highlight the challenge that UDTs provide for real code.
+
+The absence of UDTs in existing benchmarks masks the need for predicting UDT definitions alongside the code.
+\realtype helps close this gap.
+
+\begin{tcolorbox}[width=\columnwidth,
+                  boxsep=0pt,
+                  left=4pt,
+                  right=7pt,
+                  top=7pt,
+                  arc=4pt,
+                  boxrule=1pt,
+                  toprule=1pt,
+                  colback=white
+                  ]%
+Answer to \textbf{RQ2}: Code with UDTs is substantially more challenging to neurally decompile than code without UDTs, with dependency based-equivalence + type equivalence dropping by 55\%-68\% following the introduction of data with real UDTs.
+\end{tcolorbox}
+
+\subsection{RQ3: The Role of Neighboring Context}
+
+Providing additional context in the form of neighboring functions' code can lead to an increase in scores, especially with larger models.
+Interestingly, correctness is largely unchanged, though there is typically a slight increase.
+On the other hand, there is typically notable increase in UDT accuracy, especially in terms of composition where type and field names are ignored.
+Larger models are better able to take advantage of the additional context: UDT composition accuracy increases 63\% for codegemma-7b, 41\% for codellama-7b, and 56\% for codegemma-2b, with small increases in most or all other metrics.
+Smaller models struggle to handle the additional context, at least without tradeoffs.
+LLM4Decompile gains 11\% UDT composition accuracy, but suffers small losses in dependency-based equivalence and type accuracy.
+The smallest, QwenCoder2.5-5b gains only 5\% but likewise suffers small losses in structural equivalence, type accuracy and additionally the combination of the two: overall typechecked dependency-based equivalence.
+
+\begin{tcolorbox}[width=\columnwidth,
+                  boxsep=0pt,
+                  left=4pt,
+                  right=7pt,
+                  top=7pt,
+                  arc=4pt,
+                  boxrule=1pt,
+                  toprule=1pt,
+                  colback=white
+                  ]%
+Answer to \textbf{RQ3}: Neighboring context help increase UDT accuracy with little to no downside in terms of other metrics, though larger models benefit more.
+\end{tcolorbox}
+
+
+
+\section{Limitations and Threats to Validity}
+\label{sec:limitations}
+
+A key threat to validity with most work involving large language models is data leakage through pretraining.
+The training sets for most LLMs are not public, but they usually consists of large quantities of text scraped from the internet, including code from GitHub; our dataset is also derived from GitHub.
+Despite this, we think the risk of data leakage is small.
+Relatively little decompiled code is found on GitHub or on the internet in general; models will likely be unfamiliar with it.
+Further, the key function that a neural decompiler must learn is the \emph{mapping} between decompiled and original code; there is likely even less of this data used in pretraining.
+
+In this work, we only consider unoptimized (\cinline{-O0}) code.
+Several existing pieces of work consider different levels of optimization in neural decompilation or related tasks~\cite{llm4decompile,nova,varbert,dirty,slade}.
+They generally find that optimizations cause a small-to-moderate decrease in efficacy.
+Considering optimizations would have lead to a combinatorial explosion in the number of models to train and evaluate (4 experiments $\times$ 5 architectures/sizes $\times$ 4 optimization levels), exceeding our computation budget.
+Rather than reconfirm a generally well-understood phenomenon, we opted to show the generalizability of our results across models of different architectures and sizes.
+However, it is possible that optimizations make recovering UDTs specifically particularly difficult.
+We leave this to future work.
+
+Some targets of decompilation, especially malware, are often \emph{obfuscated}: that is, transformed in a way that makes them more difficult to understand, usually by making them more convoluted.
+We view deobfuscation as an orthogonal problem as there are a variety of deobfuscation techniques~\cite{dong2022cadecff,coogan2011deobfuscation,david2020qsynth,liang2018deobfuscation,tofighi2018dose,you2022deoptfuscator} that can be applied to de-obfuscate the code before feeding it to the neural decompiler.
+However, in cases where these fail or a novel obfuscation is encountered it may be necessary to input the obfuscated code to the neural decompiler directly.
+We leave studying the impacts of this to future work.
+
+Finally, our dataset is necessarily biased towards open source projects on GitHub that built.
+It is possible that some decompilation targets, especially malware, may have systematic differences from our data and thus affect performance.
+
+\section{Related work}
+
+\subsection{Neural Decompilation}
+
+The early history of neural decompilation is a story of evolving architectures.
+Katz et al.~\cite{katz2018} use a recurrent neural network.
+Coda~\cite{coda} uses a multi-stage model with tree-based encoder and decoder to generate an approximate solution followed by an ensemble of other models to edit the first stage's output.
+Cao et al.~\cite{cao2022boosting} use a graph neural network.
+BtC~\cite{hosseinibeyond} uses the powerful transformer architecture~\cite{transformer} in its encoder-decoder (sequence to sequence) configuration.
+As the immense power of the transformer architecture across a wide variety of tasks and domains has become clear, subsequent work has focused on leveraging it for neural decompilation and scaling it in size.
+SLaDe~\cite{slade} is 50\% larger than BtC~\cite{hosseinibeyond} and uses numerous small adjustments.
+LLM4Decompile~\cite{llm4decompile} introduce a family of large causal transformer models with sizes in the billions of parameters.
+LLM4Decompile models come in two flavors: one that takes assembly as input and one that takes deterministic decompilation from Ghidra as input.
+Nova+~\cite{nova} is designed to handle assembly only.
+It introduces a hierarchical attention mechanism that helps adapt attention to handling long input sequences of assembly instructions.
+
+In contrast, in our work we recast the task of neural decompilation as necessarily one of joint code and type recovery if neural decompilation is to be applicable to real code.
+We are also the first to use inter-procedural context for neural decompilation.
+
+\subsection{Type Recovery}
+
+Type recovery work spans a range of different approaches, from heuristics to constraint-based to probabilistic methods, including machine learning.
+There is sufficient information available at the executable level to deterministically eliminate some types, but not enough to determine the full types, or the names of any UDTs or their fields.
+
+TIE~\cite{tie} is a non-probabilistic technique that uses static analysis and constraint solving to predict types.
+REWARD~\cite{reward} and Howard~\cite{howard} uses dynamic analysis to collect information about variables' types.
+Dynamic approaches can be powerful, but quality inputs are difficult to obtain in reverse engineering scenarios.
+In addition, all non-probabilistic techniques are fundamentally limited by the information present in the binary, which is insufficient to recover types in general and are necessarily unable to predict type or field names.
+
+Some probabilistic techniques focus on predicting only the composition of variable types, not the names of those types or their fields.
+Osprey~\cite{osprey} combines constraint solving and probabilistic random variables to predict the composition of types.
+TyGr~\cite{tygr} does the same but uses a graph neural network.
+
+DIRTY~\cite{dirty} is a joint name and type recovery model based on the transformer architecture.
+DIRTY encodes as context not only the decompiled code of the target function but also an encoding of the memory layout of each variable.
+(We find that the memory layout encoding is redundant because it is communicated via the type names and decompiler-provided comments indicating the source of each variable, such as the \cinline{// rax} comment on line 2 of Figure~\ref{fig:intro_decompiled}. In early experiments, it offered no benefit while being more expensive to run.)
+A key limitation of DIRTY is it predicts structures out of a fixed type library, leaving it unable to generalize outside this set; further, some types in this library are pointers to UDTs without definitions.
+Recently, Xie et al.~\cite{resym} introduced ReSym, which performs the same joint code-type prediction task but with an improved approach using larger language models and providing the ability to generate arbitrary field names and types for UDTs without being restricted to a fixed library.
+
+Many of these tools struggle with nested structures (when the field of a structure is another, perhaps different, structure, or a pointer to it) or are fundamentally incapable of predicting these types.
+This represents the most challenging type recovery task.
+To be counted as correct in our experiments, type definitions for all nested structures must have equivalent composition; nested structures are extremely common in our real-world data.
+
+\section{Conclusion}
+
+In this work, we introduce the \idioms family of neural decompilers, which perform joint code and type recovery.
+We build a dataset, \realtype, which contains 157,163 total functions and the definitions of their user-defined types.
+We train models on \exebench and \realtype, and show that \realtype is a more difficult dataset despite their functions being of a similar size.
+Additionally, we show that additional neighboring context helps address the scattered evidence problem and thus improves performance on UDTs.
+We've illustrated that joint code-type recovery is crucial but a difficult problem in practice.
+We hope this motivates future work in tackling a key challenge in tackling neural decompilation.
+
+
+\section*{Acknowledgments}
+
+This material is based upon work supported in part by the National Science Foundation (award DGE2140739).
+
+\section*{Ethics Considerations}
+
+Neural decompilation offers the ability to help security practitioners with their work, which is currently a slow and painstaking job.
+However, it also has to potential to be used by bad actors to find vulnerabilities to exploit in existing closed-source commercial software or to steal proprietary intellectual property such as algorithms.
+Although many open-source software repositories are deployed in practice, our work offers little threat in these cases because the ground-truth is already publicly available.
+Reverse engineering is already an established threat to intellectual property, and IP holders generally know that proprietary information should be hidden on a controlled server and network where the executables are not available for reverse engineering.
+Obfuscation, packing, and virtualization techniques also exist to protect intellectual property, though both techniques are available to attackers and defenders and all can be bypassed with sufficient effort.
+Attackers currently have the upper hand over defenders; we believe neural decompilation has a propensity to help level the playing field.
+
+\section*{Open Science}
+
+We make available all code used to build the dataset and train and evaluate the models in all experiments.
+The code can be found at \url{https://github.com/squaresLab/idioms}.
+We also release the finetuned models/adapters for all five base models across all four experiments.
+Finally, we release \realtype, our dataset, as well as all other datasets used in the experiments for comparison.
+The datasets, models, and adapters can be found at \url{https://zenodo.org/records/14797017}.
+
+\bibliographystyle{plain}
+\bibliography{references.bib}
+
+\end{document}

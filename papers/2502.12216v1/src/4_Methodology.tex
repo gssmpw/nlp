@@ -1,0 +1,45 @@
+\section{Methodology}
+\label{sec:method}
+\input{figure-tex/Methodology}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+\subsection{Algorithm Overview}
+\label{sec:methodology:overview}
+\Cref{fig:Methodology} provides an overview of \sys's workflow. During prefill,  \sys performs K-means clustering on key vectors to group similar tokens. During decode, \sys ranks tokens based on the dot product between cluster centroids and the current query vector. \sys then models the distribution of \as{} with a fitted curve and determines the tokens to meet the desired cumulative \as{} threshold. After token selection, \sys handles the Group Query Attention (GQA) and then performs the attention using FlashInfer~\cite{ye2025flashinfer}.
+
+
+\subsection{Clustering}
+To organize tokens for efficient sorting, \sys performs K-means clustering on the key vectors for each head in every layer during the prefill phase. We empirically choose the average cluster size to be $32$ to balance accuracy and efficiency. Clustering begins by randomly sampling $\text{\textit{SeqLen}} / \text{\textit{Average cluster size}}$ data points as the initial cluster centroids.\footnote{Note that neither multiple initializations nor K-Means ++ initialization drastically improves the clustering quality, and in fact leads to high-performance overhead.}In each iteration, the distance between K-vectors and centroids is computed and the token will be assigned to the nearest cluster. After the assignment step, the centroids are updated as the mean of the key vectors assigned to each cluster. This process repeats until convergence or until a maximum of 10 iterations is reached\footnote{More iterations do not improve the quality of clustering.}. 
+
+\subsection{Querying}
+
+Once the tokens are organized into clusters, \sys identifies critical clusters for a given query vector $Q$ in the decode phase. The criticality of each cluster is determined by the dot product between $Q$ and each cluster centroid\footnote{Compared to distance, dot product directly relates to the attention score, which is more accurate.}. This process produces a sequence of clusters sorted by the criticality, from which we can derive a partially sorted token list. 
+
+\subsection{Fitting Attention Score Distribution}
+
+The next step of \sys is to determine the token budget required to meet the cumulative \as{}. \sys models the distribution of the exponential values of the dot products ($\exp(\frac{QK^\top}{\sqrt{d}})$) for each token using a lightweight function \( y = \frac{a}{x} + b \), where \( a \) and \( b \) are parameters to be determined and \( x \) is the position in the sorted list of tokens.
+To estimate these parameters, we select two segments of the tokens in the middle of the curve (e.g., 10\% and 60\% of all the tokens), and calculate the average of tokens within each segment (as labeled in \fig{fig:distribution_curve}). Using these two data points, we can solve for \( a \) and \( b \), which provides an estimation of \as{} for all tokens.
+
+However, initial tokens are often outliers and cannot be accurately described by the curve. Moreover, these tokens feature high \as{}, and thus a bad estimation would cause high deviations of estimated cumulative \as{} which affects the accuracy of \sys.
+Luckily, we observed that this only happens within 1-2\% of total tokens. Therefore, \sys directly calculates the exponential values of the dot products for these tokens. A detailed description of the Distribution Fitting stage is provided in \Cref{alg:token_selection}.
+
+\subsection{Taking Union for Group Query Attention models}
+
+
+Modern models use Grouped Query Attention (GQA) to reduce the KV cache size \cite{llama_3}, where multiple query heads share a single KV head. However, loading KV heads separately for each query head is inefficient. To optimize this, query heads within the same group are batched. A challenge arises when using sparse attention, as different query heads may select to attend to different KV tokens. Finding the minimal set of KV tokens that satisfies the cumulative attention scores (\as{}) across all query heads is NP-hard. To address this, \sys simplifies the problem by taking the union of selected tokens across all query heads and loading them at once, ensuring that each head retains the KV tokens it requires to perform attention while reducing repetitive loading.
+
+\subsection{Attention on Selected Tokens}
+Finally, \sys performs actual attention for selected tokens using FlashInfer~\cite{ye2025flashinfer}.
+Notably, variations in sparsity across different heads cause an imbalanced attention workload. Traditional implementations primarily address imbalances across varying request lengths but struggle to handle head-level imbalance efficiently. To address this, \sys divides each request into subrequests. Each subrequest processes a KV head and its corresponding Query head, with sequence length determined by the tokens selected for each KV head. This transforms head-level imbalance back into sequence-level imbalance, which Flashinfer handles efficiently.

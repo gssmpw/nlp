@@ -1,0 +1,194 @@
+\section{Detailed Design of \tool}
+\label{sec:design}
+
+\subsection{Tainting Secret Locations}
+\label{subsec:tainting}
+
+\noindent \textbf{IR Level.}
+At present, binary-level taint analysis is employed to track secret propagation by logging execution traces, but it suffers from low speed~\cite{wang2017cached, jiang2022cache} and incomprehensive implicit information flow~\cite{weiser2018data}.
+Tainting within compilation is another practice for detecting program vulnerabilities. 
+Tools like DFSan have been utilized in prior works~\cite{borrello2021constantine, deng2023cipherh} to capture secret-related IR instructions.
+Considering the subsequent program repair on Machine-IR and the need for comprehensive and readily available implicit information flow tracking, we also adopt the compiler-level taint analysis using DFSan.
+This consideration involves aligning tainted results from the IR level with the Machine-IR level. 
+Although IR is replaced by target instructions, the semantic difference is minimal since IR is transformed into Machine-IR through instruction selection and emission. 
+
+\noindent \textbf{Detection Strategies.}
+Mitigating only truly vulnerable points would minimize the performance impact on protected programs. 
+However, accurately detecting ciphertext side-channel leaks is difficult, with tools like \htool\ still generating false positives. Hence, we opt to taint all sensitive memory accesses. 
+Besides, we adopt the same strategy as \ftool\ to log execution traces multiple times for each cryptography program with varied secrets and inputs due to cryptography applications often following a relatively ``fixed'' execution flow as reported in \htool.
+
+In \S~\ref{subsec:ciphertext}, we demonstrate how secrets are tracked through direct memory writes. 
+In addition to the direct usage of secrets, it is necessary to consider data derived from the secrets as ``sensitive'' as well.
+A secret may appear in control-flow branches as a condition or in memory accesses as the index. Then variables guarded by a tainted condition are tainted as secret-related; variables assigned through memory access are tainted once the index of the buffer is tainted.
+In this manner, \tool\ comprehensively uncovers attack surfaces of the cryptography applications.
+
+\subsection{Software-based Probabilistic Encryption}
+\label{subsec:datamasking}
+
+In software-based probabilistic encryption, the key is to introduce a random nonce into secret variables before they are written back into the memory, thereby achieving unpredictable ciphertexts. 
+
+\begin{figure}[htbp]
+    \centering
+    \footnotesize
+    \begin{tabular}{|ll|}
+        \hline
+        1:\ \ \textcolor{red}{load\ \ \ \ \ \ \ \ $MEM_{key}$\ \ \ \ $REG_{key}$} &//\ sensitive\ load\\
+        2:\ \ load\ \ \ \ \ \ \ \ $MEM_{mask}$\ \ $REG_{mask}$ &//\ load\ mask\\
+        3:\ \ save\ \ \ \ \ \ \ \ EFLAGS &\\
+        4:\ \ xor\ \ \ \ \ \ \ \ \ $REG_{mask}$\ \ \ \ \textcolor{red}{$REG_{key}$} &\\
+        5:\ \ restore\ \ \ \ \ EFLAGS &\\
+        6:\ \ operate\ \ \ \ \textcolor{red}{$REG_{key}$} &\\
+        7:\ \ save\ \ \ \ \ \ \ \ EFLAGS &\\
+        8:\ \ update\ \ \ \ \ $REG_{mask}$ &//\ generate\ new\ mask\\
+        9:\ \ xor\ \ \ \ \ \ \ \ \ $REG_{mask}$\ \ \ \ \textcolor{red}{$REG_{key}$} &\\
+        10: restore\ \ \ \ \ EFLAGS &\\
+        11: store\ \ \ \ \ \ \ $REG_{mask}$\ \ \ \ $MEM_{mask}$ &//\ store\ mask\\
+        12: \textcolor{red}{store\ \ \ \ \ \ \ $REG_{key}$\ \ \ \ \ \ $MEM_{key}$} &//\ sensitive\ store \\
+        \hline
+    \end{tabular}
+    \caption{In-place code insertion.}
+    \label{fig:maskcode}
+\end{figure}
+
+\parh{Mitigation Code Insertion.}
+\F~\ref{fig:maskcode} illustrates the general scenario of inserting mitigation code, where $MEM_{key}$ represents the memory cell of a sensitive memory access instruction.
+The steps are: 1) loading the masked plaintext and corresponding random nonce (lines 1--2); 2) XORing the nonce with the masked plaintext to obtain true plaintext (lines 3--5); 3) performing calculations on the plaintext (line 6); 4) updating the random nonce and XORing it with the plaintext to obtain a new masked plaintext (lines 7--10); and 5) storing both the new masked plaintext and the new random nonce (lines 11--12).
+
+We determine the memory cells holding the random nonces for stack and heap areas with different strategies.
+In the stack, since the code is inserted during the register allocation phase in the LLVM backend, we can freely allocate a stack slot for the nonce. 
+For example, a new stack slot, $MEM_{mask}$, is created to store the random nonce (line 11 of \F~\ref{fig:maskcode}) and is associated with the source memory $MEM_{key}$ (line 1). When loading the nonce, a load instruction is inserted to reference $MEM_{mask}$.
+For heap memory, instead of intercepting memory allocation calls like \texttt{malloc}, \texttt{realloc}, \texttt{calloc}, and \texttt{free}, which would introduce significant overhead, we implement a more efficient hash-based mechanism. 
+This scheme leverages the runtime heap address of the source memory $MEM_{key}$ to compute the index where the corresponding nonce is stored in the \texttt{.bss} section (see \S~\ref{subsec:buffermanage}). 
+The random nonce is then stored at that index, allowing for efficient insertion of the same code for each tainted heap instruction without excessive system calls.
+
+\parh{Random Nonce Generation.}
+To enhance security, the random nonce is updated for each sensitive store instruction. 
+In Variant 1, a 1K random nonce buffer is pre-generated using \texttt{rdrand} during the cryptography program's initialization, stored in the \texttt{.bss} section. 
+For unmasked stack areas with secrets, Variant 1 selects a random nonce from this buffer as the initial nonce and increments it by three when storing new secrets at the same location (see \S~\ref{subsec:security} for security analysis). 
+Variant 2, instead, generates a random nonce in real-time using AES-NI or XorShift128+ schemes.
+AES-NI requires a single instruction and two 128-bit registers such as \texttt{xmm14} and \texttt{xmm15}, while XorShift128+ needs 11 instructions and three 128-bit registers, from \texttt{xmm13} to \texttt{xmm15}.
+
+\subsection{Secret-aware Register Allocation}
+\label{subsec:registeralloc}
+
+Building upon Variant 1, the masking scheme for the stack area can be further enhanced through register allocation.
+
+\parh{Feasibility Analysis.}
+However, implementing this scheme is challenging due to limited register resources. To evaluate, we conducted a heuristic investigation. 
+First, we identified the maximum number of stack slots involved in sensitive memory accesses among various cryptography programs from \T~\ref{tab:resultsoverview}, with libsodium's EdDSA implementation having the highest (583 slots). 
+Accommodating this many vector registers in SIMD is difficult as discussed in \S~\ref{subsec:memorywrite}, prompting the exploration of a secret-aware register allocation approach. 
+This involves tracking register liveness and timely deallocating frequently used stack slots in tainted functions. 
+Next, we assessed the number of vector registers required. 
+By analyzing disassembled cryptography programs, we found that the LLVM backend typically allocates the first 8 vector registers (\texttt{xmm0} - \texttt{xmm7}) for optimizing data movement, so we heuristically preserved the last 8 SSE registers (\texttt{xmm8} - \texttt{xmm15}) for sensitive stack slots. 
+This approach resulted in an average performance impact of 7\%, ranging from 1\% in SHA512 (libsodium) to 20\% in AES (mbedTLS), demonstrating that it is a viable and practical solution.
+
+% \begin{table}[htbp]
+% \centering
+% \caption{The maximum numbers of sensitive stack slots among tainted functions.}
+% \label{tab:SSEimpact}
+% \scriptsize
+% \begin{tabular}{ccccc}
+% \hline
+%     \multirow{2}{*}{\textbf{Implementation}}
+%     &\multirow{2}{*}{\textbf{Stack Slots}}
+%     &\multirow{2}{*}{}
+%     &\multicolumn{2}{c}{\textbf{Impact on performance}}\\
+%     \cline{4-5}
+%     & && \textbf{Cycles} & \textbf{Factor} \\
+% \hline
+%     libsodium-EdDSA &583 && 198331	&1.04 \\
+%     libsodium-SHA512 &27 && 43043	&1.01 \\
+% \hline
+%     mbedTLS-AES &7 && 571968	&1.20 \\
+%     mbedTLS-Base64 &25 && 11575	&1.03 \\
+%     mbedTLS-ChaCha20 &4 && 609942	&1.02 \\
+%     mbedTLS-ECDH &52 && 4586425	&1.08 \\
+%     mbedTLS-ECDSA &52 && 4095496	&1.04 \\
+%     mbedTLS-RSA &52 && 1943880	&1.03 \\
+% \hline
+%     OpenSSL-ECDH &157 && 1171024	&1.19 \\
+%     OpenSSL-ECDSA &79 && 18180467	&1.08 \\
+% \hline
+%     WolfSSL-AES &43 && 689316	&1.08 \\
+%     WolfSSL-ChaCha20 &5 && 512287	&1.06 \\
+%     WolfSSL-ECDH &100 && 362967	&1.04 \\
+%     WolfSSL-ECDSA &30 && 4559759	&1.08 \\
+%     WolfSSL-EdDSA &159 && 426239	&1.02 \\
+%     WolfSSL-RSA &28 && 543835	&1.11 \\
+% \hline
+%     Average &- && -	&1.07 \\
+% \hline
+% \end{tabular}
+% \end{table}
+
+\parh{Register Allocation.}
+When analyzing tainted functions in cryptography programs, we prioritize frequently accessed stack slots. 
+These stack slots are more susceptible to ciphertext side-channel attacks due to their sequential overwrites. Moreover, preserving these slots in registers minimizes the overhead of masking operations. 
+To manage this, we create two structures in the LLVM backend: \texttt{StackUsage}, which maps all sensitive stack slots to their respective MBB locations in the tainted functions, and \texttt{StackOpt}, which selects mappings from \texttt{StackUsage} based on the number of MBB locations for each stack slot until the available vector register capacity is reached. 
+These structures enable efficient secret-aware register allocation, focusing on optimizing register use and reducing masking overhead for frequently accessed stack slots.
+
+$\bullet$ \textit{Allocation:} When encountering a sensitive stack store where its slot is mapped in \texttt{StackOpt}, Variant 3 assigns an available vector register to hold the variable. 
+Simultaneously, the corresponding MBB location in \texttt{StackOpt} is removed to track the liveness of the allocated vector register.
+
+$\bullet$ \textit{Deallocation:} Once all MBB locations for a sensitive stack slot in \texttt{StackOpt} are removed, the associated vector register is freed, marking the end of its liveness.
+Subsequently, Variant 3 selects another stack slot from \texttt{StackUsage} based on the number of MBB locations and allocates available vector registers to the remaining stack slots in \texttt{StackOpt}.
+
+\begin{lstlisting}[basicstyle=\footnotesize, frame=single, caption=Sensitive stack slots contained in MBBs., label=reglist, escapeinside=``]
+42: entry,if.end19,if.end24,if.end30,...
+38: entry,if.end24,if.end30,...
+39: entry,while.body,if.end30,...
+52: if.end30,...
+49: if.end30,...
+46: while.body,if.then10,if.end12,if.then18,
+    if.end19,...
+43: while.body,if.end19,if.then22,if.then28,
+    if.end30,...
+40: entry,while.cond,...
+50: if.end30,...
+44: while.body,if.end19,if.end24,if.end30,...
+\end{lstlisting}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=\linewidth]{Fig_register_liveness.pdf}
+\caption{An example of register allocation from the function \texttt{bn\_mul\_add\_words} of OpenSSL-ECDSA. In the visualization, the white and shaded blocks represent the liveness of stacks, with shaded blocks containing numbers that denote registers holding the sensitive stack slots.}
+\label{fig:liveness}
+\end{figure}
+
+We illustrate the register allocation process for sensitive stack slots in the function \texttt{bn\_mul\_add\_words} from OpenSSL-ECDSA. Listing~\ref{reglist} provides a sorted \texttt{StackOpt} structure, showing sensitive stack slots and their positions in MBBs.
+The process is simulated up to the \texttt{if.end30} MBB and subsequent MBBs are omitted for brevity. 
+As shown in \F~\ref{fig:liveness}, 16 stack slots, each 8 bytes in size, are allocated across vector registers \texttt{xmm8} to \texttt{xmm15}, with \texttt{H} and \texttt{L} representing the high and low 64 bits of each register. 
+Registers such as \texttt{xmm13L}, \texttt{xmm13H}, and \texttt{xmm12L} are recycled and reallocated to stack slots 52, 49, and 50, respectively, demonstrating efficient register usage through liveness tracking.
+
+\subsection{Managing Nonce Buffers}
+\label{subsec:buffermanage}
+
+In \tool, all inserted mitigation codes for the masking protection scheme must manage random nonces, including the \textit{initial nonce} for sensitive variables requiring masking and the \textit{nonce currently in use}.
+
+\parh{Random Nonce Buffer.}
+As introduced in \S~\ref{subsec:datamasking}, \tool pre-generates a buffer in the \texttt{.bss} section with 1K random nonces using \texttt{rdrand} during initialization. 
+For unmasked stack or heap areas in Variants 1 and 3, \tool\ calculates an index based on the memory address (\textit{addr}) to select the corresponding random nonce from the buffer. 
+The index is computed as $index = addr\ \&\ 0x3FF$, and the random nonce is retrieved from the \texttt{.bss} using $randomArray(, index, 8)$, where $randomArray$ is the starting address of the buffer.
+
+\parh{Currently Used Nonces.}
+Two strategies are adopted to store random nonces for sensitive data in the stack and heap areas, enabling their subsequent decoding.
+For the stack, the compiler automatically allocates slots for nonces and associates them with the corresponding memory, accessed by applying an offset to the \texttt{rsp} register.
+This method ensures the nonces are isolated from other stack locations by using the \texttt{rbp} register. 
+Additionally, the nonce buffer, used to store active nonces, is initialized to zero and set in the entry block of each function.
+Unlike \ftool, which risks overlap by storing nonces outside the runtime stack area, our approach avoids potential malfunctions.
+
+For the heap, instead of applying a constant offset for the nonce buffer like in \ftool, we place the nonce buffer in the \texttt{.bss} section as well, pre-allocating sufficient space in advance. 
+A heuristic hash function maps heap addresses to buffer indices for retrieving nonces: $((addr\ \&\ 0xFFFFF) * 648056) \gg 22$.
+In this setting, 128K consecutive 8-byte entries are mapped independently into the 1M nonce buffer without collisions since all variants of \tool\ align masking operations to 8-byte addresses. 
+However, the maximum index generated by the hash function is 162,012, which exceeds 128K. To accommodate this, a 256K-entry buffer is required, resulting in a 2M nonce buffer with around 50\% utilization in our configuration.
+Through experimentation, we found that a nonce buffer space of 2MB is sufficient for cryptographic programs without collisions.
+
+\tool\ offers key advantages in managing nonce buffers for heap areas compared to \ftool. 
+First, it eliminates the overlap risk in \ftool, where a fixed distance between heap areas and nonce buffers can become insufficient with large dynamic allocations. 
+\tool\ uses an indexing method to ensure dedicated nonce buffers for each heap area, preventing overlap. 
+Second, \tool\ avoids the overhead caused by tracking dynamic memory calls (\texttt{malloc}, \texttt{realloc}, \texttt{calloc}, and \texttt{free}) in \ftool\ by directly calculating buffer indices, reducing system call dependency. 
+Additionally, \tool\ simplifies initialization by zeroing out the \texttt{.bss} section during program linking.
+
+To handle potential hash collisions in nonce buffers for heap areas, such as in server environments, we propose dynamically expanding the buffer by allocating multiple groups of entries for each index (10 groups per index, requiring a 20M nonce buffer). 
+If two different heap addresses generate the same index, the first 8 bytes are used to match the heap address, allowing us to locate the corresponding nonce in the subsequent 8 bytes. 
+We evaluated this method by simulating collisions across all 10$\times$128K entries. The results showed only a slight increase of time to initialize the expanded nonce buffer and handle each collision ($\approx 8 ms$), indicating minimal performance impact.

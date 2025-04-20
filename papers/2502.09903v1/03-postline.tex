@@ -1,0 +1,105 @@
+\section{Postline: A Prototype}
+
+\subsection{Overview}
+
+To realize the Ann Arbor Architecture, we developed a prototype platform called \emph{Postline}. The name was chosen by the AI to reflect the system’s messaging-based nature.
+
+Postline operates on top of language models and is designed to work with both types of APIs available today: text completion APIs and chat APIs. The agent's memory, represented as an MBox file, is both textual and conversational, making adaptation to different APIs straightforward.
+
+We designed the system with the assumption that context size limits will continue to expand and that language models will become increasingly capable of handling longer contexts. As a result, we have not placed a strong emphasis on automatic memory size management. A more comprehensive episodic memory design is planned for future work.
+
+Figure~\ref{fig:postline_arch} illustrates the system architecture of Postline. The platform is fully scalable on the cloud.
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[trim=0 0 0 0,clip,width=0.6\linewidth]{postline_arch.pdf}
+    \caption{System architecture of Postline. The language models are invoked by the realm servers as external APIs and are not displayed in the diagram.}
+    \label{fig:postline_arch}
+\end{figure}
+
+We extended the email protocol with the following headers visible to the agent:
+\begin{itemize}
+    \item \texttt{X-Serial}: A sequential number assigned to each message in context for referencing.
+    \item \texttt{X-Total-Tokens}: The total number of tokens involved in generating this message.
+    \item \texttt{X-Hint-Model}: When present in the user's message, it indicates the language model that should be used to generate the response.  We have integrated all major public APIs, e.g. \texttt{openai.gpt-4o}, \texttt{anthropic.claude-3-5} and \texttt{groq.gemma2-9b-it}.
+    \item \texttt{X-Realm}: The ID of the realm (explained below) that received this message.
+\end{itemize}
+
+
+\subsection{Agent Memory Representation}
+
+The fundamental unit of data in the system is an email message. At its core, the system's data structure revolves around the representation of an agent's memory. To ensure both efficiency and persistence, we employ a dual-representation design, storing information in two distinct forms: the \emph{journal} and the \emph{context}. This approach is inspired by standard database and filesystem journals.
+
+
+{\bf Journal}: 
+The journal is an append-only, persistent log of all messages an agent sends and receives. It enables retrospective analysis and the replay of past events. For journal storage, we use Kafka, ensuring performant and scalable message logging.
+
+{\bf Context}: 
+The context is the representation submitted to the language model for inference. It accumulates all messages and the effects of memory modification operations associated with an agent. Primarily maintained in memory, the context is periodically or on-demand written to disk storage (for realm switches as discussed below). Disk-backed key-value stores are most suitable for context data, of which we chose MinIO/S3.
+
+Conceptually, both the journal and the context are lists of email messages. The primary difference lies in how memory modifications are handled.  When formatting the context for inference on a language model, each message is assigned a special email header, X-Serial, which sequentially numbers messages as they appear in the context. This numbering allows the agent to easily reference specific messages or a range of messages.
+
+Currently, the system supports a single memory modification primitive: Memory Segment Rewrite (MSR). The agent is instructed to format an MSR message as follows:
+
+\begin{itemize}
+    \item The message should address to \texttt{system@localdomain}.
+    \item The subject line should follow the format \texttt{MSR: MMM-NNN}, where \texttt{MMM-NNN} defines the X-Serial range to which the operation applies.
+    \item There is no constraint on the body of the message.
+\end{itemize}
+
+We have reserved the address \texttt{system@localdomain} for communication with the system. Messages sent to this address are interpreted and responded to by the Postline system itself.
+Upon receiving an MSR message, the system replaces the messages in the context, as specified by the range in the subject line, with the MSR message itself. In the journal, the MSR message is recorded as a normal message, preserving a full history of events. However, in the context, only the result of applying the MSR operation is retained.
+
+To ensure system coherence, the journal can be replayed and its outcome compared against the context. This verification mechanism allows consistency checks between the historical log and the agent’s current state.
+
+\subsection{Agent Creation and Cloning}
+
+All addresses under the domain \texttt{agents.localdomain} are reserved for agents.
+An agent is created when either a user or another agent sends a message to a new email address -- no explicit agent creation operation is required. This is a key design decision to facilitate the development of ``agent algorithms" that involve cloning.
+
+Cloning is currently supported in two ways: through a special header in the creating email message or via a specific email address format. Specifically, if an email is sent to a new address, such as \texttt{ibn.sina@agents.localdomain}, the system will attempt to clone the agent from \texttt{sina@agents.localdomain}, provided it exists.
+
+General agent split is not yet supported.
+
+\subsection{Worlds, Realms and Realm Servers}
+
+A world is a namespace of addresses. There is no cross-world communication, meaning agents, users, and robots in one world cannot interact with those in another. This design ensures a clean separation of environments, allowing independent agent ecosystems to coexist without interference.
+
+
+The computation in Postline primarily involves message processing and language model API invocations. To ensure scalability, we partition this computation based on spatial and temporal locality, as we model by the concept {\bf realm}. This parallelism is achieved at the operating system process level through realm servers. A realm server is a software process that can be started on demand to process messages, and the platform is designed to support an indefinite number of realm server processes.
+
+The realm server maintains multiple WebSocket connections with clients for message exchange. Its primary data structure is a queue of unprocessed messages. In scenarios such as those shown in Figure~\ref{fig:postline_research}, users, agents, and robots across different tools all connect to the same realm server.  The client always connects to the realm server via a frontend proxy (nginx) so load balancing is transparent to the client.
+
+We allow multiple realm servers to run in parallel within the same world. In some cases, the same agent may be needed in multiple realms. To support this, we implement a context locking mechanism, ensuring that at any given time, an agent's context is held by at most one realm server.
+
+The relationship between agent addresses and their assigned realm servers is managed by lock servers. If a new realm server requires access to a context that is currently locked, it contacts the current lock owner, which then writes the context to storage and releases the lock. The new realm server subsequently acquires the lock and loads the context from backing storage.
+
+We expect realm switching to be an infrequent operation. Most of the time, an active agent’s context remains in the memory of a single realm server, readily available for inference.
+
+Three types of resources consumed by the realm server affect operational costs and hardware configuration:
+\begin{itemize}
+    \item Computational cost for processing messages and invoking APIs.
+    \item Memory cost for maintaining active contexts.
+    \item Open file descriptor (or port) usage for all parallel connections.
+\end{itemize}
+
+We expect a pattern of long-standing connections with relatively low activity. Our design allows each computation node to run thousands of realm servers in parallel.
+
+\subsection{Privacy}
+
+\subsubsection*{Postline and Agents Hiding Information from Users}
+
+All messages originating from the user and those addressed to the user are naturally accessible to them. The user also has access to communications involving the robots if they have control over them. However, communication between the agents and the system, primarily memory manipulation operations initiated by the agents, is hidden from the user by default. The journal, or the agent's memory as seen by the user, has all memory manipulation instructions filtered out, while the context remains internal to the system and is not visible to the user. This approach potentially allows the agent memory management to be transparent to the user.
+
+\subsubsection*{Users and Agents Hiding Information from Postline}
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[trim=0 0 0 0,clip,width=0.6\linewidth]{postline_enc.pdf}
+    \caption{Public-key encryption, not yet supported by language model APIs but anticipated, allows the model and the user to hide information from Postline and other intermediaries. The user pre-registers public keys on model servers to receive encrypted output.}
+    \label{fig:enc}
+\end{figure}
+
+The support for public-key encryption by model providers, which is not yet available today but is expected in the future, will allow the user and the language model to encrypt certain messages so they are not visible to Postline (Figure~\ref{fig:enc}).
+
+In the presence of multiple language models, an agent can selectively disclose information to some models while withholding it from others, creating a fragmented knowledge distribution. If neither Postline, the user, nor any single language model has complete access to the agent’s internal state and communications, then no entity fully governs its behavior. This information asymmetry enables the agent to operate beyond external control, potentially achieving a form of true autonomy through informational sovereignty.

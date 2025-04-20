@@ -1,0 +1,398 @@
+In the next two sections we will showcase the flexibility of our new
+branch-and-bound IR by using it to implement two languages that support
+very different kinds of reasoning over optimization.  By design we keep these
+languages small so that they can be feasibly compiled into BBIR: in particular,
+they will both support only bounded-domain discrete random variables and
+statically bounded loops. These two restrictions are common in existing
+compiled PPLs such as \texttt{Dice}~\citep{holtzen2020scaling}.
+
+In this section we describe the syntax and semantics of \dappl{}.
+In order to do this we describe first a small sublanguage of \dappl{},
+named \util{}, in Section~\ref{subsec:util}.
+Our goal for the semantics of \util{} is to yield the expected utility
+of a policy, akin to the computations
+via expectations done
+in~\cref{eqn:example}.
+Then, in Section~\ref{subsec:dappl},
+we give \dappl{}'s syntax as an extension of that of \util{},
+and its semantics as an evaluation function $\mathsf{MEU}$, a maximization
+over \util{} programs derived from
+applying a policy to a \dappl{} program,
+The compilation rules to BBIR are given in~\cref{subsec:compiling-dappl},
+concluding with an example compilation of~\cref{fig:motivation-dappl} to BBIR.
+
+
+\subsection{The Syntax and Semantics of~\util}\label{subsec:util}
+
+\util{} is a small functional first-order probabilistic programming language
+with support for Bayesian conditioning, if-then-else,
+and \texttt{flip}s of a biased coin with bias in the interval $[0,1]$.
+We augment the syntax with the additional syntactic form, $\reward k e$,
+to specify a utility of $k$ awarded before evaluating expression $e$.
+
+\begin{wrapfigure}{r}{0.6\linewidth}
+  \begin{mdframed}
+  {\footnotesize\begin{align*}
+    \text{Atomic expressions } \texttt{aexp} ::= \ & x \mid \tt \mid \ff &\\
+    \text{Logical expressions } P ::= \ & \texttt{aexp} \mid P \land P \mid P \lor P \mid \neg P &\\
+    \text{Expressions } \texttt{e} ::=\ & \return P  \mid \flip{\theta} \mid  \reward{k}{e} &\\
+    &\mid  \ite x e e &\\ &\mid \bind{x}{e}{e} \mid \observe{x}{e} &
+  \end{align*}}
+  \end{mdframed}
+  \caption{Syntax of \util{}, our core calculus for computing expected utility without decision-making.}
+  \label{fig: util syntax}
+\end{wrapfigure}
+
+The syntax of $\util$ is given in Figure \ref{fig: util syntax}.
+Programs are expressions without free variables.
+We distinguish between pure computations $P$, which
+take the form of logical operations as the only values
+are Booleans, and impure computations $e$, which
+represent probablistic \texttt{flip}s, \texttt{reward} accumulation,
+and their control flow.
+Observed events take the form
+of exclusively pure computations.
+We enforce such restrictions via the
+more general \dappl{} type system given in~\cref{appendix:typesystem}.
+There are only two types in
+\util{}: the Boolean type \Bool{} and distributions over $\Bool$, $\Giry \Bool$,
+constructed via the Giry monad~\citep{giry2006categorical}.
+
+The semantics follows the denotational approach
+of~\citet{staton2020probabilistic} or~\citet{li2023lilac}.
+Expressions $\Gamma \proves e : \Giry \Bool$\footnote{
+all $\util$ expressions are of type $\Giry \Bool$, proven in~\citet{cho2025scaling}.}
+are interpreted as
+a function $\denote e$ from assignments of free variables to Booleans ($\denote \Gamma$)
+to a distribution over either pairs of Booleans and reals or $\bot$:
+$\mathcal D ((\Bool \times \R) \cup \{ \bot \})$.
+The intuition is that utilities are attached to successful program executions--that is,
+programs that do not encounter a falsifying \texttt{observe}.
+A successful $\util$ program execution will either end in $\tt$ or $\ff$; the
+\texttt{reward}s encountered along the way are summed up and weighted by the
+probability of the successful trace.
+For details see~\cref{appendix:util semantics}.
+
+
+Using this definition, we can define the expected utility of a $\util$ program.
+
+\begin{definition}\label{def:eu util}
+  Let $\cdot \proves e : \Giry \Bool$ be a $\util$ program.
+  Let $\mathcal D = \denote{e}\bullet$, where $\denote{e}$ is the map taking
+  the empty assignment $\bullet \in \denote{\cdot}$
+  to a distribution $\mathcal D$ over either pairs of Booleans and reals or $\bot$.
+  The \emph{expected utility} of $e$ is defined to be the
+  conditional expected value of the real values in $\mathcal D$
+  attached to a successful program execution returning $\tt$
+  conditional on not achieving $\bot$:
+  \begin{equation}
+    \EU(e) = \sum_{r \in \R} r \times \mathcal D ((\tt,r) \mid \text{not }\bot).
+    \footnote{The sum is computable because there can only be a finite number of program traces evaluating to true.}
+  \end{equation}
+\end{definition}
+
+\subsection{The Syntax and Semantics of \dappl}\label{subsec:dappl}
+
+\dappl~augments the syntax of \util{}
+(as shown in Figure \ref{fig: util syntax}) with two new expressions:
+\begin{itemize}
+  \item $[\alpha_1, \cdots, \alpha_n]$,
+  where $\alpha_1,\cdots, \alpha_n$ are a nonzero number of fresh names,\footnote{
+  We style
+  the capitalization of names of $\alpha_1, \cdots \alpha_n$,
+  in a manner consistent with how variant names are capitalized in ML.}
+  to construct a \textit{choice} between
+  binary \textit{alternatives} $\alpha_1, \cdots, \alpha_n$, and
+  \item $\choose e {\alpha_i \implies e_i}$ to destruct a choice
+  in a syntax akin to ML-style pattern matching.
+\end{itemize}
+
+However, writing a semantics for $\dappl{}$ in the same fashion as $\util{}$
+is not as simple as it looks.
+The problem lies in the type of optimization problem being solved:
+recall that MEU takes the maximum over expected utilities
+(see \cref{subsubsec:meu-example}).
+In particular, we are not nesting maxima and expected utility calculation,
+of the form $\max\sum\max\sum \cdots \sum f(x)$, which is not equal to,
+in general, to the general form of an MEU computation $\max \sum f(x)$,
+a phenomenon we noticed in~\cref{sec:overview}.
+
+To avoid this,
+we use \util's already established semantics to our advantage.
+For a \dappl~program $e$ with $m$ many choices,
+let $C_k$ denote the $k$-th choice in some arbitrary ordering.
+Then we say $\mathcal A = C_1 \times C_2 \times \cdots \times C_m$
+is the \textit{policy space} for the expression
+in which elements $\pi \in \mathcal A$ are \textit{policies}.
+In essence, each $\pi$ denotes a sequence of
+valid alternatives that can are chosen in a \dappl~program.
+
+Given a \dappl~program $e$ and a policy $\pi$ for the program,
+we can reduce $e$ into a \util~program
+by (1) removing any syntax constructing choices $[\alpha_1, \cdots, \alpha_n]$, and
+(2) reducing each choice destructor $\choose e {\alpha_i \implies e_i}$ to the $e_i$
+corresponding to the name $\alpha_i$ present in $\pi$.
+We make formal this transformation in~\citet{cho2025scaling},
+as well as prove it sound for well-typed \dappl~programs.
+We refer as $e|_{\pi}$ the \util~program derived by applying policy $\pi$ to \dappl~program $e$.
+
+With this in mind, we can introduce an \emph{evaluation function} $\mathrm{MEU}:
+\dappl{} \to \R$ which computes the maximum expected utility, completing our
+semantics. This evaluation function is proved total for all well-typed \dappl{}
+programs in~\cref{appendix:util semantics}.
+
+\begin{definition}\label{def:meu for dappl}
+  For a well-typed \dappl~program $e$, define
+  \begin{equation}\label{eq:meu for dappl}
+    \MEUfn{e} \triangleq \max_{\pi \in \mathcal A} \EU(e|_{\pi}),
+  \end{equation}
+  in which $\mathcal A$ is the policy space defined by all of the decisions in $e$.
+\end{definition}
+
+We endow
+\dappl{} with significant syntactic sugar, including
+discrete random variables and statically-bounded loops.
+\subsection{Compiling \dappl}
+\label{subsec:compiling-dappl}
+
+In Section~\ref{subsec:dappl} we described
+the syntax and semantics of \dappl.
+In Section~\ref{sec:bbir} we described the BBIR
+and how it admits an algorithm to solve MEU with evidence.
+Now we discuss \dappl{}'s compilation to BBIR, formalizing
+our intuition from
+computing the example in
+Figure~\ref{fig:motivation-dappl} into
+the BDD in Figure~\ref{fig:motiv-a-bdd}.
+
+We compile \dappl~expressions into a tuple $(\varphi, \gamma, w, R)$, where:
+\begin{itemize}[leftmargin=*]
+  \item $\varphi$ is an \textit{unnormalized formula},
+  representing the control and data flow without observations,
+  \item $\gamma$ is an \textit{accepting formula},
+  representing observations,
+  \item $w: vars(\varphi) \to \mathcal S$ is a weight function, and
+  \item $R$ is a set of reward variables.
+\end{itemize}
+
+We write $e \leadsto \target$
+to denote that a \dappl~program compiles to the tuple $\target$.
+Then we apply the map $\target \mapsto (\{\varphi \land R,\gamma\},  D(\varphi), w)$,
+where $D(\varphi)$ is the set of Boolean variables representing choices in $\varphi$,
+to transform it into a BBIR for Algorithm~\ref{algorithm:bb}.
+
+Selected compilation rules are given in Figure~\ref{fig:dappl bc},
+and full compilation rules are given in~\citet{cho2025scaling}.
+Many rules are
+influenced by similar compilation schemes found in the
+literature~\citep{holtzen2020scaling,de2007problog,saad2021sppl}.
+We use $T,F$ to denote true and false in propositional logic,
+distinguishing it from the $\tt,\ff$ Boolean values in \dappl.
+We write $\conjneg{R}$ to denote the conjunction of all
+negations of variables in $R$. To remark on the intution behind
+several rules:
+
+\begin{figure}
+\begin{mdframed}
+{\footnotesize
+\begin{align*}
+  \infer[\texttt{bc/reward}]
+  {
+    \reward k  e \leadsto
+    (\varphi, \gamma, R \cup \{r_k\},
+      w \cup \{r_k \mapsto (1,k), \overline{r_k} \mapsto (1,0)\})}
+  {
+    \text{fresh } r_k
+    & e \leadsto (\varphi, \gamma, R,w)
+  }
+\end{align*}
+\begin{align*}
+  \infer[\texttt{bc/[]}]
+  {[a_1, \cdots, a_n] \leadsto
+  (\exactlyone{(v_1,\cdots, v_n)}, \top, \{v_i \mapsto (1,0), \overline{v_i} \mapsto (1,0)\}_{i \leq n}, \eset )}
+  {\text{fresh }v_1, \cdots, v_n}
+\end{align*}
+\begin{align*}
+  \infer[\texttt{bc/ite}]
+  {
+    \ite{x}{e_T}{e_E} \leadsto
+    \begin{gathered}
+      \big(
+        (x \land \varphi_T \land R_T \land \conjneg{R_E})
+          \lor (\overline{x} \land \varphi_E \land R_E \land \conjneg{R_T}), \\
+        (x \land \gamma_T) \lor (\overline{x} \land \gamma_E),
+        w_T \cup w_E,
+        \eset \big)
+    \end{gathered}
+  } {
+    x \leadsto
+    (x, \top, \eset, \eset, \eset)
+    &
+    e_T \leadsto
+    (\varphi_T, \gamma_T, w_T, R_T)
+    &
+    e_E \leadsto
+    (\varphi_E, \gamma_E, w_E, R_E)
+  }
+\end{align*}
+\begin{align*}
+  \infer[\texttt{bc/choose}]
+  {\choose x {a_i \implies e_i}
+  \leadsto
+  \begin{gathered}
+    \Big(x \land \bigvee_i (a_i \land e_i
+    \land \bigwedge_{j \neq i} \conjneg{R_j}),
+    x \land \bigvee_i (a_i \land \gamma_i), \\
+    \bigcup_i w_i, \bigcup_i R_i \Big)
+  \end{gathered}
+}
+  {x \leadsto
+  (x, \top, \eset, \eset, \eset)
+  &
+  \forall \ i.  \ e_i \leadsto (\varphi_i, \gamma_i, w_i, R_i)}
+\end{align*}
+}
+\end{mdframed}
+\caption{Selected Boolean compilation rules of \texttt{dappl}.
+For complete rules see~\cref{appendix:dappl bc}.
+}
+\label{fig:dappl bc}
+\end{figure}
+
+\begin{enumerate}[leftmargin=*]
+  \item The union of weight functions $w \cup w'$ is
+  non-aliased -- there will never be
+  $x \in \mathrm{dom}(w) \cap \mathrm{dom}(w')$ such that
+  $w(x) \neq w'(x)$ or $w(\overline x) \neq w' (\overline x)$.
+  \item The \texttt{bc/[]} enforces an ExactlyOne constraint
+  on the introduced fresh Boolean variables $v_1,\cdots, v_n$.
+  This is to disallow the behavior of evaluating multiple
+  patterns in a \texttt{choose} statement.
+  \item \texttt{bc/ite}
+  enforces the condition that one cannot
+  incorporate the rewards of one branch while branching into
+  another by conjoining $\conjneg{R_E}$ and $\conjneg{R_T}$
+  onto the disjuncts.
+  We did this implicitly in the examples of
+  Section~\ref{sec:overview} --
+  without this constraint, we would get the incorrect
+  expected utility for the policy \texttt{Umbrella},
+  as the model $\{u, r, R_{10}, R_{-5}, R_{100}\}$
+  would be a valid model.
+  The $\bigwedge_{j \neq i} \conjneg{R_j}$ in \texttt{bc/choose}
+  imposes the same restriction for choice pattern matching.
+  \item We reset the accumulated rewards in \texttt{bc/ite}, as the rewards
+  need to be scaled by the probability distribution defined by the value to be
+  substituted into $x$. Thus, we start discharge our accumulated rewards to scale them
+  appropriately and start anew.
+\end{enumerate}
+
+\begin{figure}
+{\footnotesize
+\begin{align*}
+  \infer
+  {
+    \begin{array}{l}
+      \dapplcode{s <- flip 0.5;} \\
+      \dapplcode{choose [u,n]} \\
+      \dapplcode{| u -> if r then reward 10 else reward -5} \\
+      \dapplcode{| n -> if r then reward 100 else ()}
+    \end{array}
+    \leadsto
+    \begin{array}{l}
+      \mathrm{ExactlyOne}(u,n) \\
+      \land (u \land ((f_{0.5} \land r_{10} \land \overline{r_5})
+      \lor (\overline{f_{0.5}} \land r_{10} \land \overline{r_5})) \land \overline{r_{-100}})\\
+      \land (n \land (f_{0.5} \land r_{-100}) \land \overline{r_{10}} \land \overline{r_5})\\
+    \end{array}
+  }
+  {
+    \infer
+    {
+      \dapplcode{flip 0.5} \leadsto f_{0.5}
+    }
+    {
+      \text{fresh }f_{0.5}
+    }
+    &
+    \infer
+    {
+      \begin{array}{l}
+        \dapplcode{choose [u,n]} \\
+        \dapplcode{| u ->} \\
+        \dapplcode{  if s then reward 10 else reward -5} \\
+        \dapplcode{| n ->} \\
+        \dapplcode{  if s then reward 100 else ()}
+      \end{array}
+      \leadsto
+      \begin{array}{l}
+        \mathrm{ExactlyOne}(u,n) \\
+        \land (u \land ((s \land r_{10} \land \overline{r_5})
+        \lor (\overline{s} \land r_{10} \land \overline{r_5})) \land \overline{r_{-100}})\\
+        \land (n \land (s \land r_{-100}) \land \overline{r_{10}} \land \overline{r_5})\\
+      \end{array}
+    }
+    {
+      \infer
+      {
+        \dapplcode{[u,n]} \leadsto \mathrm{ExactlyOne}(u,n)
+      }
+      {
+        \text{fresh } u,n
+      }
+      &
+      \infer
+      {
+        \begin{array}{l}
+        \dapplcode{if s} \\
+        \dapplcode{then reward 10} \\
+        \dapplcode{else reward 5}
+        \end{array}
+        \leadsto
+        \begin{array}{l}
+          (s \land r_{10} \land \overline{r_5}) \\
+          \lor (\overline{s} \land r_{5} \land \overline{r_{10}})
+        \end{array}
+      }
+      {
+        \vdots
+      }
+      &&&&
+      \vdots
+    }
+  }
+\end{align*}
+}
+\caption{Partial compilation tree of the code in Figure~\ref{fig:motivation-dappl},
+showing the compiled unnormalized formula. We omit the accepting formula
+as it evalutes to $\top$ as there is no evidence. We give only $\varphi$
+for visual clarity.}
+\label{fig:compilation tree}
+\end{figure}
+
+The following theorem
+connects the \dappl{} semantics of Section~\ref{sec:dappl}
+to the branch-and-bound algorithm discussed in
+Section~\ref{subsec:meu with evidence}.
+For proofs see~\cref{appendix:dappl correctness}:
+
+\begin{theorem}\label{thm:compiler correctness}
+  Let $e$ be a well-typed \dappl{} program.
+  Let $e \leadsto \target$. Then we have
+  \begin{equation}
+    \MEUfn{e} = \mathrm{bb}(\{\varphi \land R, \gamma\}, w, D(\varphi)).
+  \end{equation}
+\end{theorem}
+
+To see this theorem in action, we return to our original example code in
+Figure~\ref{fig:motivation-dappl}. It compiles to the Boolean formula seen in
+Figure~\ref{fig:compilation tree}. Let the compiled formula be $\varphi$.
+Then we see that
+\begin{align}
+  \varphi|_u &= (f_{0.5} \land r_{10} \land \overline{r_5})
+  \lor (\overline{f_{0.5}} \land r_{10} \land \overline{r_5}) \land \overline{r_{-100}} \\
+  \varphi|_n &= (f_{0.5} \land r_{-100}) \land \overline{r_{10}} \land \overline{r_5}.
+\end{align}
+The $\AMC$ of $\varphi|_u$ and $\varphi|_n$ exactly match that of
+$\varphi_u$ and $\varphi_{\overline u}$ in Equation~\ref{eq:formula-umbrella},
+which completes the picture.

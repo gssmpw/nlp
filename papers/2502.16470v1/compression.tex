@@ -1,0 +1,82 @@
+\section{\name{} Compression Algorithm}
+\label{sec:algorithm}
+
+The key novelty of \name{} is its compression algorithm, a reference-based lossless algorithm co-optimized with hardware acceleration to achieve high performance for both compression and decompression, without sacrificing compression efficiency.
+The primary goal of the design is to achieve a high enough compression ratio and decompression performance in hardware to close the performance gap between PCIe and on-device DRAM, providing \name{} with practically unlimited amounts of high-performance memory.
+Both compression and decompression performance are important goals, for analytics acceleration as well as archiving and distribution workloads.
+
+
+\subsection{Algorithm and Data Structures}
+
+The \name{} compression algorithm belongs to the class of reference-based compression algorithms, which find matching regions between the input ``\emph{target}'' data and a ``\emph{reference}'' genome.
+\name{} addresses two key limitations to compression and decompression performance: Speed of discovering matching regions during compression, and complexity of decoding variable-width encoded compression schemes.
+
+To overcome these limitations, \name{} introduces the following three strategies.
+Each strategy will be described in more detail, along with the compression and decompression algorithms below.
+
+\begin{itemize}
+    \item \textbf{Strategy~1}: Fixed-k k-mers and fixed-stride matching.
+    \item \textbf{Strategy~2}: Fixed-width grouped header encoding.
+    \item \textbf{Strategy~3}: Cuckoo hashes for match discovery.
+\end{itemize}
+
+Strategies 1 and 2 work together to improve decompression performance and resource efficiency, while strategies 1 and 3 work together to improve compression performance.
+We demonstrate the minimal impact of these strategies on compression efficiency, in Section~\ref{sec:compression_efficiency}.
+
+
+\subsection{Compression Algorithm}
+
+Figure~\ref{fig:fixed-width} illustrates how \name{} performs alignment between the target and reference with high performance.
+The algorithm has two parameters: the width of the k-mer $K$, and the stride $S$.
+Similar to how seeding works in modern sequence alignment algorithms, \name{} finds exact matches between the target and reference sequences in k-mer units.
+Since we are looking for exact matches, we avoid using a complex index structure in favor of an $O(1)$ hash table, which is pre-constructed from the reference genome to hold the offset of each k-mer within the reference.
+Such efficient lookup vastly improves \name{} performance compared to conventional schemes using suffix arrays or alignment algorithms~\cite{chen2023efficientsequencingcompressionfpga,arram2015fpgareferencecompressiongenomic}.
+Since the offset table is constructed offline once for each reference and used repeatedly for the same organism, we adopt the cuckoo hash for better space efficiency.
+Cuckoo hashes use two hash functions per query, so each query can have a choice of avoiding conflicts by selecting one of two locations.
+Its algorithm ensures that all keys can be accommodated without conflict misses if the capacity of the table is 2$\times$ the set size of keys~\cite{pagh2004cuckoo}.
+
+Each potential match from the reference is compared against the target k-mer.
+If a match exists, the whole k-mer is encoded compactly as a single offset, and the window moves forward by $K$ instead of $S$.
+If neither is a match, then the mismatched stride is encoded verbatim, and the window moves forward by $S$ to check the next k-mer. 
+In our eventual prototype, $K$ was set to 64, and $S$ was set to 16. 
+Only considering exact matches and having a wide stride can potentially trade off compression efficiency for higher performance.
+The compression efficiency impact of these parameters is presented in Section~\ref{sec:compression_efficiency}.
+We also note that \name{} actually uses four hash functions during compression, although the cuckoo hash is constructed using two.
+This is because we also look for reverse complemented versions of the target k-mers, as sequencing machines emit both directions of reads.
+
+\begin{figure}[htb]
+    \centering
+    \includegraphics[width=\columnwidth,page=4]{figures/figures-swjun-crop.pdf}
+    \caption{Reference matching with fixed-k, fixed-stride.}
+    \label{fig:fixed-width}
+\end{figure}
+
+Our choice of $S$ and $K$ enables high performance and resource efficiency beyond just a high compression ratio.
+Figure~\ref{fig:compressed_format} shows the compressed encoding scheme.
+Firstly, \name{} uses a grouped header scheme to enable fast decompression, similar to Group VarInt~\cite{dean2009challengesgroupvarint}.
+Second, since the 2-bit encoded human reference is less than 4~GB (\textasciitilde 700~MB) and $S=16$ means verbatim encoding of a stride takes up 32 bits, every field in the encoding scheme has a fixed width of 32 bits.
+This scheme enables extraordinarily simple decoding schemes, as described in Section~\ref{sec:decompression_arch}.
+
+\begin{figure}[htb]
+    \centering
+    \includegraphics[width=.7\columnwidth,page=1]{figures/figures-swjun-crop.pdf}
+    \caption{Grouped header compression encoding.}
+    \label{fig:compressed_format}
+\end{figure}
+
+The header for each stride consists of two bits, meaning the payload for the grouped encoding scheme can consist of up to 16 32-bit words, either verbatim encodings or indices.
+The payload can have fewer words, since \name{} does not encode the index for ``\emph{continuations}'', which are matches that occur immediately after the previous match in terms of the offset within the reference.
+Instead, continuations are only specified in the header.
+Specifically, \texttt{00} specifies verbatim encoding, \texttt{01} specifies a forward match, \texttt{10} specifies a reverse complement match, and \texttt{11} specifies a continuation without a payload.
+
+The hardware-accelerated implementation described in Section~\ref{sec:compression_arch} also introduces transparent performance enhancements, including probabilistic filtering, to overcome the computation and memory system bottleneck of this algorithm during compression.
+
+
+\subsection{Decompression Algorithm}
+
+Thanks to the hardware-aware considerations during encoding, the decompression process is very simple.
+The decompression software or accelerator simply scans through the header, and decodes the 32-bit words in the payload as verbatim encodings, or as indices to look up the reference genome.
+If the next element is a continuation, depending on whether the last match or continuation was in forward or reverse order, the next or previous k-mer is fetched from the reference genome.
+
+We show in Section~\ref{sec:decompression_arch} that the grouped header encoding allows very efficient decoding of both verbatim values and efficient reference genome lookups.
+

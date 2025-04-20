@@ -1,0 +1,224 @@
+\section{Multi-Hybrid Model Architecture}\label{sec:architecture}
+
+\paragraph{Notation}
+Unless specified otherwise, (input) sequences are denoted with $x \in \RR^{\ell \times d}$. We use subscripts to index in the time dimension, and Greek superscripts to index in the space (or width) dimension. To keep the notation compact, we also occasionally omit summation signs for repeated indices in longer tensor contractions e.g., $y^\alpha_t = A^{\alpha\beta}x^{\beta}_t$ is shorthand for $y^\alpha_t = \sum_{\beta} A^{\alpha\beta}x^{\beta}_t$.
+
+\subsection{Basic Design}
+
+We consider input-dependent convolutional operators that adhere to the following structure from the original Hyena work \citep{poli2023hyena}:
+
+\begin{equation}\label{eq:hyena_structure}
+\begin{aligned}
+q_t^{\alpha} &= T^{\alpha}_{t t'} (x_{t'}^{\beta} W^{\beta \alpha}) \\ 
+k_t^{\alpha} &= H^{\alpha}_{t t'} (x_{t'}^{\beta} U^{\beta \alpha}) \\ 
+v_t^{\alpha} &= K^{\alpha}_{t t'} (x_{t'}^{\beta} P^{\beta \alpha}) \\
+y_t^{\alpha} &= (q_t^{\beta} G^{\beta}_{t t'} k_{t'}^{\beta} v_{t'}^{\beta}) M^{\beta \alpha}
+\end{aligned}
+\end{equation}
+% \columnbreak
+where $T, H, K, G\in\RR^{d \times \ell \times \ell}$ are Toeplitz matrices (corresponding to the convolution with the respective filters $h_T, h_H, h_K, h_G$), and $W, U, P, M\in\RR^{d \times d}$ are dense matrices (parametrized as dense matrices or low-rank matrices). A schematic representation is provided in Figure \ref{fig:overview}.
+
+In Hyena, the filters $h_T, h_H, h_K$ are parametrized explicitly: the entries of the filters are learnable parameters, analogous to the approach of classical convolutional neural networks\footnote{The presence of short explicit filters in the featurization step for query, key and value, first proposed for input-dependent convolution in \citep{poli2023hyena} and linear attention in \citep{peng2023rwkv}, has also been later adopted by other modern operator variants}. The inner filter $h_G$ is instead parametrized implicitly, with the values obtained as a combination of basis functions or as outputs of a neural network \citep{romero2021ckconv}. For this reason, computational primitives following the structure in Equation \ref{eq:hyena_structure} have been also broadly referred to as long convolution operators.
+
+We build on this basic structure, leaning into the design of convolution operators. The main insights are that not every input-dependent convolution in a hybrid should rely on long, implicit filters, and that convolutional operators should be tailored to run fast on target hardware.
+
+\paragraph{Input-dependent convolutional operators} The first class of input-dependent convolutions is \textsf{Hyena-LI} (long implicit), the closest relative to the original design. In \textsf{Hyena-LI}, the filters $h_T, h_H, h_K$ remain short and explicit, while the inner filter is obtained as a linear combination of real exponentials $h_t = \sum_{n=1}^{d} R_n \lambda_n^{t-1}, R_n, \lambda_n \in \RR$ \citep{massaroli2024laughing}. This is a real-valued, simplified version of a variety of other parametrizations \citep{orvieto2023resurrecting,gupta2022diagonal}, with the addition of filter grouping (Section \ref{sec:additional_design_decisions}). Due to this choice, \textsf{Hyena-LI} retains the ability to switch to an recurrent parametrization for constant memory.
+
+Next, we define \textsf{Hyena-SE} (short explicit), a variant with short, explicit filters in all its convolutions. When the filters are short\footnote{In our experiments, shorter than 14. In our final runs at scale, we used a range of 4 to 7.}, a simple explicit parametrization is sufficient to achieve convergence. \textsf{Hyena-SE} is key in achieving speedups across a range of input regimes, including short sequences, while still excelling at local, multi-token recall. With a hardware-aware implementation using tensor cores, \textsf{Hyena-SE} achieves the highest throughput of any sequence mixing operator (Section \ref{sec:kernel_optimizations}). \textsf{Hyena-SE} can also be utilized as a replacement for feed-forward layers.
+
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.8\textwidth]{figures/sh2_new.pdf}
+    \caption{
+    Overview of the convolutional operators forming the basis of StripedHyena 2: \textsf{Hyena-SE} (short explicit filters), \textsf{Hyena-MR} (medium regularized filters), \textsf{Hyena-LI} (long implicit filters). All operators use the Hyena structure \citep{poli2023hyena}, tailoring the inner convolution parametrization for an improved balance of quality and efficiency. Given these operators, we explore different striped layouts.}
+    % StripedHyena 2 (\textbf{D}) is constructed by interleaving different variants of the input-dependent convolution operator class: \textsf{Hyena-SE}, \textsf{Hyena-MR}, \textsf{Hyena-LI} (\textbf{B}), to achieve a new Pareto frontier of quality (\textbf{A}) and efficiency (\textbf{E}), compared to previous generation hybrids.
+    % StripedHyena 2 (\textbf{D}) is constructed by interleaving different variants of the input-dependent convolution operator class: \textsf{Hyena-SE}, \textsf{Hyena-MR}, \textsf{Hyena-LI} (\textbf{B}), to achieve a new Pareto frontier of quality (\textbf{A}) and efficiency (\textbf{E}), compared to previous generation hybrids.}
+    \label{fig:overview}
+\end{figure}
+
+
+Finally, we introduce \textsf{Hyena-MR} (medium regularized), a variant with explicitly parametrized filters of length in the hundreds. While it can be difficult to optimize longer explicit convolutions, we find that a simple exponential decay regularizer i.e., $h_t = \hat{h}_t \lambda^{-\alpha t}$, where $\alpha$ is swept across channels and $\hat{h}_t$ is the learnable parameter, is sufficient for convergence. With filter grouping and an efficient implementation using tensor cores, this variant remains significantly faster than linear attention and state-space models (Section \ref{sec:kernel_optimizations}). \textsf{Hyena-MR} is to \textsf{Hyena-LI} what sliding window attention is to the classic attention operator.
+
+Since the filters in \textsf{Hyena-MR} and \textsf{Hyena-SE} are finite-impulse response (FIR), these operators trivially retain constant memory during autoregressive generation, analogous to sliding window attention.
+
+Multi-hybrids interleave \textsf{Hyena-SE}, \textsf{Hyena-MR} and \textsf{Hyena-LI} to obtain the full architecture.
+% We call this baseline class of operators \textsf{Hyena-LI} (long implicit), corresponding to the classical design with a real modal parametrization of the filter 
+% The first insight is that not every input-dependent convolution needs long, implicit filters. We call this baseline class of operators \textsf{Hyena-LI} (long implicit), corresponding to the classical design with a real modal parametrization of the filter 
+
+
+% For this reason, we explore 
+% \begin{itemize}
+%     \item Multiple types of filters work in synergy 
+%     \item We can adapt the cost 
+%     \item We design directly for hybrid
+% \end{itemize}
+
+% \paragraph{Short Explicit Filters: \textsf{Hyena-SE}}
+
+% \paragraph{Medium Regular Filters: \textsf{Hyena-MR}}
+
+% \paragraph{Long Implicit Filters: \textsf{Hyena-LI}}
+
+% The class of long convolution operators, with Hyena first introducing the structure and setting $T, H, K$ to be Toeplitz matrices of shorter finite-impulse response (FIR) filters, 
+
+% In this work, we have explored the role 
+% \centering
+
+% \[
+
+% \]
+% \end{multicols}
+
+\subsection{Additional Design Decisions}\label{sec:additional_design_decisions}
+
+Next, we detail additional design aspects of convolutional multi-hybrids, including block layout, weight-sharing filter patterns, and effectiveness of context extension techniques. 
+
+Experiment configuration files and code are provided in \textsf{Savanna}, our fully open-source pretraining infrastructure for research on multi-hybrids: \href{https://github.com/Zymrael/savanna}{{\tt https://github.com/Zymrael/savanna}}.
+
+\paragraph{Multi-hybrid block layout}
+%
+
+% We explore a multi-hybrid design, where the operator layout is a mix of linear attention, convolutional and recurrent operators. We find that a mix of operators is beneficial for performance, as it allows for a more efficient use of the computational resources. The multi-hybrid design is particularly useful for long sequences, where the computational cost of attention becomes prohibitive. In this case, the convolutional and recurrent operators can be used to reduce the computational cost of the model, while still maintaining the benefits of attention.
+
+We explore the effect of block layouts on performance and training speed. Table \ref{tab:block_layouts} shows the results of training 7B multi-hybrid models on 400B tokens of {\tt OpenGenome2} \citep{brixievo2}, each with different block layouts. We use our default inner filter lengths of 7 for \textsf{SE} and 128 for \textsf{MR}.
+
+%
+\begin{wraptable}[11]{r}{0.4\columnwidth}
+    \centering
+    \begin{tabular}{lcccc}
+        \toprule
+        \rowcolor{blue!10}\textbf{\textsf{Layout}} & \textbf{\textsf{PPL@400B}} \\
+        \midrule
+        \textsf{MHA-MHA-MHA} & 3.09 \\
+        \midrule
+        \textsf{LI-LI-LI} & 2.87 \\
+        \textsf{SE-SE-LI} & 2.88 \\
+        \textsf{SE-MR-LI} & \underline{2.83} \\
+        \bottomrule
+    \end{tabular}
+    \caption{Effect of different block layouts on pretraining at the 7B parameter scale.}
+    \label{tab:block_layouts}
+\end{wraptable}
+%
+
+The blocks are repeated until target 7B parameter model depth (32) is achieved. All StripedHyena 2 models in addition interleave 5 MHA operators with the convolutional blocks. Validation perplexity measured after training of 400B tokens of byte-tokenized data (DNA sequences from {\tt OpenGenome2}), with 7B parameter StripedHyena 2 models.
+
+At this scale, \textsf{SE-MR-LI} perform best on pretraining quality. Notably, we find that pure long convolution \textsf{LI-LI-LI} layouts can be replaced by \textsf{SE-SE-LI} blocks for little-to-no loss in quality and significant benefits to throughput. While \textsf{SE-MR-LI} block layouts provide a general stable baseline for multi-hybrids, we recommend ablating block layouts for new tasks or domains, particularly if parametrization hyperparameters such as filter length, decay strength, and initialization are modified.
+%
+
+% \begin{note}{colback=blue!5}
+%     \textbf{Finding:} Multi-hybrid block layouts containing local operators such as \textsf{Hyena-SE}, paired with other longer filter variants, can greatly improve training speed without negatively affecting quality. 
+% \end{note}
+%
+
+
+
+
+
+\paragraph{Weight-sharing filter patterns}
+%
+We propose a grouped\footnote{Note that this approach is not the same as traditional grouped CNN layers, which instead mixes across channels in the same group.} design for input-dependent convolutional operators, where the filters are shared across groups of channels. Namely, let $\mathcal{G}$ be a group of channels of size $d_g$. Then,
+\[
+\forall \alpha \in \mathcal{G}: y^\alpha_t = \sum_{j=0}^{t} h_{t-j}^\mathcal{G} x_{j}^\alpha.
+\]
+The main benefit of our grouping is to enable efficient representation of the discrete convolution as a series of general matrix-matrix multiplications ({\tt GEMM}) instead of general matrix-vector multiplications ({\tt GEMV}). We use this property to co-design hardware-aware algorithms for our architecture (see Section \ref{sec:kernel_optimizations}). Grouping has minimal effect on quality (Section \ref{sup-fig:overlapping_comm}).
+
+
+
+% . {\color{red}Results on grouping in \textsf{Hyena-SE} and \textsf{Hyena-MR} are provided in Appendix A.}
+
+% \textsf{Hyena-SE} and \textsf{Hyena-MR}, where the filters of the inner convolution are shared across groups of channels, with each group of size $d_g$. Namely:
+
+% We explore a grouped design for \textsf{Hyena-SE} and \textsf{Hyena-MR}, where the filters of the inner convolution are shared across groups of channels, with each group of size $d_g$. Namely:
+
+% By default, convolutions in {\tt Hyena-SE}, {\tt Hyena-MR} and {\tt Hyena-LI} are applied independently across channels of the embedding dimension (a \textit{depthwise} convolution). This is a common design choice for convolutional and recurrent operators. For {\tt SE} and {\tt MR}, we find a grouped design -- where filters are shared by groups of channels of size $g$ -- to be both parameter and compute efficient.
+%
+
+% {\color{red}TODO: figure / table with panels: group ablations, Loss during extension, 7B 400B ablations with different variants}
+
+
+
+
+\paragraph{Context extension}
+%
+
+We tested context extension up to 1 million sequence length on 7B and 40B multi-hybrids using techniques developed for rotary attention, such as \textit{position interpolation} PI \citep{chen2023extending} and \textit{adjusted base frequency} (ABF) \citep{xiong2023effective} and a combination of both. We found only minor differences in perplexity (Table \ref{tab:context_extension}), with all models capable of in-context recall at the target maximum context length. Recall results are shown in Figure \ref{fig:niah_extension}.
+
+\begin{table}[H]
+    \centering
+    \begin{tabular}{lcccccc}
+        \toprule
+        \rowcolor{blue!10}\textbf{\textsf{Extension Method}} & \multicolumn{6}{c}{\textbf{\textsf{Context Length (K)}}} \\ \cmidrule{2-7}
+        & \textbf{32} & \textbf{65} & \textbf{131} & \textbf{262} & \textbf{524} & \textbf{1048} \\ 
+        \midrule
+        \textsf{Position Interpolation (PI)} & 2.785 & 2.763 & 2.750 & - & - & - \\
+        \textsf{PI + ABF} & 2.782 & 2.763 & 2.748 & 2.707 & 2.663 & 2.597 \\
+        \bottomrule
+    \end{tabular}
+    \caption{Validation perplexity of 7B StripedHyena 2 architecture on {\tt OpenGenome2} after midtraining extension with different techniques, terminating in extension at 1 million context length. Midtraining is performed on the base StripedHyena 2 7B trained on 2T tokens of {\tt OpenGenome2} at byte resolution and 8192 context length (Evo 2 7B). The values are collected at the end of training, for a visualization of the trends see Figure \ref{fig:niah_extension}.}
+    \label{tab:context_extension}
+\end{table}
+
+
+% Multi-hybrids 
+% We find convolutional hybrid and multi-hybrids to not require specialized techniques for context extension at scale. We tested a variety of techniques for rotary embeddings, including position interpolation (PI [CIT]), adjusted base frequency (ABF [CIT]), as well as a combination of both (PI+ABF [CIT]) at 32K, 64K and 128K extension stages, and found only minor differences in perplexity (see Table X) and no significant differences in recall performance.
+
+
+
+\subsection{Measuring Throughput at Scale}
+
+Owing to its design incorporating FIR convolution operators such as \textsf{Hyena-SE} and \textsf{Hyena-MR}, multi-hybrids achieve consistent speedups compared to previous generation hybrids and Transformers.
+
+Across the 7B and 40B parameter scales, StripedHyena 2 trains 1.2 to 2.9 times faster on a H100 cluster compared to our optimized Transformer based on a reference {\tt Transformer Engine} implementation, collected during training with FP8 precision on dense (SwiGLUs, projections) and normalization layers (Figure \ref{fig:all_scaling}). Notably, it also achieves speedups at shorter sequence lengths, compared to both Transformers and StripedHyena \citep{polistripedhyena}, a previous generation hybrid. Given an comparable degree of optimization in the implementations, we expect similar or better gains on other training infrastructure. See Table \ref{tab:appendix_scaling} for details on the measurement protocol.
+
+% \footnote{Our Transformer implementation is built on NVIDIAs Transformer Engine for X and Y.}
+
+%  at both 7B, 256 H100s, global batch size 4 million tokens and 40B parameters, 1024 H100s, global batch size 8 million tokens. It also trains 1.1x to 1.3x faster than SH 1, a previous generation hybrid of long convolutions and attention.
+
+
+% \begin{itemize}
+%     \item Drop of MFU with context parallel turned on, hints at optimization (will discuss), and further tuning of distributed training settings. 
+%     \item We used regular strategy (e.g., FA2) to compute FLOPS.
+% \end{itemize}
+
+We also report TFLOPS per second per GPU and MFU\footnote{We use a reference number of 1000 TFLOPs per H100.} in Figure \ref{fig:all_scaling}. Since we use the same distributed settings for all architectures, we note a lower MFU for hybrids at longer sequence lengths. This is primarily due to a reduction in overall model FLOPS\footnote{We used actual model FLOPS instead of approximations, since most approximations are not accurate at very long context. For self-attention FLOPS, we used the estimate in \cite{dao2023flashattention}.} caused by subquadratic scaling in sequence length. Consequently, we expect further tuning of distributed settings for multi-hybrids at long context to yield even larger speedups by using e.g., larger micro batch sizes to increase compute intensity of each rank. Further discussion on context parallelism implementation is provided in Section \ref{sec:context_parallelism}.
+
+\begin{figure}[H]
+    \includegraphics[width=0.99\textwidth]{figures/all_scaling.pdf}
+    \vspace{-0.1cm}
+    \caption{End-to-end iteration times (forward and backward) during training, collected on a large cluster of H100 SXM GPUs. See Table \ref{tab:appendix_scaling} for details on the measurement protocol.}
+    \label{fig:all_scaling}
+\end{figure}
+
+
+Convolutional multi-hybrids such as StripedHyena 2 similarly outscale other previous-generation hybrids, including those based on linear attention or state-space models. Latency and MFU at the operator level are provided in the following section.
+
+% other single-level hybrids based on linear attention or state-space models. We show how {\tt Hyena-SE} and {\tt Hyena-MR}\footnote{Both critical components of SH 2.}, using our {\tt cgcg} kernels, achieve XX spedups at the single operator level over baseline DeltaNet and Mamba2 implementations. The speedups are larger at shorter sequence lengths, which is the traditional regime where attention is typically faster or on par with recurrent alternatives.
+% %
+
+% %
+% The multihybrid design achieves speedups during training and inference. During training at scale (see Table X for details on the measurement protocol), SH 2 trains 1.3x to 3.2x faster than an optimized Transformer\footnote{Our Transformer implementation leverages NVIDIAs Transformer Engine for X and Y.} at both 7B, 256 H100s, global batch size 4 million tokens and 40B parameters, 1024 H100s, global batch size 8 million tokens. It also trains 1.1x to 1.3x faster than SH 1, a previous generation hybrid of long convolutions and attention. 
+
+
+
+
+
+
+% %
+% \begin{wraptable}{r}{0.5\textwidth}
+%     \begin{tabular}{lcc}
+%         \toprule
+%         Method & 32K $\rightarrow$ 64K & 64K $\rightarrow$ 128K \bigstrut \\
+%         \midrule
+%         PI & 3.42 & 3.51 \bigstrut \\
+%         ABF & 3.44 & 3.49 \bigstrut \\
+%         PI+ABF & 3.43 & 3.50 \bigstrut \\
+%         \bottomrule
+%     \end{tabular}
+%     \caption{Perplexity after context extension using different techniques. All methods achieve similar performance, suggesting convolutional hybrids are robust to extension method choice.}
+% \end{wraptable}
+% %
+
+
+

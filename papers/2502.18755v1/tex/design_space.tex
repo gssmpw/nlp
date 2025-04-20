@@ -1,0 +1,115 @@
+\section{\proj Quantization Framework}
+\label{sec:dse}
+
+
+This section introduces the \proj quantization framework, focusing on the quantization methods for weight, activation, and KV cache.
+Initially, we discuss the weight quantization with \mbox{\proj} in \mbox{\Sec{sec:weight_quant}}.
+Subsequently, we illustrate why activation is quantized with \texttt{INT8} in \Sec{sec:dse_act}.
+% Finally, we explore the challenges of group-wise quantization in the KV cache and present our solutions in \Sec{sec:dse_kv}.
+Finally, we introduce a real-time \proj quantization mechanism to tackle the challenge brought by the dynamic KV cache and customize quantization strategies for K and V cache, respectively, in \Sec{sec:dse_kv}.
+
+% We first detail the quantization process for key LLM components, including activation, weight, and KV cache.
+
+\subsection{Weight Quantization}
+\label{sec:weight_quant}
+
+Weight is encoded offline to select the most suitable coefficient $a$ for each group.
+Within the \proj framework, a calibration dataset~\cite{gao2020pile} is used to identify the coefficient $a$ that minimizes the mean square error (MSE) of the output.
+The following equation describes the optimization objective:
+\begin{equation}	
+    a = \mathop{argmin}\limits_{a} ||X \hat{W}_{a} - X W||^2_{2}
+    \label{eqn:min_mse}
+\end{equation}
+$\hat{W}_{a}$ represents the weight that is first quantized and subsequently dequantized using a specific coefficient $a$.
+% We represent the original activations and weights as $X$ and $W$, respectively.
+Broadening the range of data types in the search space typically enhances accuracy.
+Nevertheless, slight modifications to $a$, increasing or decreasing it by one, only slightly alters the data distribution.
+% Extending the variety of data types available during the search phase can increase accuracy, but the improvements are marginal when a sufficient variety is already in use.
+Consequently, we selected 16 data types for weight quantization, including the set $\{0, 5, 10, 17, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120\}$ and an additional \texttt{INT} option.
+
+
+\subsection{Activation Quantization}
+\label{sec:dse_act}
+
+For the activation quantization, we follow the common practice that quantizes them using the group-wise \texttt{INT8} for near-lossless accuracy and efficient hardware implementation~\cite{frantar2023gptq,lin2023awq, kim2023squeezellm}.
+Meanwhile, unlike weight and KV cache, activations are temporary variables.
+They are dynamically generated, quantized, and consumed, so they cannot be reused in the latter inference iteration.
+Finally, the weights and KV caches already consume most of memory in the LLM inference so that activations occupy only a minor fraction of the memory ($<$5\%~\cite{yuan2024llm}).
+As such, further reducing the activation bit width only leads to marginal improvement.
+
+ 
+
+This choice of using \texttt{INT8} to activation quantization also allows the computation between the weight that quantized using our \proj{} and the activation that quantized using \texttt{INT8} to exploit the low-bit computation units, as detailed in \mbox{\Sec{sec:encode_decode}}.
+\proj further leverages a streaming comparator unit to determine the maximum value of activations, facilitating the activation quantization.
+
+Real-time quantizing activation requires two operations: derive the maximum value of a group to calculate scaling factor and map the \texttt{FP16} value to \texttt{INT8}.
+\proj hides the latency of searching the maximum value with hardware design fusing this operation into the streaming of systolic array output, as detailed in \Sec{sec:real_time_engine}.
+
+
+
+\subsection{KV Cache Quantization}
+\label{sec:dse_kv}
+
+
+\paragraph{The Quantization Dimension.}
+We quantize K and V along the accumulation dimension, as we discuss in \Fig{fig:kv_process}.
+Some prior algorithmic works~\cite{liu2024kivi,hooper2024kvquant} do use a different quantization direction for V cache, which we believe is orthogonal to our work. 
+First, MANT can also work with the channel direction of V cache quantization, which may sacrifice the computation efficiency of all quantization methods, including ANT. 
+Second, those prior works are based on channel-level quantization or extremely low bit, while the impact of directions for the 4-bit group-level quantization is much smaller, as we show later. 
+Finally, emerging incoherent processing algorithms~\cite{ashkboos2024quarot,tseng2024quipbetterllmquantization,xiao2023smoothquant} (where SmoothQuant~\cite{xiao2023smoothquant} is a special case) are very promising to further mitigate this gap.
+
+\paragraph{Select \proj through Variance.}
+In KV cache quantization, real-time data type selection is required.
+Although the searching method based on MSE achieves less accuracy loss, it requires performing quantization to each data type for MSE searching, which is intolerable in a real-time scenario.
+Thus, we develop a mapping mechanism based on the data characteristics like variance, which can be derived in a streaming way.
+
+Since variance can reflect the distribution of a data group and \proj with different $a$ has a different variance, \proj determines the coefficient $a$ using a variance.
+% For a group of data, we first normalize them to the range [-1, 1] based on their maximum value.
+Then, calculate the variance:
+\begin{equation}
+    \sigma^2 = \frac{1}{n} \sum_{i=1}^{n} x_i^2 - \left( \frac{1}{n} \sum_{i=1}^{n} x_i \right)^2
+    \label{eqn:variance}
+\end{equation}
+% Variance can be calculated using $\sigma^2 = \frac{1}{n} \sum_{i=1}^{n} x_i^2 - \left( \frac{1}{n} \sum_{i=1}^{n} x_i \right)^2$,  where $\sigma^2$ is the variance and $x_i$ is a parameter in the group.
+
+In \proj, a larger $a$ corresponds to higher variance, with each value of $a$ associated with a specific variance range.
+We first sample the K and V tensors through a calibration dataset~\cite{gao2020pile}, and select $a$ for each group to minimize quantization error.
+Next, we calculate the variance of the groups with different $a$ to decide the appropriate range.
+The elements within each group are first normalized, ensuring that the absolute maximum value in the group is scaled to 1. 
+Following this normalization step, the variance of the normalized elements is then computed.
+For example, when $a=35$, the variance is 0.104; when $a=45$, the variance is 0.118.
+We define the range for $a=40$ as [0.104, 0.118].
+If the variance of normalized data falls within a specific range of $a$, it will be quantized with that $a$ with \proj.
+We fuse the computation flow of variance with matrix multiplication to hide latency, which we will detail in \Sec{sec:real_time_engine}.
+
+
+\paragraph{Prefill Stage.}
+During the prefill stage, the input comprises a sequence, so the K and V are both matrices, where the sequence length typically exceeds the group size.
+Thus, both the K cache and V cache can obtain the data needed to calculate variance.
+% The K cache and V cache in a group will be normalized first, and their variance is calculated.
+By selecting the appropriate $a$ based on the variance, the K cache and V cache can be quantized to 4-bit \proj.
+
+\paragraph{Decode Stage.}
+In the decode stage, since inputs are vectors, generated K and V are vectors.
+Thus, the K cache can obtain all data of the group in a single iteration to execute real-time quantization, similar to activation in decode stage.
+The difference is that each group needs to calculate the partial sum of $x_i$ and $x_i^2$ as well as the maximum value since K cache needs to be quantized to 4-bit \proj.
+However, when it comes to V cache, a new challenge arises as each iteration only generates one element of a group.
+
+To address this, we propose a two-phase quantization scheme for the V cache, as shown in \Fig{fig:v_update}.
+We define every $G$ iterations in the decode phase as a process window for V cache, where $G$ is the group size. 
+In the first phase, newly generated V vector is quantized to \texttt{INT8} with channel-wise scaling factors derived from prefill stage, denoted as `scales' in \Fig{fig:v_update}. 
+Meanwhile, we update the maximum value and partial sum of $v_i$ and $v_i^2$, denoting the parameter in a group as $v_i$.
+This operation persists until the process window is full. 
+
+
+The second phase involves quantizing the 8-bit V cache to 4-bit \proj.
+When the process window is full, we calculate the variance with partial sum of $v_i$ and $v_i^2$ by ~\eqref{eqn:variance}.
+Then, the coefficient $a$ is decided similarly to the prefill phase, and the stacked \texttt{INT8} V cache is quantized to 4-bit \proj.
+
+This two-phase quantization scheme effectively quantizes all but the latest V vectors in the processing window to 4 bits.
+The process window is similar to the residual group used in KIVI~\cite{liu2024kivi}.
+The overhead of \texttt{INT8} operation of V cache in processing window is marginal and tolerable.
+Besides, it helps improve the quality of newly generated tokens, since some studies have shown that the latest tokens are more important~\cite{duanmu2024skvqslidingwindowkeyvalue}.
+
+
+\input{figure_text/fig_frame_vcache.tex}

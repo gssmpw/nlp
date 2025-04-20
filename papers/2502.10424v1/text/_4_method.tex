@@ -1,0 +1,86 @@
+\section{\OURS\ }
+\subsection{Overview of \OURS}
+
+In this section, we introduce \OURS, a self-speculative decoding framework designed to accelerate both short- and long-context generation by quantizing the model weights and KV cache into INT4 precision. We begin by noting that self-speculative decoding is particularly well-suited for long-context generation, as the draft model shares the same architecture as the target model. This architectural alignment improves both the acceptance rate and the model’s ability to handle long contexts effectively. However, a naive implementation 
+of self-speculative decoding (e.g. based on sparse KV) would require maintaining a separate, fully quantized copy of the KV cache, leading to inefficiencies in memory usage and computational overhead.
+
+To address this limitation, \OURS{} introduces a novel hierarchical KV cache design, which we discuss in detail in Section~\ref{subsec:Hierarchical_kv_cache}. This design enables dynamic switching between INT4 and INT8 representations of the KV cache without the overhead of on-the-fly quantization. By eliminating redundancy between the draft and target models' KV caches, our method significantly reduces the total memory footprint while preserving efficiency. We also address the inefficient combination of conventional quantization strategies with the reject-and-revert-back mechanism specific to speculative decoding methods by proposing a full-precision KV cache buffer in \OURS. As we further explain in Section~\ref{subsec:full_precision_buffer}, this helps achieve high acceptance rates for the draft model and thus results in greater end-to-end speedup.
+
+\subsection{Hierarchical KV Cache}\label{subsec:Hierarchical_kv_cache}
+We propose a 4-bit hierarchical KV cache wherein we strategically structure each tensor's representation such that the draft and target models are able to dynamically reconstruct their KV cache without any on-the-fly quantization overhead. Firstly, we observe that using an INT8 KV cache for the target model is comparable in terms of accuracy and performance with the same target model using an FP16 KV cache. To demonstrate this, we conduct a perplexity analysis for Llama-2-7B on the WikiText-2 \cite{merity2016pointer} and C4 \cite{raffel2020exploring} datasets in Table \ref{tab:pplx_eval}, which shows that the target model with an INT8 KV cache maintains competitve generation quality with respect to the FP16 baseline while using half the KV cache's memory.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{c|cc}
+    \toprule
+     & \multicolumn{2}{c}{Datasets} \\
+    \midrule
+    KV Cache & WikiText2 & C4 \\
+    \midrule
+    % FP16 (Baseline) & 1.8655 & 1.9826 \\
+    % INT8 (\OURS\ target) & 1.8671 & 1.9827 \\
+    % INT4 (\OURS\ draft) & 1.8730 & 1.9883 \\
+    FP16 (Baseline) & 6.4595 & 7.2617 \\
+    INT8 (\OURS\ target) & 6.4696 & 7.2620 \\
+    % INT4 (\OURS\ draft) & 6.5077 & 7.3030 \\
+    \bottomrule
+\end{tabular} 
+\caption{Perplexity evaluations of Llama-2-7B with FP16, INT8 with group size = 128, residual length = 256 on different datasets.}
+\label{tab:pplx_eval}
+\end{table}
+
+Having observed this, we further note that an INT8 KV cache can be represented as an INT4 KV cache plus its INT4 residual. This works by decomposing an INT8 value into two INT4 components corresponding to its first and second 4-bit segments, which we call the upper and lower 4-bits. This effectively allows us to use a hierarchical design to represent the KV cache of the draft model in INT4 and the target model in INT8 at the same time, removing the need to store a separate INT4 copy.
+
+
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=\linewidth]{figs/HierarchCache.pdf}
+    \caption{How our Hierarchical KV Cache works in the speculative decoding setting.}
+    \label{fig:hierarch_cache}
+\end{figure*}
+
+Our method is visualized in Figure~\ref{fig:hierarch_cache}. During prefill, \OURS{} quantizes the FP16 KV cache to form the upper and lower INT4 representations. To obtain the upper 4-bits $C_{U}^{\text{INT4}}$ and lower 4-bits $C_{L}^{\text{INT4}}$ values, we first calculate $C_{U}^{\text{INT4}}$, then quantize the quantization error $E_U^{\text{INT4}}$ to get $C_{L}^{\text{INT4}}$. $C_{U}^{\text{INT4}} \in [0, 15]$ uses asymmetric and round-to-nearest quantization. Since the distribution of $E_U^{\text{INT4}}$ is symmetric and has an expectation close to zero, for $C_{L}^{\text{INT4}} \in [-8, 7]$ we use symmetric and round-to-nearest quantization to better match the distribution of errors. 
+% \amir{I suggest adding a sentence that we chose symmetric here because that better matches the distribution of errors which have an expectation of zero. \haocheng{fixed. Please check}}
+
+Then during decoding, when using the draft model to generate candidate tokens, we only load the upper 4-bit representation in our kernel and dequantize it for inference. When verifying the drafted tokens using the target model, we utilize both the upper and lower 4-bit representations to reconstruct the KV cache in the higher INT8 precision. To represent the INT8 KV cache $C^{\text{INT8}}$ as the upper INT4 KV cache $C_{U}^{\text{INT4}}$ and the lower INT4 cache $C_{L}^{\text{INT4}}$, the INT8 KV cache can be expressed as $C^{\text{INT8}} = 2^4 C_{U}^{\text{INT4}} + C_{L}^{\text{INT4}},$ where we multiply by $2^4$ to align their represented values. The asymmetric quantization for the KV cache can be represented as
+$C^{\text{FP32}} = C^{\text{INT8}} S^{\text{INT8}} + Z^{\text{INT8}},$
+where $S^{\text{INT8}}$ is the scaling factor, $Z^{\text{INT8}}$ is the zero point, and $C^{\text{INT8}} \in [0, 2^8 - 1]$.
+In this scenario, its 4-bit representation can be viewed as
+\begin{align*}
+    C^{\text{FP32}} &= (2^4 C_{U}^{\text{INT4}} + C_{L}^{\text{INT4}}) S^{\text{INT8}} + Z^{\text{INT8}} \\
+    &= C_{U}^{\text{INT4}} S^{\text{INT4}} + C_{L}^{\text{INT4}} \frac{S^{\text{INT4}}}{2^4} + Z^{\text{INT4}}, \\
+    \text{where~~} & Z^{\text{INT4}} = Z^{\text{INT8}}, ~~S^{\text{INT4}} = 2^4 S^{\text{INT8}}.
+\end{align*}
+
+
+
+\subsection{KV Cache with Double Full Precision Buffer}\label{subsec:full_precision_buffer}
+\subsubsection{Challenges with KV Cache Quantization and Speculative Decoding} 
+The key and value caches have each been found to exhibit unique characteristics indicating that they should be quantized with different strategies~\cite{liu2024kivi}. Specifically, quantizing the key cache along the channel axis and quantizing the value cache along the token axis minimizes quantization error (as shown in Appendix~\ref{appendix:quantization_strategies} Table~\ref{tab:token_channel_wise_quant}), and therefore leads to a higher acceptance rate in speculative decoding. We apply \textit{asymmetric quantization} and \textit{per-group quantization} to both the key and value caches in INT4 precision, and we set the group size $G$ to be equal to the head dimension to reduce overhead. These quantization techniques are illustrated in Appendix~\ref{appendix:quantization_strategies} Figure~\ref{fig:group_quant_asymmetric_quant}.
+
+
+However, these quantization strategies for the key and value caches pose efficiency challenges when combined with speculative decoding. Regarding the value cache wherein the values are quantized along the token axis, the naive strategy of directly quantizing newly generated tokens at each decoding step is expensive, as it introduces high computational overhead that occurs very frequently. Moreoever, regarding the key cache for which we apply quantization along the channel axis, the naive approach is to store multiple tokens in full precision until they equal the quantization group size, and then quantize them. However, since the KV cache for the most recent tokens is no longer preserved in full precision after quantization, this strategy adversally affects the acceptance rate, thus reducing the effectiveness of speculative decoding. Moreover, since speculative decoding may result in frequent rollbacks due to the target model rejecting the draft tokens, the quantized KV cache for the rejected tokens need to be discarded and replaced with new tokens in the quantization group. This leads to repeated quantization and dequantization, slowing down the decoding process.
+
+\input{text/_7_results_table}
+\subsubsection{Adapt to Speculative Decoding Using Full Precision Buffer} \label{sec:buffer}
+To enhance efficiency and ensure compatibility with speculative decoding, we propose maintaining a \textit{double full-precision buffer} of size \(2G\), where \(G\) is the quantization group size. This buffer is divided into two equal parts: \(C_{F_1}\) and \(C_{F_2}\), each of size \(G\). During prefill, we quantize the input tokens in batches of \(G\) while ensuring that at least \(G\) but no more than \(2G\) of the most recent tokens remain in full precision. This ensures that \(C_{F_1}\) is always filled. In the decoding stage, newly generated tokens are stored in full precision in the second buffer, \(C_{F_2}\). Once the full-precision buffer reaches its maximum capacity of \(2G\), we wait for the target model to verify the generated tokens. If any tokens are rejected, we first remove the corresponding full-precision KV cache entries. Then, we quantize \(C_{F_1}\) and append it to the quantized KV cache. We then move \(C_{F_2}\) to \(C_{F_1}\), which fully occupies \(C_{F_1}\) while leaving \(C_{F_2}\) empty and ready for tokens generated in future decoding steps. This whole process is visualized in Figure~\ref{fig:double_size_fp_buffer}.
+
+Using this design, we ensure that (1) at every step $C_{F_1}$ is always filled, so there are at least recent $G$ tokens kept in full precision, which is beneficial for the acceptance rate. (2) Quantization and KV cache movement will only happen every $G$ decoding steps, which significantly reduces the overhead. (3) The design is compatible with speculative decoding since we can discard the KV cache for rejected tokens very flexibly by only operating on the second full-precision buffer $C_{F_2}$ and without needing extra quantize and dequantize operations. We also show that our method is fully compatible with FlashDecoding in Appendix~\ref{appendix:flash_decoding}.
+
+
+\subsubsection{Summary}
+In summary, \OURS\ allows the draft and target models to share the same 
+architecture in a self-speculative decoding manner, ensuring greater consistency 
+between drafting and verification as opposed to traditional big-little speculative 
+decoding methods. Our approach is mainly designed for long-context scenarios, 
+where efficient KV cache management is critical, but it also supports short contexts where using weight quantization becomes more critical.
+We quantize the KV cache using our 
+hierarchical INT4 design and use a double full-precision cache buffer for higher acceptance 
+rates and flexibility with speculative decoding. Then in the decoding stage, when 
+generating draft tokens, we only load the upper 4-bit of the KV cache and achieve 
+speedup by significantly reducing the memory load/store operations. When verifying 
+these draft tokens, we load both the upper and lower 4-bit KV cache representations 
+and dequantize them into their INT8 representation to achieve performance that is 
+comparable with an FP16 KV cache. If the full-precision buffer is saturated, after 
+verification we quantize and clear one-half of the full-precision buffer to prepare for the next 
+round of generation. The whole algorithm can be visualized in Figure~\ref{fig:hierarch_cache} (and Algorithm ~\ref{alg:our_algorithm} in Appendix).

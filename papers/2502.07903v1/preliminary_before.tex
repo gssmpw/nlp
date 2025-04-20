@@ -1,0 +1,53 @@
+\section{Preliminary}
+\subsection{LLM Inference and Serving}
+
+\textbf{LLM inference phases.} Given the input request, the LLM inference process typically contains two phases: \textit{prefill} and \textit{decode}. The prefill phase processes the request to compute the key-value (KV) cache and generates the first token for the response in a single step. The decode phase then takes the last input token and KV cache as inputs to generate subsequent tokens in several steps, processes only one token at a step. The distinct characteristics of both phases lead to differing GPU resource utilizations: the prefill phase is more compute-bound, whereas the decode phase is more memory I/O-bound. Most of the inference engines choose to colocate the two phases on GPUs, despite their distinct computational characteristics.
+
+\textbf{Performance metrics for LLM serving.}
+\label{sec:slo}
+There are two essential metrics to evaluate LLM serving: \textit{system throughput} and \textit{inference latency}. System throughput refers to the number of tokens a system can generate within a specified time period, which is crucial for understanding the capacity of the system to process data efficiently under varying loads. Inference latency is the time required to complete each inference request from start to finish. We assess system performance on inference latency using Service Level Objective (SLO) attainment, which gauges the proportion (e.g., 99\%) of requests fulfilled within a time frame predefined by the SLO. This SLO is adjusted to various multiples of single device execution latency (termed as SLO scale) to measure performance under different degrees of SLO stringency.
+
+\textbf{Batching.}
+\label{sec:batching}
+Due to the distinct computational characteristics of the two phases, integrating batching strategies leads to varying performance outcomes. As shown in \autoref{fig:batch}, in the prefill phase, a small batch size quickly saturates the GPU. Once the total number of batched tokens reaches 2048, no further improvement in throughput is observed, as GPU efficiency plateaus rather than increases, and the prefill latency escalates with batch size. Conversely, in the decode phase, the throughput increases linearly as the total number of batched tokens rises, underscoring the importance of batching in this phase for performance enhancement.
+
+\begin{wrapfigure}{r}{0.5\linewidth}
+    % \vspace{-2.5em}
+    \centering
+    \includegraphics[width=\linewidth]{ICLR 2025 Template/img/prefill decode.pdf}
+    \caption{Effects of batching on different phases (\textsc{Llama-2 (7B)} with input sequence length of 512).}
+    \label{fig:batch}
+    % \vspace{-2.5em}
+\end{wrapfigure} 
+
+The current state-of-the-art LLM serving system employs a batching optimization called \textit{continuous batching}~\cite{yu2022orca}, which batches the prefill of new requests with the decode of ongoing ones to enhance GPU utilization. However, this leads to severe prefill-decode interference. Adding a single prefill job to a batch of decoding requests significantly slows down both processes, with the slowdown intensifying as the prefill length increases.
+
+\subsection{Parallelism}
+Given the large scale of the LLMs, distributed or parallel execution is necessary. To parallel the LLM over multiple GPUs, there are two standard parallel strategies: \textit{tensor parallelism} and \textit{pipeline parallelism}.
+
+\textbf{Tensor parallelism.} Tensor parallelism (TP)~\cite{narayanan2021efficient} distributes inference computations across multiple GPUs by partitioning the weight matrices of transformer layers both row-wise and column-wise, each layer's output activations are aggregated through two \texttt{AllReduce} operations. It divides both the data scan and computation among a tensor model parallel group, effectively scaling out inference computations given a fast connection within the group. However, if intra-group communication is slower (i.e., not facilitated by NVLink or PCIe), tensor parallelism may perform poorly.
+
+\textbf{Pipeline parallelism.} Pipeline parallelism (PP)~\cite{huang2019gpipe} divides the layers of a model into multiple stages, each assigned to a specific GPU or group of GPUs for execution. This setup forms a pipeline where only the inter-layer activations need to be communicated between stages. Unlike tensor parallelism, pipeline parallelism does not reduce the inference latency for a single request, as only one stage can be active at a time. However, the communication volume included in pipeline parallelism
+is much less when compared with tensor model parallelism, which is beneficial for slow GPU connections.
+
+\textbf{Hybrid model parallelism.} Existing approaches~\cite{jianghexgen,zhong2024distserve,miao2024spotserve,li2023alpaserve} use a combination of tensor and pipeline parallelism to deploy LLM efficiently. For instance, given a cluster of two nodes, each equipped with multiple GPUs, tensor parallelism performs poorly due to the limited inter-node bandwidth, and pipeline parallelism increases inference latency as only one stage can be activated at once. In this case, hybrid model parallelism employs tensor parallelism within nodes and pipeline parallelism between nodes to enhance overall performance.
+
+\textbf{Model replication.} Given a set of GPUs, we can choose to replicate a model into several replications instead of model parallelism. Although more GPU memory is used to store additional model parameters, it largely enhances the parallel processing ability of the system.
+
+\subsection{Disaggregated Architecture}
+
+As the two phases in LLM inference have distinct computational characteristics, recent efforts~\cite{zhong2024distserve,patel2024splitwise,jin2024p,qin2024mooncake,hu2024inference} propose a disaggregated inference architecture that splits the two phase on to separate hardware resources. The illustration of this process are demonstrated in \autoref{fig:kv transfer}.
+
+\begin{wrapfigure}{r}{0.5\linewidth}
+    % \vspace{-1.5em}
+    \centering
+    \includegraphics[width=\linewidth]{ICLR 2025 Template/img/kv transfer.pdf}
+    \caption{Illustration of disaggregated architecture.}
+    \label{fig:kv transfer}
+    % \vspace{-1.5em}
+\end{wrapfigure} 
+
+
+\textbf{Phase separation.} In the disaggregated inference architecture, there are two types of model replications: \textit{prefill instance} is responsible for processing the incoming request, generating the first token and KV cache; \textit{decode instance} takes the generated token and KV cache as inputs, and generates the subsequent tokens. This separation enhances LLM serving by: 1) eliminating the prefill-decode interference as mentioned in \autoref{sec:batching}. 2) Allowing prefill and decode instances to utilize different batching and parallelism strategies aligned with their computational needs. For example, prefill instances benefit from tensor parallelism and smaller batches for reduced per-request latency, whereas decode instances perform better with strategies that support larger batch sizes to increase system throughput. 3) Accommodating varying LLM serving workloads by adjusting resource allocations between the two phases. For instance, the coding workload characterized in~\cite{patel2024splitwise} with typically longer prefill and shorter decode sequence lengths requires more resources for prefilling to optimize performance.
+
+\textbf{KV cache transmission.} As prefill and decode instances operate independently, it is crucial to transmit the KV cache from the prefill to the decode instances. Given the substantial number and size of the KV caches in LLM serving, current implementations necessitate a high-bandwidth communication link to facilitate the transmission of the KV cache. \cite{patel2024splitwise} utilize InfiniteBand (IB) for inter-node KV cache transmission, while \cite{qin2024mooncake} deploy their system on GPU clusters equipped with RDMA network cards, and \cite{zhong2024distserve} collocate prefill and decode instances on GPUs within the same node to expedite KV cache transmission via NVLink. Therefore, in heterogeneous environments characterized by varying network bandwidths, it is imperative to implement a well-considered scheduling strategy for the transfer of the KV cache.

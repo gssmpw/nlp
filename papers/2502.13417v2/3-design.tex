@@ -1,0 +1,254 @@
+% \section{Problem Definition}
+
+% \begin{itemize}
+%     \item Application context: FT LLM to respond to custom tasks
+%     \begin{itemize}
+%         \item Summarization
+%         \item extraction
+%         \item QA
+%     \end{itemize}
+%     \item Weak supervision: Only few (hundreds) human annotation available
+%     \item Harder tasks: are important
+%     \item Controlled data-visibility: no domain heuristics can be used
+%     \begin{itemize}
+%         \item Concern: people may challenge whether we are still exposing visibility to trusted experts
+%         \item why data masking won't work: enterprise task are complex
+%     \end{itemize}
+% \end{itemize}
+
+% story: 
+% If you are given a dataset, you will:
+% get large number of annotations (x)
+% -> generalize data processing from few samples
+% -> SER: pairing, not generalizable; don't go for harder samples; bad performance
+% -> Take data science teams (which you may not have to find representative sample for FT
+% -> read through the dataset (x, controlled data visibility)
+% -> subject matter expert doesn't have DS background
+% -> incorporate their feedback
+% -> Sargy
+% (
+% 1. weak supervision: starting GPT initial alignment, extending to similar samples
+% 2. hard tasks: RM reranking + SME
+% 3. controlled visibility: working with SME
+% )
+
+% (include the meta-correction: use top-bottom annotate to tune the guidelines)
+
+% (implicit supervision: middle point)
+
+% (look at how reward is calculated for a long sequence)
+
+% tasks:
+% 1. writing
+% 2. find the dataset
+% 3. fix extraction
+
+
+\section{Improving Human Alignment with \myname{}}
+\label{sec:design:overview}
+
+\myname{} enhances human alignment in preference datasets used for training preference optimization techniques like DPO and PPO. It facilitates LLM training for various downstream tasks, including summarization, compliance, and grounding. Starting with an unlabeled preference dataset, \myname{} strategically integrates AI-generated labels with selective human feedback to maximize alignment while minimizing annotation effort. As illustrated in Figure~\ref{fig:overview}, \myname{} operates in three stages: 1) \textit{Initial alignment}, where an off-the-shelf LLM provides dataset labeling to establish a coarse task understanding, 2) \textit{Iterative alignment improvement}, which leverages reward distribution by an RM to locate and rectify hard-to-annotate samples mislabeled by the LLM with selective human feedback while investing the correct LLM labels, 3) \textit{Transferring knowledge for downstream task}, where the curated preference dataset is fed into the DPO pipeline or the trained \myname{} reward model is integrated into the PPO pipeline.
+
+% Specially, for text extraction, \myname{} separates the task into two steps: Filtering step applies the initial alignment and progressive hard-problem resolution; and the learned filtering RM is re-purposed to provide high-quality extractions.
+
+
+\subsection{Initial Alignment}
+\label{sec:design:init}
+
+This stage aims to establish an initial coarse alignment in the unlabeled dataset using a general-purpose LLM, which provides preference annotations for each unannotated sample. Prior research suggests that model selection here depends on task complexity relative to the model's capability~\cite{snell2024scaling}. While \myname{} is not found to be sensitive to the choice of model at this stage, a well-suited model can accelerate alignment convergence. The only assumption is that the general-purpose LLM possesses a basic understanding of the downstream task, enabling it to provide a rough initial alignment that serves as a seed for \myname{}.     
+
+Our prompt for obtaining preference judgments from the LLM consists of three key components: 1) task description, 2) preference judgment principles provided by the end user, and 3) few-shot examples with optional chain-of-thought (CoT) reasoning. The prompt templates are detailed in Appendix~\ref{appendix:prompt}. We do not perform explicit fine-grained prompt tuning, as full visibility into the data may be restricted when offering fine-tuning services to third-party customers. However, to ensure that the selected LLM with our prompt attains a reasonable level of alignment, we perform an eyes-off validation using strategic human feedback, as detailed in Section~\ref{sec:leveraging_reward_score}.   
+
+As mentioned earlier, AI-generated feedback is prone to errors due to factors such as model biases from pre-training data, task complexity, and prompt optimization, which is also evident in our evaluation. When our ultimate goal is to customize an existing model through fine-tuning to align with end-user preferences, we inherently assume that an off-the-shelf LLM lacks comprehensive alignment with the end-user. However, \myname{} builds upon the initial AI-provided alignment and systematically refines it in subsequent stages to achieve oracle-level human alignment. 
+
+% We form the user-provided components into fill-in-the-blank style to ensure the prompt template is generalizable for various tasks and provide user with proper guidance. We provide the prompt templates in Appendix~\ref{appendix:prompt}.
+
+% With the preferences/judgments are obtained for all unannotated data samples, we train a initial RM to align with the general-purpose language model on this task. The training data preparation will be the same as the processes described in Section~\ref{sec:design:pref_learn} and ~\ref{sec:design:doc_filter} except that there is no human feedback.
+
+% \subsection{Progressive Hard-Problem Resolution}
+% \label{sec:design:progressive}
+% \begin{itemize}
+%     \item Re-ranking by reward scores
+%     \item Preference grouping by detecting inflection point
+%     \item Annotation sampling with confidence margin: 2 hyperparams introduced
+%     \begin{itemize}
+%         \item middle ratio: determined by the level of confidence for each iteration
+%         \item sample ratio: determined by the budget for human annotation
+%     \end{itemize}
+%     \item Lightweight human annotation
+%     \begin{itemize}
+%         \item Absolute
+%         \item Preference
+%     \end{itemize}
+% \end{itemize}
+
+% The major issue of the initial RM is that it may not capture the hard problems well as the general-purpose may be making wrong preferences/judgments on those samples. Therefore, the next goal is to fully exploit the limited feedback from trusted human experts and teach the model how to solve the hard problems. To achieve this, \myname{} divides the training samples into a \textit{sanitized group} and \textit{confused group} by learning from the reward distribution of training samples. The sanitized group contains the samples that have already received confident annotations. The confused group contains the hard samples that will be partially sent for human annotation. After that, the two groups will be combined and reorganized into the new training set for the next iteration to progressively infuse deeper knowledge to the RM. The detailed procedure are different for preference learning (for instruction tuning) and document filtering (for text extraction) but follow the same principles.
+
+\subsection{Iterative Alignment Improvement}
+\label{sec:design:pref_learn}
+In this stage, we refine the LLM-labeled preference dataset by iteratively training a reward model (RM) with selective human annotations to enhance alignment. Before diving into the details of this process, we first establish the premise for RM.
+
+\subsubsection{Reward Model}
+ Given a labeled preference dataset $\mathcal{D}_{\mathbf{\Lambda}} = \{x_i, y_{i,c}, y_{i,r} \}$, where $i\in [N]$, $x_i$ is the prompt, $y_{i,c}$ and $y_{i,r}$ denote the chosen and rejected completions, respectively, as labeled according to the annotator's preference, $\mathbf{\Lambda}$. Here, if we represent the relative preference orientation of $i^{th}$ completion pair with $\lambda = [-1, +1 ]$, $\mathbf{\Lambda}$ is a $N$-dimensional vector consists of $[\lambda_i]_{i=1}^{N}$, meaning that flipping the preferences of all completion pairs results in $\mathcal{D}_{\mathbf{-\Lambda}}$. To train an RM on this dataset, we can formulate the probability distribution of $y_{i,c}$ being preferred over $y_{i,r}$ given $x_{i}$ as an input, following the Bradley-Terry (BT) model~\cite{david1963method}.
+\begin{equation}
+    P(x\succ y) = \sigma(r(x_i, y_{i,c}) - r(x_i, y_{i,r}))
+\label{eq:rm_prob}
+\end{equation}
+where $\sigma(\cdot)$ denotes the sigmoid function and $r(\cdot)$ denotes the reward function. Assuming the existence of a true deterministic reward function, the goal is to train the RM to learn this function and predict the reward, $\hat{r}(x,y)$. The RM training can be framed as a binary classification problem~\cite{sun2024rethinking}, where a labeled pair of $\rho_{i,c}\coloneqq(x_i, y_{i,c})$ and  $\rho_{i,r}\coloneqq(x_i, y_{i,r})$ is passed to the model to predict the conditional class probability according to Eq.~\ref{eq:rm_prob}. This leads to the negative log-likelihood loss function for training.
+\begin{equation}
+    \mathcal{L(\hat{\text r})} = - \mathbb{E}_{(x,y)\sim\mathcal{D}} [\log{\sigma(\hat{r}(\rho_{i, c}) - \hat{r}(\rho_{i,r}))}] 
+\end{equation}
+
+In essence, during the RM training, we pass a preference pair $\{\rho_{i,c}, \rho_{i,r}\}$ labeled as $\rho_{i,c}$ winning over $\rho_{i,r}$ according to the annotator's preference $\mathbf{\Lambda}$. Provided sufficient preference samples in a dataset, the RM learns the winning preference features of the data that determine the winner in a pair, captured in the reward function $\hat{r}_{\mathbf{\Lambda}}$.
+\begin{figure*}[t]
+\centering
+\begin{subfigure}{0.23\linewidth}
+\centering
+\includegraphics[width=\linewidth]{figures/reward_curve_hh_itr0.png}
+\caption{Reward dist. : Itr-0}
+\label{fig:hh_itr0_reward_curve}
+\end{subfigure}
+\begin{subfigure}{0.23\linewidth}
+\centering
+\includegraphics[width=\linewidth]{figures/accuracy_curve_hh_itr0.pdf}
+\caption{Correctness dist. : Itr-0}
+\label{fig:hh_itr0_accuracy_curve}
+\end{subfigure}
+\begin{subfigure}{0.23\linewidth}
+\centering
+\includegraphics[width=\linewidth]{figures/reward_curve_hh_itr5.png}
+\caption{Reward dist. : Itr-5}
+\label{fig:hh_itr5_reward_curve}
+\end{subfigure}
+\begin{subfigure}{0.23\linewidth}
+\centering
+\includegraphics[width=\linewidth]{figures/accuracy_curve_hh_itr5.pdf}
+\caption{Correctness dist. : Itr-5}
+\label{fig:hh_itr5_accuracy_curve}
+\end{subfigure}
+\caption{Reward (assigned by a trained RM) and correctness (w.r.t. human preference) distribution curves for the very first and last iterations of \myname{}. These two types of curves provide the intuition of strategically selecting the samples for efficient human annotation towards improving alignment in the dataset. These curves further highlight the iterative refinement process, showing how alignment in the dataset progressively improves.}\vspace{-0.2in}
+\label{fig:hh_reward_and_accuracy_curve}
+\end{figure*}
+
+\subsubsection{Looking at Reward Distribution}
+\label{sec:leveraging_reward_score}
+At this stage, we analyze the distribution of the predicted reward function ($\hat{r}_{\mathbf{\Lambda}}$) within the training preference dataset $\mathcal{D}_{\mathbf{\Lambda}}$. For each labeled preference pair $\{\rho_{i,c}, \rho_{i,r}\}$, we compute the reward score difference as $ \Delta_{\mathbf{\Lambda}}{\hat{r}_\mathbf{\Lambda}} = (\hat{r}_{\mathbf{\Lambda}}(\rho_{c}) - \hat{r}_{\mathbf{\Lambda}}(\rho_{r}))$. It is important to note that $\Delta_{\mathbf{\Lambda}}$ quantifies the relative preference score of a given pair in alignment with the annotator's preference orientation $\mathbf{\Lambda}$, satisfying the property $\Delta_{\mathbf{\Lambda}}{r} = - \Delta_{\mathbf{-\Lambda}}{r}$. By ranking all preference pairs in $\mathcal{D}_{\mathbf{\Lambda}}$ based on $\Delta_{\mathbf{\Lambda}}{\hat{r}_\mathbf{\Lambda}}$, a monotonic reward distribution curve, denoted as $\vartheta(\Delta_{\mathbf{\Lambda}}{\hat{r}_\mathbf{\Lambda})}$, emerges. This distribution, as depicted in Figure~\ref{fig:hh_itr0_reward_curve}, provides insight into the model’s reward assignment across the dataset, though for the moment, the legend in the graph can be disregarded. 
+
+The reward distribution curve $\vartheta(\Delta_{\mathbf{\Lambda}}{\hat{r}_\mathbf{\Lambda})}$, derived from the training preference dataset $\mathcal{D}_{\mathbf{\Lambda}}$, reflects the degree of alignment the RM (trained with optimal validation loss) has achieved during training across $\mathcal{D}_{\mathbf{\Lambda}}$. The upper left region of the curve consists of samples with high positive $\Delta_{\mathbf{\Lambda}}\hat{r}_\mathbf{\Lambda}$, indicating strong agreement between the RM and the training preference labels $\mathbf{\Lambda}$. This suggests that the RM effectively identifies and reinforces strong winning preference features in these samples, implying that these features were dominant in $\mathcal{D}_{\mathbf{\Lambda}}$. Conversely, the bottom right region of the curve contains samples with very low or even negative $\Delta_{\mathbf{\Lambda}}\hat{r}_\mathbf{\Lambda}$, signaling disagreement between the trained reward function $\hat{r}_\mathbf{\Lambda}$ and the training preference label for these samples. This misalignment arises from two primary factors. (1) Absence of strong features, where RM is not able to find any strong preference feature in these samples according to $\hat{r}_\mathbf{\Lambda}$. (2) Conflicting samples within $\mathcal{D}_{\mathbf{\Lambda}}$, where the preference features of these samples are highly conflicting with other stronger preference features learned in $\hat{r}_\mathbf{\Lambda}$, leading the RM to penalize them.
+
+\subsubsection{\myname{} Leveraging Reward Distribution}
+\label{sec:leveraging_reward_score}
+\myname{} trains the initial RM using a preference dataset filtered by a general-purpose LLM in the previous stage. We denote this dataset as $\mathcal{D}_{\mathbf{\Lambda_{LLM}}}$ where $\mathbf{\Lambda}_{LLM}$ represents the preference labeling performed by the LLM. Since the RM training includes a validation set derived from $\mathcal{D}_{\mathbf{\Lambda_{LLM}}}$, this ensures that the trained RM is broadly aligned with the LLM’s preferences. We assume that the LLM has a coarse but reasonable understanding of preference judgments, particularly for relatively easy-to-annotate samples. As a result, the features of these samples dominate in $\hat{r}_\mathbf{\Lambda_{LLM}}$. Based on our earlier discussion, the upper left region of the reward density curve, $\vartheta(\Delta_{\mathbf{\Lambda_{LLM}}}{\hat{r}_\mathbf{\Lambda_{LLM}})}$ contains high density of samples with prominent preference features, i.e., those that are easier for the LLM to annotate accurately. Before proceeding, we further validate that the LLM is at least roughly aligned with the end-user’s preferences in terms of these easy-to-annotate samples. This step mitigates the risk of significant misalignment due to prompt curation or model selection. To achieve this, \myname{} automatically (details in the following section) samples a small subset ($<0.1\%$) of preference data from the upper left region and gathers eyes-off user feedback. If human agreement on these samples is low, it signals a major misalignment between the user’s preferences and the LLM’s outputs. While we did not observe such cases in our experiments, this issue can be addressed by refining the judgment principles in the prompt. Updates can be made directly by the user, by incorporating verbose user feedback, or even through automated prompt optimization techniques~\cite{kepel2024autonomous, li2024learning}.
+
+At this stage, we can identify regions with a high density of correctly labeled samples by the LLM, i.e., those that are relatively easy for the LLM to annotate in alignment with human preference. Now, we turn our attention to two critical types of samples necessary for achieving fine-grained alignment: (1) hard-to-annotate samples and (2) samples mislabeled by the LLM w.r.t. the human preference $\mathbf{\Lambda}_h$. Since the LLM was unable to correctly label these samples initially, the reward function $\hat{r}_\mathbf{\Lambda_{LLM}}$ cannot accurately capture their preference features. Consequently, these samples are expected to cluster around the bottom right region of the reward distribution curve $\vartheta(\Delta_{\mathbf{\Lambda_{LLM}}}{\hat{r}_\mathbf{\Lambda_{LLM}})}$. To illustrate this, we refer to Figure~\ref{fig:hh_itr0_reward_curve} and \ref{fig:hh_itr0_accuracy_curve}. Figure~\ref{fig:hh_itr0_reward_curve} shows $\vartheta(\Delta_{\mathbf{\Lambda_{LLM}}}{\hat{r}_\mathbf{\Lambda_{LLM}})}$ from one of our experiments. In this figure, we classify each sample $\rho_i \in \mathcal{D}_{\mathbf{\Lambda_{LLM}}}$ as either correctly or incorrectly labeled w.r.t. the human preference $\mathbf{\Lambda_{h}}$, i.e., whether the preference assigned by $\mathbf{\Lambda_{LLM}}$ is matching $\mathbf{\Lambda_{h}}$.
+As observed, the upper left region of the curve contains a high density of correctly labeled samples, supporting our earlier claim that these represent the LLM’s easy-to-annotate cases. To quantify this, we generate an accuracy density curve for $\vartheta(\Delta_{\mathbf{\Lambda_{LLM}}}{\hat{r}_\mathbf{\Lambda_{LLM}})}$ w.r.t. the full-human preference $\mathbf{\Lambda_{h}}$, as shown in Figure~\ref{fig:hh_itr0_accuracy_curve}. This figure confirms that alignment with human preference decreases as we move towards the right side of the curve.   
+
+While we can observe how alignment with $\mathbf{\Lambda_{h}}$ varies across the reward distribution curve, in real-world scenarios, we lack ground-truth labels to quantify this accuracy directly. Therefore, we need to \textit{estimate} the boundaries of key regions within the curve. To achieve this, we identify two strategic points: the ``elbow'' and the ``knee'', as illustrated in Figure~\ref{fig:hh_itr0_reward_curve}. These points correspond to sharp changes in $\Delta_{\mathbf{\Lambda_{LLM}}}{\hat{r}_\mathbf{\Lambda_{LLM}}}$, which we detect using the first-order derivative. The ``knee'' marks the transition to a region with lower accuracy density, whereas the ``elbow'' indicates a shift toward higher accuracy density. It is important to note that these points serve only as rough estimations of the region boundaries rather than precise demarcations.
+
+\subsubsection{Selective Human Annotation}
+To enhance alignment from this stage, human annotation is necessary, but it must be done efficiently to maximize its impact. A straightforward approach is to refer to the accuracy density curve—annotations in the lowest accuracy region will yield the highest benefit. Thus, we could start annotating from the very bottom of the curve. However, as previously discussed, some samples in this region may exhibit preference features that are largely opposite to the dominant features captured by $\hat{r}_\mathbf{\Lambda_{LLM}}$. These samples are highly likely to be mislabeled in $\mathbf{\Lambda_{LLM}}$ (see Appendix~\ref{appendix:iterative_improvement}). Instead of requiring human annotation, we can simply flip the preference of these samples to correct the mislabeling. To estimate the positions of such samples, we take the reflection of the ``elbow'' point across the x-axis, as the elbow marks the region containing strong preference features. This reflected point, known as the ``reflection point'', always lies to the right of the ``knee'' in the lowest accuracy density region. Human annotation then begins from the reflection point, ensuring the most effective correction of alignment errors.
+
+\subsubsection{Iterative Approach}
+\label{sec:design:improve:iter}
+The current reward function $\hat{r}_\mathbf{\Lambda_{LLM}}$, trained on $\mathcal{D}_{\mathbf{\Lambda_{LLM}}}$, exhibits an alignment gap with respect to $\mathbf{\Lambda_{h}}$ due to the presence of hard-to-annotate samples for the LLM and mislabeling by the LLM. Since we have identified ways to rectify these issues, we can refine $\mathcal{D}$ to improve alignment and train a new RM that better aligns with $\mathbf{\Lambda_{h}}$. Now, the question is how to prepare the dataset for the next iteration of RM training. Suppose we are currently in iteration 0 (Itr-0) with $\mathcal{D}_{\mathbf{\Lambda_{LLM}}}$ and $\hat{r}_\mathbf{\Lambda_{LLM}}$. For the iteration 1 (Itr-1) training dataset, $\mathcal{D}_{\mathbf{\Lambda_{Itr-1}^{T}}}^{T}$, our primary goal is to include high-confidence samples that are well-aligned with $\mathbf{\Lambda_{h}}$. The first choice is definitely human annotated samples from Itr-0.  Additionally, another set of candidates can be drawn from the high-accuracy density region of $\vartheta(\Delta_{\mathbf{\Lambda_{LLM}}}{\hat{r}_\mathbf{\Lambda_{LLM}})}$, specifically the region to the left of the ``elbow'', where the RM has learned strong preference features in alignment with $\mathbf{\Lambda_{h}}$.
+
+Although these two sets of samples offer high precision, $\mathcal{D}_{\mathbf{\Lambda_{Itr-1}^{T}}}^{T}$ will still face a data coverage issue. These two candidate sets represent samples with the longest feature distance, leaving gaps in intermediate regions. However, expanding the dataset by including samples from the middle region, i.e., right of the ``elbow'' and left of the ``knee'' risks introducing misaligned samples. Since the accuracy in this region is likely to be just above $50\%$, obtaining human annotations for these samples would be inefficient. 
+Furthermore, as the number of samples annotated from the right of the knee is relatively small, their preference features are likely to be overshadowed by the dominant preference features of the high numbers of left-side samples. As a result, their features may not be effectively captured in $\hat{r}_\mathbf{\Lambda_{Itr-1}^{T}}$. To balance these trade-offs, we introduce two hyperparameters specific to \myname{}, allowing for a more controlled and effective dataset expansion while maintaining alignment quality.
+
+\begin{itemize}[leftmargin=*,topsep=2pt]
+    \item \textbf{Back-off ratio ($\beta$)}: Determines how far to back off from the ``knee'' when selecting samples for the next iteration's dataset. A higher $\beta$ results in a more sanitized dataset, reducing noise but at the expense of lower data coverage.  
+    \item \textbf{Amplification ratio ($\alpha$)}: Increases the influence of human-annotated samples by repeating them in the dataset, reinforcing their preference features in $\hat{r}_\mathbf{\Lambda_{Itr-1}^{T}}$. However, an excessively high $\alpha$ may lead to overfitting to selective human annotations.
+\end{itemize}
+
+The dataset $\mathcal{D}_{\mathbf{\Lambda_{Itr-1}}}^{T}$ consists of carefully selected samples from $\mathcal{D}_{\mathbf{\Lambda_{LLM}}}$, ensuring high alignment with $\mathbf{\Lambda_{h}}$ by optimally tuning the hyperparameters $\alpha$ and $\beta$. Training the RM on $\mathcal{D}_{\mathbf{\Lambda_{Itr-1}^{T}}}^{T}$ results in $\hat{r}_\mathbf{\Lambda_{Itr-1}^{T}}$, which is more closely aligned with $\mathbf{\Lambda_{h}}$. After training, we construct the dataset for generating the reward distribution curve by incorporating the remaining samples from Itr-0: $\mathcal{D}_{\mathbf{\Lambda_{Itr-1}}} = \mathcal{D}_{\mathbf{\Lambda_{Itr-1}^{T}}}^{T} \cup (\mathcal{D}_{\mathbf{\Lambda_{LLM}}} - \mathcal{D}_{\mathbf{\Lambda_{Itr-1}^{T}}}^{T})$. From this, we generate a new reward distribution curve, $\vartheta(\Delta_{\mathbf{\Lambda_{Itr-1}}}{\hat{r}_\mathbf{\Lambda_{Itr-1}^{T}})}$. While this curve demonstrates improved alignment with $\mathbf{\Lambda_{h}}$, full alignment is not necessarily achieved. However, it presents \myname{} with a distinct reward distribution curve compared to the previous iteration. This evolving diversity in $\vartheta(\cdot)$ enhances the variety of human annotations, maximizing the return on annotation investments and incrementally enriching $\mathcal{D}$. It is important to note that the effectiveness of this diversification, as well as the corresponding improvements, depends on factors such as hyperparameter tuning (see Section~\ref{sec:results}), the original data distribution, and model selection.
+
+As we have seen, \myname{} maximizes the efficiency of human annotations by iteratively refining $\vartheta(\cdot)$ and exposing annotators to diverse, LLM-mislabeled samples. To further enhance annotation efficiency, \myname{} employs random sharding to down-sample the original corpus. It begins by selecting a random shard of the dataset, iteratively improving alignment within that subset. Once the desired alignment is achieved, the final iteration's RM is used to label the entire corpus. This approach enables \myname{} to concentrate human annotations in a smaller, more targeted space while effectively propagating alignment across the full dataset at the end. 
+
+\vspace{-0.1in}
+\subsection{Reward Knowledge Transfer}
+\vspace{-0.05in}
+
+\myname{} progressively converges toward the comprehensive human preference through iterative RM training and strategic human annotation investment. As shown in Figure ~\ref{fig:hh_itr5_reward_curve} and ~\ref{fig:hh_itr5_accuracy_curve}, after five iterations, the reward distribution and accuracy curves closely align with the full-human annotation. Intermediate iteration curves can be found in Appendix~\ref{appendix:iterative_improvement}. The required number of iterations depends on the available human annotation and RM training budget. Notably, full-human alignment can sometimes be achieved before exhausting the annotation budget. In such cases, the samples selected for human annotation would largely lack distinct preference features, indicating that the model has effectively captured the  human preference. Once desired alignment is achieved or the annotation budget is fully utilized, we proceed with fine-tuning the model for the downstream task. This can be done in two ways: 1) incorporating the final iteration RM into the PPO loop, or 2) labeling the whole dataset with the final RM and feeding the labeled dataset to a DPO pipeline.
+
+% In this task, each input sample is a preference pair. The goal is to obtain an RM that can output higher reward score for the preferred response. \myname{} ranks all training samples by the reward gap between the chosen and rejected response $RM(Q,A_\text{chosen})-RM(Q,A_\text{rejected})$, and draw the gap-rank curve (example illustrated in Figure~\ref{fig:design:pref_curve}). 
+% We have some key observations on the curve:
+% \begin{enumerate}
+%     \item The samples on the right of the "knee" point contains dense samples wrongly annotated in previous training.
+% \end{enumerate} 
+% \myname{} detects two strategic points on this curve to determine the sanitized group and confused group:
+% \begin{itemize}
+%     \item \textbf{L Margin}: This is the point dividing the samples with confidently correct annotations. \myname{} determines its position by detecting the "knee" on the curve.
+%     \item \textbf{R Margin}: This is the point dividing the samples with confidently wrong annotations. \myname{} determines its reference position by reflect the "elbow" w.r.t. the "knee" on the curve.
+% \end{itemize}
+
+
+% \begin{figure}
+%     \centering
+%     \includegraphics[width=0.8\linewidth]{figures/pref_curve.png}
+%     \caption{Example reward curve for preference learning.}
+%     \label{fig:design:pref_curve}
+% \end{figure}
+
+% The sanitize group is constructed by the samples with their original preference labels on the left of L Margin plus the samples with flipped preference labels on the right of R Margin. The confused group is constructed by the samples between the L and R margin. Since the confused group mainly contains the confusing samples that are hard to be self-resolved by models, \myname{} randomly selects a few samples and sends it for human annotation.
+
+% \textbf{Why knee and elbow?}
+% The knee separate the samples that cannot effectively converge with a low loss during the reward training from others. The underlying reason is that they are disagreed by the rules learned from most other samples (i.e., the main cluster in the "middle platform" on the curve), and therefore receiving great resistance in leading the model weights to propagate towards its direction during training. The elbow works vice versa.
+
+% \subsubsection{Document Filtering}
+% \label{sec:design:doc_filter}
+% In this task, each input sample is a document. The goal of the filtering step is to figure out whether each document is good (contains the text of interest) or bad (does not contain the text of interest). \myname{} proposes to solve it with an RM that judge the existence of text of interest in a document with its reward score, where a similar pipeline can be applied. However, there are critical unsolved challenges: 1) the documents are unpaired and the good/bad ratio may be far from 1:1; 2) RM does not inherently provide a clear bar of what is good and bad. To tackle these issues, \myname{} ranks all training samples by the absolute reward score of each document $RM(D)$, and draw the reward-rank curve (example illustrated in Figure~\ref{fig:design:filter_curve}). 
+% \myname{} detects three strategic points on this curve to determine the sanitized group and confused group:
+% \begin{itemize}
+%     \item \textbf{L Margin}: This is the point dividing the confidently good documents. \myname{} determines its position by detecting the "left knee" on the curve.
+%     \item \textbf{Middle Point}: This is the dynamic bar for good/bad document split. \myname{} determines it by detecting the middle inflection point.
+%     \item \textbf{R Margin}: This is the point dividing the samples with confidently bad documents. \myname{} determines its position by detecting the "right elbow" on the curve.
+
+% \end{itemize}
+
+% \begin{figure}
+%     \centering
+%     \includegraphics[width=0.8\linewidth]{figures/filter_curve.png}
+%     \caption{Example reward curve for document filtering.}
+%     \label{fig:design:filter_curve}
+% \end{figure}
+
+% The sanitize group is constructed by a pool of good documents on the left of L Margin plus pool of bad documents on the right of R Margin. The confused group is constructed by the samples between the L and R margin. Again, the confused group is randomly sampled is sent for human annotation and labeled with good or bad.
+
+% \textbf{Why left knee and right elbow?}
+% The knees and elbows are formed in the same way as in the preference learning case. However, in document filtering, there will be two clusters of documents, one good and one bad, which shape the curve with two knees. Among them, the left knee is what differentiate the good cluster from others, and the right elbow works vice versa.
+
+% \textbf{Why middle inflection point?}
+% The middle inflection point marks the sparsest point between the good cluster and bad cluster. As the training progresses, the good/bad documents gather toward high/low reward direction, with the middle inflection point naturally becomes the bar for differentiating good and bad.
+
+% Specially, in document filtering case, the sanitized and confused groups cannot be directly used for reward training. To produce the training pairs, \myname{} introduces a document re-pairing process which randomly selects documents from the good and bad pools while ensuring: 1) each document appears at least once, 2) all documents has (almost) equal appearance time in the training set.
+
+% \subsubsection{Human Feedback Amplification}
+% For both use cases, the annotated samples from trusted human experts are considered the golden input, while their proportion in the training set is small. To ensure the human feedback is playing enough role in the reward training process, \myname{} repeat all human-annotated preference pairs (for preference learning) or document pairs that include at least one human-labeled document (for document filtering) with by a pre-configured number to amplify their knowledge.
+
+% \subsubsection{Instruction Tuning}
+% For general instruction tuning, the RM learned from preference learning is directly ready for PPO to fine-tune an instruction-tuned language model. We adopts the standard PPO training process here~\cite{}.
+
+% \subsubsection{Text Extraction}
+% For text extraction, we repurpose the reward signal from the RM for document filtering into a new reward for extraction for each document $D$ and extraction $E$:
+% \begin{equation}
+%     R_\text{extract}(D,E) = \frac{RM_\text{filter}(D) - RM_\text{filter}(D-E)}{length(E)}
+% \end{equation}
+% where $D-E$ stands for the remain text after removing $E$ from $D$. The $RM_\text{filter}(D) - RM_\text{filter}(D-E)$ component rewards for complete extraction and penalizes missing extraction where partial text of interest remain in $D-E$ and leads to a high $RM_\text{filter}(D-E)$ value. The $length(E)$ component penalizes unnecessary extraction on the other hand. Theoretically, with an ideal $RM_\text{filter}$ that provides higher reward for more confident existence of text of interest, it is impossible to find an alternative extraction $E_\text{alt}$ that is preferred over the ground truth extraction $E_\text{gt}$, \textit{i.e.}, $R_\text{extract}(D,E_\text{alt}) > R_\text{extract}(D,E_\text{gt})$. 
+
+% Practically, the extraction from a language model $E_\text{LM}$ may not be faithful to the raw document. To determines $E$, \myname{} uses a sliding window with the same length (in tokens) as $E_\text{LM}$ and let $E$ be the window with the minimum Levenshtein distance to $E_\text{LM}$.
+
+% The repurposed reward signal can be used for PPO to train a language model dedicated for text extraction, or used with a general purpose LM for better sampling~\cite{}.
+
+% \subsection{Iterative Reward Learning}
+% \begin{itemize}
+%     \item Preference re-pairing
+%     \begin{itemize}
+%         \item Merging human annotation with confident groups
+%         \item Random matching but guarantee each good/bad has equal change of appearance in the training set
+%     \end{itemize}
+%     \item Hyperparameter determination?
+%     \item Stop condition: implicit supervision from human annotated samples 
+% \end{itemize}
+
+
+% \subsection{Extraction (?)}

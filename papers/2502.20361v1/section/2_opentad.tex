@@ -1,0 +1,105 @@
+\section{A Unified TAD Framework}
+We unify modern temporal action detection methods within a single framework by analyzing the essential roles of different design choices and modularizing the entire pipeline, as illustrated in Fig.~\ref{fig:tad_arch}. 
+To predict action categories and start/end timestamps from an input video, the TAD framework consists of three stages of network components, which will be detailed in Sections~\ref{sec:stage0}, \ref{sec:stage1}, and \ref{sec:stage2}. Following the introduction of OpenTAD’s core components, we present our unified data preprocessing and postprocessing pipeline in Sec.~\ref{sec:data_processing}. Finally, we describe how various TAD methods are integrated into OpenTAD, categorizing them into one-stage, two-stage, DETR-based, and end-to-end approaches in Sec.~\ref{sec:categorization}. 
+
+OpenTAD is implemented in PyTorch within a unified codebase, which we have open-sourced along with our trained models, datasets, and configurations for all re-implemented methods. In the OpenTAD codebase, each component is designed as an independent module, allowing it to be instantiated in different variants without affecting—or being affected by—other components. This modular design enables seamless integration of novel techniques into the framework while ensuring fair comparisons under a consistent setup.
+
+For clarity, we consistently adopt the following notations to represent the dimensions of video data throughout the OpenTAD pipeline. We use $H$ and $W$ for frame height and width, respectively, $T$ for sequence length, $D$ for the number of feature channels, $C$ for the number of action classes, $A$ for the number of predefined candidate actions per temporal location (referred to as \textit{anchors}), $N$ for the total number of predicted candidate actions (including \textit{proposals} and final predictions), and $K$ for the temporal length of each extracted proposal. The prime notation ($'$) is used to indicate a value change in a specific dimension.
+
+\subsection{Stage 0: Video Feature Extraction}\label{sec:stage0}
+
+The first computational block of the TAD pipeline encodes raw videos into snippet-level or frame-level features, which serve as generic video representations requiring further processing by subsequent TAD-specific components. Therefore, we designate this step as \textbf{Stage 0}. 
+
+\textbf{Backbone: $T\times H\times W\times3\rightarrow T'\times D$}. The backbone is responsible for feature extraction, encoding an input video sequence $\mathcal{V}$ into a sequence of feature vectors $\mathcal{F}$. It consists of multiple layers that perform spatio-temporal aggregation, such as 3D convolution (e.g., I3D~\cite{carreira2017quo}, SlowFast~\cite{slowfast}) or space-time attention (e.g., VideoSwin~\cite{vswin}, VideoMAE~\cite{tong2022videomae}). This backbone is typically pretrained on a large-scale dataset of short video clips, such as Kinetics~\cite{zisserman2017kinetics}, using classification tasks, self-supervised learning~\cite{tong2022videomae}, or vision-language pretraining~\cite{li2023unmasked}. 
+
+We identify two primary approaches for encoding video sequences using the backbone: (1) \textbf{snippet encoding.} A snippet refers to a short video clip consisting of a small number of frames. In this approach, the video sequence is divided into $T'$ snippets, typically with overlap, and each snippet is processed independently by the backbone to generate a feature vector, i.e., temporal aggregation occurs only within each snippet. Both the spatial and temporal dimensions are globally pooled in the output feature vector for each snippet. (2) \textbf{frame encoding}. In contrast, this approach processes the entire video sequence $\mathcal{V}$ as a single long clip, meaning that all frames are temporally-aware within the backbone. The spatial dimension is globally pooled, while the temporal dimension $T$ is preserved in the output feature vectors. Frame encoding offers greater computational and memory efficiency by reducing redundant computations across neighboring snippets, making it particularly suitable for end-to-end training (Sec.~\ref{sec:categorization}). On the other hand, snippet encoding processes each snippet independently, making it more appropriate for offline feature extraction in feature-based TAD settings. OpenTAD supports both approaches, ensuring flexibility for different experimental setups.
+
+\subsection{Stage 1: Temporal Aggregation and Initial Prediction}\label{sec:stage1}
+
+This stage consists of a neck component for temporal aggregation of video features and a dense head that directly predicts candidate actions. It corresponds to the first stage in two-stage methods (e.g., BMN~\cite{lin2019bmn}, GTAD~\cite{xu2020g}) and the sole stage in one-stage methods (e.g., ActionFormer~\cite{zhang2022actionformer}, TriDet~\cite{shi2023tridet}). Therefore, we designate this step as \textbf{Stage 1}.
+
+\textbf{Neck: $T'\times D\rightarrow T''\times D'$.} The neck performs temporal aggregation across the entire feature sequence $\mathcal{F}$. Compared to the backbone, it is more lightweight and can provide either single-scale~\cite{xu2020g, lin2019bmn} or multi-scale~\cite{zhao2021video, zhang2022actionformer} temporal features. The neck is a crucial component for TAD as it consists of temporal aggregation modules, such as 1D convolution~\cite{lin2018bsn, lin2019bmn}, graph networks~\cite{xu2020g}, temporal attention~\cite{zhang2022actionformer}, or state-space models (SSM)~\cite{chen2024video}, to capture complex temporal relations.
+In Sec.~\ref{sec:component_importance}, we analyze the importance of the neck and compare the effectiveness of different design choices.
+
+\textbf{Anchor Generation:} Anchors~\cite{redmon2016you} are predefined candidate action segments at each temporal location, allowing the model to predict offsets relative to these anchors instead of directly estimating action boundaries. This strategy simplifies training and improves localization accuracy. Anchors can be defined in different formats, such as fixed temporal segment sizes centered at each location~\cite{zhao2021video} or all possible start-end combinations~\cite{xu2020g}. 
+Recent one-stage methods have shifted towards an anchor-free approach, where the action start and end offset are directly predicted~\cite{zhao2021video,zhang2022actionformer}.
+
+\textbf{Dense Head: $T''\times D' \rightarrow T''\times \left(2A+CA+X\right)$.} The dense head is responsible for making predictions at each temporal location after the neck. In one-stage methods, these predictions are directly used for post-processing, whereas in two-stage methods, they serve as \textit{proposals} to be further refined in the next stage. We categorize the predicted outputs at each temporal location as follows: (1)~\textit{start/end offsets:} $2A$, where $A$ represents the number of anchors at each temporal location. These offsets define the distances of ground truth actions relative to predefined anchors. (2)~\textit{confidence scores of each category:} $CA$, where $C$ denotes the number of action categories. In some cases, $C$ is set to 2 to represent the presence or absence of an action. (3) \textit{other auxiliary predictions,} which include probabilities of being inside an action segment or located on a start/end boundary~\cite{lin2018bsn, xu2020g}. These prediction branches are optimized using different loss functions, \textit{e.g.}, GIoU loss~\cite{rezatofighi2019generalized} for the start/end offsets regression~\cite{zhao2021video} and cross-entropy loss or focal loss~\cite{Lin2020FocalLF} for category prediction~\cite{zhang2022actionformer}.
+
+
+\subsection{Stage 2: RoI Extraction and Action Refinement}\label{sec:stage2}
+
+Given the predicted action candidates from stage 1, i.e., proposals, this stage further refines their boundaries and confidence scores to yield higher-quality action predictions. To achieve this, two key components are required: RoI extraction and the proposal head. This stage is unique to two-stage methods~\cite{lin2019bmn,xu2020g} and is therefore designated as \textbf{Stage 2}.
+
+\textbf{RoI Extraction: $T''\times D' \rightarrow N\times K \times D'$.} Given the predicted action candidates, the corresponding proposal features are constructed through the region of interest (RoI) extraction module. Specifically, features within the proposal boundaries are extracted to generate $N$ proposal features, each with a temporal length of $K$ and a feature dimension of $D'$.
+Different RoI extraction methods process features differently. For example, RoI Align~\cite{chao2018rethinking} and SGAlign~\cite{xu2020g} utilize all features within the boundaries, whereas PBRNet~\cite{liu2020progressive} and VSGN~\cite{zhao2021video} extract only center and boundary features. Additionally, the boundary matching mechanism in BMN~\cite{lin2019bmn} can also be regarded as a matrix implementation of RoI alignment.
+
+\textbf{Proposal Head: $N\times K \times D' \rightarrow N\times (2 + C + X')$.} The proposal head processes each proposal feature to refine its boundaries and predict the action category~\cite{zhao2021video, lin2021learning}. Some methods also include additional predictions, such as completeness scores~\cite{lin2019bmn,xu2020g}. To further improve localization accuracy, multiple proposal heads can be stacked sequentially to form a cascade refinement~\cite{liu2020tsi}.
+When dealing with a large number of proposals, the computational complexity of the proposal head can significantly exceed that of the dense head. This is one of the primary reasons why one-stage methods are preferred in scenarios where efficiency is a priority. Similar to the dense head, regression loss and classification loss are used to supervise boundary refinement and action classification, respectively, although different label assignment strategies are often employed.
+
+
+\subsection{Data Pre-processing and Post-processing}\label{sec:data_processing}
+
+Beyond the neural network components, pre-processing of video data and post-processing of proposal predictions play crucial roles in improving TAD performance.
+
+\textbf{Pre-processing:} Since the TAD task involves long video sequences with variable durations, each input video sequence must be mapped to a fixed length $T$ for batch processing during training. In OpenTAD, we support three temporal-scale mapping mechanisms to accommodate various methods: (1) Rescaling the entire video sequence to a fixed length of $T$ frames/features, e.g., via interpolation. This approach is often used in datasets such as ActivityNet~\cite{caba2015activitynet} and HACS~\cite{zhao2019hacs}, where action durations vary significantly and may span almost the entire video. (2) Randomly extracting a continuous video segment of $T$ frames from a long video. In this setting, a subset of frames is used for training in each epoch, as seen in ActionFormer on THUMOS dataset~\cite{zhang2022actionformer}. If the video sequence is shorter than $T$, zero-padding is applied to reach the required length. (3) Applying a sliding window to partition each video into multiple segments, resulting in multiple training samples from a single video per epoch~\cite{lin2019bmn,xu2020g}.
+
+\textbf{Post-processing:} Once action predictions are generated from either the dense head or the proposal head—typically numbering in the thousands—redundant proposals must be reduced. To achieve this, techniques such as non-maximum suppression (NMS) or Soft-NMS~\cite{softNMS} are commonly employed. If a video has been partitioned into multiple segments using a sliding window during pre-processing, all predictions from these segments are first aggregated before applying NMS or Soft-NMS.
+
+
+\subsection{TAD Methods and Datasets Unified in OpenTAD }\label{sec:categorization}
+
+As a unified framework, OpenTAD supports a wide range of deep learning-based TAD methods. We have modularized and re-implemented \textbf{16 TAD methods} under the OpenTAD framework and provide a detailed mapping of how each method instantiates OpenTAD components in Tab.~\ref{tab:mapping_to_opentad} in the supplementary material. Additionally, we compare our re-implementation performance to the original reported results for all methods in Tab.~\ref{tab:re-implementation_results}, and present benchmarking results on two datasets in Tab.~\ref{tab:benchmark_anet} and Tab.~\ref{tab:benchmark_thumos}, also in the supplementary material.
+
+These methods belong to various categories, each contributing to different components, as detailed in Table~\ref{tab:supported_methods}. We categorize a TAD method as \textbf{end-to-end} if it jointly trains the backbone alongside the other network components, \textit{e.g.}, AFSD~\cite{lin2021learning}, Re$^2$TAL~\cite{zhao2023re2tal}, and AdaTAD~\cite{liu2024adatad}. Conversely, we classify a method as \textit{feature-based} if it utilizes a pretrained and frozen backbone during training, \textit{e.g.}, BMN~\cite{lin2019bmn} and ActionFormer~\cite{zhang2022actionformer}. Feature-based methods are further divided into \textit{one-stage} or \textit{two-stage}, depending on whether they incorporate Stage 2 components. Additionally, we classify methods as \textit{DETR-based} if they adopt the encoder-decoder architecture of DETR to directly learn action queries (e.g., TadTR~\cite{liu2022end}).
+In Column 4 of Table~\ref{tab:supported_methods}, we indicate the OpenTAD component corresponding to each paper’s primary contribution, while in Column 5, we describe the claimed innovations related to that component.
+
+\begin{table}[t]
+\centering
+\caption{\textbf{Example TAD methods unified in OpenTAD with their main contribution.} \textbf{Column 4}: the OpenTAD component
+corresponding to each paper’s primary contribution.  \textbf{Column 5}: the claimed innovations related to the target component.}
+\small
+\setlength{\tabcolsep}{6.5pt}
+\begin{Tabular}{@{}lllll@{}}
+\toprule
+\textbf{Category}    & \textbf{Method}           & \textbf{Publication} & \textbf{Target} & \textbf{Innovation}   \\
+\midrule
+\multicolumn{5}{c}{\textbf{Feature-based Approaches}} \\
+\addlinespace[2pt]
+\hdashline
+\addlinespace[4pt]
+\multirow{6}{*}{\makecell[l]{ One-stage}}   & ActionFormer~\cite{zhang2022actionformer}     & ECCV 22   & Neck          &   Transformer                 \\
+            & TriDet~\cite{shi2023tridet}           & CVPR 23   & Neck; Head          &   SGP; Trident Head                 \\
+            & TemporalMaxer~\cite{tang2023temporalmaxer}    & ArXiv 23    & Neck         &     MaxPooling               \\
+            & VideoMambaSuite~\cite{chen2024video}  & ArXiv 24    & Neck          &     Mamba               \\
+            & DyFADet~\cite{yang2024dyfadet}  & ECCV 24    & Neck; Head          &     Dynamic Feature Aggregation               \\
+            & CausalTAD~\cite{liu2024harnessing}  & ArXiv 24    & Neck          &     Causal Modeling               \\
+
+\addlinespace[2pt]
+\hdashline
+\addlinespace[4pt]
+\multirow{4}{*}{\makecell[l]{ Two-stage}}   & BMN~\cite{lin2019bmn}              & ICCV 19   & RoI          & Boundary Matching Mechanism               \\
+            & GTAD~\cite{xu2020g}             & CVPR 20   & Neck           & Graph Convolutional Network \\
+            & TSI~\cite{liu2020tsi}              & ACCV 20   & Loss           & Scale-Invariant Loss            \\
+            & VSGN~\cite{zhao2021video}             & ICCV 21   & Neck        & Pyramid Cross-Scale Graph Network           \\
+\addlinespace[2pt]
+\hdashline
+\addlinespace[4pt]
+DETR  & TadTR~\cite{liu2022end}           & TIP 22    & Architecture          &  DETR + RoI Extraction                  \\
+\midrule
+\multicolumn{5}{c}{\textbf{End-to-End Approaches}} \\
+\addlinespace[2pt]
+\hdashline
+\addlinespace[4pt]
+Two-stage & AFSD~\cite{lin2021learning}             & CVPR 21   & RoI           &   Boundary Pooling                 \\
+DETR      & E2E-TAD~\cite{liu2022empirical}           & CVPR 22   & Training           &  Empirical Study                  \\
+Two-stage    & ETAD~\cite{liu2022etad}             & CVPRW 23  & Training           & Sequentialized Gradient Sampling                   \\
+One | Two & Re$^2$TAL~\cite{zhao2023re2tal}           & CVPR 23   & Backbone           & Reversible Finetuning           \\
+One-stage & AdaTAD~\cite{liu2024adatad}           & CVPR 24   & Backbone          & Adapter Tuning           \\
+\bottomrule
+\end{Tabular}
+\label{tab:supported_methods}
+\end{table}
+
+OpenTAD supports \textbf{9 TAD datasets}, including widely used benchmarks such as ActivityNet-v1.3~\cite{caba2015activitynet}, THUMOS-14~\cite{jiang2014thumos}, HACS~\cite{zhao2019hacs}, and EPIC-Kitchens 100~\cite{damen2018scaling}, as well as recently published datasets like Ego4D-Moment Query~\cite{grauman2022ego4d} and FineAction~\cite{liu2022fineaction}. Beyond these single-label detection datasets, OpenTAD also supports multi-label datasets such as Multi-THUMOS~\cite{yeung2018every} and Charades~\cite{sigurdsson2016hollywood}. Additionally, OpenTAD extends support to audio-based action detection with datasets such as EPIC-Sounds~\cite{EPICSOUNDS2023}.
+Thanks to OpenTAD’s modular design, switching between datasets is straightforward, enabling seamless adaptation of prior methods to all 9 TAD datasets, even if they were originally not implemented for them. In Table~\ref{tab:results_all_datasets} in the supplementary material, we report the detection performance of ActionFormer under the OpenTAD framework across all these datasets. Our results not only achieve comparable or superior performance on previously reported datasets such as THUMOS-14 and EPIC-Kitchens, but also establish new state-of-the-art results on newer datasets like FineAction.

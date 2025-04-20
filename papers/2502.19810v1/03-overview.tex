@@ -1,0 +1,317 @@
+\section{Overview}
+\label{sec:overview}
+
+In this section, we use a few running examples to explain
+the core ideas behind \rarust{} that integrates AARA with Rust's
+borrow mechanisms.
+%
+\cref{sec:overview:Shared} shows how \rarust{} deals with \textbf{shared} borrows.
+%
+\cref{sec:overview:Mutable} shows how \rarust{} deals with \textbf{mutable} borrows.
+%
+\cref{sec:overview:Lattice} shows how \rarust{} deals with the aliasing problem.
+%
+Recall that we propose a lightweight design for \rarust{}, which assumes the programs already pass Rust's borrow checking so that \rarust{} works directly on \emph{well-borrowed} and \emph{well-typed} Rust programs.
+%
+Concretely, \rarust{} assumes that all borrows in the analyzed program have known lifetimes (the span they live) and satisfy the following properties:
+\begin{itemize}
+    \item multiple shared but no mutable borrows from the same piece of data are live at the same time; or
+    \item no shared but at most one mutable borrow from the same piece of data are live at the same time.
+\end{itemize}
+We will show how \rarust{} exploits those properties to carry out AARA for Rust programs.
+
+% With some running examples, we first informally present the core idea of our type inference system, which will be formally presented in other sections. Examples are for indicating critical problems to solve. Instead of showing only the solution we worked out, we will explain our design step by step, with some failed attempts, to clearly convey the reason why our system formulates as it is.
+
+% We organize subsections as follow: We first analyze shared borrows with sharing \ref{sec:overview:Shared} and then mutable borrows with prophecy \ref{sec:overview:Mutable}; we finally conclude the lattice algebra of resource types and discuss weak update and how it introduces inaccuracy \ref{sec:overview:Lattice}.
+
+\begin{figure}[t]
+\centering
+\footnotesize
+\hrule
+\begin{subfigure}[b]{0.52\textwidth}
+\begin{lstlisting}[language=Rust, style=colouredRust]
+fn iter_twice(l: &List) {
+  // l : &list(4)
+  iter(&*l); // share 4 as 2 + 2, &*l : &list(2)
+  // l : &list(2)
+  iter(&*l); // share 2 as 2 + 0, &*l : &list(2)
+  // l : &list(0)
+}
+\end{lstlisting}
+\caption{Shared Reborrowing}
+\label{fig:ex-sharing}
+\end{subfigure}
+%
+\begin{subfigure}[b]{0.46\textwidth}
+\begin{lstlisting}[language=Rust, style=colouredRust]
+fn update(l: &mut List) {
+  iter(&*l);
+  // l : &mut list(0)
+  *l = Cons(3, Box::new(Nil));
+  // l : &mut list(4)
+  iter(&*l); iter(&*l);
+}
+\end{lstlisting}
+\caption{Mutating A Mutable Borrow}
+\label{fig:ex-mut-borrow}
+\end{subfigure}
+%
+\hrule
+%
+\begin{subfigure}[b]{0.48\textwidth}
+\begin{lstlisting}[language=Rust, style=colouredRust]
+fn prophecy() {
+  let mut l = Cons(3, Box::new(Nil));
+  // l : list(p)
+  let x = &mut l;
+  // l : list(q),  x : &mut(list(p ), list(q))
+  update(x);    // x : &mut(list(p'), list(q))
+  /* drop(x) */ // p' >= q
+}
+\end{lstlisting}
+\caption{Creating \& Dropping A Mutable Borrow}
+\label{fig:ex-prophecy}
+\end{subfigure}
+%
+\begin{subfigure}[b]{0.51\textwidth}
+\begin{lstlisting}[language=Rust, style=colouredRust]
+fn weak(b: bool, l1: &mut List, l2: &mut List) {
+  let l = if b { 
+    &mut *l1 // : &mut(list(p1), list(q1))
+  } else { 
+    &mut *l2 // : &mut(list(p2), list(q2))
+  }; // : &mut(list(min(p1,p2)), list(max(q1,q2)))
+  update(l);
+}
+\end{lstlisting}
+\caption{Mutable Reborrowing \& Aliasing}
+\label{fig:ex-weak}
+\end{subfigure}
+\hrule
+\caption{Examples to Demonstrate How \rarust{} Works}
+\label{fig:running-examples}
+\end{figure}
+
+\subsection{Dealing with Shared Borrows via Shared Potentials}
+\label{sec:overview:Shared}
+
+In \cref{sec:overview:AARA}, we demonstrate the key concepts of AARA via
+the Rust program shown in \cref{fig:list-iteration}, which already features shared borrows.
+%
+However, this is not the end of the story: multiple shared borrows from the same memory location can exist simultaneously; for example, the function
+\verb|iter_twice| shown in \cref{fig:ex-sharing} uses the reborrowing mechanism
+to create two more shared borrows by \verb|&*l|.
+%
+If we still follow the methodology presented in \cref{sec:overview:AARA},
+suppose that the function parameter \verb|l| has type $\&\kwd{list}(\alpha)$,
+it would be unsound to type the two shared reborrows \verb|&*l| as $\&\kwd{list}(\alpha)$, because it would double the potentials stored in \verb|l|.
+
+% The story of \cref{fig:list-iteration} does not end, because we actually do not follow the intuition : simply typing the shared borrow $\&t$ with $\& T$ when $t$ is typed with type $T$. Remember that there could be many shared borrows for one variable.
+
+% \textbf{Sharing Operation:} 
+
+Fortunately, prior research on AARA has proposed a notion of \emph{sharing} to allow multiple uses of a variable in a linear or affine type system~\cite{AARA-Poly-Multivar,AARA-Poly}. 
+%
+This is because AARA for functional programs needs shared potentials to pass value by reference.
+%
+The idea is to replace a variable $x$ of resource-annotated type $T$
+with two fresh variables $x_1,x_2$ of types $T_1,T_2$, such that the potential function denoted by $T$ equals the sum of the potential functions denoted by $T_1,T_2$.
+%
+In RaRust, we reuse the sharing mechanism to handle shared borrows and prove it is sound with respect to the safe Rust semantics.
+% 
+In our setting, this indicates that we can replace a typing context
+$x : \kwd{list}(\alpha)$ with $x_1 : \kwd{list}(\alpha_1), x_2:\kwd{list}(\alpha_2)$ such that $\alpha = \alpha_1 + \alpha_2$.
+
+In \rarust{}, we adopt a more imperative design inspired by \emph{remainder contexts}~\cite{kn:Walker02,ICFP:KH21}.
+%
+We associate every program point with a typing context, and when a statement performs a shared (re)borrow, we split the potentials into two parts by splitting the resource-annotated type into two types as shown above: one becomes the type
+of the shared (re)borrow, and the other is put back into the remainder context, i.e., the typing context after the statement.
+%
+For example, in \cref{fig:ex-sharing}, suppose that the function parameter \verb|l| has type $\&\kwd{list}(4)$, the first function call to \verb|iter|
+performs a shared reborrow and we split the type $\&\kwd{list}(4)$ to $\&\kwd{list}(2)$ (for the function call) and $\&\kwd{list}(2)$ (for the remainder context).
+%
+The second function call also performs a shared reborrow, but this time the typing context indicates that \verb|l| has type $\&\kwd{list}(2)$, so we split it to $\&\kwd{list}(2)$ (for the function call) and $\&\kwd{list}(0)$.
+%
+Observing that the function \verb|iter| requires one unit of additional potentials, we derive the following signature for \verb|iter_twice|:
+\[
+\verb|iter_twice| : \kwd{fn}(\verb|l|:\&\kwd{list}(4)) \to () | 2 .
+\]
+
+% In original AARA, there exists the sharing operation for multiple usage of one variable, sharing $l:\kwd{list}(\alpha)$ as $l_1:\kwd{list}(\alpha_1)$ and $l_2:\kwd{list}(\alpha_2)$, with constraints $\alpha = \alpha_1+\alpha_2$ and that all potentials are non-negative, $\alpha_i\geq 0, i=1, 2$. In our calculus, we have a similar operation for shared borrows. When a shared borrow occurs, we will share a type as two parts, one for the borrow, another back to original, as is shown in the comment of Figure \ref{fig:ex-sharing}.
+
+It is worth noting that Rust's shared borrows are \emph{immutable}.
+However, \rarust{}'s analysis \emph{mutates} the resource-annotated types of shared borrows because shared borrows could consume resources when being accessed. 
+%
+This is safe unless the value of the borrow is mutated.
+%
+For example, a shared borrow \verb|l| points to a list of length 10 that carries 2 units of potentials per element; thus, the total potentials are 20 units.
+%
+We then create another shared borrow \verb|&*l| and split the potentials to let \verb|&*l| carry one unit of potentials per element.
+%
+Now suppose we mutate the value via the borrow \verb|l| to increment the list length by one.
+%
+The type of \verb|&*l| still indicates one unit of potentials per element, thus indicating 11 units of total potentials, but it only has 10 units.
+%
+To tackle the problem, \rarust{} exploits Rust's borrow mechanisms to render the reasoning sound:
+mutable borrows and shared borrows from the same memory location cannot exist simultaneously.
+%
+Thus, if a Rust program mutates the list via a mutable reference \verb|l|, then the previous shared borrow \verb|&*l| must have ended its lifetime. 
+
+% \textbf{Resource Characterization:}
+% Until now, our approach seems nearly the same as original AARA. We need to point out our insight that the sharing operation characterizes the shared borrows, in the prospect of resource analysis. In purely functional world, this insight is just abstract nonsense, whereas in Rust's land, it is precious due to the distinction between shared and mutable borrows, handled by borrow mechanism. 
+
+% \textbf{Updates on Shared Borrows:}
+% Also, our version of sharing is more imperative. We will update the resource typing context along the checking, making it more similar to symbolic execution. We therefore need to define not only reading but also writing towards typing context.  One interesting observation is that even shared borrow can mutate corresponding type, but only decrease its resource. It indicates that the borrow mechanism is too coarse to differentiate value mutation and resource mutation. Resource sensitive languages, especially those for smart contracts, expects a more precise type system.
+
+\subsection{Dealing with Mutable Borrows via Prophecy Potentials}
+\label{sec:overview:Mutable}
+
+It might seem straightforward to support mutable borrows in the approach sketched in \cref{sec:overview:Shared}.
+%
+For example, \cref{fig:ex-mut-borrow} implements a function \verb|update| that manipulates a mutable reference \verb|l|.
+%
+Suppose that the function parameter \verb|l| has type $\&\kwd{mut}~\kwd{list}(2)$.
+%
+For the first function call to \verb|iter| with a shared reborrow \verb|&*l|, we split the type to $\&\kwd{list}(2)$ and $\&\kwd{mut}~\kwd{list}(0)$.
+%
+The next assignment statement mutates the list stored in the location referenced by \verb|l|, so we mutate its type in the typing context accordingly.
+%
+To obtain enough potential for the remaining two function calls to \verb|iter|, we set the type of \verb|l| to $\&\kwd{mut}~\kwd{list}(4)$.
+%
+Because the new list \verb|*l| is a singleton list, the mutation itself consumes 4 units of potentials.
+%
+Similarly to the reasoning in \cref{sec:overview:Shared}, the potential is sufficient to perform the remaining two function calls, and the final remainder context is $\verb|l|: \&\kwd{mut}~\kwd{list}(0)$.
+%
+Noting that three calls to \verb|iter| need three units of additional potentials, we derive the following signature for \verb|update|:
+\[
+\verb|update|: \kwd{fn}(\verb|l|:\&\kwd{mut}~\kwd{list}(2)) \to () | 7 .
+\]
+
+A tricky issue arises when one considers creating and dropping mutable borrows.
+%
+\cref{fig:ex-prophecy} shows an example where the program creates a mutable borrow \verb|x| from a mutable list \verb|l|.
+%
+Note that it is no longer sound to split the potentials of \verb|l| into two parts and store one part in \verb|x|: the reason is stated already at the end of \cref{sec:overview:Shared}; that is, the program can later mutate the list \verb|l| through the mutable reference \verb|x|, making the remainder type of \verb|l| unsound.
+%
+Fortunately, Rust's borrow mechanisms ensure a good property that
+at most, one mutable borrow from the same memory location can be live simultaneously, so in principle, it would be possible to track the change in the type of the mutable borrow \verb|x| and pass the change back to \verb|l| when \verb|x| gets dropped.
+%
+It is worth noting that our type system is aware of when a borrow $x$ gets dropped via an explicit statement $\kwd{drop}~ x$, which is generated according to lifetime constraints given by the Rust compiler.
+
+% \textbf{Mutation might increase resource.}
+% We start by comparing shared borrows with mutable borrows. According to borrow properties, when lifetime of shared borrows does not end, the value is immutable and the resource can only monotonically decrease(non strict). But if mutable borrow exists, the resource can increase at need. Figure \ref{fig:ex-mut-borrow} presents such an example. Before assignment, the mutable borrow has $0$ resource and the value is to remove, while after it, the borrow should have at least $4$ per \lstinline|Cons| to pay for two iterations. Note that the value, or specifically the length, of the list has changed, therefore the example is different from just iterating 3 times.
+
+% \textbf{Mutable borrow is the true borrow to restore.}
+% Because the mutable borrow might increase resource, i.e. $\alpha - \alpha_2 < 0$, the sharing technique $\alpha = \alpha_1 + \alpha_2$ with $\alpha_1 \geq 0$ mentioned in the previous subsection is no longer applicable.  The mutable borrow should take away the resource from original place, and give back when it drops. Mutable borrow is the true borrow because it really borrow the resource instead of sharing a part, and will finally restore. This is the main difference between mutable borrows and shared borrows from the aspect of resource analysis. 
+
+% \textbf{To attempt to mutably borrow with places is doomed to fail.} 
+
+% Mutable borrow needs to restore its resource when it drops. 
+
+One idea might emerge immediately that the resource-annotated type of a mutable borrow keeps the location where it borrows from, as $\verb|l|:\&\kwd{mut}(\kwd{list}(\alpha), \verb|p|)$ with \verb|p| be the location such that \lstinline|l = &mut p|.
+%
+However, this design essentially embeds a pointer analysis in the type system, and one would soon find out that every mutable reference type needs to record a \emph{set} of possible locations.
+%
+\cref{fig:ex-weak} exemplifies this case and we will revisit this example in \cref{sec:overview:Lattice}.
+%
+Because those locations are usually local variables, it becomes unclear how to carry out inter-procedural analysis in a compositional way, and we certainly do not want function signatures to reveal local variables.
+
+% It is a bad design because the mutable borrow type disastrously depends to places, or said term variables. The dependent type will definitely increase the complexity of analysis. We just enumerate some simple but non-trivial problems. 
+% \begin{enumerate}
+%     \item {\textbf{Parameters:}
+%     When the mutable borrow types appear as types of functions' formal parameters, the interpretation of places is confusing, and like a placeholder. When analyzing recursive functions, it is hard to assume a set of places as signatures. And such a analysis will soon degenerate to point-to analysis and may diverge.
+%     }
+%     \item {\textbf{Subtyping:} 
+%     Recall that AARA approach needs a resource subtyping relation. There exists research\cite{CapTypes} on subtyping over resource dependent types, while it is complex. 
+%     }
+%     \item{\textbf{Identification:}
+%     Places are usually local variables. When analyzing inter-procedural, it will be a big problem to identify whether two places are the same.
+%     }
+% \end{enumerate}
+
+Such an issue is not uncommon in the studies of advanced type systems or verification frameworks for Rust.
+%
+\citet{ProphecyInSepLogic} adapt \emph{prophecy variables}---which were originally proposed by \citet{LICS:AL88} to talk about future's program states during reasoning---to integrate separation logic with prophecies.
+%
+RustHorn~\cite{RustHorn} and RefinedRust~\cite{RefinedRust} also use prophecy variables in their verification frameworks.
+%
+The high-level idea of using prophecy variables to analyze Rust's mutable borrows is to record additional information which corresponds to the final value of a reference, i.e., the value when the reference gets dropped. 
+%
+However, prophecy variables usually record the final values, which are too heavy for AARA.
+
+In \rarust{}, we propose \emph{prophecy potentials}, a novel adaption of prophecy variables to the AARA methodology to reason about the future's potential functions.
+%
+\cref{fig:ex-prophecy} shows how prophecy potentials work with mutable borrows.
+%
+We now represent the type of mutable reference as $\&\kwd{mut}(\tau_1,\tau_2)$, where $\tau_1$ denotes the current potential function and $\tau_2$ denotes the prophecy potential function, i.e., the expected potential function when the lifetime of the reference ends.
+%
+In \cref{fig:ex-prophecy}, suppose that the initial type of \verb|l| is $\kwd{list}(p)$ with some $p \ge 0$.
+%
+To create a mutable borrow \verb|x| from \verb|l|, we generate a prophecy type $\kwd{list}(q)$ with some $q \ge 0$, which indicates the final resource-annotated type of \verb|x| when \verb|x| gets dropped.
+%
+The mutable reference type of \verb|x| is initialized to $\&\kwd{mut}(\kwd{list}(p), \kwd{list}(q))$.
+%
+After the call to the function \verb|update|, the type of \verb|x| becomes $\&\kwd{mut}(\kwd{list}(p'), \kwd{list}(q))$.
+%
+Note that the prophecy type should remain unchanged.
+%
+When the mutable reference \verb|x| drops, \rarust{} emits a constraint that the potentials indicated by $\kwd{list}(p')$ are no less than the potentials indicated by the prophecy type $\kwd{list}(q)$, i.e., $p' \ge q$.
+%
+If \verb|l| would later be used again, we can start from the type $\kwd{list}(q)$.
+%
+In this way,
+prophecy potentials enable \emph{compositional} reasoning about mutable borrows.
+
+% \textbf{Prophecy variables characterize restoring.} 
+% Among problems listed above, identification might be the most pathological, yet shedding light on global demands. We need a global staff to indicate where the borrows come from. Note that AARA utilizes linear programming, which contains lots of linear variables global to the analyzed program. Just as it is used to indicate future values in research \cite{RustHorn} in program verification, prophecy variables can be used to indicate the resource when the mutable borrow drops and restore. In such a meaning, we say that prophecy variables characterize the prophetic restoring at the time when the borrow occurs. 
+
+% \textbf{Restoring captured as linear constraints.}
+% Figure \ref{fig:ex-prophecy} shows how prophecy variables are correlated with places. When the mutable borrow occurs, resource type in the original place $l$ will be replaced with prophecy type $\kwd{list}(p)$, and mutable borrow takes away original type $\kwd{list}(q)$; when the borrow drops, type checker will generate linear constraints from subtyping relation $\kwd{list}(p) \preceq \kwd{list}(q')$, to ensure the prophetic is bound by the final resource $\kwd{list}(q')$. We explicitly point out that the restoring is captured as linear constraints, fully utilized by linear programming solvers.
+
+% \textbf{Higher order borrows can be characterized by subtyping over mutable borrow types.}
+% It is obviously that prophecy types are contravariant for subtyping, i.e.$\&^\kwd{m}(\tau_{\text{c}, 1}, \tau_{\text{p}, 1}) \preceq \&^\kwd{m}(\tau_{\text{c}, 2}, \tau_{\text{p}, 2})$ if and only if $\tau_{\text{c}, 1} \preceq \tau_{\text{c}, 2}, \tau_{\text{p}, 2} \preceq \tau_{\text{p}, 1}$. With subtyping over mutable borrow types, borrows of borrows, or said higher order borrows can be easily characterized by prophetic version of mutable borrow types. 
+
+\subsection{Dealing with Aliasing via A Lattice of Resource-Annotated Types}
+\label{sec:overview:Lattice}
+
+A type system sometimes cannot precisely determine where a mutable reference is borrowed from.
+%
+For example, \cref{fig:ex-weak} uses a conditional expression to assign a mutable reference \verb|l| to a mutable reborrow from either \verb|l1| or \verb|l2|, depending on the runtime value of the Boolean-valued variable \verb|b|.
+%
+As the example shows, although Rust's borrow mechanisms enjoy some good properties that aid our design of \rarust{}, we still face the problem of \emph{aliasing}, as other static analyses of heap-manipulating programs would also face.
+
+In our work, we can still exploit Rust's borrow mechanisms, which ensure that aliasing and mutation cannot happen at the same time.
+%
+Therefore, we only need to consider \emph{control-flow aliasing}; that is,
+when the control-flow paths merge at a program point, we need to \emph{merge} the types---including the mutable reference types---of a variable from different paths.
+%
+The merging here needs to be conservative, similarly to the \emph{weak updates} usually seen in pointer analyses.
+%
+In \rarust{}, we formulate a subtyping relation among resource-annotated types to formalize the notion of ``conservative'' and then construct a \emph{lattice} of resource-annotated types based on subtyping to carry out merging.
+%
+For example, in \cref{fig:ex-weak}, suppose that the mutable reborrows \verb|&mut *l1| has type $\&\kwd{mut}(\kwd{list}(p_1),\kwd{list}(q_1))$ and \verb|&mut *l2| has type $\&\kwd{mut}(\kwd{list}(p_2),\kwd{list}(q_2))$.
+%
+Recall that $\kwd{list}(q_1)$ and $\kwd{list}(q_2)$ are prophecy types.
+%
+To obtain the type of the mutable reference \verb|l|, we need to merge the two types above.
+%
+Thinking about the merging conservatively, one can derive that
+\verb|l| can hold potentials no more than the potentials indicated by
+$\kwd{list}(p_1)$ and $\kwd{list}(p_2)$, so \verb|l|'s current potential type is
+at most $\kwd{list}(\min(p_1,p_2))$.
+%
+Meanwhile, to ensure that the prophecies are sound no matter which branch is executed, \verb|l|'s prophecy potential type should be at least $\kwd{list}(\max(q_1,q_2))$.
+%
+In addition, because the type system cannot know which of \verb|l1| and \verb|l2| would be mutated later or which of them would remain unchanged, \rarust{} enforces that $p_1 \ge q_1$ and $p_2 \ge q_2$.
+
+As illustrated above, \rarust{}'s current mechanism of handling aliasing compromises the precision of the resource analysis, mostly due to weak updates.
+%
+On the one hand, such precision loss is unavoidable---at least for \cref{fig:ex-weak}---due to insufficient information about runtime values during type checking.
+%
+On the other hand, recent work such as Flux~\cite{Flux} introduces \emph{strong references} to perform strong updates, and it is interesting future research to adapt them in \rarust{}.
+
+% \textbf{Merging of Typing Context:} 
+% Recall that resource typing context will be updated during type checking, for shared borrows, also for mutable borrows. Together with branching statements, it brings a new problem that after branching there would be more than one typing contexts to merge as one. With the help of resource subtyping, exactly the lattice algebra of resource types, we can use meet operation in algebra to merge contexts. 
+
+% \textbf{Weak Update:} 
+% Branching statements will introduce weak mutable borrows, those pointing to multiple possible places. Actually, it is also one reason why we give up mutable borrow with places. The updates on weak borrows are what called weak updates in literates of program verification. It is dangerous to update all possible places, because it might generate resource from the vacuum. As the example in Figure \ref{fig:ex-weak}, when updating $l$ increasingly, it is definitely wrong to increase resource at both $l1$ and $l2$, because in runtime, there always only one place to increase. To ensure soundness, our choice is to force non-increasing when merge mutable borrows, therefore additional non-increasing constraints introducing inaccuracy into our sound analysis. Besides, in presence of nondeterministic boolean values, or said static unknown values, weak updates and inaccuracy are unavoidable, in the sense of analysis. The inaccuracy of our sound analysis are mainly introduced by weak updates.

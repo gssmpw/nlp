@@ -1,0 +1,159 @@
+\section{Anthemius}
+\label{sec:overview}
+
+The primary objective of \sys is to redesign the block-assembly approach in blockchains that offer parallel execution to improve the overall system throughput and prevent popular applications from creating bottlenecks by factoring in transaction dependencies and execution time.
+
+At the time of writing, most blockchains that support parallel transaction execution use a single parameter such as the computational complexity in gas, the raw block size in bytes, or the number of transactions to limit the block size~\cite{aptos,sui,solana}. However, in the context of parallel transaction execution, a single parameter does not reflect the execution complexity of a block. If all transactions in the block access the same resource, the execution time is the sum of the runtime of all transactions. In contrast, if none of the transactions access conflicting resources, the runtime depends on the number of cores.
+
+%For example, if the maximum block size is chosen in relation to the number of transactions or raw transaction size, a block that contains too many computationally heavy transactions could result in an unreasonably long execution time and slow down the system significantly.
+
+%However, user estimates on execution time cannot be trusted because they tend to purposefully overestimate the execution cost to guarantee that their transaction will be executed and, as such, taking this as a basis would result in a strong performance degradation. In a preliminary analysis we identified that clients on the Aptos network estimate an on average 25 times higher gas cost, compared to Ethereum or Polygon with around 2 times the gas cost, which would cut the potential throughput by the same factor.
+%While it is theoretically possible to create incentives for clients to estimate the gas cost more accurately, this degrades the user experience significantly as this could increase abort rates.
+
+%However, even given accurate transaction run-time predictions, there is another problem. While in Ethereum transactions are executed sequentially and, as such, the sum of the accurate run-time predictions of the transactions also perfectly mirrors the actual execution time of the block, the moment we introduce parallel transaction execution, the total run-time heavily depends on how transactions are scheduled and their interdependencies. If all transactions in a given block depend on each other, the best-case total execution time is equal to serial execution. However, in the worst case, if executors are unaware of transaction dependencies, concurrent accesses have to be detected and transactions have to be re-executed to avoid diverging states, resulting in worse than serial execution time~\cite{blockstm}.
+
+%As such, a single heavily sequential application can bottleneck the entire system. This can happen due to bad engineering practices when designing the smart contract, but may also be a result of malicious design.
+
+Therefore, as a first step to begin constructing ``Good Blocks'', we need parameters that allow us to quantify this. We deploy two parameters to address this. First a transaction complexity parameter in Gas, similar to Ethereum, and second a concurrency parameter $c$ describing the system's ability to execute transactions in parallel (i.e. number of cores). As a result, the total maximum capacity of each block is $c * Gas$.
+
+In the next sections, we first discuss where \sys fits into existing blockchain architectures. Following that, we outline the design of the block construction algorithm that considers both parameters and constructs blocks sensitive to transaction dependencies and their execution time to speed up the parallel execution of the block.
+
+\subsection{Architecture}
+
+\begin{figure}
+\begin{center}
+	\includegraphics[width=1\columnwidth]{figures/architecture.pdf}
+\end{center}
+\caption{\sys is inserted between the Mempool and Consensus}
+\label{fig:architecture}
+\end{figure}
+
+Figure~\ref{fig:architecture} shows where \sys fits into the existing protocol stack of a blockchain. \sys is a modular layer that can be inserted between the consensus layer and the mempool where client transactions are stored and handled. 
+In \sys, instead of fetching transactions directly from the mempool, the consensus layer fetches blocks of transactions through \sys. In turn, \sys obtains its transactions from the mempool, divides transactions into batches, and constructs the block to return to consensus.
+Following that, the block is proposed in consensus which outputs an ordered list of blocks to the execution engine.
+
+\sys requires the read and write sets of transactions, as well as an estimation of their execution time, to assess dependencies between transactions and construct blocks that can be executed efficiently in parallel. This information is already available in blockchains such as Solana~\cite{solana} and Sui~\cite{sui}, where transactions must declare all resource addresses they access during execution. In other blockchains, such as Ethereum~\cite{ethereum}, this information can be obtained, for example, by executing the transactions.
+
+This design allows \sys to be seamlessly integrated into any existing blockchain stack with minimal architectural and system changes, and without changing the block structure. Furthermore, since \sys operates solely on the set of transactions, their read and write sets, and their gas footprints, it remains essentially stateless. This makes \sys particularly suitable for deployment in modular architectures, such as Narwhal, where only the execution layer is stateful~\cite{narwahl}.  
+
+\subsection{Block Construction}
+
+An important problem that has to be tackled when constructing good blocks is the absence of information regarding the structure of the current workload. If all transactions in the mempool access the same resources, attempting to schedule them efficiently can further slow down an already bottlenecked system. Similarly, if the algorithm is too strict in situations where a large percentage of transactions access the same resources, the synergetic effects of executing larger batches of transactions are lost. This is the case, as, for each block, the system has to instantiate the executor and worker threads, set up the virtual machine, extract the execution results, etc.
+
+Therefore, as a first step, we divide \sys into two modular elements. First, the \textit{batch handler}, which polls batches of transactions from the mempool and hands the batches to the \textit{batch scheduler} in a batch-by-batch fashion. Second, the \textit{batch scheduler}, that attempts to include a given batch into the current block and provides feedback to the \textit{batch handler} about the success rate.
+Subsequently, based on the feedback, the batch handler can adjust the inclusion policy to prevent too small blocks and also avoid wasting scheduling time on difficult-to-schedule workloads.
+
+\paragraph{Batch handler.}
+
+\begin{algorithm}[t]
+
+\centering
+\caption{\textsl{Batch Handler}}
+\label{algo:batchhandler}
+\begin{algorithmic}[1]
+
+\Procedure{CreateGoodBlock}{$block, maxgas, c$}
+\State{$seqlimit = \frac{maxgas}{c}$} \Comment{Limit on the sequential path}
+\State{$resmap \gets \emptyset$} \Comment{Map to track transaction dependencies}
+\State{$skippedclients \gets \emptyset$} \Comment{Set to track clients with skipped transactions}
+\State{$numrelax \gets 0$} \Comment{Number of times inclusion rate was relaxed}
+\For{\textbf{all} $\textit{batch} \in mempool$}
+\State{$incrate \gets$ \textsc{schedule($block, batch, seqlimit, c, resmap, skippedclients$)}} \label{algo:batchhandler:schedule}
+\If{$incrate < \textsc{targetincrate} $}
+\If{$numrelax \geq \textsc{maxrelaxnum} \lor (incrate = 0 \land batch.isfull)$} \label{algo:batchhandler:check}
+\State{\textbf{return}}
+\EndIf
+\State{$seqlimit = \frac{maxgas}{c} * \textsc{min}(\textsc{maxrelaxrate}, incrate*\textsc{targetincrate})$} \label{algo:batchhandler:relax}
+\State{$numrelax++$}
+\EndIf
+\EndFor
+
+\EndProcedure
+\end{algorithmic}
+\end{algorithm}
+
+The functionality of the Batch Handler is outlined in Algorithm~\ref{algo:batchhandler}. The batch handler receives a $block$ to fill, the global concurrency parameter $c$, and the maximum gas limit. It then calculates a limit on the sequential path $seqlimit$ and initiates a map to track the transaction dependencies $resmap$ as well as a set of clients with skipped transactions $skippedclients$. 
+
+Next, the batch handler retrieves transaction batches from the mempool and hands them to the batch scheduler alongside the block, the limit on the gas, the number of cores, the transaction resource dependencies $resmap$, and $skippedclients$ set in Line~\ref{algo:batchhandler:schedule}.
+The batch scheduler responds with the transaction inclusion rate $incrate$.
+
+Depending on the workload, as mentioned, the $seqlimit$ may be very strict which can result in very few transactions being included in a block.
+Therefore, if the inclusion rate $incrate$ is smaller than some $\textsc{targetincrate}$, we relax the gas limit relative to the inclusion rate, up to some \textsc{maxrelaxrate} (Line~\ref{algo:batchhandler:relax}).
+
+However, if the inclusion rate was too small for several consecutive attempts (i.e. $numrelax \geq \textsc{maxrelaxnum}$), we exit scheduling to avoid building a heavily sequential block again.
+Furthermore, if there was an attempt to schedule a full batch and no transaction of this batch was successfully included in the current block ($incrate = 0$) we also stop scheduling (Line~\ref{algo:batchhandler:check}) as this indicates that at this point transactions are only included at a high cost to execution performance and scheduling latency. The rest of the transactions are then only included in a later block.%(i.e. marginal scheduling time increases with each added transaction significantly).
+
+%\lef{what happenst to these transactions? I am guessing the skipped eventually forces them to be included?}
+
+\paragraph{Batch Scheduler.}
+
+Scheduling transactions with interdependencies and varying runtimes is a known NP-complete problem~\cite{BAKER1996225} where approximate solutions can construct near optimal schedules in polynomial time. However, polynomial runtime, particularly when executed on the critical path of consensus, may lead to a construction time that outweighs the performance gains achieved from producing ''Good Blocks.''
+
+Fortunately, our first insight is that a near-optimal schedule for block construction is unnecessary. Instead, our main objective is to prevent popular resources and applications from creating a bottleneck while maximizing the parallel execution. We can achieve this by iterating over the set of resources each transaction accesses, recording the cost of the sequential path leading up to the transaction, and deciding if the transaction should be included in the current block by comparing the cost of the path with the gas per core parameter.
+Furthermore, we also want to delay transactions that access multiple hot resources as they make it harder to schedule subsequent transactions.
+
+As a result, the complexity of the block construction is of $O(N*k)$ where $N$ is the number of transactions and $k$ is the average number of resource accesses per transaction.
+
+\begin{algorithm}[t]
+
+\centering
+
+\caption{\textsl{Batch Scheduler - Called in Line~\ref{algo:batchhandler:schedule} of Algorithm~\ref{algo:batchhandler}}}
+\label{algo:batchscheduler}
+\begin{algorithmic}[1]
+
+\Procedure{schedule}{$block, batch, seqlimit, c, resmap, skippedclients$}
+\For{\textbf{all} $\textit{tx} \in batch$} \Comment{Iterate over transactions} \label{algo:batchscheduler:iterate}
+     \If{$tx.sender$ \textbf{in} $skippedclients$}
+            \State{\textbf{continue}} \Comment{Skip transaction inclusion} \label{algo:batchscheduler:skipuser}
+    \EndIf
+    \State{$chaincost \gets 0$} \Comment{Longest chain length}
+    \State{$hotresources \gets 0$}
+    \For{\textbf{all} $\textit{readres} \in tx.readset$} \Comment{Iterate over readset} \label{algo:batchscheduler:readloop}
+        \If{$readres \in resmap$} \Comment{Find longest chain}
+            \If{$resmap[readres] > chaincost$} \Comment{Find read with largest cost}
+                \State{$chaincost \gets resmap[readres]$}
+            \EndIf
+            \If{$resmap[readres] > \frac{block.gas}{c}$} \Comment{Check if read exceeds limit}
+                \State{$hotresources++$} \label{algo:batchscheduler:hotread}
+            \EndIf
+        \EndIf
+    \EndFor
+    \If{$hotresources \geq \textsc{maxhotr} \land (|block| > \textsc{lim} \lor |block| < \textsc{maxlen}-\textsc{lim})$}  \label{algo:batchscheduler:hotreadcheck}
+        \State{$skippedclients \gets skippedclients \cup tx.sender$}
+        \State{\textbf{continue}} \Comment{Skip transaction inclusion}
+    \EndIf
+    
+    \If{$chaincost + tx.gas > seqlimit \lor block.gas + tx.gas > seqlimit*c$}  \label{algo:batchscheduler:gascheck}
+            \State{$skippedclients \gets skippedclients \cup tx.sender$}
+            \State{\textbf{continue}} \Comment{Skip transaction inclusion}
+    \EndIf
+    \State{$block \gets block \cup tx$} \Comment{Add tx to Block}
+    \For{\textbf{all} $\textit{writeres} \in tx.writeset$} \Comment{Iterate over writeset}
+        \If{$writeres \notin resmap \lor resmap[writeres] < chaincost$}
+         \State{$resmap[writeres] \gets chaincost$} \Comment{Note new chain length}
+        \EndIf
+    \EndFor
+\EndFor
+\State{\textbf{return}$(\frac{numscheduled}{|batch|})$}
+\EndProcedure
+\end{algorithmic}
+\end{algorithm}
+
+
+Algorithm~\ref{algo:batchscheduler} shows how we achieve this. The algorithm starts with the call of the \textsc{schedule} method, which receives the block to include the transactions in, the batch of transactions to schedule, the maximum gas per core $seqlimit$, the concurrency parameter $c$, the map of resources and the skipped clients. Following that, it starts iterating over all transactions in the batch (line~\ref{algo:batchscheduler:iterate}).
+First, to maintain the order clients specified (e.g. through sequence numbers), after a client had a transaction skipped, the client is added to the $skippedclients$ set and no further transaction from this client will be included in this block.(Line~\ref{algo:batchscheduler:skipuser}).
+Following that, we iterate over all reads in the transaction read-set and attempt to calculate the read with the longest path in gas leading up to this transaction (Line~\ref{algo:batchscheduler:readloop}).
+In parallel, we count the number of \textit{hot} reads. A hot read is a read on a resource that is accessed significantly more often than other resources. 
+%We approximate this by checking if it has a longer path than the total gas in the block so far, divided by the number of cores.
+
+After this, we check whether the number of hot reads exceeds a predefined threshold, \textsc{maxhotr}. If this condition is met and the transaction is not within the first or last \textsc{lim}(i.e. 10\%) transactions, we skip the transaction (Line~\ref{algo:batchscheduler:hotreadcheck}).
+We delay transactions with too many hot reads as they unify several critical paths of transactions which can severely bottleneck the execution.
+However, we initially allow any transactions to be included up to some threshold \textsc{lim} to accumulate sufficient data to assess the complexity of reads and to guarantee that transactions that access several hot resources are eventually included. Furthermore, we also allow including transactions with multiple hot reads towards the end of the block as the block is almost full already and they are less likely to cause scheduling problems at this point.
+
+Following that, we check if the transaction cost itself is larger than the max gas per core $seqlimit$ or if the current transaction exceeds the total gas limit of the block. If so, we also skip the transaction (Line~\ref{algo:batchscheduler:gascheck}).
+
+Finally, we include the transaction in the block, iterate over its write set, and record the transaction path cost in the resource map $resmap$ if its writes increase the critical path.
+This results in an algorithm that is linear to the number of transactions per block, as the map accesses are $O(1)$ and we check each transaction at most once per block.
+
+

@@ -1,0 +1,94 @@
+\section{Methodology}
+\label{methods}
+
+In the following sections we elaborate on our method for reducing memory costs during inference time using \topk attention. Along the way, we more concretely define some minimal notation and terminology required to describe inference operations in transformer language models.
+
+\subsection{Inference With KV Caches}
+
+As stated previously, causal inference using trained transformer models is split into two steps: the prefill and decode stages. Assume we are given a---potentially very large---set of tokens $x$ of size $N$ that we would like to make many queries over.
+
+The query, key and value embeddings during prefill are of size $(N\times D)$, so this stage of inference incurs a maximum activation memory cost of $O(N^2)$ due to the size of the attention matrix. Memory saving attention methods like \cite{dao2022flashattentionfastmemoryefficientexact} can in practice reduce this to an $O(N)$ memory cost by tiling the attention computation. As the cache is being filled, it also grows in size and persistently costs $O(N)$ memory across the duration of the computation.
+
+In the decoding stage, we have a smaller query we would like to make over this context, as well as a pre-filled KV cache. Our queries comes in one token at a time, with decoding in a self-attention layer performed as follows:
+
+\begin{equation}\label{eqn:attn}
+    \text{Attention}(q,K,V) = \text{Softmax}\left(\frac{qK^{T}}{\sqrt{D}} \right)V
+\end{equation}
+
+Here $q \in \mathbb{R}^{1\times D}$ is the new query vector, $, K, V \in \mathbb{R}^{N\times D}$ are the KV cache for that layer, and $D$ is the hidden dimension. We refer to $S = qK^T \in \mathbb{R}^{1\times N}$ as the \emph{score} matrix, and the quantity $\text{Softmax}\left(\frac{S}{\sqrt{D}} \right)$ as the \emph{attention} matrix.
+
+When the incoming query $q$ is multiplied by all previous keys in the cache during decoding, the memory and compute cost incurred for the score matrix at this step is $O(N)$. This dependence on $N$ for the cost of GPU memory during inference can become prohibitive for large context lengths.
+
+%\begin{figure*}[h!]
+%    \centering
+%    \includegraphics[width=0.33\textwidth]{Figures/attn_diagram.pdf}
+%    \includegraphics[width=0.33\textwidth]{Figures/attn_diagram_topk.pdf}
+%    \includegraphics[width=0.29\textwidth, trim={0.0cm -4.0cm 0.0cm 1.8cm}, clip]{Figures/attn_diagram_topk_selection.png}
+%    \caption{Comparing dense causal self-attention vs \topk causal attention with $k=3$.}
+%    \label{fig:attn}
+%\end{figure*}
+
+\subsection{\Topk Attention: Accelerating Decoding}\label{sec:topk-attention}
+
+We cut down on the growing memory and compute costs by dynamically considering only the most relevant keys in the KV cache. To do this we perform a \texttt{k}-nearest neighbor search over the key vectors with the new query vector, returning only those value vectors corresponding to the \texttt{k}-largest score values.
+
+
+The core of our implementation is in \Cref{alg:gen_topk}. We assume we are given a prefilled KV cache that is on the CPU. This cache is a sequence $\{K_{\ell}, V_{\ell}\}_{\ell=1}^{L}$ of key and value activation tensors, one for each layer. 
+
+First we convert the key tensors across all layers in the KV cache into a nearest-neighbor search index. This index data structure can be as simple as a list (for exact nearest neighbors) or as sophisticated as a graph-based structure (for approximate nearest neighbors) as in \cite{10.1109/TPAMI.2018.2889473}. For multi-head attention, we construct a separate index for each key head at every layer. For each layer we store the indices in a list called $\texttt{K\_index}$.
+
+We embed each new token during decoding into $q, k, $ and $v$ on the GPU. We offload $q$ to the CPU and perform a nearest neighbor search to get the \topk score values of the query over the context:
+\[
+    \texttt{vals}, I = \texttt{knn\_search}\left(q, \texttt{K\_index}[\ell], \texttt{k}\right)
+\]
+Here \texttt{k} is the number of the largest score values we'd like use. The operation $\texttt{knn\_search}$ performs a \texttt{k}-nearest neighbor search of $q$ over the key vector index for layer $\ell$, $\texttt{K\_index}[\ell]$. Here the \texttt{k}-nearest neighbor search distance is measured using the dot product metric, mirroring the attention score mechanism. This search returns two items: \texttt{vals}, a vector of size $\texttt{k}$ containing the \topk score values, and $I$, a list of $\texttt{k}$ integers mapping the score values in $\texttt{vals}$ to their corresponding key vectors. Let $I = (i_1, \dots i_k)$. We collect the relevant keys selected by the nearest neighbor search by concatenating them as row vectors together, denoted as $V_{\ell}[I]$:
+\[
+    V_{\ell}[I] =
+    \begin{pmatrix}
+        \text{---} \hspace{-0.2cm} & V_{\ell}[i_1] & \hspace{-0.2cm} \text{---}\\
+        \text{---} \hspace{-0.2cm} & V_{\ell}[i_2] & \hspace{-0.2cm} \text{---}\\
+                                   & \vdots        &                           \\
+        \text{---} \hspace{-0.2cm} & V_{\ell}[i_k] & \hspace{-0.2cm} \text{---}\\
+    \end{pmatrix}
+    \in \mathbb{R}^{k\times D}
+\]
+
+After the model generates the first token using the context, the key and value embeddings of this token are left on the GPU directly. This splits the total KV cache into two parts: a large part on the CPU constructed from the given context, and a small part on the GPU constructed from previously generated tokens. Given a new query, the \texttt{k}-nearest neighbor search is only performed on the CPU cache; on the GPU, we compute the attention directly between this query and the keys from previous generated tokens. This process resembles windowed attention \citep{Beltagy2020Longformer}, where a window of recently generated tokens are stored directly on the GPU. These GPU window caches are labeled $\texttt{K\_gen}$ and $\texttt{V\_gen}$ in \Cref{alg:gen_topk}.
+
+The $V_{\ell}[I]$ and \texttt{vals} are then moved to the GPU. Using these, we perform the final attention computation, combining both the weighted values from the context as well as the value vectors from previously generated tokens. This method gives us a peak GPU memory cost of $O(k)$ GPU memory cost, as opposed to $O(N)$. We find that $k$ can be chosen to be a small fraction (around 1\% for most tasks) of $N$ while still recovering near-equivalent performance.
+
+% The memory savings this method allows for are highlighted in \Cref{fig:enter-label} \jwk{I can't figure out what result this is trying to reference, not just because it was ``enter-label''.}.
+\begin{algorithm}
+    \caption{\Topk KV Cache Decoding}\label{alg:gen_topk}
+    \begin{algorithmic}[1]
+        \REQUIRE KV-Cache $\{K_{\ell}, V_{\ell}\}_{\ell=1}^{L}$ where $K_{\ell}, V_{\ell} \in \mathbb{R}^{N \times D}$, token $x\in \mathbb{R}^{1\times D}$, $\texttt{k} \in \mathbb{N}$
+        \STATE $N_{gen} = 1$, $\texttt{K\_gen} = []$, $\texttt{V\_gen} = []$
+        \STATE \texttt{K\_index} = []
+        \FOR{$\ell \in \{1, \dots, L\}$}
+            \STATE $\texttt{K\_index}[\ell] \gets \texttt{build\_index}(K_{\ell})$
+        \ENDFOR 
+        \WHILE{$N_{gen} < N_{max}$}
+            \FOR{$\ell \in \{1, \dots, L\}$}
+                \STATE Pre-attention transformer layer computations...
+                \STATE $q = xW_{Q_{\ell}}$, $k = xW_{K_{\ell}}$, $v = xW_{V_{\ell}}$
+                \STATE $\texttt{K\_gen}[\ell] \gets \texttt{concat}(\texttt{K\_gen}[\ell], k)$  
+                \STATE $\texttt{V\_gen}[\ell] \gets \texttt{concat}(\texttt{V\_gen}[\ell], k)$ 
+                \STATE $\texttt{vals}, I \gets \texttt{knn\_search}(q, \texttt{K\_index}[\ell], \texttt{k})$ 
+                \STATE Move $V_{\ell}[I]$, \texttt{vals} to GPU
+                \STATE $\hat{x}\gets \texttt{Softmax}(\frac{1}{\sqrt{D}}\texttt{vals})V_{\ell}[I] $ 
+                \STATE $\hat{x}\gets \hat{x} + \texttt{Softmax}\left(\frac{1}{\sqrt{D}}q\cdot\texttt{K\_gen}[\ell]^T\right)$
+                \STATE Post-attention transformer layer computations...
+            \ENDFOR
+            \STATE $x \gets \texttt{sample\_new\_token}(\hat{x})$
+            \STATE $N_{gen} \gets N_{gen} + 1$
+        \ENDWHILE
+    \end{algorithmic}
+\end{algorithm}
+\subsection{Prefilling a KV Cache at the Million Token Scale}
+The prefill forward pass in the construction of a KV cache potentially requires incurring the full $O(N^{2})$ memory cost. However, there are multiple ways one could prefill a cache. 
+
+Given (relatively brief) access to large amounts of compute, one could parallelize over many GPUs and construct the cache using algorithms like Ring Attention \cite{liu2023ringattentionblockwisetransformers}. The larger up-front cost of the cache construction would then be amortized over the many queries that would be made over it on much cheaper hardware. Additionally, the attention could be approximated in the construction of the cache. Algorithms like windowed attention would allow for the construction of large caches with more modest compute as in \cite{child2019generatinglongsequencessparse}. For small enough $N$ (100's of thousands of tokens), and with a high-memory GPU, the vLLM library can quickly construct KV caches by performing a standard forward pass on the model using the paged attention algorithm \cite{kwon2023efficient}. Finally, for very large N, \topk attention could be employed at cache construction time as well. 
+
+For our largest experiments, we utilize Flash Attention and an H100 GPU to prefill the caches $N$=1M tokens of context. This allows us to generate exact prefilled KV caches with only small modifications to the network to accommodate the extreme memory requirements. The exact changes we made in order to prefill caches can be found in the Appendix and we employ a chunking strategy similar to \cite{guptaMemoryefficientTransformersTopk2021}. We note that our experiments mimic an important use case of our method, namely a user with a large amount of documents that has access to only a limited amount of compute. In this case, the user can rent the required compute on the cloud for prefill \emph{once}, then make as many queries as they want quickly with our method on their own hardware.
+
+

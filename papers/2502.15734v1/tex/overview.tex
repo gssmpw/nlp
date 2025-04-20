@@ -1,0 +1,450 @@
+\section{\sys Design}
+\label{sec:overview}
+
+At a high level, \sys enhances a RAG system by managing the KV-caches of knowledge chunks, as illustrated in Fig.\ref{fig:rag_overview}. We denote the \textit{Chunk-Cache} of a chunk $C$ that was originally computed from $H^L(C_1\!:\!C_i\!:\!C_kU)$, while serving a request $U$ at the $i^\text{th}$ position (i.e., $C_i=C$), as
+\begin{align}
+\small
+    \mathscr{C}\big(C \ |\ C_1\!:\!C_{i-1}\big) := \left\{\left(K_C^l, V_C^l\right)\ \middle| \ l\in [L]\right\}, 
+\end{align} 
+where $K_C^l$ and $V_C^l$ are the key and value vectors in $l^\text{th}$ layer corresponding to the tokens in $C$. 
+
+Apart from storing the $\mathscr{C}\big(C \ |\ C_1\!:\!C_{i-1}\big)$, We also store certain metadata to determine whether a particular of KV-cache $C$ can serve a new request $U'$ in future. \sys operates in two phases: online and offline. 
+The metadata computation is performed in the offline phase, and the determination of its ``usefulness'' is performed in the online phase, while serving a new request $U'$. 
+
+In its online phase, \sys first selects the most useful (w.r.t. $U'$) version of \textit{chunk-cache} of $C$ out of all the stored versions $\mathscr{C}(C | \cdots)$. 
+Then \sys selectively recomputes the key and value vectors for a few tokens of $C$ to contextualize w.r.t. $U'$. Clearly, if there are no \textit{chunk-caches} of $C$, then the key and value vectors for all tokens have to be computed afresh. Once the $K$ and $V$ matrices of $C$ are contextualized for $U'$, either by fixing a stored chunk or by computing afresh, \sys repeats this same online procedure for the chunk next to $C$ that is inline to serve $U'$.
+
+
+
+\subsection{Determining Cache Reusability} 
+\label{sec: cache_quality}
+
+From our analysis in Fig. \ref{fig:tasks_quality_eval_} and \ref{fig:tasks_quality_eval2}, we observe that reusability can be assessed by determining how much a chunk’s KV computation is influenced by external context (tokens outside the chunk) versus its own tokens. If a chunk is mainly influenced by its own tokens, it is more likely to produce high-quality answers when reused.
+
+
+In fact, a chunk with more tokens is more reusable because tokens closer to each other have stronger attention due to positional embeddings, compared to distant tokens from other chunks~\cite{su2024roformer}. 
+To capture the attention within and across the chunks, we define the following two attention-based metrics:
+
+\begin{enumerate}
+     \item 
+     \textbf{Inter attention} measures the cumulative attention weight from tokens in chunk $C_{i}$ to tokens in chunk $C_{j}$ where $i<j$:
+    \begin{align}\label{eq:inter}
+        inter(C_{i}, C_{j}) = \sum_{k \in C_{i}} \sum_{l \in C_{j}} a_{kl},
+    \end{align}
+    \hl{where $a_{kl}$ is the \textit{attention weight} from the $k^{th}$ token of chunk $i$ to the $l^{th}$ token of chunk $j$, computed from the softmax in \eqref{eq:attn}.}
+    
+    \item 
+    \textbf{Intra attention} measures the cumulative attention weight within chunk $C_{i}$ from each token to previous tokens in the same chunk:   
+    \begin{align}\label{eq:intra}
+    \small
+        intra(C_{i}) = \sum_{k,l\in C_{i}: k < l} a_{kl}.
+    \end{align}
+\end{enumerate}
+    
+   
+The attention weights involved in the $inter$ and $intra$ are used to obtain the output from the attention computation. For instance, in case of $3$ chunks \( [C1, C2, C3] \), the attention output is
+{\small
+\begin{align}
+\begin{bmatrix}
+\tilde{V}_{C_1} \\
+\tilde{V}_{C_2} \\
+\tilde{V}_{C_3}
+\end{bmatrix} =
+\begin{bmatrix}
+\small
+\overline{intra}(C_1) & \mathbf{0} & \mathbf{0} \\
+\overline{inter}(C_1, C_2) & \overline{intra}(C_2) & \mathbf{0} \\
+\overline{inter}(C_1, C_3) & \overline{inter}(C_2, C_3) & \overline{intra}(C_3)
+\end{bmatrix}
+\begin{bmatrix}
+V_{C_1} \\
+V_{C_2} \\
+V_{C_3}
+\end{bmatrix},
+\end{align}
+}
+where $\overline{intra}$ and $\overline{inter}$ represent the associated attention weights in \eqref{eq:inter} and \eqref{eq:intra} without summing them, \hl{$V_C$ represents the pre-attention value vectors of all tokens in chunk $C$, and $\tilde{V}_C$ represents the corresponding post-attention value vectors.}
+
+
+Reusability of the cache $\mathscr{C}(C_3 | C_1C_2)$ for a new request depends on the new prefixes.
+% with different prefixes will differ. 
+Consider $2$ cases with prefixes (i) $C_{4}$-$C_{2}$-$C_{3}$ and (ii) $C_{5}$-$C_{6}$-$C_{3}$. The first sequence carries the $C_2$ as a prefix similar to that of $\mathscr{C}(C_3 | C_1C_2)$, making it more reusable than the second sequence, which does not have any common chunk in its prefix. 
+
+
+Assuming that the higher the prefix overlap, the higher will be the reusability,
+we calculate a 
+\textit{Prefix Overlap Score $\beta$} for a \textit{chunk-cache} of $C_i$ corresponding to the current prompt sequence $S_{new}$ as:
+\begin{align}
+    \small
+\beta(C_i \mid S_{new}) = \frac{\sum_{j \in S_{old} \cap S_{new}} inter(i,j)}{\sum_{j \in S_{old}} inter(i,j)},
+\end{align}
+where $S_{old}$ is the set of chunks forming $C_i$'s old prefix.
+
+  
+However, since $\beta$ simply sums the $inter$ attention terms for overlapping chunks, it is order-invariant and only captures the subset match between the previous and current prefixes. 
+For instance, consider the two scenarios: \(C_{1}\)-\(C_{2}\)-\(C_{3}\) and \(C_{2}\)-\(C_{1}\)-\(C_{3}\). 
+In both cases, $\beta$ equals 1, yet the potential for reusing the cached chunk \(C_{3}\) can differ significantly due to the reordering of the prefix sequence. 
+Note, it is not prudent to manipulate the retrieved order of chunks to match the prefix of the cached-chunk, due to \textit{lost-in-the middle} phenomena with LLM-based RAG systems~\cite{liu2024lost}.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.9\columnwidth]{figures/Plots/contexualise_reuse_cases.pdf}
+    \caption{\textit{Chunk-cache} reuse scenarios. Inter and intra-attention for the blue chunk are shown on the left. Dark arrows represent high contextualization, and gray arrows indicate low. Case 1: Blue chunk is self-contextualized, so cache can be used even with new context with purple chunk. Case 2: Blue chunk is heavily contextualized on outside orange chunk, no reuse. Case 3: Only few tokens of blue are contextualized outside, so can be reused with selective recomputation.
+    }
+    \label{fig:contexual_cases}
+\end{figure}
+
+
+
+To account for prefix reordering, we introduce the \textit{Order Penalty Score ($\gamma$)}, which penalizes a chunk for different ordering in the prefix sequence. 
+Let \( A_{old} = \langle C_i \mid C_i \in S_{old} \cap S_{new} \rangle \) 
+denote the ordered sequence of chunks according to $S_{old}$'s order, and similarly $A_{new}$. We define $\gamma$ for chunk $C_{i}$ w.r.t. $S_{new}$ as the normalized Kendall's Tau distance \cite{cicirello2019kendall} between vector $A_{old}$ and $A_{new}$:
+\begin{align}
+\gamma(C_{i} \mid S_{new}) = \frac{D}{T},  \quad T = \binom{m}{2} = \frac{m(m-1)}{2},
+\end{align}
+where $m=|S_{old} \cap S_{new}|$ and \(D\) is the number of discordant pairs between \(A_{1}\) and \(A_{2}\). A higher value of \(D\) indicates a greater discrepancy in ordering, leading to a higher penalty for reuse. Hence, we adjust \(\beta\) to account for this discrepancy by penalizing it, resulting in the
+\textit{Adjusted Prefix Overlap Score} denoted by
+\begin{align}
+    \beta^{'} (C_{i} \mid S_{new}) = \beta (C_{i} \mid S_{new}) \cdot (1 - \gamma (C_{i} \mid S_{new})).
+\end{align}
+
+
+Finally, to assess the reusability of a chunk across different prefix contexts, we measure how much the chunk's KV is contextualized by its prefix. A chunk’s KV is more reusable if it is \hl{a) less influenced by its prefix and b) more influenced by its own tokens.} 
+We formulate these two effects by calculating as:
+\begin{align}
+    a(C_i) = \sum_{j < i} \frac{{inter}(C_j,C_i)}{|C_i| \cdot |C_j|} \quad \text{and} \quad b(C_i) = \frac{{intra}(C_i)}{|C_i|^2},
+\end{align}
+where $a$ is the normalized sum of $inter$-attention scores between chunk $C_i$ and its prefix chunks at the time of caching,
+and $b$ is the normalized $intra$-attention score of chunk $C_i$. 
+Normalizing w.r.t. the chunk length $|C|$ ensures comparability across chunks of varying sizes.
+\hl{The layer-wise inter and intra values
+% , i.e., 
+% $a_l$ and $b_l$, 
+% are computed for every layer $l$ and 
+are averaged to 
+\begin{align}
+    \Bar{a}(C_i) = \frac{1}{L}\sum_{l=1}^L a_l(C_i) \quad \text{and} \quad \Bar{b}(C_i) = \frac{1}{L}\sum_{l=1}^L b_l(C_i).
+\end{align}}
+\textit{A higher $\frac{\Bar{a}}{\Bar{b}}$ ratio indicates greater outside contextual influence on the chunk's KV.} 
+We use this ratio to define the \textit{Cache Context Impact (CCI)} for chunk $C_i$ as
+\begin{align}
+    CCI(C_i) = \frac{1}{1 + e^{-\frac{\Bar{a}}{\Bar{b}}}},
+\end{align}
+\hl{where the \texttt{sigmod} function standardizes its range between $0$ and $1$.}
+A high value of the $CCI$ for a cache indicates that the chunk is highly contextualized, reducing its potential for reuse unless the prefix context matches closely. Conversely, a low $CCI$ suggests that the chunk is largely independent of its prefix context, making it more reusable across different contexts. 
+%
+Fig. \ref{fig:contexual_cases} shows three different scenarios to illustrate how \textit{chunk-cache} is reused by \sys.
+%
+Inter- and intra-attention for the blue chunk are shown on the left and dark/black arrows for high contextualization, while gray arrows are for low contextualization. \textbf{Case 1:} The blue chunk is self-contextualized, allowing cache reuse even with the new purple chunk context. \textbf{Case 2:} The blue chunk is highly contextualized by the orange chunk, so no reuse is possible. \textbf{Case 3:} Only a few tokens in the blue chunk are contextualized externally, allowing partial reuse with selective recomputation.
+
+
+\begin{figure}[t!]
+    \centering
+    \begin{minipage}[h!]{0.485\linewidth}
+        \centering
+        \includegraphics[width=1.0\linewidth]{figures/Plots/loss_x.pdf}
+        \caption{Output deviation with increasing $CCI$, 1-$\beta$ and 1-$\gamma$}
+        \label{fig:loss_x}
+    \end{minipage}
+    \hfill
+    \begin{minipage}[h!]{0.475\linewidth}
+        \centering
+        \includegraphics[width=1.0\linewidth]{figures/Plots/recomp_cdf_1.pdf}
+        \caption{$CFO$ as a function of $CCI$ and $1-\beta'$ to find $\alpha$ in Eq. \ref{eq: alpha}}
+        \label{fig:recomp_cfo}
+    \end{minipage}
+\end{figure}
+
+\begin{figure}[t!]
+    \centering
+     \begin{minipage}[h!]{0.44\linewidth}
+        \centering
+        \includegraphics[width=1.0\linewidth]{figures/Plots/cci_recomp.pdf}
+        \caption{$CCI$ score is majorly from top recomp candidates}
+        \label{fig:cci_tokens}
+    \end{minipage}
+    \hfill
+    \begin{minipage}[h!]{0.475\linewidth}
+        \centering
+        \includegraphics[width=1.0\linewidth]{figures/Plots/loss_recomp.pdf}
+        \caption{Output deviation decreases with higher recomputation}
+        \label{fig:loss_recomp}
+    \end{minipage}
+\end{figure}
+
+
+
+\subsection{Fixing {Chunk-Cache} via Recomputation} \label{sec: fixing_recomputation}  
+\hl{We \textit{fix}} the \textit{chunk-caches} at runtime to make them reusable across different contexts. 
+Fixing refers to recomputing only the necessary KV values to ensure the output of the reused cache closely mimics the output without any cache reuse. Fig. \ref{fig:loss_x} shows how output deviations increase with higher $CCI$ and higher $1 - \beta'$, indicating greater fixing requirements. 
+$CCI$ captures the chunk’s contextual dependency, while \(1 - \beta'\) reflects prefix mismatch. 
+We use this to define Cache Fix Overhead ($CFO$) for chunk $C_i$ as
+\begin{align}
+\label{eq: alpha}
+    CFO(C_i \mid S_{new}) = \alpha \cdot CCI \cdot (1 - \beta'),
+\end{align}
+\hl{where $\alpha$ is a scaling hyperparameter that adjusts the recomputation factor. A higher value of $CFO$ indicates a higher fraction of the tokens in $C_i$ needs KV recomputation: $CFO=1$ for recomputing all tokens in $C_i$.} 
+
+\noindent\textbf{Setting $\alpha$ in deployment:}
+\hl{
+As we lower the value of \(\alpha\), and corresponding $CFO_{\alpha}$, in expectation we would employ less recomputation per request. This might lead to corresponding quality score ($\text{F1}_\alpha$) to go down below the acceptable level ($\text{F1}_{desired}$).
+We determine \(\alpha\) from a validation dataset by solving:
+%\vspace{-0.3em}
+\begin{align}
+    \alpha^* = \arg\min_{\alpha} \mathbb{E}[\text{CFO}_\alpha],\quad \text{subject to} \quad \text{F1}_\alpha \geq \text{F1}_{\text{desired}}.
+\end{align}
+% \[
+% \alpha^* = \arg\min_{\alpha} \mathbb{E}[\text{CFO}_\alpha], \quad \text{subject to} \quad \text{F1}_\alpha \geq \text{F1}_{\text{desired}}.
+% \]
+%
+Fig. \ref{fig:recomp_cfo} plots $CFO$ against $CCI\cdot(1 - \beta')$ for different $\alpha$ values and F1 scores on 2WikiMQA \cite{ho-etal-2020-constructing} dataset.
+}
+
+
+
+    
+\subsubsection{Token Selection for Recomputation:}
+\label{sec: token_selection}
+
+
+\begin{figure}[t!]
+    \centering
+    \begin{minipage}[t]{0.42\linewidth}
+        \centering
+        \includegraphics[width=0.9\linewidth]
+    {figures/Plots/focus_chunks.pdf}
+        \caption{Algorithm selects \textit{"focused" Chunks}  across layers to reduce recomputation}
+        \label{fig:focus_chunks}
+    \end{minipage}%
+    \hfill
+    \begin{minipage}[t]{0.26\linewidth}
+        \centering
+        \includegraphics[width=1.0\linewidth]{figures/Plots/heatmap_layers.png}
+        \caption{Question to Chunks attention across layers}
+        \label{fig:layers_signal}
+    \end{minipage}%
+    \hfill
+    \begin{minipage}[t]{0.26\linewidth}
+        \centering
+        \includegraphics[width=\linewidth]{figures/Plots/metadata_cache.pdf}
+        \caption{Metadata Store for \textit{"chunk-cache"} lookup}
+        \label{fig:chunk_level_metadata}
+    \end{minipage}
+\end{figure}
+
+
+We have observed that a small subset of tokens in a chunk significantly impacts the \(CCI\) score (Fig.~\ref{fig:cci_tokens}). Also, recomputing these critical tokens reduces output deviation (Fig. \ref{fig:loss_recomp}). Hence, to reuse a \textit{chunk-cache}, we focus on recomputing the top $N = \lceil CFO(C_i) \cdot |C_i| \rceil$ tokens with the highest inter-attention scores from prior chunks.
+We select the top-N contextualized tokens for chunk $C_{i}$ as
+\hl{\begin{align}
+    \mathbb{T}(C_{i}) = \arg top_{N}\Big(\Big\{ \sum_{j<i} inter( C_{j}, t_k) \Big\}_{t_k \in C_i}\Big),
+    \vspace{-5mm}
+\end{align}}
+% \vspace{-2mm}
+where \hl{${inter}(t_k, C_j)$} denotes the inter-attention score between token $t_k$ in chunk \hl{$C_i$ and a prefix chunk $C_j$}. This method ensures the selection of the most contextualized tokens for recomputation.
+
+
+
+
+
+    
+\subsubsection{Adaptive Early \hl{Recomputation Termination}.} \label{sec: focus_selection}
+
+In RAG pipelines, it is a standard practice to retrieve a sufficient number of chunks from a large knowledge base and utilize the LLM to filter out irrelevant content for coherent answers~\cite{wang2023learning}. In \sys, we leverage this characteristic to reduce runtime recomputation costs.
+
+\hl{In each layer $l$, during the recomputation of selected tokens,} 
+we monitor the attention between a chunk $C_i$ and the current question $U$, i.e., $inter_l(C_i, U)$, to identify the chunks that consistently receive \textit{"focused"} attention from $U$
+as shown in Fig. \ref{fig:focus_chunks}. 
+We find that while \hl{the inter-attention scores vary during the initial layers}, after a certain number of layers, \hl{they settle into values that can segregate the focused chunks from the others.}
+Fig. \ref{fig:layers_signal}  illustrates that for approximately 80\% of queries, focused chunks can be detected between layers 10 and 15 for the \llama-3-8B model.
+Consequently, we early-terminate the recomputation of tokens in the \textit{"unfocused"} chunks to minimize unnecessary computations. 
+
+\hl{
+Algorithm~\ref{algo:predict_focused} details our method for predicting focused chunks, drawing ideas from change-point detection ~\cite{aminikhanghahi2018real}.
+In each a layer $l$, we first calculate the inter-attention scores w.r.t. the user question $U$ for each chunk cumulated up to layer $l$: 
+\begin{align}
+    cinter_l(C_i, U) = \sum_{l'=1}^l inter_{l'}(C_{i}, U) \quad \text{for all } i \in [k].
+\end{align}
+Then based on these cumulative scores, we segregate the high-valued chunks from the low-valued ones in an adaptive manner (lines 5-9). If this set of high-valued chunks does not change for $w$ consecutive layers, then we deem them as the focused chunks and stop the recomputation for other chunks. }
+
+In \S\ref{sec:discussion} (Fig. \ref{fig:design_ablate}), we observe that this approach reduces token recomputation by about 55\% while maintaining similar output quality.
+
+
+\subsection{Cache Variants: Retrieval and Eviction}
+\label{sec:variants}
+
+\sys maintains a data structure, \hl{as shown in Fig.~\ref{fig:chunk_level_metadata}}, for efficient lookup, retrieval, and eviction. Each \textit{chunk-cache} is identified by hashing the original chunk texts linked to the RAG vector similarity search (\S\ref{sec:intro}). This results in a \texttt{map} where chunk hashes serve as keys and lists of prefixes for each chunk are stored as values. \sys targets to store $N \times M$ \textit{chunk-cache} instances, starting with $N$ chunks (the number of keys in the \texttt{map}), each having $M$ variants. These variants help \sys recover from cases where the initial  \textit{chunk-cache} may not be optimal (e.g., excessive token recomputation due to high contextualization), while subsequent \textit{chunk-cache} variants may be more reusable for common contexts. Each variant stores the $CCI$ value and an ordered list of token indices needing recomputation. To find the best \textit{chunk-cache} for a request, \sys calculates the reusability score \(CFO = CCI \times (1 - \beta')\) (as discussed in \S~\ref{sec:chunk_reuse}) and selects the variant with the lowest score to minimize token recomputation.
+
+For each \textit{chunk-cache} access, \sys updates its \textit{frequency-reuse} ($f_r$) as \(f_r \mathrel{+}= 1/CFO\). Consequently, \textit{chunk-caches} with higher prefix matches or less contextualization become more reusable, as indicated by increasing \(f_r\) over time. New variants are added when \sys encounters a unique chunk and prefix until it reaches $N \times M$ instances. After this, \sys periodically evicts caches with the lowest \(f_r\) to make room for more effective variants. This allows diverse configurations, from one popular chunk with \hl{$N \times M$ variants to $N \times M$} chunks, each with a single variant.
+
+This design enables \sys to manage storage dynamically, prioritizing caches that maximize reusability while minimizing recomputation, thus reducing prefill computation. Traditional policies like LRU, LFU, or FIFO do not offer this capability. The choice of \(M\) and \(N\) is influenced by the popularity and reusability of the \textit{chunk-caches}, the RAG setting (i.e., the number of retrieved chunks), the architecture (GPU/CPU memory size and interconnects), and the deployment configuration of the LLM.
+
+
+
+
+
+\subsection{{Chunk-Cache} Reuse Pipeline}
+\label{sec:overview_pipeline}
+
+
+
+
+
+
+\begin{algorithm}[t]
+    \caption{Predicting Focused Chunks}
+    \label{algo:predict_focused}
+    \scalebox{0.9}{  % Adjust this value for size control
+    \begin{minipage}{1.15\linewidth}
+    \begin{algorithmic}[1]
+    % \REQUIRE $Q^l_{inter}$: layer-wise inter-attention score
+    % \REQUIRE \makebox[0.9\linewidth][l]{$inter\_attn\_key$: Mapping of scores to chunks}
+    \REQUIRE \makebox[0.9\linewidth][l]{$L$: total number of layers, $w$: layer confidence window}
+    \ENSURE \makebox[0.9\linewidth][l]{$F^*$: set of focused chunks, $L^*$: recomputation cut-off layer}
+    % \ENSURE \makebox[0.9\linewidth][l]{$L^*$: layer threshold for recomputation}
+    
+    \STATE $F_{all} \gets [ ]$, \ $cinter_i \gets 0 \quad \forall i \in [k]$
+    \FOR{$l=1$ to $L$}
+        % \STATE $Q_{inter}$ $\gets$ $\sum_{l=0}^{L} Q_{inter}^l$
+        \STATE $cinter_i \ +\!= \ inter_l(C_i, U) \quad \forall i \in [k]$
+        \STATE $sorted\_cinter \gets \textbf{sort}([cinter_i \ |\  i \in [k]], \text{descending})$
+        \STATE $diff \gets [sorted\_cinter_i - sorted\_cinter_{i+1} \mid i \in [k-1]]$
+        \STATE $p_i \gets \frac{diff_i}{\sum_{i=1}^{k-1} diff_i} \quad \forall i \in [k-1]$
+        \STATE $h_i \gets -\sum_{j=0}^{i} p_j \cdot \log(p_j) \quad \forall i \in [k-1]$
+        % \STATE $D_{H} \gets [H[i] - H[i-1] \mid i \in 1 \ldots n-2]$
+        \STATE $i^* \gets \textbf{argmax}([h_{i+1} - h_{i} \mid i \in [k-2]])$
+        \STATE F = top $i^*$ chunks in $sorted\_cinter$
+        \STATE $F_{all}$.\text{append}(F)
+        \IF{$l \geq w$ \& {is\_all\_equal}($F_{all}[l-w:l]$) == 1 }
+            \STATE $F^*, L^* \gets F, l$
+            \STATE 
+            \textbf{Break}
+        \ENDIF
+    \ENDFOR
+    \RETURN{} $F^*,\ L^*$
+    \end{algorithmic}
+    \end{minipage}
+    }
+    \end{algorithm}
+
+
+
+\sys implements an efficient LLM inference pipeline to minimize redundant computations in RAG by strategically reusing \textit{chunk-caches} across prefill requests.
+
+
+
+
+\subsubsection{Recomputation Planning:} 
+\label{sec: request_manager}
+
+
+For a \hl{user query $U$}, the prefill request consists of ordered chunks \( C_1, C_2, \ldots, C_n \) provided by RAG. The system first queries the \textit{Metadata Store}, \hl{a CPU-memory-based hash-table}, to determine which chunks have their \textit{chunk-caches} available. Based on this, the chunks are then classified into two subsets: \( C_{hit} \) (with \textit{chunk-caches}) and \( C_{miss} \) (without \textit{chunk-caches}). 
+
+It then generates an Inference Plan, designating chunks in \( C_{miss} \) for \textit{chunk-cache} computation and those in \( C_{hit} \) for \textit{chunk-cache} retrieval. It uses the metadata retrieved from the \textit{Metadata Store} to compute the \textit{Adjusted Prefix Overlap} score (\(\beta'\)) and the \textit{Chunk Context Impact} score (\(CCI\)) and then determines the \textit{Cache Fixing Overhead} (\(CFO\)) (\S\ref{sec: fixing_recomputation}). Finally, the \textit{top-N contextualized tokens} \(\mathbb{T}\), that need to be recomputed for each  \( C_{hit} \) \textit{chunk-cache} are identified.
+
+
+\hl{Note that both the \textit{Metadata Store} and \texttt{vLLM}'s KV-block manager are distinct CPU-memory hash-tables. While the \textit{Metadata Store} tracks RAG chunk metadata, the KV-block hash-table maps tokens to their respective KV-blocks. Details on enabling independent chunk access without relying on prior prefixes are provided in }\S\ref{sec:impl}.
+
+
+
+
+\subsubsection{\hl{Layer-wise Preloading of \textit{cache-chunks}:}}
+\label{sec: preloading_kv}
+
+\hl{
+\sys uses a hierarchical caching mechanism across GPU memory, CPU memory, and SSD to expand the effective memory capacity available to store the \textit{chunk-caches}. To reduce average loading latency, the most frequently used \textit{chunk-caches} are stored in GPU, less frequently ones in CPU, and infrequent ones in SSD.
+Further, \sys uses a layer-wise preloading technique to minimize cache loading delays.} 
+While the GPU processes layer \(l\), the \textit{chunk-caches} for the layer \(l+1\) are concurrently loaded from host memory or SSD.
+% , effectively minimizing delays. 
+Specifically, \textsc{Cache-Craft} overlaps the loading of caches for $C_{hit}$ chunks for layer \(l+1\) with two activities: a) prefill computation of new \(C_{miss}\) chunks and b) KV recomputation of tokens in $C_{hit}$ chunks in layer \(l\). This ensures that by the time the GPU begins computing attention for layer \(l+1\), the corresponding \textit{chunk-caches} are already available in the execution buffer.
+
+However, preloading may not fully overlap with computation if the \textit{chunk-cache} loading time exceeds the computation time for a layer, particularly when loading from SSDs. To address this, \sys reserves an HBM read buffer that allows preloading \textit{chunk-caches} for multiple layers in advance. We determine the optimal preloading depth \hl{$L_{p}$} as:
+\begin{align}
+    L_p = (L-1) \left( 1 - \frac{T_{prefill}}{T_{load}} \right) + 1,
+    \label{eq:layerwise}
+\end{align}
+\hl{where $L$ is the total} number of layers, $T_{prefill}$ is prefill computation time and $T_{load}$ is KV loading time.
+\hl{The goal is to} preload \(L_p\) layers such that the \textit{chunk-caches} for the remaining \((L-L_p)\) layers can be loaded within the computation time for \((L-1)\) layers. 
+
+
+\hl{Algorithm \ref{alg:layerwise_preloading} shows how layer-wise preloading is implemented.}
+When \(T_{load} > T_{prefill}\), preloading \(L_p\) layers minimizes wait times by eliminating layer execution gaps. If \(T_{prefill} \geq T_{load}\), preloading just one layer is sufficient due to the longer prefill time. Fig. \ref{fig: layerwise} shows an example for \(L=5\) layers with a \(T_{prefill} : T_{load}\) ratio of 1:2 where preloading \(L_p=3\) layers eliminates execution gaps.
+
+
+
+\begin{algorithm}[t]
+\small
+\caption{\hl{Layer-wise Preloading of Chunk-Caches}}
+\label{alg:layerwise_preloading}
+\begin{algorithmic}[1]
+\REQUIRE $L$: Total layers, $T_{\text{prefill}}$: Prefill time, $T_{\text{load}}$: Load time
+\ENSURE Minimized execution gaps
+
+\STATE $L_p \gets \max(1, (L-1) \cdot (1 - T_{\text{prefill}} / T_{\text{load}}) + 1)$
+\FOR{$i = 1$ to $L$}
+    \FOR{$j = i$ to $\min(i+L_p, L)$}
+        \STATE Preload layer $j$
+    \ENDFOR
+    \STATE Compute layer $i$
+    \STATE Release resources for layer $i$
+\ENDFOR
+\end{algorithmic}
+\end{algorithm}
+
+
+
+
+\subsubsection{Handling Partial Prefill in  LLM:}
+\label{sec: inference_runner}
+
+
+
+For each layer, \hl{the Key-Value pairs (KV)} for \textit{chunk-caches} are fetched from HBM, while the K, V, and Q are computed only for new chunks and recomputation tokens.
+To support \textit{chunk-cache} reuse across contexts, \sys decouples Rotary Position Embedding (RPE) from K in KV caches. This allows dynamic RPE application during inference, adapting \textit{chunk-caches} to new positions. The system first merges the retrieved and newly computed $KV$, then applies the new RPE to the merged $K$ based on updated chunk positions, and also applies RPE to the computed Query Q. 
+
+
+Next, attention is computed using the newly computed Q and the merged K and V. Since Q has a different shape than K and V, a custom attention mask is required, replacing the standard triangular causal mask. As shown in Fig.~\ref{fig:rag_overview}, \textit{attention scores} (Q$XK^T$) are computed with this custom mask, multiplied by V, and passed through the feedforward network (\texttt{FFN}) to produce the layer output.
+
+
+During attention computation, new \textit{chunk-caches} and inter/intra attention ($QXK^T$) for the new chunks are asynchronously saved in the background. Additionally, at every layer, attention output between question and RAG chunks ($Q_{inter}^l$) is used for \textit{Focused Chunk Selection} (\S\ref{sec: focus_selection}). Once the focused chunks are determined at layer $L^*$, recomputation for "unfocused" chunks stops.
+Note that the Q for the last prefill token is always computed to generate the first decode token. After prefill, the decode phase proceeds as usual with all KV data—cached, newly computed, and recomputed. 
+
+
+\subsection{\hl{Hierarchical {Chunk-Cache} Management}} 
+\label{sec: storage,swap,loading}
+
+\hl{
+\sys manages cache storage efficiently across GPU High Bandwidth Memory (HBM), host (CPU) memory, and SSD so that less frequent caches are moved to
+further locations (from GPU HBM-memory to SSD) without deleting them when the LLM requires more GPU memory.
+}
+
+
+To offset the loading time of caches from non-HBM locations, \sys employs preloading techniques that start to move the caches to GPU memory, asynchronously, while requests are still in the queue.
+If the caches are available in GPU memory when the request is ready to be executed, \sys uses it; otherwise, it defaults to prefill from scratch starting from input text tokens. 
+This technique ensures that highly reusable chunks remain in HBM while low-reuse chunks are progressively swapped to CPU-memory, and later to SSD, before eventual eviction, if not reused. 
+
+\hl{Using such asynchronous as well as layer-wise (\S~\ref{sec: preloading_kv}) preloading, \sys significantly reduces loading delay to make chunk-caching effective.
+%
+For example, the loading time required for 5 RAG \textit{chunk-caches} corresponding to a request in \X takes \textbf{0.03s} for CPU and \textbf{0.59s} for SSD. 
+In \X a typical queue wait time is \textbf{0.32s}, allowing for preloading chunks from CPU or SSD without impacting latency significantly.
+For higher loads, queue time can completely mask the loading time even from the SSD.
+}
+
+
+
+
+
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.85\linewidth]{figures/Plots/layerwise.pdf}
+    \caption{Layer-wise preloading of \textit{chunk-caches} into GPU memory to eliminate wait time during prefill execution.}
+    \label{fig: layerwise}
+\end{figure}
+
+
+
+\hl{\textbf{Cache Scaling and Workload Adaptability:} In production workloads, the \textit{chunk-cache} size grows with question diversity but a small set of chunks remains crucial. For example, in \textsc{Sys-X}, 20.6\% of chunks were accessed over 1 month, with 85\% of requests hitting only 13.5\% of chunks. By 3 months, chunk accesses increased to 24\%, but 85\% of requests still accessed just 14.8\%, indicating minimal growth in the required chunk set. In this workload, these stable highly reused chunks (119 GB for \texttt{LLaMA}-3-70B) fit comfortably within the 135 GB free GPU memory budget (corresponding to LLaMa-3-70B hosted on 4, A100-80GB GPUs~\cite{9361255}, with \texttt{Tensor-Parallelism}). 
+Hence, our design ensures we can handle growth in \textit{chunk-cache} size in the future. 
+%For other workload patterns, the hierarchical design allows \textsc{Cache-Craft} to move less-used chunks to CPU and SSD as needed.
+}
+

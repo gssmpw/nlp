@@ -1,0 +1,1013 @@
+\documentclass{article} % For LaTeX2e
+\usepackage{iclr2025_conference,times}
+
+% Optional math commands from https://github.com/goodfeli/dlbook_notation.
+\input{math_commands.tex}
+\usepackage{wrapfig}
+\usepackage{graphicx} 
+\usepackage{hyperref}
+\usepackage{xurl}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{xspace}
+\usepackage{tablefootnote}
+\usepackage{enumitem}
+
+\title{\sys: Disaggregated Generative Inference of LLMs in Heterogeneous Environment}
+
+% Authors must not appear in the submitted version. They should be hidden
+% as long as the \iclrfinalcopy macro remains commented out below.
+% Non-anonymous submissions will be rejected without review.
+
+\author{Youhe Jiang\thanks{Equal contribution}, Ran Yan\footnotemark[1], Binhang Yuan \\
+Department of Computer Science and Engineering\\
+The Hong Kong University of Science and Technology\\
+\texttt{youhejiang@gmail.com, ryanaf@connect.ust.hk, biyuan@ust.hk}  \\
+% \And
+% Ji Q. Ren \& Yevgeny LeNet \\
+% Department of Computational Neuroscience \\
+% University of the Witwatersrand \\
+% Joburg, South Africa \\
+% \texttt{\{robot,net\}@wits.ac.za} \\
+% \AND
+% Coauthor \\
+% Affiliation \\
+% Address \\
+% \texttt{email}
+}
+
+% The \author macro works with any number of authors. There are two commands
+% used to separate the names and addresses of multiple authors: \And and \AND.
+%
+% Using \And between authors leaves it to \LaTeX{} to determine where to break
+% the lines. Using \AND forces a linebreak at that point. So, if \LaTeX{}
+% puts 3 of 4 authors names on the first line, and the last on the second
+% line, try using \AND instead of \And before the third author name.
+
+\newcommand{\fix}{\marginpar{FIX}}
+\newcommand{\new}{\marginpar{NEW}}
+\newcommand{\sys}{\textsc{HexGen-2}\xspace}
+
+\newcommand{\ryan}{\textcolor{red}}
+\newcommand{\jyh}{\textcolor{red}}
+\newcommand{\rebuttal}{\textcolor{black}}
+
+% \usepackage{ulem}
+
+\iclrfinalcopy % Uncomment for camera-ready version, but NOT for submission.
+\begin{document}
+
+
+\maketitle
+
+\begin{abstract}
+Disaggregating the prefill and decoding phases represents an effective new paradigm for generative inference of large language models (LLM), which eliminates prefill-decoding interference and optimizes resource allocation. However, it is still an open problem about how to deploy the disaggregated inference paradigm across a group of heterogeneous GPUs, which can be an economical alternative to deployment over homogeneous high-performance GPUs.
+Towards this end, we introduce \sys, a distributed system for efficient and economical LLM serving on heterogeneous GPUs following the disaggregated paradigm. 
+Built on top of \textsc{HexGen}, the core component of \sys is a \textit{scheduling algorithm} that formalizes the allocation of disaggregated LLM inference computations and communications over heterogeneous GPUs and network connections as a constraint optimization problem. We leverage the \textit{graph partitioning} and \textit{max-flow} algorithms to co-optimize resource allocation, parallel strategies for distinct inference phases, and the efficiency of inter-phase key-value (KV) cache communications. We conduct extensive experiments to evaluate \sys, i.e., on \textsc{OPT (30B)} and \textsc{Llama-2 (70B)} models in various real-world settings, the results reveal that \sys delivers up to a 2.0$\times$ and on average a 1.3$\times$ improvement in serving throughput, reduces the average inference latency by 1.5$\times$ compared with state-of-the-art systems given the same price budget, and achieves comparable inference performance with a 30$\%$ lower price budget.
+\end{abstract}
+
+\vspace{-1.5em}
+\section{Introduction}
+\vspace{-0.85em}
+
+% What is the problem?
+Large Language Models (LLMs), such as \textsc{OPT}~\citep{zhang2022opt}, \textsc{Llama}~\citep{touvron2023llama}, \textsc{GPT}~\citep{gpt4o}, \textsc{Gemini}~\citep{reid2024gemini}, \textsc{Claude}~\citep{claude3} and \textsc{Mixtral}~\citep{jiang2024mixtral} have shown exceptional performance across various advanced applications. However, deploying the generative inference service for such LLMs can be costly, typically requiring a substantial number of homogeneous, high-performance GPUs to meet the service demands, such as first token latency and generation throughput. In this paper, we explore an alternative solution that \textit{deploys the most advanced disaggregated generative inference paradigm over a set of heterogeneous GPUs to provide an efficient and economical LLM service}.
+
+
+
+% Why is it interesting and important?
+Disaggregated inference is currently the most \textit{efficient} framework for serving the generative inference requests of LLMs~\citep{zhong2024distserve, patel2024splitwise}. By splitting the prefill phase (compute-bounded) and decoding phase (HBM IO-bounded) across different GPUs, the disaggregation significantly reduces interference between different requests and enables more flexible parallel configurations for the two phases. When compared with colocating the prefill and decoding computations, the disaggregated approach optimizes resource usage and enhances the scalability and efficiency of the LLM inference service.
+Recent efforts~\citep{jianghexgen,griggs2024m,zhao2024llm,miao2024spotserve} have shown that serving LLMs with heterogeneous GPUs can be a \textit{economical} alternative to deploying over homogeneous high-performance GPUs. Heterogeneous deployments offer significant opportunities to reduce inference service costs by leveraging the wide availability of diverse GPU types across commercial and private computing platforms. Note that Nvidia typically releases new GPU generations every 24 months, e.g., Turing in 2018, Ampere in 2020, Hopper in 2022, and Blackwell scheduled for Q4 2024; but one particular version of GPU general remains in use for a much longer period.\footnote{For example, Tesla K80 GPUs, released in 2006, are still available on AWS as \texttt{p2} instances}. 
+
+%Mainstream LLM serving systems~\citep{kwon2023efficient,tensorrt_llm} primarily focus on high-performance GPUs like NVIDIA H100 and A100 in homogeneous GPU clusters. However, it is difficult for users to access a large number of high-performance GPUs at once, either due to the GPU shortage problem~\citep{strati2024ml,yang2023skypilot} or the substantial fees. Meanwhile, as new generations of AI chips are typically released every 24 months~\citep{Nvida_turing,Nvida_ampere,Nvida_hopper}, and AI chip often remains in use by cloud service platforms, technology companies, or research institutions for a much longer period, deploying LLMs across heterogeneous GPUs is a practical option for democratizing LLM serving. Recent efforts~\citep{jianghexgen,griggs2024m,zhao2024llm,miao2024spotserve} have demonstrated that serving LLM with heterogeneous GPUs presents opportunities in reducing the serving cost and enhancing the serving performance.
+
+%There are two phases in LLM inference to generate the output response for an input request, which are prefill and decoding phases. In the prefill phase, the LLM processes the input request, generates the first token of the response and the key-value (KV) cache in a single step, which is usually computationally intensive. While in the decoding phase, the LLM generate subsequent tokens in a token-by-token manner, which is usually memory I/O bounded.
+%Given the distinct properties of the two phases in LLM inference, recent works~\citep{zhong2024distserve,patel2024splitwise,qin2024mooncake,jin2024p,hu2024inference} have proposed the disaggregated architecture for LLM inference, which splits the inference request, puts them on separate GPU devices, and transmits the intermediate results (primarily KV caches) between them. Many empirical studies have demonstrated that this disaggregated inference architecture significantly enhances overall hardware utilization and system efficiency. 
+
+
+% Why is it hard?
+The wide availability of heterogeneous GPU pools presents significant opportunities to adapt the most advanced disaggregated inference paradigms. However, effectively adapting the disaggregated paradigm to this heterogeneous setting is much harder to implement than to ask for. Traditional implementation of co-locating prefill and decoding phases only leverage standard \textit{tensor model parallelism}~\citep{narayanan2021efficient} and  \textit{pipeline parallelism}~\citep{huang2019gpipe} for LLM inference, where only the activations are communicated.  %aggregated by \texttt{AllReduce} operator in tensor model parallelism, or transferred by \texttt{Send-Recv} operators between nearby stages in pipeline parallelism. 
+In the disaggregated paradigm, transferring the key-value (KV) cache between prefill and decoding model replicas introduces significant data movement, potentially creating a communication bottleneck that must be carefully managed in a heterogeneous setting. Additionally, the flexibility of parallel configurations among prefill and decoding model replicas also introduces new complexity in the heterogeneity-aware scheduling.   
+
+%To efficiently distribute the LLM inference computation among multiple GPUs, the two most commonly employed approaches in the state-of-the-art inference engines~\citep{zhong2024distserve,kwon2023efficient} are \textit{tensor parallelism}~\citep{narayanan2021efficient},. 
+%However, coordinating distributed computation and communication across heterogeneous GPUs and network connections with the disaggregated inference architecture presents significant challenges. Different phases of the disaggregated inference process have varying resource requirements and preferences for different forms of parallelism. Additionally, the KV cache communication is highly sensitive to peer-to-peer communication bandwidth, which can become a bottleneck if not scheduled properly. 
+
+
+%Why hasn't it been solved before?
+%This work aims at boosting the LLM serving performance with heterogeneous GPU resources and disaggregated inference architecture, there are two key challenges to achieve our goal:
+
+Towards efficiently adapting the disaggregated paradigm under the heterogeneous setting, we identify two types of new challenges and opportunities that previous heterogeneity-aware scheduling approaches~\citep{jianghexgen} fail to integrate: 
+
+\begin{itemize}[topsep=5pt, leftmargin=*]
+    \vspace{-0.95em}
+    \item \textbf{Accommodate the computation flexibility in disaggregated paradigm.} In a heterogeneous setting, each GPU type has distinct peak FLOPS, HBM memory bandwidth, and HBM memory limit, even making optimal computation allocation for the colocating paradigm a difficult problem. The disaggregated paradigm adds further complexity, as the prefill and decoding phases have different resource requirements and favor specific parallel strategies depending on varying LLM inference workloads, such as arrival rates and input/output sequence lengths.
+    %Given the limited availability of resources for each type of GPU, fully leveraging the economic computation power of GPUs necessitates employing a variety of GPU types, each has distinct peak FLOPS, GPU device memory bandwidth, and GPU device memory constraints. Determine the resource allocation and parallelism plans for LLM serving is challenging, less powerful GPUs can become bottlenecks and more capable GPUs can be underutilized with inappropriate management. Moreover, the introduction of the disaggregated inference architecture further complicates this management, as different phases have distinct resource requirements and preferences for different parallell plans based on differing LLM inference workloads, such as arrival rates, and input and output request sequence lengths.
+
+    \vspace{-0.5em}
+    \item \textbf{Accommodate additional KV cache movement over heterogeneous connections.} GPU communication bandwidth also varies widely, from different NVLink and PCIe generations within a server to InfiniteBand(IB), RoCE, TCP, and Ethernet connections among different servers. Along with communication demands from parallel strategies within each model replica, disaggregated inference requires extensive KV cache transmissions, which are especially sensitive to low-bandwidth links. Therefore, an effective scheduling algorithm is essential to manage communication across heterogeneous GPU connections and minimize costs.
+    %In a fully heterogeneous setting, peer-to-peer GPU communication bandwidth can vary significantly, including different generations of NVLink and PCIe connections within machines, InfiniteBand (IB), RoCE and TCP connections between machines, and Ethernet connections within and across data centers. Moreover, in addition to the communications introduced by different parallel plans, the disaggregated inference architecture necessitates a high volume of KV cache transmissions, which are particularly sensitive to low-bandwidth links. Therefore, an effective scheduling algorithm is crucial for managing communications across the heterogeneous GPU connections to minimize communication costs.
+    \vspace{-0.65em}
+\end{itemize}
+
+
+
+%What are the key components of my approach and results?
+
+In order to overcome these challenges, we propose \sys, a disaggregated LLM inference system that coordinates distributed LLM inference computations and communications over a set of GPUs with different computation capabilities and heterogeneous network connections. Our contributions are summarized as:
+
+
+\underline{\textbf{Contribution 1:}} We formulate the scheduling problem of allocating disaggregated LLM inference computations over a set of heterogeneous GPU devices as a constraint optimization problem. To solve this problem efficiently, we propose a sophisticated scheduling algorithm that employs a combination of graph partitioning and max-flow algorithm to coordinate the resource allocations and parallelism plans for the prefill and decoding phases of LLM inference. Concretely, the graph partitioning algorithm partitions the available GPUs into multiple model serving groups, where each group should be dedicated to serving a prefill or decoding model replica; and the max-flow algorithm guides the iterative refinement of the graph to optimize model placement.
+
+\underline{\textbf{Contribution 2:}} We implement \sys, a heterogeneous LLM inference system that facilitates tensor model parallelism and pipeline parallelism with a disaggregated paradigm. \sys allows the two phases of LLM inference to be split onto separate GPUs with different parallel plans, effectively eliminating prefill-decoding interference and boosting inference performance.
+
+
+\underline{\textbf{Contribution 3:}} We evaluate \sys through extensive experiments, where we compare \sys's system efficiency across various LLM inference workloads with \textsc{HexGen} on several heterogeneous settings and \textsc{DistServe} on a standard homogeneous setting. We conduct these comparisons on the popular LLM models \textsc{OPT (30B)} and \textsc{Llama-2 (70B)}. We show that given the same budget in terms of cloud service fees, \sys can choose to achieve up to a $2.0\times$ and on average a 1.3$\times$ higher serving throughput or reduce the average inference latency by $1.5\times$. Additionally, when given only $70\%$ of the budget, \sys can still maintain a comparable level of inference service compared to the homogeneous baseline.
+
+
+%\underline{\textbf{Overview.}} The rest of the paper is organized as follows. We provide some preliminaries in Section 2; introduce our scheduling algorithm in Section 3 and system implementation in Section 4; present the experimental results in Section 5, summarize related work in Section 6, and conclude in Section 7.
+
+
+\input{preliminary}
+
+
+% \subsection{Style}
+
+% Papers to be submitted to ICLR 2025 must be prepared according to the
+% instructions presented here.
+
+%% Please note that we have introduced automatic line number generation
+%% into the style file for \LaTeXe. This is to help reviewers
+%% refer to specific lines of the paper when they make their comments. Please do
+%% NOT refer to these line numbers in your paper as they will be removed from the
+%% style file for the final version of accepted papers.
+
+% Authors are required to use the ICLR \LaTeX{} style files obtainable at the
+% ICLR website. Please make sure you use the current files and
+% not previous versions. Tweaking the style files may be grounds for rejection.
+
+% \subsection{Retrieval of style files}
+
+% The style files for ICLR and other conference information are available online at:
+% \begin{center}
+%    \url{http://www.iclr.cc/}
+% \end{center}
+% The file \verb+iclr2025_conference.pdf+ contains these
+% instructions and illustrates the
+% various formatting requirements your ICLR paper must satisfy.
+% Submissions must be made using \LaTeX{} and the style files
+% \verb+iclr2025_conference.sty+ and \verb+iclr2025_conference.bst+ (to be used with \LaTeX{}2e). The file
+% \verb+iclr2025_conference.tex+ may be used as a ``shell'' for writing your paper. All you
+% have to do is replace the author, title, abstract, and text of the paper with
+% your own.
+
+% The formatting instructions contained in these style files are summarized in
+% sections \ref{gen_inst}, \ref{headings}, and \ref{others} below.
+
+% \section{General formatting instructions}
+% \label{gen_inst}
+
+% The text must be confined within a rectangle 5.5~inches (33~picas) wide and
+% 9~inches (54~picas) long. The left margin is 1.5~inch (9~picas).
+% Use 10~point type with a vertical spacing of 11~points. Times New Roman is the
+% preferred typeface throughout. Paragraphs are separated by 1/2~line space,
+% with no indentation.
+
+% Paper title is 17~point, in small caps and left-aligned.
+% All pages should start at 1~inch (6~picas) from the top of the page.
+
+% Authors' names are
+% set in boldface, and each name is placed above its corresponding
+% address. The lead author's name is to be listed first, and
+% the co-authors' names are set to follow. Authors sharing the
+% same address can be on the same line.
+
+% Please pay special attention to the instructions in section \ref{others}
+% regarding figures, tables, acknowledgments, and references.
+
+
+% There will be a strict upper limit of 10 pages for the main text of the initial submission, with unlimited additional pages for citations. 
+
+% \section{Headings: first level}
+% \label{headings}
+
+% First level headings are in small caps,
+% flush left and in point size 12. One line space before the first level
+% heading and 1/2~line space after the first level heading.
+
+% \subsection{Headings: second level}
+
+% Second level headings are in small caps,
+% flush left and in point size 10. One line space before the second level
+% heading and 1/2~line space after the second level heading.
+
+% \subsubsection{Headings: third level}
+
+% Third level headings are in small caps,
+% flush left and in point size 10. One line space before the third level
+% heading and 1/2~line space after the third level heading.
+
+
+% \begin{figure}
+%     \centering
+%     \includegraphics[width=0.7\linewidth]{ICLR 2025 Template/img/graph pic.pdf}
+%     \caption{Graph partitioning algorithm workflow.}
+%     \label{fig:gp}
+% \end{figure}
+
+
+\section{Scheduling Algorithm in \sys}
+\label{sec:4}
+
+% \begin{figure}
+%     \centering
+%     \includegraphics[width=\linewidth]{ICLR 2025 Template/img/graph pic.pdf}
+%     \caption{Graph partitioning illustration.}
+%     \label{fig:gp}
+% \end{figure}
+
+
+The core technique component in \sys is a scheduling module that can efficiently allocate the heterogeneous GPUs to serve prefill or decoding model replicas.
+In this section, we formulate the scheduling problem and introduce our solution.
+
+\vspace{-0.5em}
+\subsection{Problem Formalization}
+\label{sec:problem formulation}
+\vspace{-0.5em}
+
+To support LLM serving with the disaggregated paradigm under heterogeneity, the scheduling algorithm should determine four essential allocations: (\underline{1}) \textit{the group partition}, i.e., how to partition the GPUs to multiple groups, where each responsible for serving one model replica; (\underline{2}) \textit{the group type}, i.e., whether a group serves a prefill or decoding model replica. (\underline{3}) \textit{the parallel strategy} for each model serving group, i.e., the combination of TP and PP under the heterogeneous setting~\citep{jianghexgen}; (\underline{4}) \textit{the KV cache communication strategy} among prefill and decoding model replicas. We term a solution to these four components as a \textit{model placement strategy}.
+
+\ryan{}Given the exponential search space, determining the optimal model placement is an NP-hard problem. To solve the problem, we adopt a two-phase search algorithm, which can be summarized as:
+
+\begin{itemize}[topsep=5pt, leftmargin=*]
+    \vspace{-0.75em}
+    \item \textbf{Graph partition}: \rebuttal{Given} a set of heterogeneous GPU devices $\mathbf{D}$, the first phase (\S\ref{sec:first-phase}) aims to partition them into multiple model serving groups, and determines the group type.
+    \vspace{-0.25em}
+    \item \textbf{Max flow}: \rebuttal{Based} on the outputs from the first phase, the second phase (\S\ref{sec:second-phase}) find the current optimal parallel strategies for prefill and decoding model replicas, and generates the optimal KV cache communication strategy among them.
+    \vspace{-0.25em}
+    \item \textbf{Iterative refinement}: \rebuttal{We} iteratively repeat the two-phase algorithm to find the optimal model placement strategy (\S\ref{sec:graph_refine}) that maximizes the end-to-end system performance.%, and the final model placement strategy should maximize the end-to-end system performance in term of serving throughput. 
+    \vspace{-0.5em}
+\end{itemize} 
+
+
+% Given a set of GPUs $\mathbf{D}$, our task is to efficiently divide them into $2N$ distinct clusters $\mathbf{P}_1, \mathbf{P}_2, ..., \mathbf{P}_N$; $\mathbf{D}_1, \mathbf{D}_2, ..., \mathbf{D}_N$. Half of the clusters $\mathbf{P}_1, \mathbf{P}_2, ..., \mathbf{P}_N$ will handle inference requests and execute the prefill stage. The remaining clusters $\mathbf{D}_1, \mathbf{D}_2, ..., \mathbf{D}_N$ will receive the $KV$ cache from the prefill clusters, perform the decoding stage computation, and produce the inference results. The best cluster assignment should maximize end-to-end performance, as measured by throughput.
+
+% Given the exponential scale of candidate allocation, finding the optimal parallel strategy, considering the computation costs, communication costs, and memory consumptions, is an NP-hard problem. To solve the problem, we design a two-phase scheduling algorithm to find a cluster assignment and iteratively update it to the optimal assignment. To be more concrete:
+
+% \begin{itemize}
+% \item We introduce the first phase of our algorithm in Section \ref{sec:first-phase} that partitions device set $\mathbf{D}$ into multiple GPU clusters, each of which will be used as a prefill cluster $\mathbf{P}_i$ or decoding cluster $\mathbf{D}_{i}$.
+
+% \item We enumerate the second phase of our algorithm Section \ref{sec:second-phase} that first decides prefill and decoding GPU clusters $\mathbf{P}_{i}$, $\mathbf{D}_{i}$, respectively, and then refine the assignment by running max-flow algorithm.
+
+% % \item We iteratively repeat the two-phase algorithm and find the optimal assignment $\sigma^*$, illustrated in
+
+% \end{itemize}
+
+\vspace{-0.25em}
+\subsection{First Phase: Graph Partition}
+\label{sec:first-phase}
+\vspace{-0.5em}
+
+\begin{figure}
+    \centering
+    \includegraphics[width=0.95\linewidth]{img/merged_graph.pdf}
+    \caption{Illustration of each scheduling step.}
+    \label{fig:scheduling steps}
+\end{figure}
+
+The first phase of our scheduling algorithm aims to partition the GPU devices $\mathbf{D}$ into multiple model serving groups and determine whether each group is a prefill or decoding model replica. We first formulate the GPU device set $\mathbf{D}$ as a global graph $\text{G}=(\mathbf{D}, \mathbf{E})$, with each GPU $d \in \mathbf{D}$ representing a \textit{graph node}, and the GPU memory limit $m_d$ defined as the node weight. The communication link $e_{d,d'} \in \mathbf{E}$ between GPU $d$ and $d'$, $\forall d, d' \in \mathbf{D}$, is defined as the \textit{graph edge}, with communication bandwidth $\beta_{d,d'}$ as the edge weight. Then, we partition the formulated graph $\text{G}$ into partition $\mathbf{P} = \{p_1 \ldots p_K \}$, where $p_k$ denotes the $k$-th model serving group, and determine the type for each group. 
+Concretely, there are three steps in the first phrase:
+
+% sub pics of merged graph
+% \begin{wrapfigure}{r}{0.5\linewidth}
+% \centering
+% \includegraphics[width=\linewidth]{ICLR 2025 Template/img/init partition.pdf}
+% \caption{Illustration of initial partition.}
+% \label{fig:ip}
+% \end{wrapfigure}
+
+\textbf{Step (\underline{i}) - Initial partition}: \rebuttal{We} first partition the global graph into multiple model serving groups based on edge weights (bandwidths), and balance the node weights (memory capacities) across groups. 
+We leverage the \textit{spectral partitioning} method~\citep{alpert1995spectral} to partition the graph $\text{G}$ into $K$ groups, which uses the eigenvectors of the Laplacian matrix to guide partitioning and minimize inter-group edge weights. \rebuttal{The group size $K$ is determined by dividing the cluster's total memory by the estimated memory required for a single model replica (detialed in~\autoref{appendix:a}).} Then we adopt the \textit{Kernighan-Lin algorithm}~\citep{kernighan1970efficient} to iteratively refine the partition $\mathbf{P}$ by swapping node pairs between groups, which further reduces edge weights and balances node weights \rebuttal{(memory capacities)} across groups.
+% We adopt the \textit{Spectral Partitioning} method~\citep{alpert1995spectral} followed by a short refinement with \textit{Kernighan-Lin algorithm}~\citep{kwon2023efficient}. \textit{Spectral Partitioning} uses the eigenvectors of the Laplacian matrix to guide the partitioning, which minimizes the edge weights between different groups. \textit{Kernighan-Lin algorithm} iteratively adjusts the partition through swapping pairs of nodes between different groups, which further reduces the edge weights between groups and balances the node weights across the groups.
+% , which adopts the following cost function to guide the node swapping process:
+% \begin{equation}
+% \tiny
+% \textsc{C} = \left(\sum_{d' \in p_k \setminus p_k' - \{d\}}\!\beta_{d,d'} - \sum_{d' \in p_k' \setminus p_k - \{d\}}\!\beta_{d,d'}\right) + \mu\left|\frac{\sum_{d \in \mathbf{D}}\!m_d}{K} - 2m_d\right|
+% \end{equation}
+% The upper formula demonstrates the cost function of swapping a node $d$ from partition $p_k$ to $p_k'$. And $\mu$ represents the maximum imbalance degree we can tolerate. The algorithm
+\autoref{fig:scheduling steps} demonstrates the process. \rebuttal{Note that we balance memory rather than compute capacity to avoid potential OOM issues and provide a solid starting point for further optimization.}
+
+\textbf{Step (\underline{ii}) - Coarsen \& secondary partition}: \rebuttal{We} then determine the group type, where the graph is coarsened and partitioned again to determine the model replica type for each group. Note that coarsen is a common operation that merges nodes and edges to simplify graph partition~\citep{hendrickson1995multi}. 
+Here, the coarsening operation merges \rebuttal{graph nodes (GPUs)} within the same group \rebuttal{(model replica)} into super nodes, which ensures the graph only includes relationships among the super nodes. The coarsened graph is then partitioned to distinguish between prefill and decoding model replicas. As illustrated in \autoref{fig:scheduling steps}, \rebuttal{the four super nodes are divided into two parts: the two super nodes on the left are designated as prefill model replicas, while the two on the right are designated as decoding model replicas}. Different from initial partition, the secondary partition focuses on \textit{maximizing} inter-partition edge weights \rebuttal{(i.e., the edge weights between prefill and decoding model replicas)} to support frequent KV cache communications between different group types.
+
+% sub pics of merged graph
+% \begin{wrapfigure}{r}{0.5\linewidth}
+% \centering
+% \includegraphics[width=\linewidth]{ICLR 2025 Template/img/second partition.pdf}
+% \caption{Illustration of secondary partition.}
+% \label{fig:sp}
+% \end{wrapfigure}
+
+\textbf{Step (\underline{iii}) - Projection}: \rebuttal{Once} we allocate the super nodes into prefill and decoding model replicas, we need to apply project operation, i.e., the reverse operation of the coarsen operation described in step (\underline{ii}), to recover the GPU information within each super node. Note that after the projection, we can leave the problem of determining the optimal parallel strategies for each prefill or decoding model replica based on the GPU information within each super node during the second phase.
+% \vspace{0.25em} 
+% \noindent \textbf{Initial Graph Partition.}
+% First, create a connected graph in which GPUs are as vertices, memory capacities are as vertex weights and communication bandwidths are as edges. Then, we can initially partition the GPUs into an even number of clusters with high intra-cluster bandwidth and low inter-cluster bandwidth, under the constraint that total memories are balanced among different clusters. This creates initial clusters. The communication speed within each cluster and memory capacities among clusters are balanced.
+
+% % \begin{figure}
+% %   \centering
+% %   \includegraphics[width=\textwidth]{ICLR 2025 Template/img/graph pic.pdf}
+% %   \caption{Graph partitioning workflow.}
+% %   \label{fig:gp}
+% % \end{figure}
+
+% \vspace{0.25em}
+% \noindent \textbf{Tuning the Number of Clusters}. The optimal number of clusters $N$ for prefilling and decoding under a given set of GPUs is not immediately apparent. Fewer clusters result in stronger capacity for each model replica, while more clusters allow for parallel processing of more inference requests. Under the constraint that no clusters have out-of-memory issues, we need to execute our first-phase algorithm, followed by the second-phase algorithm, through multiple rounds to create varying numbers of clusters and optimize performance. Besides, the graph partition is also guided by the second-phase algorithm, by detecting which edges should be partitioned onto and which should not. 
+
+
+\vspace{-1.0em}
+\subsection{Second Phase: Max-flow}
+\label{sec:second-phase}
+\vspace{-0.75em}
+
+The second phase of our scheduling algorithm determines the parallel strategies within each super node and KV cache communication strategies between each super node. We leverage \textit{max-flow}, as a promising method, to formulate the disaggregated inference pradiagm.
+%To formulate the max-flow problem with the 
+Taking the partitioned graph from the first phase as input, we transform it into a \textit{directed graph} with \textit{compute nodes} and \textit{network connections}. We define the source and sink of the directed graph to be the coordinator node $h$, which is responsible for request dispatching and completion. Formally, we define:
+
+\textbf{Compute nodes.} The prefill and decoding model replicas are defined as compute nodes $\mathcal{C}$, with $\phi_i \in \mathcal{C}$ denoting a prefill model replica and $\delta_i \in \mathcal{C}$ denoting a decoding model replica. For each compute node $\phi_i/\delta_i \in \mathcal{C}$, we force it connect with two other nodes in the graph, named $\phi_i^{in}/\delta_i^{in}$ and $\phi_i^{out}/\delta_i^{out}$. The capacity of the directed edge $(\phi_i^{in}/\delta_i^{in}, \phi_i^{out}/\delta_i^{out})$ represents the maximum number of requests this node can process within a certain time period \textsc{T} (e.g., 10 minutes). We adopt the \textit{inference cost model} from \textsc{HexGen}~\citep{jianghexgen} and detail the node capacity estimation in \autoref{appendix:a}. To optimize capacity, the optimal parallel strategy should be selected for each node. As discussed in \S\ref{sec:batching}, given the distinct computational characteristics of different phases, their optimal parallel strategies also vary. For prefill model replicas, we aim to determine the \textit{latency-optimal} parallel configurations, as they are computation-intensive and batching does not enhance efficiency. In contrast, for decoding model replicas, we aim to deduce the \textit{throughput-optimal} parallel configurations, since this phase is memory I/O-bound and benefits from batching more requests. Based on these considerations, we iterate through all possible model parallelism combinations for each model replica and select the optimal one. For compute node $\phi_i/\delta_i$, the amount of flow that passes through $(\phi_i^{in}/\delta_i^{in}, \phi_i^{out}/\delta_i^{out})$ should be no larger than its maximum capacity.
+
+\textbf{Network connections.} A node in the directed graph might be connected with any other nodes, while only a subset of those connections are valid. A \textit{valid connection} should satisfy one of the following criteria: (\underline{1}) the connection is from coordinator node $h$ to compute node $\phi_i$, we represent the connection with directed edge $(source, \phi_i^{in})$; (\underline{2}) the connection is from $\delta_i$ to coordinator node $h$, we represent the connection with directed edge $(\delta_i^{out}, sink)$; (\underline{3}) the connection is from a compute node $\phi_i$ to another compute node $\delta_i$, we represent the connection with directed edge $(\phi_i^{out}, \delta_i^{in})$. The edge capacity equals the maximum number of requests this connection can process within the time period \textsc{T}. Note that for connection type (\underline{3}), between any two prefill and decoding model replicas $\phi_i$ and $\delta_i$ with an edge connection, each GPU containing the $j$-th layer within $\phi_i$ should transmit its KV cache to the matching GPU housing the $j$-th layer within $\delta_i$. The edge capacity is determined by the collective performance of all GPU-to-GPU transmission connections, as each connection is responsible for a portion of the KV cache transmission. The estimation of edge capacity is detailed in~\autoref{appendix:a}. We only permit flow to pass through valid network connections, and the transmitted flow should not exceed the maximum capacity of the connection.
+
+% sub pics of merged graph
+% \begin{wrapfigure}{r}{0.6\linewidth}
+% \centering
+% \includegraphics[width=\linewidth]{ICLR 2025 Template/img/kv cache transfer.pdf}
+% \caption{Example of the directed graph and weights.}
+% \label{fig:kv}
+% \end{wrapfigure}
+
+After constructing the directed graph, we run \textit{preflow-push algorithm}~\citep{cheriyan1989analysis} to get the max flow between source and sink node, with one unit of flow representing one request that can pass through a compute node or network connection per unit time. This algorithm continuously pushes the maximum allowable flow up to the edge's capacity to maximize the flow through the direct connection. The generated \textit{flow assignments} between compute nodes $\phi_i$ and $\delta_i$ are used to guide the KV cache communication. The communication frequency is set to be proportional to these flow values to follow the max flow of the directed graph without creating bursts, as illustrated in \autoref{fig:scheduling steps}. However, the algorithm may not fully utilize edge capacities as flows within the directed graph are interdependent; upstream and downstream edges can restrict total flow, preventing the full utilization of higher-capacity edges due to bottlenecks or imbalanced capacities. For instance, a low capacity on the edge $(\phi_i^{out}, \delta_i^{in})$ can restrict the flow on edge $(\delta_i^{in}, \delta_i^{out})$ from reaching node capacity. Therefore, iteratively refining the directed graph is essential.
+
+
+\vspace{-0.5em}
+\subsection{Iterative Refinement}
+\label{sec:graph_refine}
+\vspace{-0.5em}
+
+\S\ref{sec:second-phase} presented how we obtain the max flow for a given graph partition; now we introduce how we can iteratively refine the graph partition to maximize the flow.
+We refine the graph iteratively based on edge swapping, which is a common approach for optimizing graph partition~\citep{hendrickson1995multi,vaishali2018efficient}, and we further propose a \textit{max-flow guided edge swap} operation, which uses max-flow outputs to guide the iterative refinement of the graph. 
+
+% sub pics of merged graph
+% \begin{wrapfigure}{r}{0.6\linewidth}
+% \centering
+% \includegraphics[width=\linewidth]{ICLR 2025 Template/img/edge swap.pdf}
+% \caption{Example of edge swapping.}
+% \label{fig:es}
+% \end{wrapfigure}
+
+The \textit{preflow-push algorithm} mentioned in \S\ref{sec:second-phase} provides the detailed flow assignments necessary to analyze edge utilization~\citep{waissi1994network}. By comparing the flow through each edge with its capacity, we can identify \textit{bottleneck} and \textit{underutilized} edges. Bottleneck edges are defined as those where the flow reaches capacity limits, preventing the directed graph from achieving a higher overall flow. Underutilized edges are those where the flow falls short of capacity and could accommodate more data flow. \textit{As long as these imbalances exist, we attempt to swap edges.} Therefore, we implement local swaps of edges guided by the max-flow outputs to form a new graph partition, as illustrated in \autoref{fig:scheduling steps}. This swap operation is essential in terms of: (\underline{i}) balancing the inter- and intra-group edge weights to maintain high intra-group capacities while enabling efficient inter-group KV cache communicating; and (\underline{ii}) adjusting the node and edge weights across intra-groups to optimize resource allocation. After the swaps, we rerun the two-phase algorithm to obtain the optimal model placement strategy and max flow of the new graph partition. We then refine the partition again. This iterative process continues until no further improvements can be made. Evaluation in \S\ref{sec:scheduling results} highlights the necessity of our design, the max flow guided edge swap overcomes local minima and accelerates optimization compared with other approaches. \rebuttal{To better illustrate each phase of our scheduling algorithm, we provide a detailed analysis in~\autoref{appendix:analysis}, and a case study in~\autoref{appendix:scheduling}.}
+
+% \vspace{0.25em}
+% \noindent \textbf{Decide the Prefill and Decode Clusters}. Given the partitioned results in the first stage algorithm, we need to decide which clusters are responsible for prefilling, and which are responsible for decoding. This can be achieved by another graph bi-partition on a coarsened graph, which has clusters as nodes and their connections as edges. The clusters are partitioned into two parts, the first of which will be prefill clusters, while the others will be decoding clusters. Observing that prefill clusters do not communicate with other prefill clusters, neither do decoding clusters. We can reserve the high bandwidths between prefill and decoding clusters to accelerate the $KV$ cache communication. 
+
+
+% However, simply classifying prefill and decoding clusters will not necessarily lead to optimal performance. There is a trade-off between intra-cluster capacity and inter-cluster communication efficiency. When the communication bandwidth used to send $KV$ cache from a prefill cluster to a decoding cluster is too slow, $KV$ cache communication will cause bottlenecks for these prefill and decoding clusters and the inference requests assigned for them will have higher latency. The overall performance of the system is thus downgraded. On the other hand, when the prefill or decoding capacity is not enough due to the improperly used communication bandwidth, prefill or decoding clusters, instead of $KV$ cache communication will cause bottlenecks. In this case, the performance made up of these prefill and decoding clusters is also not satisfying. 
+
+% \noindent \textbf{Run Max-flow algorithm to optimize the clusters}. To solve this problem, we first create a new coarsened graph. The nodes in the coarsened graph can be classified into four categories, which are prefill-in, prefill-out, decoding-in, and decoding-out. To finish an inference request, a sequence of input tokens must first enter the prefill stage via prefill-in, finish the prefill stage and reach prefill-out, send the $KV$ cache from prefill-out to decoding-in, and finish the decoding stage and output the output tokens from decoding-out. When there are more than $2$ clusters partitioned from the first phase algorithm, there will also be more than one path for an inference request to choose. 
+
+% Second, by applying a max-flow algorithm, we can detect which edges are under the minimum and maximum burden, and then adjust the corresponding prefill or decoding cluster. Concretely, for the detected bottleneck edge, we can swap the bandwidths for pipeline parallelism communication and $KV$ cache communication to increase the bandwidth used for this bottleneck edge and thus increase its capacity. Such an operation is equivalent to swapping the edges~\citep{vaishali2018efficient} on the created graph for the max-flow algorithm, we can relieve the burden of the bottleneck edge, and increase the relative workload on the low utilization edge. Applying the max-flow algorithm for once is often not enough, since there can be more than one bottleneck and potentially new bottlenecks after the swapping of used bandwidths. Thus, we rerun the max-flow algorithm to adjust bottleneck edges in several rounds. In some cases, those adjusted edges can still be bottlenecks in the next round, we can adjust the corresponding clusters again. While adjusted edges in the previous round are not bottlenecks anymore, we will detect new bottlenecks and adjust the corresponding clusters. After repeating the detection of bottlenecks by the max-flow algorithm, and adjusting the bottleneck clusters for several rounds, we can optimize the performance of all clusters by balancing the capacity to task burden ratio.
+
+% Third, the global graph created before graph partitioning also swaps the edges to cut in the next iteration, based on the detected bottlenecks in the max-flow algorithm that appeared in the second phase algorithm. When we partition the global graph on a certain edge, and it becomes a bottleneck in $KV$ cache communication, we should avoid partitioning on this edge from the beginning. On the contrary, when a certain edge is not partitioned but has a low burden as evaluated by the max-flow algorithm, we can try to partition the global graph on this edge and use it for $KV$ cache communication. 
+
+% \vspace{0.25em}
+% \noindent \textbf{Tuning the number of clusters}. 
+
+\vspace{-0.5em}
+\section{System Implementation}
+\vspace{-0.5em}
+
+\sys is a distributed system designed to support efficient LLM inference service under the disaggregated paradigm in heterogeneous environments. 
+%which features a disaggregated architecture to split the two phases of LLM inference onto separate GPUs, and develops a sophisticated scheduling algorithm to coordinate the resource allocations and strategies for each phase.
+\sys uses a \textit{task coordinator} to handle the dispatch of incoming LLM inference requests, which is based on an open-source implementation of decentralized computation coordination~\citep{yao2023open} that utilizes libP2P~\citep{libp2p} to establish connections among the work groups in a peer-to-peer network. 
+All parallel communications in \sys are implemented using NVIDIA Collective Communication Library (NCCL)~\citep{nccl2024}, and all required communication groups for different parallelism plans are established in advance to avoid the overhead associated with constructing NCCL groups. 
+\sys utilizes asynchronous NCCL \texttt{SendRecv}/\texttt{CudaMemcpy} for KV cache communication to enable overlapping between computation and communication. Furthermore, \sys integrates popular features for optimizing LLM inference such as continuous batching~\citep{yu2022orca}, FlashAttention~\citep{dao2022flashattention,dao2023flashattention2}, PagedAttention~\citep{kwon2023efficient}, and supports open-source LLMs such as \textsc{OPT}~\citep{zhang2022opt} and \textsc{Llama}~\citep{touvron2023llama}.
+
+\vspace{-0.5em}
+\section{Evaluation}
+\vspace{-0.5em}
+
+To evaluate the design and implementation of \sys, we
+ask the following essential questions:
+\begin{itemize}[topsep=5pt, leftmargin=*]
+    \vspace{-0.5em}
+    \item \textit{What is the end-to-end performance comparison in terms of throughput and latency between \sys and the state-of-the-art homogeneous or heterogeneous generative inference systems?}
+    % \vspace{-0.5em}
+    \item \textit{How effective is our scheduling algorithm in terms of finding the optimal assignment of the inference workflow compared with existing methods?}
+    % \item \textit{Is our scheduling algorithm universally applicable across various heterogeneous configurations?}
+    % % \vspace{-0.5em}
+\end{itemize}
+
+\subsection{Experimental Setup}
+\label{sec:exp}
+
+\textbf{Distributed environment.} We rent GPUs from RunPod~\citep{runpod2023}, a GPU cloud provider with services for various GPUs, and perform evaluation in the following setups:
+
+% sub table
+% \begin{wraptable}{r}{0.5\textwidth}
+% \centering
+% \tiny
+% \caption{Settings and prices on RunPod GPU platform.}
+% \label{tab:settings}
+% \begin{tabular}{@{}lccccc@{}}
+% \hline
+%  & \textbf{H100} & \textbf{A100} & \textbf{L40} & \textbf{A6000} & \textbf{Price (\$/h)} \\ 
+% \hline
+% Homogeneous Setting & 8 & 0 & 0 & 0 & 29.52 \\
+% Heterogeneous Setting 1 & 2 & 6 & 4 & 8 & 28.80 \\
+% Heterogeneous Setting 2 & 3 & 3 & 6 & 6 & 26.88 \\
+% Heterogeneous Setting 3 & 0 & 6 & 12 & 6 & 27.06 \\
+% Heterogeneous Setting 4 & 3 & 9 & 0 & 0 & 26.28 \\
+% Heterogeneous Setting 5 & 0 & 4 & 6 & 10 & 20.54 \\
+% \hline
+% \end{tabular}
+% \end{wraptable}
+
+\begin{itemize}[topsep=5pt, leftmargin=*]
+    % \vspace{-0.5em}
+    \item \underline{\textbf{Homogeneous setup:}} We rent one on-demand instance equipped with 8×NVIDIA H100-80G GPUs, with a budget of \$29.52/hour to represent the standard homogeneous case.
+    % \vspace{-0.5em}
+    \item \underline{\textbf{Heterogeneous setups:}} We utilize four types of GPUs: H100, A100, L40, and A6000, to construct five different heterogeneous cluster setups, where the first four settings use a similar budget as the homogeneous setting, while the last setting use a $70\%$ budget of the homogeneous settings. The detailed configuration is illustrated in~\autoref{fig:comm_matrix}. 
+    % We maintain the same price budget as the homogeneous setup while varying the GPU composition by type and number across heterogeneous settings 1 to 4, and reduce the budget to 70\% of the original cost in heterogeneous setting 5.
+    % to assess the cost efficiency of our system.
+    % \vspace{-0.5em}
+\end{itemize}
+
+We measure the communication bandwidth between each pair of GPUs via NCCL for all above mentioned environments. As shown in \autoref{fig:comm_matrix}, the heterogeneous environments demonstrate notable bandwidth limitation and heterogeneity.
+
+\begin{figure}
+    \centering
+    \includegraphics[width=\linewidth]{img/communication_matrix.pdf}
+    \caption{  {Communication bandwidth (Gbps) matrix for different settings. Homogeneous setting contains $8\times$H100 GPUs with a budget of 29.5 $\$/h$; heterogeneous setting 1 contains $2\times$H100, $6\times$A100, $4\times$L40 and $8\times$A6000 GPUs with a budget of 28.8 $\$/h$; heterogeneous setting 2 contains $3\times$H100 and A100, $6\times$L40 and A6000 GPUs with a budget of 26.9 $\$/h$; heterogeneous setting 3 contains $6\times$A100 and A6000, $12\times$L40 GPUs with a budget of 27.1 $\$/h$; heterogeneous setting 4 contains $3\times$H100 and $9\times$A100 GPUs with a budget of 26.3 $\$/h$; heterogeneous setting 5 contains $4\times$A100, $6\times$L40 and $10\times$A6000 with a $70\%$ budget of 20.5 $\$/h$.}}
+    \label{fig:comm_matrix}
+\end{figure}
+
+% \begin{table}[ht]
+% \centering
+% \tiny
+% \caption{Settings and prices on RunPod GPU platform.}
+% \label{tab:settings}
+% \begin{tabular}{@{}lccccc@{}}
+% \hline
+%  & \textbf{H100} & \textbf{A100} & \textbf{L40} & \textbf{A6000} & \textbf{Price (\$/h)} \\ 
+% \hline
+% Homogeneous Setting & 8 & 0 & 0 & 0 & 29.52 \\
+% Heterogenous Setting 1 & 2 & 6 & 4 & 8 & 28.80 \\
+% Heterogenous Setting 2 & 3 & 3 & 6 & 6 & 26.88 \\
+% Heterogenous Setting 3 & 0 & 6 & 12 & 6 & 27.06 \\
+% Heterogenous Setting 4 & 3 & 9 & 0 & 0 & 26.28 \\
+% Heterogenous Setting 5 & 0 & 4 & 6 & 10 & 20.54 \\
+% \hline
+% \end{tabular}
+% \end{table}
+
+\textbf{LLM inference workloads.} To evaluate the performances in different LLM inference workloads, we run four different types of workloads: heavy prefill with light decoding (HPLD), heavy prefill with heavy decoding (HPHD), light prefill with heavy decoding (LPHD), light prefill with light decoding (LPLD). Prefill requests that have more than $512$ tokens are categorized as heavy, others are light, and decoding requests with more than $128$ tokens are categorized as heavy~\citep{hu2024inference}. We generate these workloads using samples from the Azure Conversation dataset~\citep{patel2024splitwise}.
+
+\begin{wrapfigure}{r}{0.45\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{img/request_rate.pdf}
+    \caption{Request traces for online testing.}
+    \label{fig:req_traces}
+\end{wrapfigure}
+
+\textbf{Online and offline testing.} We test two different arrival rates: In the \textit{online setting}, we scale the average arrival rate to $75\%$ of the cluster's peak throughput to prevent request bursts that could cause system outages due to out-of-memory (OOM) errors, ~\autoref{fig:req_traces} illustrates the distribution of input and output lengths in our trace. In the \textit{offline setting}, we permit requests to arrive at a rate that fully utilizes the cluster, testing all four types of workloads (HPLD, HPHD, LPHD, LPLD).
+
+\textbf{Models.} We evaluate \sys on \textsc{OPT (30B)}~\citep{zhang2022opt} and \textsc{Llama-2 (70B)}~\citep{touvron2023llama} models, both are representative and popular open-source transformer models, to study the system performance on models of different sizes.
+
+\textbf{Baselines.} We carefully select state-of-the-art approaches as baselines. To understand end-to-end performance, we compare \sys with \textsc{DistServe}~\citep{zhong2024distserve} as the state-of-the-art approach under the homogeneous setting, \rebuttal{which enhances LLM serving by disaggregating prefill and decoding computations across different GPUs, allowing different resource allocation and parallelism for each phase.} And \textsc{HexGen}~\citep{jianghexgen} as the state-of-the-art approach under heterogeneous settings, \rebuttal{which is a distributed inference engine that efficiently manages LLM inference across heterogeneous environments, leveraging asymmetric parallelism with a scheduling algorithm to optimize resource allocation.} To understand the efficiency of the proposed scheduling algorithm, we compare its convergence with the truncated variant of our scheduling algorithm and \textit{genetic algorithm}.
+
+\textbf{Evaluation metrics.} For offline serving, we report the average decoding throughput, measured as the number of tokens generated per second. For online serving, we additionally report the SLO attainments as detailed in \S\ref{sec:slo}.
+
+\begin{figure}
+    \centering
+    \includegraphics[width=0.95\linewidth]{img/llama_70b_resize.pdf}
+    \caption{Throughput results to evaluate \sys on \textsc{Llama-2 (70B)}. Each row corresponds to a particular heterogeneous setting. The first four columns demonstrates the offline inference results on different LLM workloads. The last column represents the online inference results.}
+    \label{fig:llama70b}
+\end{figure}
+
+\begin{figure}
+    \centering
+    \includegraphics[width=0.95\linewidth]{img/opt_30b_resize.pdf}
+    \caption{Throughput results to evaluate \sys on \textsc{OPT (30B)}.}
+    \label{fig:opt30b}
+\end{figure}
+
+\subsection{End-to-end Experimental Results}
+
+\begin{figure}
+    \centering
+    \includegraphics[width=0.75\linewidth]{img/bk3.pdf}
+    \caption{Latency results in online experiments.}
+    \label{fig:latency}
+\end{figure}
+
+\vspace{-0.5em}
+\textbf{End-to-end performances.} \autoref{fig:llama70b} and \autoref{fig:opt30b} demonstrate the end-to-end throughput results of \sys compared with \textsc{HexGen} with different models, workloads, and heterogeneous settings, \rebuttal{and \textsc{DistServe} in the homogeneous setting.} Given the same price budget, \sys outperforms its counterparts in almost all cases. In fact, compared with \textsc{HexGen}, \sys achieves up to a 1.5$\times$ and, on average, a $1.4\times$ increase in serving throughput. Compared with \textsc{DistServe}, \sys achieves up to a $2\times$ and, on average, a $1.3\times$ higher serving throughput. We also demonstrate the latency results of \sys compared with \textsc{HexGen} in different heterogeneous settings and with \textsc{DistServe} in the homogeneous setting. As shown in \autoref{fig:latency}, \sys achieves on average a $1.5\times$ lower latency deadlines than its counterparts. Specifically, analyzing the scheduling results\footnote{The placements chosen by \sys for online experiments can be found in \autoref{appendix:scheduling results}.} under different heterogeneous settings and LLM workloads, we find that: (\underline{1}) our scheduling approach  prioritizes tensor model parallelism for prefill model replica to minimize latency and hybrid parallelism for decoding model replica to maximize throughput; (\underline{2}) the scheduled result also employs pipeline parallelism to reduce the inter-machine communication over limited bandwidth, and avoid ultra-low cross data center communication; (\underline{3}) relatively more resources are assigned for prefill and decoding in the HPLD and LPHD workloads to balance the resource demands for different phases; (\underline{4}) our approach always schedules KV cache communications through high-bandwidth links such as NVLink and PCIe to prevent them from becoming system bottlenecks. \rebuttal{We also compare \sys with the state-of-the-art LLM serving platform \textsc{vLLM} in \autoref{appendix:vllm}, and demonstrate the performance of \sys in the homogeneous setup in \autoref{appendix:homogeneous}.}
+
+\begin{wrapfigure}{r}{0.6\linewidth}
+    \vspace{-1em}
+    \centering
+    \includegraphics[width=\linewidth]{img/bk2.pdf}
+    \caption{Throughput results with 70\% price budget.}
+    \label{fig:bk_2}
+\end{wrapfigure}
+
+\textbf{Cost efficiency.} To evaluate cost-efficiency in terms of serving throughput between homogeneous and heterogeneous setup,  we reduce the budget in the heterogeneous setting by $30\%$. As shown in \autoref{fig:bk_2}, \sys in heterogeneous setting 5 still reveals similar performance to \textsc{DistServe} in the homogeneous setting, and even outperforms it by $30\%$ in some specific workloads. We believe that this is strong evidence to illustrate that a heterogeneous system such as \sys is capable of managing heterogeneous GPUs to provide more economical LLM inference services without compromising service quality.
+
+\subsection{Effectiveness of the Scheduling Algorithm}
+\label{sec:scheduling results}
+
+To evaluate the effectiveness of our scheduling algorithm, we compared its convergence behavior with some truncated variants, which disables the max-flow guided edge swap operation mentioned in \S\ref{sec:graph_refine} by replacing it with a random swap operation, and with the genetic algorithm. \rebuttal{The genetic algorithm, designed to optimize model deployment, uses a population-based approach involving merge, split, and swap operations to iteratively refine GPU groupings~\citep{jianghexgen}. In our comparison, we replaced the group generation step in the graph partition phase and the iterative refinement phases of our algorithm with the genetic algorithm to enable \sys with this method.} We benchmarked heterogeneous setting 1 across all four types of workloads. \autoref{fig:converge} and \autoref{fig:bk1} illustrate the convergence curves and experimental results. Our scheduling algorithm identifies optimal assignments for all scenarios within $90$ to $120$ seconds, which significantly outperforms both the truncated variant and the genetic algorithm, finds assignments that deliver on average a $1.8\times$ higher serving throughput and converges much faster, while the others get stuck in local minima. Additionally, we verified that in all cases, the estimated serving throughput closely aligns with the actual throughput. \rebuttal{Our scheduling algorithm also scales effectively with larger clusters, we demonstrate the experimental results in \autoref{appendix:scalability}.}
+
+\begin{figure}
+    \centering
+    \includegraphics[width=0.8\linewidth]{img/converge_curve.pdf}
+    \caption{Convergence comparison of our proposed search strategy, our strategy without edge swap, and genetic algorithm, where all run 15 times.}
+    \label{fig:converge}
+\end{figure}
+
+\begin{figure}
+    \centering
+    \includegraphics[width=0.8\linewidth]{img/bk1.pdf}
+    \caption{Throughput comparison in heterogeneous setting 1 among \textsc{HexGen-2}, \textsc{HexGen-2} without edge swap, and \textsc{HexGen-2} empowered by genetic algorithm.}
+    \label{fig:bk1}
+\end{figure}
+
+\section{Related Works}
+
+\textbf{LLM inference serving and disaggregated inference paradigm.} There are plenty of recent researches focused on optimizing LLM inference and serving ~\citep{li2023alpaserve,kwon2023efficient,agrawal2024taming,liu2023deja,wu2023fast,zhou2022pets,yu2022orca}. Among them, 
+vLLM~\citep{kwon2023efficient} proposes paged-attention to improve the memory efficiency of the system.
+Orca~\citep{yu2022orca} introduces continuous batching to improve inference throughput. 
+AlpaServe~\citep{li2023alpaserve} adopts model parallelism to optimize LLM serving performance.
+SARATHI~\citep{agrawal2024taming} introduces a chunked-prefill approach and piggybacks decoding requests to improve hardware utilization. 
+Deja Vu~\citep{liu2023deja} predicts contextual sparsity on-the-fly and uses an asynchronous and hardware-aware implementation to enhance LLM inference. 
+%Differently, our approach focuses on optimizing LLM inference and serving in heterogeneous environments.
+On the other hand, many very recent works have been produced using disaggregated paradigm. 
+Splitwise~\citep{patel2024splitwise} splits the prefill and decoding phases onto separate machines to optimize hardware utilization. 
+DistServe~\citep{zhong2024distserve} further implements distinct parallel strategies for different phases. TetriInfer~\citep{hu2024inference} partitions prompts into fixed-size chunks and adopts a two-level scheduling algorithm to improve the performance of disaggregated inference. Mooncake~\citep{qin2024mooncake} features a KV cache-centric disaggregated architecture that enhances inference by fully leveraging the underutilized resources of GPU clusters, excelling in long-context scenarios. 
+These works further confirm the effectiveness of the disaggregated architecture.
+
+
+
+
+\textbf{Heterogeneous GPU computing.} 
+Recent efforts have investigated diverse approaches to deploying LLMs in heterogeneous environments. 
+LLM-PQ~\citep{zhao2024llm} supports adaptive model quantization and phase-aware partitioning to boost LLM serving efficiency on heterogeneous GPU clusters. 
+Helix~\citep{mei2024helix} formulates heterogeneous GPUs and network connections as a maxflow problem, and adopts a mixed integer linear programming algorithm to discover highly optimized strategies for serving LLMs. HexGen~\citep{jianghexgen} proposes asymmetric parallelism and an advanced scheduling algorithm to deploy generative inference in decentralized and heterogeneous environments. Mélange~\citep{griggs2024m} formulates the GPU allocation task as a cost-aware bin packing problem and optimizes cost efficiency for LLM services by leveraging heterogeneous GPU types. 
+Note that our work shares a similar objective and but is the first to adapt the disaggregated inference architecture for heterogeneous environments.
+
+
+\vspace{-0.5em}
+\section{Conclusion}
+We explore the potential of implementing a disaggregated inference framework in heterogeneous environments with devices of diversified computational capacities connected over a heterogeneous network. Toward this end, we propose \sys, a generative inference framework that incorporates a disaggregated architecture alongside an efficient scheduling algorithm tailored for such deployments. Our empirical study suggests that, given the same budget, \sys can outperform state-of-the-art homogeneous and heterogeneous inference frameworks by up to $2.0\times$ and on average $1.3\times$ in serving throughput, and reduces the average inference latency by $1.5\times$. Additionally, \sys maintains competitive inference performance relative to leading frameworks with a $30\%$ lower price budget. We believe that such an effort from \sys to provide \textit{efficient economical} LLM inference could potentially democratize the usage of generative AI. 
+
+% \section{Citations, figures, tables, references}
+% \label{others}
+
+% These instructions apply to everyone, regardless of the formatter being used.
+
+% \subsection{Citations within the text}
+
+% Citations within the text should be based on the \texttt{natbib} package
+% and include the authors' last names and year (with the ``et~al.'' construct
+% for more than two authors). When the authors or the publication are
+% included in the sentence, the citation should not be in parenthesis using \verb|\citet{}| (as
+% in ``See \citet{Hinton06} for more information.''). Otherwise, the citation
+% should be in parenthesis using \verb|\citep{}| (as in ``Deep learning shows promise to make progress
+% towards AI~\citep{Bengio+chapter2007}.'').
+
+% The corresponding references are to be listed in alphabetical order of
+% authors, in the \textsc{References} section. As to the format of the
+% references themselves, any style is acceptable as long as it is used
+% consistently.
+
+% \subsection{Footnotes}
+
+% Indicate footnotes with a number\footnote{Sample of the first footnote} in the
+% text. Place the footnotes at the bottom of the page on which they appear.
+% Precede the footnote with a horizontal rule of 2~inches
+% (12~picas).\footnote{Sample of the second footnote}
+
+% \subsection{Figures}
+
+% All artwork must be neat, clean, and legible. Lines should be dark
+% enough for purposes of reproduction; art work should not be
+% hand-drawn. The figure number and caption always appear after the
+% figure. Place one line space before the figure caption, and one line
+% space after the figure. The figure caption is lower case (except for
+% first word and proper nouns); figures are numbered consecutively.
+
+% Make sure the figure caption does not get separated from the figure.
+% Leave sufficient space to avoid splitting the figure and figure caption.
+
+% You may use color figures.
+% However, it is best for the
+% figure captions and the paper body to make sense if the paper is printed
+% either in black/white or in color.
+% \begin{figure}[h]
+% \begin{center}
+% %\framebox[4.0in]{$\;$}
+% \fbox{\rule[-.5cm]{0cm}{4cm} \rule[-.5cm]{4cm}{0cm}}
+% \end{center}
+% \caption{Sample figure caption.}
+% \end{figure}
+
+% \subsection{Tables}
+
+% All tables must be centered, neat, clean and legible. Do not use hand-drawn
+% tables. The table number and title always appear before the table. See
+% Table~\ref{sample-table}.
+
+% Place one line space before the table title, one line space after the table
+% title, and one line space after the table. The table title must be lower case
+% (except for first word and proper nouns); tables are numbered consecutively.
+
+% \begin{table}[t]
+% \caption{Sample table title}
+% \label{sample-table}
+% \begin{center}
+% \begin{tabular}{ll}
+% \multicolumn{1}{c}{\bf PART}  &\multicolumn{1}{c}{\bf DESCRIPTION}
+% \\ \hline \\
+% Dendrite         &Input terminal \\
+% Axon             &Output terminal \\
+% Soma             &Cell body (contains cell nucleus) \\
+% \end{tabular}
+% \end{center}
+% \end{table}
+
+% \section{Default Notation}
+
+% In an attempt to encourage standardized notation, we have included the
+% notation file from the textbook, \textit{Deep Learning}
+% \cite{goodfellow2016deep} available at
+% \url{https://github.com/goodfeli/dlbook_notation/}.  Use of this style
+% is not required and can be disabled by commenting out
+% \texttt{math\_commands.tex}.
+
+
+% \centerline{\bf Numbers and Arrays}
+% \bgroup
+% \def\arraystretch{1.5}
+% \begin{tabular}{p{1in}p{3.25in}}
+% $\displaystyle a$ & A scalar (integer or real)\\
+% $\displaystyle \va$ & A vector\\
+% $\displaystyle \mA$ & A matrix\\
+% $\displaystyle \tA$ & A tensor\\
+% $\displaystyle \mI_n$ & Identity matrix with $n$ rows and $n$ columns\\
+% $\displaystyle \mI$ & Identity matrix with dimensionality implied by context\\
+% $\displaystyle \ve^{(i)}$ & Standard basis vector $[0,\dots,0,1,0,\dots,0]$ with a 1 at position $i$\\
+% $\displaystyle \text{diag}(\va)$ & A square, diagonal matrix with diagonal entries given by $\va$\\
+% $\displaystyle \ra$ & A scalar random variable\\
+% $\displaystyle \rva$ & A vector-valued random variable\\
+% $\displaystyle \rmA$ & A matrix-valued random variable\\
+% \end{tabular}
+% \egroup
+% \vspace{0.25cm}
+
+% \centerline{\bf Sets and Graphs}
+% \bgroup
+% \def\arraystretch{1.5}
+
+% \begin{tabular}{p{1.25in}p{3.25in}}
+% $\displaystyle \sA$ & A set\\
+% $\displaystyle \R$ & The set of real numbers \\
+% $\displaystyle \{0, 1\}$ & The set containing 0 and 1 \\
+% $\displaystyle \{0, 1, \dots, n \}$ & The set of all integers between $0$ and $n$\\
+% $\displaystyle [a, b]$ & The real interval including $a$ and $b$\\
+% $\displaystyle (a, b]$ & The real interval excluding $a$ but including $b$\\
+% $\displaystyle \sA \backslash \sB$ & Set subtraction, i.e., the set containing the elements of $\sA$ that are not in $\sB$\\
+% $\displaystyle \gG$ & A graph\\
+% $\displaystyle \parents_\gG(\ervx_i)$ & The parents of $\ervx_i$ in $\gG$
+% \end{tabular}
+% \vspace{0.25cm}
+
+
+% \centerline{\bf Indexing}
+% \bgroup
+% \def\arraystretch{1.5}
+
+% \begin{tabular}{p{1.25in}p{3.25in}}
+% $\displaystyle \eva_i$ & Element $i$ of vector $\va$, with indexing starting at 1 \\
+% $\displaystyle \eva_{-i}$ & All elements of vector $\va$ except for element $i$ \\
+% $\displaystyle \emA_{i,j}$ & Element $i, j$ of matrix $\mA$ \\
+% $\displaystyle \mA_{i, :}$ & Row $i$ of matrix $\mA$ \\
+% $\displaystyle \mA_{:, i}$ & Column $i$ of matrix $\mA$ \\
+% $\displaystyle \etA_{i, j, k}$ & Element $(i, j, k)$ of a 3-D tensor $\tA$\\
+% $\displaystyle \tA_{:, :, i}$ & 2-D slice of a 3-D tensor\\
+% $\displaystyle \erva_i$ & Element $i$ of the random vector $\rva$ \\
+% \end{tabular}
+% \egroup
+% \vspace{0.25cm}
+
+
+% \centerline{\bf Calculus}
+% \bgroup
+% \def\arraystretch{1.5}
+% \begin{tabular}{p{1.25in}p{3.25in}}
+% % NOTE: the [2ex] on the next line adds extra height to that row of the table.
+% % Without that command, the fraction on the first line is too tall and collides
+% % with the fraction on the second line.
+% $\displaystyle\frac{d y} {d x}$ & Derivative of $y$ with respect to $x$\\ [2ex]
+% $\displaystyle \frac{\partial y} {\partial x} $ & Partial derivative of $y$ with respect to $x$ \\
+% $\displaystyle \nabla_\vx y $ & Gradient of $y$ with respect to $\vx$ \\
+% $\displaystyle \nabla_\mX y $ & Matrix derivatives of $y$ with respect to $\mX$ \\
+% $\displaystyle \nabla_\tX y $ & Tensor containing derivatives of $y$ with respect to $\tX$ \\
+% $\displaystyle \frac{\partial f}{\partial \vx} $ & Jacobian matrix $\mJ \in \R^{m\times n}$ of $f: \R^n \rightarrow \R^m$\\
+% $\displaystyle \nabla_\vx^2 f(\vx)\text{ or }\mH( f)(\vx)$ & The Hessian matrix of $f$ at input point $\vx$\\
+% $\displaystyle \int f(\vx) d\vx $ & Definite integral over the entire domain of $\vx$ \\
+% $\displaystyle \int_\sS f(\vx) d\vx$ & Definite integral with respect to $\vx$ over the set $\sS$ \\
+% \end{tabular}
+% \egroup
+% \vspace{0.25cm}
+
+% \centerline{\bf Probability and Information Theory}
+% \bgroup
+% \def\arraystretch{1.5}
+% \begin{tabular}{p{1.25in}p{3.25in}}
+% $\displaystyle P(\ra)$ & A probability distribution over a discrete variable\\
+% $\displaystyle p(\ra)$ & A probability distribution over a continuous variable, or over
+% a variable whose type has not been specified\\
+% $\displaystyle \ra \sim P$ & Random variable $\ra$ has distribution $P$\\% so thing on left of \sim should always be a random variable, with name beginning with \r
+% $\displaystyle  \E_{\rx\sim P} [ f(x) ]\text{ or } \E f(x)$ & Expectation of $f(x)$ with respect to $P(\rx)$ \\
+% $\displaystyle \Var(f(x)) $ &  Variance of $f(x)$ under $P(\rx)$ \\
+% $\displaystyle \Cov(f(x),g(x)) $ & Covariance of $f(x)$ and $g(x)$ under $P(\rx)$\\
+% $\displaystyle H(\rx) $ & Shannon entropy of the random variable $\rx$\\
+% $\displaystyle \KL ( P \Vert Q ) $ & Kullback-Leibler divergence of P and Q \\
+% $\displaystyle \mathcal{N} ( \vx ; \vmu , \mSigma)$ & Gaussian distribution %
+% over $\vx$ with mean $\vmu$ and covariance $\mSigma$ \\
+% \end{tabular}
+% \egroup
+% \vspace{0.25cm}
+
+% \centerline{\bf Functions}
+% \bgroup
+% \def\arraystretch{1.5}
+% \begin{tabular}{p{1.25in}p{3.25in}}
+% $\displaystyle f: \sA \rightarrow \sB$ & The function $f$ with domain $\sA$ and range $\sB$\\
+% $\displaystyle f \circ g $ & Composition of the functions $f$ and $g$ \\
+%   $\displaystyle f(\vx ; \vtheta) $ & A function of $\vx$ parametrized by $\vtheta$.
+%   (Sometimes we write $f(\vx)$ and omit the argument $\vtheta$ to lighten notation) \\
+% $\displaystyle \log x$ & Natural logarithm of $x$ \\
+% $\displaystyle \sigma(x)$ & Logistic sigmoid, $\displaystyle \frac{1} {1 + \exp(-x)}$ \\
+% $\displaystyle \zeta(x)$ & Softplus, $\log(1 + \exp(x))$ \\
+% $\displaystyle || \vx ||_p $ & $\normlp$ norm of $\vx$ \\
+% $\displaystyle || \vx || $ & $\normltwo$ norm of $\vx$ \\
+% $\displaystyle x^+$ & Positive part of $x$, i.e., $\max(0,x)$\\
+% $\displaystyle \1_\mathrm{condition}$ & is 1 if the condition is true, 0 otherwise\\
+% \end{tabular}
+% \egroup
+% \vspace{0.25cm}
+
+
+
+% \section{Final instructions}
+% Do not change any aspects of the formatting parameters in the style files.
+% In particular, do not modify the width or length of the rectangle the text
+% should fit into, and do not change font sizes (except perhaps in the
+% \textsc{References} section; see below). Please note that pages should be
+% numbered.
+
+% \section{Preparing PostScript or PDF files}
+
+% Please prepare PostScript or PDF files with paper size ``US Letter'', and
+% not, for example, ``A4''. The -t
+% letter option on dvips will produce US Letter files.
+
+% Consider directly generating PDF files using \verb+pdflatex+
+% (especially if you are a MiKTeX user).
+% PDF figures must be substituted for EPS figures, however.
+
+% Otherwise, please generate your PostScript and PDF files with the following commands:
+% \begin{verbatim}
+% dvips mypaper.dvi -t letter -Ppdf -G0 -o mypaper.ps
+% ps2pdf mypaper.ps mypaper.pdf
+% \end{verbatim}
+
+% \subsection{Margins in LaTeX}
+
+% Most of the margin problems come from figures positioned by hand using
+% \verb+\special+ or other commands. We suggest using the command
+% \verb+\includegraphics+
+% from the graphicx package. Always specify the figure width as a multiple of
+% the line width as in the example below using .eps graphics
+% \begin{verbatim}
+%    \usepackage[dvips]{graphicx} ...
+%    \includegraphics[width=0.8\linewidth]{myfile.eps}
+% \end{verbatim}
+% or % Apr 2009 addition
+% \begin{verbatim}
+%    \usepackage[pdftex]{graphicx} ...
+%    \includegraphics[width=0.8\linewidth]{myfile.pdf}
+% \end{verbatim}
+% for .pdf graphics.
+% See section~4.4 in the graphics bundle documentation (\url{http://www.ctan.org/tex-archive/macros/latex/required/graphics/grfguide.ps})
+
+% A number of width problems arise when LaTeX cannot properly hyphenate a
+% line. Please give LaTeX hyphenation hints using the \verb+\-+ command.
+
+% \subsubsection*{Author Contributions}
+% If you'd like to, you may include  a section for author contributions as is done
+% in many journals. This is optional and at the discretion of the authors.
+
+% \subsubsection*{Acknowledgments}
+% Use unnumbered third level headings for the acknowledgments. All
+% acknowledgments, including those to funding agencies, go at the end of the paper.
+
+\nocite{zhang2025sageattention,zhang2024sageattention2,zhang2025spargeattn,jiang2025demystifying}
+
+\bibliography{iclr2025_conference}
+\bibliographystyle{iclr2025_conference}
+
+\newpage
+\appendix
+\input{cost_table}
+\input{strategy_table}
+\section{Generative Inference Cost Estimation}
+\label{appendix:a}
+
+\textbf{Node capacity estimation.} To estimate the generative inference cost, we adopt the \textit{cost model} from \textsc{HexGen} \citep{jianghexgen} and summarize the computation costs, communication costs, and memory consumption constraints in~\autoref{tab:formula}. The inference latency for a single request is calculated by summing the total computation and communication costs. We determine the capacity of the compute-bound prefill node, where batching more requests does not enhance system throughput, by dividing the predefined time period by the latency. Conversely, for the memory I/O-bound decoding node, which benefits from batching, we calculate its capacity by dividing the product of the maximum available batch size and the time period by the latency.
+
+\textbf{Edge capacity estimation.} For connection types (\underline{1}) and (\underline{2}) mentioned in \S\ref{sec:second-phase}, the edge capacities are equal to the product of the predefined time period and the connection bandwidth, divided by the transmission size of a request. For connection type (\underline{3}), the edge capacity is equal to the time period divided by the estimated KV cache communication cost in~\autoref{tab:formula}. As mentioned in~\S\ref{sec:second-phase}, the edge capacity of connection type (\underline{3}) is determined by the collective performance of all GPU-to-GPU transmission connections, as each connection is responsible for a portion of the KV cache transmission. To optimize it, given the parallel configurations of the prefill and decoding model replicas, we adjust the pipeline stage order of both phases to minimize the overall KV cache communication cost, which in turn determines the edge capacity.
+
+\rebuttal{\textbf{Memory requirement estimation for a single model replica.} The memory cost model in \autoref{tab:formula} estimates the memory required for a single model replica. To determine the total memory requirement for a single model replica, we assume a batch size of 32 concurrent requests (i.e., $b_t=32$). Thus, the total memory requirement is calculated as: model parameter size + 32 * KV cache size per request.}
+
+\section{\sys Scheduling Results}
+\label{appendix:scheduling results}
+We list the model serving group partitions and types generated by \sys in the online experiments for each heterogeneous setting in~\autoref{tab:strategies}.
+
+% \section{Discussion on Online Serving}
+% Online serving typically encompasses diverse workload types. However, the model placement strategy in \sys is optimized for a specific inference workload, which may become suboptimal over time. Therefore, adjusting the model placement strategy to accommodate varying workload types can further enhance the performance of online LLM serving. In the max-flow formulation of \sys, changes in the workload (e.g., shifting from HPLD to LPHD) directly affect the capacities of prefill and decoding nodes. To address these changes, we can employ the iterative refinement approach described in \S\ref{sec:graph_refine}, enabling a local search for an updated model placement strategy that better meets the new workload demands. Although we do not explore real-time adjustments of the model placement strategy based on workload changes in this work, the scheduling algorithm of \sys demonstrates the potential to adapt to different workload types with minimal effort.
+
+\color{black}{
+\section{Scheduling Algorithm Analysis}
+\label{appendix:analysis}
+The scheduling algorithm aims to optimize the deployment of large language model (LLM) inference workloads on a heterogeneous GPU cluster. The optimization involves the following essential phases:
+
+\begin{itemize}[topsep=5pt, leftmargin=*]
+    \vspace{-0.5em}
+    \item \textbf{Graph partition.} The initial partition focuses on creating memory-balanced groups and optimizing the capacity within each group. The secondary partition determines group type (i.e., prefill or decoding), focusing on maximizing inter-type communication bandwidth for efficient KV cache transfer.
+    \item \textbf{Max-flow.} This phase determines optimal parallel strategies for each group and determines the optimal inter-type KV cache communication paths based on the max-flow outputs.
+    \item \textbf{Iterative refinement.} This phase continuously adjusts partitions and strategies based on workload demands until no further improvements can be made.
+    \vspace{-0.5em}
+\end{itemize}
+
+\textbf{The upper bound for graph partitioning} indicates \textit{the optimal utilization of heterogeneous computation power and connections.} The theoretical upper bound of the graph partition phase is achieved when the cluster is partitioned into groups with balanced memory capacities and optimized processing capabilities, and the groups are assigned types (i.e., prefill or decoding) in a manner that maximizes inter-type communication bandwidth for key-value (KV) cache transfers.
+
+\textbf{The upper bound for max-flow} indicates \textit{the maximum possible data flow within the cluster.} The theoretical upper bound of the max flow phase is determined by the maximum possible data transfer rate of the entire system. This upper limit is achieved when the system fully utilizes the inter-type network bandwidth for KV cache transfers and optimizes the processing capabilities of the prefill and decoding model replicas.
+
+Based on our scheduling algorithm, the optimization will iteratively narrow the gap between the current allocation and the theoretical upper bounds, where the iterative refinement process \textit{addresses the limitations inherent in each phase}. The challenges in reaching upper bounds lie in two aspects:
+
+\begin{itemize}[topsep=5pt, leftmargin=*]
+\vspace{-0.5em}
+\item \textbf{In the graph partition phase,} creating an ideal graph partition in a single iteration is challenging since this phase lacks critical information (e.g., parallel strategy and KV cache communication path) from subsequent phases. Without these insights, the initial graph partitioning cannot guarantee an ideal utilization of the heterogeneous cluster, leading to potential communication bottlenecks and workload imbalances.
+
+\item \textbf{The max flow phase} operates within the constraints set by the graph partition. The max-flow algorithm cannot achieve the theoretical maximum flow if the preceding graph partition results in less-than-optimal grouping. Limited inter-group communication bandwidth and unbalanced node capacities prevent the system from fully utilizing the network's data transfer capabilities.
+\vspace{-0.5em}
+\end{itemize}
+
+\textbf{Iterative refinement.}
+\textit{The iterative refinement phase is crucial in bridging the gap toward the upper bounds.} It continuously evaluates and adjusts groupings, fine-tunes parallel configurations and recalculates optimal KV cache communication paths based on updated partitions. This approach allows the algorithm to:
+\begin{itemize}[topsep=5pt, leftmargin=*]
+    \vspace{-0.5em}
+    \item \textbf{Rebalance trade-offs for graph partition.} Balance intra-group resource optimization with inter-type communication efficiency for optimized resource utilization.
+    \item \textbf{Enhance max-flow potential.} Balance overutilized and underutilized edges within the formulated flow network for optimized data flow efficiency.
+    \vspace{-0.5em}
+\end{itemize}
+}
+
+\rebuttal{
+\section{Disaggregation and Chunked Prefill}
+\label{appendix:pdandcp}
+Chunked prefill~\citep{agrawal2024taming} is a method that divides input tokens into smaller chunks, which are then processed in a continuous batch. This approach simplifies scheduling by treating all nodes uniformly and enhances computational efficiency during decoding, improving machine utilization. However, this approach may not result in significant performance gains across all workload types. We evaluate chunked prefill using vLLM~\citep{kwon2023efficient} on one H100 GPU serving the OPT-30B model. Experimental results demonstrate that on HPLD and LPLD workloads, chunked prefill brings an approximately 20\% throughput improvement, while it only brings around 5\% throughput gains on HPHD and LPHD workloads. Therefore, we choose disaggregation, which enables different batching strategies, resource allocations, and parallel approaches for each phase, providing greater flexibility in handling various types of workloads.
+}
+
+{\color{black}
+\section{Case Study: Scheduling Algorithm Analysis on a Small Cluster}
+\label{appendix:scheduling}
+In this section, we provide a case study of our scheduling algorithm on relatively small size heterogeneous cluster with 4 H100s and 4 A100s for better understanding of our scheduling algorithm. The detailed procedures are listed bellow.
+
+\subsection{Phase 1: Graph Partition}
+
+The graph partition phase aims to find the group construction and type mentioned in \S\ref{sec:problem formulation}.
+
+\textbf{Step 1: initial partition.} Step 1 divides the GPUs into multiple independent groups based on minimizing inter-group communication bandwidth and balancing the memory capacity of each group. After step 1, the cluster is divided into four groups g1-4, and the construction of each group is: g1: two H100, g2: two H100, g3: two A100, and g4: two A100.
+
+\textbf{Step 2 \& 3: coarsen \& secondary partition \& projection.} This step aims to distinguish the type for each group (prefill or decoding). In the small case, g1 and g3 are determined to be the prefill model replicas, and g2 and g4 are determined to be the decoding model replicas.
+
+\subsection{Phase 2: Max-Flow Algorithm}
+
+The max-flow algorithm aims to fine the parallel strategy and KV cache communication path mentioned in \S\ref{sec:problem formulation}.
+
+\textbf{Step 1: find the optimal parallel strategies for prefill and decoding groups.} This step determines the latency- and throughput-optimal parallel strategies for prefill and decoding model replicas. After searching, g1 and g3 (prefill model replicas) use a parallel strategy of (TP=2, PP=1) (latency-optimal), while g2 and g4 (decoding model replicas) use a parallel strategy of (TP=1, PP=2) (throughput-optimal).
+
+\textbf{Step 2: find the optimal KV communication path.} We run a preflow-push algorithm to get the max flow of the cluster. The generated flow assignments are used to guide the KV cache communication. In the small case, g1 (prefill model replica) communicates with g2 (decoding model replica), and g3 (prefill model replica) communicates with g4 (decoding model replica).
+
+\subsection{Phase 3: Iterative Refinement}
+
+The iterative refinement phase aims at co-optimizes the four objectives (group construction, group type, parallel strategy and KV cache communication path) in the first and second phases.
+
+\textbf{Iterative refinement using swap operation.} We use max-flow guided edge swap to iterative refine the graph partition until no further improvements can be made. For instance, for workloads with light prefill and heavy decoding (LPHD) needs, the algorithm would attempt to allocate more resources to decoding model replicas. In the small case with LPHD workloads, one H100 from g1 (prefill model replica) is swapped into g2 (decoding model replica) and one A100 from g3 (prefill model replica) is swapped into g4 (decoding model replica) for enhancing the decoding ability of the system and maximizing the system throughput. The iterative refinement will optimize the plan for any given LLM inference workload accordingly given the workload characteristics.
+
+In this small case, the output of our scheduling algorithm is the same as the output that is derived through exhaustive search.
+}
+
+\color{black}{
+\section{Compare \sys with \textsc{vLLM}}
+\label{appendix:vllm}
+In this section, we conduct additional experiments to compare \sys with state-of-the-art LLM serving platform. We evaluated vLLM using the same homogeneous experimental setup described in \S\ref{sec:exp}. Specifically, we rent 8 H100 GPUs from the RunPod platform and test vLLM with the Llama2-70B model using samples from the Azure Conversation dataset. As demonstrated in~\autoref{tab:vllm}, \sys achieves up to a 2.1$\times$ and on average a 1.5$\times$ higher serving throughput compared with \textsc{vLLM} in our testbed.
+}
+
+\begin{table}[h]
+\centering
+\rebuttal{
+\caption{\rebuttal{Comparison between different frameworks with different setups.}}
+\resizebox{\linewidth}{!}{
+\begin{tabular}{l | l | c | c | c | c | c}
+\hline
+\textbf{Setting} & \textbf{System} & \textbf{HPLD} & \textbf{HPHD} & \textbf{LPHD} & \textbf{LPLD} & \textbf{Online} \\
+\hline
+Heterogeneous Setting 1 & \sys & 157 tokens/s & 448 tokens/s & 689 tokens/s & 570 tokens/s & 350 tokens/s \\
+\hline
+Heterogeneous Setting 1 & \textsc{HexGen}    & 123 tokens/s & 375 tokens/s & 492 tokens/s & 407 tokens/s & 259 tokens/s \\
+\hline
+Homogeneous Setting     & \textsc{DistServe} & 128 tokens/s & 368 tokens/s & 553 tokens/s & 291 tokens/s & 251 tokens/s \\
+\hline
+Homogeneous Setting     & \textsc{vLLM}      & 97 tokens/s  & 437 tokens/s & 563 tokens/s & 270 tokens/s & 256 tokens/s \\
+\hline
+\end{tabular}
+\label{tab:vllm}
+}
+}
+\end{table}
+
+\color{black}{
+\section{Case Study: Homogeneous System Comparison}
+\label{appendix:homogeneous}
+In this section, we compare \sys with \textsc{DistServe} and \textsc{HexGen} in a homogeneous setup.
+
+\textbf{Experimental setup.} To compare the runtime of \sys with \textsc{DistServe} and \textsc{HexGen}, we rented 4 H100 GPUs from the RunPod platform and tested serving throughput on the OPT-30B model using the four types of LLM inference workloads (HPLD, HPHD, LPHD, LPLD) described in \S\ref{sec:exp}.
+
+\textbf{Compare with \textsc{DistServe}.} We found that for certain inference workloads, the scheduling results of \sys and \textsc{DistServe} differ. For example, with the HPLD workload, \sys favors replicating more model replicas to enhance the system's parallel processing, while \textsc{DistServe} prefers model parallelism to distribute the computation of a single model replica across multiple GPUs. Experimental results demonstrate that \sys outperforms \textsc{DistServe} in certain cases due to better scheduling results while delivering comparable performance when the scheduling outcomes are the same.
+
+\textbf{Compare with \textsc{HexGen}.} \sys, with optimized scheduling in a disaggregated architecture, minimizes interference between the prefill and decoding phases of LLM inference. It selects appropriate parallelism and batching strategies for each phase, resulting in improved inference performance compared to \textsc{HexGen} in a homogeneous environment.
+
+\begin{table}[h]
+\centering
+\rebuttal{
+\caption{\rebuttal{Throughput comparison in a homogeneous cluster.}}
+\begin{tabular}{l|c|c|c}
+\hline
+          & \sys       & \textsc{DistServe}     & \textsc{HexGen}        \\
+\hline
+HPLD      & 365 tokens/s  & 302 tokens/s  & 277 tokens/s  \\
+\hline
+HPHD      & 683 tokens/s  & 692 tokens/s  & 505 tokens/s  \\
+\hline
+LPHD      & 758 tokens/s  & 774 tokens/s  & 533 tokens/s  \\
+\hline
+LPLD      & 730 tokens/s  & 553 tokens/s  & 545 tokens/s  \\
+\hline
+\end{tabular}
+}
+\end{table}
+}
+
+\color{black}{
+\section{Case Study: Scheduling Algorithm Scalability}
+\label{appendix:scalability}
+In this section, we conduct additional experiments to evaluate the scalability of our scheduling algorithm. The results are shown below.
+
+\begin{table}[h]
+\centering
+\rebuttal{
+\caption{\rebuttal{Algorithm convergence time across different cluster sizes.}}
+\begin{tabular}{c | c}
+\hline
+\textbf{Ngpus} & \textbf{Time (min)} \\
+\hline
+64  & 4.03    \\
+\hline
+128 & 7.93    \\
+\hline
+192 & 21.66   \\
+\hline
+256 & 28.44   \\
+\hline
+320 & 47.77   \\
+\hline
+\end{tabular}
+}
+\end{table}
+
+Experimental results demonstrate that our scheduling algorithm scales polynomially and shows potential for addressing larger and more complex heterogeneous scheduling problems.
+}
+
+\end{document}

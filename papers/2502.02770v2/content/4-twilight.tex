@@ -1,0 +1,148 @@
+\section{Twilight}
+% \cf{TODO(Chaofan): Section 4 needs refactor.}
+\begin{figure*}[t]
+\begin{center}
+\centerline{\includegraphics[width=\columnwidth*2]{figures/arch.pdf}}
+% \mingyu{Nits: to beautify, all figures in the paper should have similar font size \emph{after} embedded in the paper. That is, even you use the same font size when drawing them, you also need to make sure they have the same scaling ratio when included in the paper. Since the final absolute widths are fixed (single-column or double-column), this means you need to be careful how wide your figures should be when drawing them.}
+\caption{Architecture of Twilight. Twilight is built on certain existing algorithm and serves as its optimizer. It computes self-attention in three steps. First, \textbf{Token Selector} select critical tokens using the strategy of base algorithm under a relaxed budget. Then, \textbf{Twilight Pruner} prunes the selected token indices via top-$p$ thresholding. Finally, the optimized token indices are passed to \textbf{Sparse Attention Kernel} to perform attention computation.}
+\label{fig:arch}
+\end{center}
+\end{figure*}
+
+In the previous section, we demonstrated that top-$p$ attention can adaptively control the budget while ensuring that the sum of normalized attention weights meets a certain threshold $p$. Our primary goal is to use top-$p$ to endow more existing algorithms with adaptive attention sparsity, rather than simply inventing another sparse attention, which is motivated by two main reasons: On one hand, despite their budget-related challenges, existing sparse algorithms have achieved significant success in current serving systems ~\cite{vllm, sglang}, thanks to their effective token selection strategies. These strategies can be readily reused and enhanced with adaptive sparsity.
+On the other hand, we anticipate that future sparse attention methods may still employ top-$k$ selection. By developing a general solution like ours, we aim to automatically equip these future methods with adaptive attention sparsity, thereby improving their efficiency and adaptability without requiring extensive redesign. Consequently, we initially positioned our system, Twilight, as an \textbf{optimizer} for existing algorithms.
+
+However, deploying top-$p$ to different existing sparse attention algorithms faces majorly three challenges, both algorithm-wise and system-wise.
+
+% \mingyu{I think such challenges are better put at the end of the last section rather than here. They belong to the high-level discussions rather than our concrete designs, i.e., they are not unique to Twilight.}
+
+\textbf{(C1) Not all algorithms are suitable for top-$p$.} Top-$p$ imposes strict constraints on the layout of attention weights. For example, simply replacing top-$k$ with top-$p$ in Quest \cite{tang2024quest} would not work, as Quest performs max pooling on weights with a per-page layout (16 tokens per page). Additionally, some other methods \cite{yang2024tidaldecodefastaccuratellm, liu2024retrievalattention} do not use attention weights to select critical tokens at all.
+
+\textbf{(C2) It's harder to estimate weights for top-$p$ than top-$k$.} 
+% Section \ref{sec:top_p} shows great potential of top-$p$ pruning method. However, either oracle top-$k$ or oracle top-$p$ attention can only save the load of $V$ since we need to load all keys to compute full attention weights \cite{sheng2023flexgen}. Numerous top-$k$ based methods dedicate to find ways to better estimate attention weights without loading full keys through either loading less channels \cite{ribar2023sparq, yang2024post, zhang2024pqcache} or less tokens \cite{tang2024quest}. To summarize, their core purpose is to represent the $K$ cache in a lower-precision way. For example, DS \cite{yang2024post} compresses $K$ cache to 2-bit with only half channels, therefore saving $1/16$ memory I/O. However, 
+The precision requirement of top-$p$ is higher than that of top-$k$, because the former requires a certain degree of numerical accuracy while the latter only demands ordinality. 
+% \mingyu{There is no explanation in the paper for this claim. The table also directly says so without reasons.} 
+\autoref{table:prune_cmp} provides a basic comparison of top-$k$, top-$p$, and full attention. The precision requirement of top-$p$ attention lies between the other two, which leads us to reconsider the appropriate precision choice for compressing the $K$ cache.
+
+\textbf{(C3) System-level optimizations are needed.} Since our work is the first work introduce top-$p$ to attention weights, many algorithms need to be efficiently implemented in hardware, including efforts on both efficient parallel algorithm designs and efficient kernel optimizations.
+% \mingyu{This is a very vague discussion that offers little info to readers. Try to be more specific, e.g., what (extra or untraditional) computations are needed (e.g., a prefix sum?), and their impls are not widely explored, etc.}
+
+In Section \ref{sec:hp}, we address \textbf{C1} by proposing a unified pruning framework for sparse attention. In 
+ Section \ref{sec:kernel}, we mitigate the runtime overhead of by efficient kernel implementations (top-$p$, SpGEMV, Attention) and 4-bit quantization of $K$ cache, addressing \textbf{C2} and \textbf{C3}. Lastly, in Section \ref{sec:disc}, we analyze the overhead of Twilight and discuss some topics.
+\begin{table}[t]
+\caption{Comparing of different pruning methods on attention weights. "Normalize" indicates \texttt{softmax}.}
+\label{table:prune_cmp}
+% \mingyu{This table seems important, but none of the information in it has been explained anywhere in the paper. You cannot let the readers to derive these characteristics by themselves.}
+\begin{center}
+\begin{small}
+\resizebox{\linewidth}{!}{
+\begin{tabular}{ccccc}
+\toprule
+\textbf{Methods} & \textbf{Efficiency} & \textbf{Precision} & \textbf{Output} & \textbf{Need} \\
+ & & \textbf{Requirement} & \textbf{Accuracy} & \textbf{Normalize?} \\
+\midrule
+Top-$k$ & High & Low  & Median & $\times$ \\
+Top-$p$ & High & Median & High & $\surd$\\
+Full Attn.   & Low  & High & High & $\surd$ \\
+\bottomrule
+\end{tabular}
+}
+\end{small}
+\end{center}
+\end{table}
+
+\subsection{Hierarchical Pruning with Select-then-Prune Architecture\label{sec:hp}}
+
+% Despite various designs in different algorithms we mentioned before, there is a core commonality we can observe from the formulation in Section \ref{sec:formulate} \textemdash most \mingyu{for emdash, you either have spaces both before and after (then you need to use \{\} after the command (like \textemdash{}) to ensure the space is not removed), or have no spaces both before and after.} sparse algorithms select a subset of tokens.
+
+% Based on this, we abstract the base algorithm into a black-box \textbf{Token Selector}, which uses some metadata to select critical tokens. 
+% \mingyu{I think you can improve this description like this. You start by reminding that existing algorithms have the difficulty of choosing a proper budget, either too conservative (good accuracy, bad efficiency) or too aggressive (bad accuracy, good efficiency). So we make it a two-step process like this. Now Token Selector only needs to be conservative, and we have a Pruner to help. This achieves both good accuracy and good efficiency, ...\\
+% Essentially in this paragraph you are missing the point that why this would work. It works because the Selector is conservative. (A2) in the next paragraph touches on this, but it is a bit too late, and also not detailed enough to show how it resolves the tradeoff.}
+% And we treat top-$p$ as a \textbf{Pruner}, which optimizes the indices dumped by Token Selector by further pruning unimportant tokens, consisting of the hierarchical \textbf{Select-then-Prune} architecture we propose as the left side of \autoref{fig:arch} illustrates. This hierarchical architecture also share commonalities to the LLM sampling stage, where we usually use a mixture of top-$k$ and top-$p$ to sample final token (Similarly, in LLM sampling, we also first apply top-$k$ then apply top-$p$ according to the implementation of open-source LLM engines like vLLM \cite{vllm}).
+
+% Comparing to the original algorithm, inserting a pruner in the middle has the following advantages. \textbf{(A1) The pruner makes the algorithm efficient.} As we mentioned above, existing algorithms suffer from inefficiency and always mistakenly select some less important tokens. Top-$p$ pruning is more accurate than Token Selector which is based on top-$k$, which can further prune these tokens. \textbf{(A2) The pruner makes the algorithm adaptive to budget.} In this architecture, due to the presence of pruner, the Token Selector is allowed to use a very conservative budget like $\frac{1}{4}$ sparsity (which equals to $8192$ in $32k$ context length). Note that the latency of Token Selector is irrelevant to the budget in most algorithms. Then the pruner will automatically lower the budget across different heads, layers and queries, solving the problem that the budget is difficult to determine.
+
+Recall that existing algorithms face the challenge of choosing a proper budget: either over-selection or under-selection. To address this, we propose a two-step process. We first abstract the base algorithm into a black-box \textbf{Token Selector}, which uses some metadata to select a subset of critical tokens. And we allow the Token Selector to a conservative budget (e.g. $1/4$ sparsity), as we have a \textbf{Pruner} after that to further optimize the selected indices by pruning unimportant tokens. This hierarchical \textbf{Select-then-Prune} architecture is illustrated on the left side of \autoref{fig:arch}.
+
+% This design shares similarities with the LLM sampling stage, where a mixture of top-$k$ and top-$p$ is commonly used to sample the final token (similarly, in LLM sampling, we first apply top-$k$ and then top-$p$, as implemented in open-source LLM engines like vLLM \cite{vllm}).
+% Compared to the original algorithm, inserting a pruner in the middle offers the following advantages:
+
+% \textbf{(A1) The pruner makes the algorithm efficient.} Existing algorithms often suffer from inefficiency due to mistakenly selecting less important tokens. The top-$p$ pruner is more accurate than the Token Selector, which is based on top-$k$, allowing it to further prune these unnecessary tokens.
+% \textbf{(A2) The pruner makes the algorithm adaptive to budget.} In this architecture, the Token Selector is allowed to use a very conservative budget, such as 41​ sparsity (equivalent to 8192 tokens in a 32k context length). Importantly, the latency of the Token Selector is largely independent of the budget in most algorithms. The pruner then dynamically adjusts the budget across different heads, layers, and queries, solving the problem of determining the optimal budget.
+
+\subsection{Efficient Kernel Implementation\label{sec:kernel}}
+
+\subsubsection{Efficient SpGEMV with 4-bit Quantization of Key Cache}
+
+As previously analyzed, the precision requirement of top-$p$ lies between top-$k$ and full attention. For top-$k$, many works \cite{yang2024post, zhang2024pqcache} push the compression to a extreme low-bit (1-bit/2-bit). For full attention, SageAttention \cite{zhang2025sageattention} is proposed recently as a 8-bit accurate attention by smoothing $K$ and per-block quantization. In this work, we find 4-bit strikes a balance between accuracy and efficiency, making it the ideal choice to calculate estimated attention weights for top-$p$. And we implement an efficient sparse GEMV (SpGEMV) kernel based on FlashInfer.
+% \cite{ye2025flashinfer} which loads $K$ in a scattered manner, aligning with the design of Paged $K$ cache \cite{vllm}. 
+We maintain an extra INT4 asymmetrically quantized $K$ cache in GPU as \autoref{fig:arch} shows. The INT4 $K$ vectors are unpacked and dequantized in shared memory which reduces I/O between global memory and shared memory to at most $1/4$, leading to a considerable end-to-end speedup.
+
+% \mingyu{I do not see much novelty from this part. Are we just using an existing impl from FlashInfer, or do we have some new contributions? If the former, this subsubsection should be put \emph{after} those in which we have contributions in this subsection. If the latter, explicitly highlight the contributions.}
+
+\subsubsection{Efficient Top-$p$ Kernel via Binary Search}
+
+\begin{algorithm}[tb]
+   \caption{Top-$p$ via Binary Search}
+   \label{alg:binary}
+\begin{algorithmic}
+   \STATE {\bfseries Input:} Normalized attention weights $W \in \mathbb{R}^{BS \times H \times N}$, Threshold of TopP $p$, Hyper-parameter $\epsilon$
+   \STATE {\bfseries Output:} Indices $I$, Mask $M \in \{0, 1\}^{BS \times H \times N}$
+   \STATE \textbf{Initialize:} $l = 0$, $r = \max(W)$, $m = (l + r) / 2$;
+   \REPEAT
+   \STATE $W_0 =\text{where}(W < m, 0.0, W)$;
+   \STATE $W_1 =\text{where}(W \le l, \text{INF}, W)$;
+   \STATE $W_2 =\text{where}(W > r, \text{-INF}, W)$;
+   \STATE $s=\text{sum}(W_0)$; //\texttt{ Compute the sum over current threshold } $m$;
+   \IF{$s \ge p$}
+   \STATE $l = m$;
+   \ELSE
+   \STATE $r = m$;
+   \ENDIF
+   \UNTIL{$\max(W_2) - \min(W_1) \ge \epsilon$}
+   \STATE Select indices $I$ or mask $M$ where $W \ge l$;
+   \STATE \textbf{return }{$I$, $M$};
+\end{algorithmic}
+\end{algorithm}
+
+As we mentioned before, our top-$p$ method is motivated by the top-$p$ sampling, which also takes up a portion of decode latency. Therefore, our efficient kernel is modified from the top-$p$ sampling kernel from FlashInfer \cite{ye2025flashinfer}, a high performance kernel library for LLM serving.
+
+A brute-force way to do top-$p$ sampling is to sort the elements by a descending order and accumulate them until the sum meets the threshold, which is quite inefficient in parallel hardwares like modern GPU. Our kernel adopts a parallel-friendly binary search algorithm as \cref{alg:binary}.
+% \mingyu{Fix: ref name is missing. Also, consistently use either ref or autoref or cref throughout the paper} described.
+
+% However, since our scenario is a bit different from token sampling, there are still some problems when adapting this algorithm to Twilight. First, as our top-$p$ is performed on attention weights, with different shape and layout comparing with the logits distribution on vocabulary, we need to redesign the parallel strategy including blocks/threads launching. \mingyu{So this is the problem. What is your solution?}
+% Second, we can fuse top-$p$ with GEMV kernel which reduces kernel launch time and reuse some median results such as maximum which are already computed in the softmax part.
+
+% \subsubsection{Efficient Sparse Attention with Awareness of Head Dynamism}
+
+% Top-$p$ pruner brings head-wise dynamic budgets, which also brings some system challenges especially in the attention kernel. Traditional Sparse(Paged) Attention kernel allocates uniformed computation resources to all heads, leading to computation inefficiency. 
+% Other head-wise dynamic budget works also face the same challenge. DuoAttention \cite{xiao2024duo} packs the retrieval heads and streaming heads separately and computes them in two steps. AdaKV \cite{feng2025adakvoptimizingkvcache} adopts a flattened KV cache and reuses \texttt{flash\_attn\_varlen}. These methods are either not general enough or not efficient enough to be used in Twilight. 
+% FlashInfer \cite{ye2025flashinfer} deeply investigates the load balancing problem, but only for requests with dynamic lengths. To build an attention kernel with awareness of head-wise dynamism, Twilight borrows the idea from AdaKV \cite{feng2025adakvoptimizingkvcache}, reusing the load balancing algorithm in FlashInfer by flattening the head dimension.
+% \mingyu{I am not sure about whether the last sentence (just one sentence) is sufficiently clear to explain how we did it. It seems very abstract. But maybe this is the style of AI papers in contrast to system papers. Use your own judgment.}
+
+\subsection{Overhead Analysis and Discussion\label{sec:disc}}
+
+\textbf{Runtime Overhead.} The runtime of Twilight-optimized algorithm consists of three parts according to the pipeline in \autoref{fig:arch}: $T_{\text{Token Selector}} + T_{\text{Twight Pruner}} + T_{\text{Sparse Attention}}$. Comparing to the baseline without Twilight, our method introduces an extra latency term $T_{\text{Twight Pruner}}$ but reduces $T_{\text{Sparse Attention}}$ because it further reduces its I/O. Our hierarchical architecture naturally fits the hierarchical sparsity, where the number of tokens gradually decreases as the precision increases. Suppose the Token Selector has a $\frac{1}{16}$ sparsity, then the theoretical speed up can be formulated as 
+
+$$
+    \frac{N/16 + B_0}{N/16 + B_0/4 + B_1}
+$$
+
+where $B_0 = |I_0|$ is the budget of Token Selector, $B_1 = |I_1|$ is the budget after pruned by Twilight. Suppose $B_0 = N/4, B_1 = N/64$, then the speed up is approximately $2 \times$. Here we omit the overhead of top-$p$ since SpGEMV dominates the latency when $B_0 = N/8 \sim N/4$.
+
+% \begin{figure}[ht]
+% \begin{center}
+% \centerline{\includegraphics[width=\columnwidth]{figures/time_io.pdf}}
+% % \mingyu{The figure, e.g., its x and y axes and the several boxes, is not easy to understand. Maybe more explanation is needed.\\
+% % Some of the texts are too small to read.}
+% % \caption{A theoretical time cost model for Sparse Attention with Twilight.}
+% \label{fig:time_model}
+% \end{center}
+% \end{figure}
+% \mingyu{INT4 vs. int4 (and similarly FP16, fp16, etc.); be consistent. Check the whole paper}
+
+% \textbf{Memory Overhead.} As \autoref{fig:arch} shows, Twilight introduces an extra INT4 quantized key cache, which brings a $\frac{1}{2} \times \frac{1}{4} = \frac{1}{8}$ extra KV cache memory overhead. However, this additional overhead doesn't appear in all cases. On one hand, some base algorithms also maintain an INT4 key cache like DS \cite{yang2024post}, which is already included in the metadata part. On the other hand, there are some recent efforts \cite{zhang2024sageattention2} explore the INT4 full attention. This brings chances that we directly involve the estimated attention weights calculated by INT4 key cache in the attention computation, which allows us not to maintain the original FP16 key cache. Moreover, there are some optimizations when GPU memory becomes a bottleneck, like offloading and selective quantization (Only maintain extra INT4 key cache for hot tokens), which we leave as future works.
+
+\textbf{Integrate with Serving System.} Since our system design naturally aligns with PagedAttention \cite{vllm}, Twilight can be 
+% \mingyu{``can be'' is something you have not done. So what is the implementation now? Have we already done the integration? Do we want to briefly discuss the implementation?} 
+seamlessly integrated into popular serving systems like vLLM~\cite{vllm} and SGLang~\cite{sglang}. Prefix sharing and multi-phase attention \cite{lin2024parrot, sglang, zhu2024relayattention, ye-etal-2024-chunkattention, cascade-inference} also become common techniques in modern serving systems, which also fit Twilight since we use paged-level or token-level sparse operations and can achieve flexible computation flow.

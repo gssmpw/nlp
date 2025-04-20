@@ -1,0 +1,320 @@
+\section{Trusted NIC Hardware}
+\label{sec:t-nic-hardware}
+
+Figure~\ref{fig:hardware-design} shows our \projecttitle{} hardware architecture that implements trusted network operations on the SmartNIC device. \projecttitle{} is comprised of two key hardware components: \emph{(i)} the attestation kernel that guarantees the non-equivocation and transferable authentication properties over the untrusted network ($\S$~\ref{subsec:nic_attest_kernel}) and \emph{(ii)} the RoCE protocol kernel that implements the RDMA protocol on the FPGA including the transport and network layers ($\S$~\ref{subsec:roce_protocol_kernel}). Lastly, we design a remote attestation protocol for our \projecttitle{} based on the \projecttitle{} Controller module that we discuss $\S$~\ref{subsec:nic_controller}. Importantly, we formally verify \projecttitle{}'s remote attestation and initialization protocol ($\S$~\ref{subsec::formal_verification_remote_attestation}).
+
+%securely bootstraps the device and flushes the bitstream. % initializes the device, offers remote attestation to ensure the authenticity of the device and the flushed bitstream and guarantees run-time isolation.
+
+
+
+% PUT THIS IN OVERVIEW To prevent equivocation and guarantee the validity of the network traffic, we require each node that participates in a distributed protocol to be equipped with a \trustedfpga{} subsystem. Each \trustedfpga{} is configured by the developer at the initialization with a secret (asymmetric) key, and it is uniquely identified by an identifier that corresponds to the node that hosts the subsystem.
+
+%The secret key is private, whereas the public key is exposed to the application layer. Apart from the private key, the internal state of the \trustedfpga{} and the algorithm used to authenticate messages may be known publicly. %The private keys are generated and installed to each \trustedfpga{} during initialization.
+%For now, we assume that the secret key is manually
+%installed before system startup. In a future version, every
+%CASH subsystem would maintain a private key and expose
+%the corresponding public key. A shared secret key for every
+%protocol instance may be generated during initialization, encrypted under the public key of every subsystem, and trans-
+%ported securely to every replica.
+
+\begin{algorithm}
+\SetAlgoLined
+\small
+\textbf{function} \texttt{Attest(c\_id, msg)} \{ \\
+\Indp
+{\tt cnt} $\leftarrow$ {\tt send\_cnts[c\_id]++};\\
+$\alpha$ $\leftarrow$ {\tt hmac(keys[c\_id], msg||cnt)}; \\
+\textbf{return} $\alpha${\tt ||msg||cnt};\\
+\Indm
+\} \\
+
+
+\vspace{0.3cm}
+
+\textbf{function} \texttt{Verify(c\_id, $\alpha$||msg||cnt)} \{ \\
+\Indp
+    $\alpha$' $\leftarrow$ {\tt hmac(keys[c\_id], msg||cnt)};\\
+    \textbf{if} {\tt (}$\alpha$' $=$ $\alpha$ {\tt \&\&} {\tt cnt} $=$ {\tt recv\_cnts[c\_id]++} {\tt )}\\
+    \Indp
+        \textbf{return} ($\alpha${\tt ||msg||cnt)}; \\
+    \Indm
+    \textbf{assert(False)}; \\
+\Indm
+\} \\
+%\vspace{0.1cm}
+\vspace{-1pt}
+\caption{\texttt{Attest()} and \texttt{Verify()} functions.}
+\label{algo:primitives}
+\end{algorithm}
+
+\if 0
+\begin{center}
+\begin{table}[ht]
+\small
+\centering
+\begin{tabular}{ |m{2cm}||m{5.6cm}|}
+ \hline
+ {\tt ID} & A unique ID for this \projecttitle{} instance. \\
+ {\tt keys[]} & (shared) Keys network sessions. \\
+ {\tt send\_cnts[]} & Current counters values on transmission path per session.\\
+ {\tt recv\_cnts[]} & Current counters values on reception path per session.\\
+ \hline
+ \end{tabular}
+\caption{Attestation kernel state.}
+\label{table:api}
+\end{table}
+\end{center}
+\fi 
+
+\subsection{NIC Attestation Kernel}
+\label{subsec:nic_attest_kernel}
+\myparagraph{Overview} 
+The attestation kernel {\em shields} the network messages and materializes the properties of non-equivocation and transferable authentication by generating {\em attestations} for the transmitted messages. As shown in Figure~\ref{fig:hardware-design}, the attestation kernel is pipelined on the data path, processing the messages as they {\em flow} from host memory to the device and vice versa to optimize for throughput. The module resides in the data pipeline between the RoCE protocol kernel that transmits/receives the network messages and the PCIe DMA which fetches and pushes data {\em asynchronously} from the host memory to the FPGA memory.
+%\atsushi{Figure 2 and the following paragraphs: "XDMA IP" and "CMAC" are specific terms for Xilinx FPGAs. If we want to make the hardware architecture/design vendor-agnostic, we should use another term such as "PCIe IP" and "Ethernet IP", for example, respectively.}
+
+
+%{\noindent \underline{Attestation kernel state.}} 
+\myparagraph{System design} The attestation kernel is comprised of three components that represent its state and functionality: the HMAC component that generates the message authentication codes (MAC), the Keystore which stores the keys used by the HMAC module, and the Counters store that keeps the messages latest sent and received timestamp. 
+
+%Table~\ref{table:api} summarizes the internal state of the attestation kernel (per device). 
+Each \projecttitle{} device is initialized from the Protocol Designer during bootstrapping ($\S$~\ref{subsec:nic_controller}) with a unique identifier (ID) and some shared secret keys---ideally, one shared key for each session, which is stored in static memory (Keystore). The keys are shared and, hence, not known to the untrusted parties. % and as such even local (single-node) attestations always need pass through the \projecttitle{}. 
+
+The \projecttitle{} also holds two counters per session stored in the Counters store (Figure~\ref{fig:hardware-design}), the {\tt send\_cnts} to be used for sending messages and the \texttt{recv\_cnts} that holds the latest seen counter value for each session. The counters represent the messages' timestamp and are increased monotonically and deterministically after every send and receive operation to ensure that unique messages will be assigned to unique counters (for non-equivocation) and consequently, no messages can be lost, re-ordered, or doubly-executed.
+
+
+
+
+\myparagraph{Algorithm} Algorithm~\ref{algo:primitives} shows the functionality of the attestation kernel. The module implements two core functions: the {\tt Attest} function which generates a unique and verifiable attestation for a message and the {\tt Verify} function which verifies the attestation of a received message. When the application transmits a message, the data flow passes through the {\tt Attest} function and upon a message reception, the message is verified (with {\tt Verify} function) before it is copied to the application's (host) memory. 
+
+As shown in Figure~\ref{fig:hardware-design}, a request passes from the application layer to the \projecttitle{} through two separate paths, i.e., the data and control paths. The metadata and the request opcode pass through the control path from the host to the device and vice versa. On the other hand, the message data is first forwarded to the attestation kernel and then, the output is forwarded to the RoCE protocol kernel. The attestation kernel upon transmission executes the \texttt{Attest} function and generates an {\em attested} message comprised of the message data and its attestation certificate, or simply attestation $\alpha$. The function calculates $\alpha$ as the HMAC of the message concatenated with the counter {\tt send\_cnt} using the {\tt key} for that connection (Algorithm~\ref{algo:primitives}:~L3). It also increases the next available counter for subsequent future messages (Algorithm~\ref{algo:primitives}:~L2). The function forwards to the RoCE protocol the original message along with $\alpha$ for transmission (Algorithm~\ref{algo:primitives}:~L4).
+
+%where the control flow forwards the request for \emph{increment} (\circled{1c}) and also fetches the corresponding sequencer \texttt{<mc\_id, v, cnt>} from the \emph{mc ids index} (\circled{1a}, \circled{1b}). After the increment the producing message is of the form \texttt{<sequencer, msg>} which is now being signed with the node's private key following the same workflow (\circled{2a}, \circled{2b}, \circled{2c}). The signed message \texttt{<(header, h(msg))$\sigma$, msg>}  can be logged (for recoverability) and is now forwarded to the network stack for transmission.
+
+%{\noindent \underline{Verify path.}} 
+Upon reception, the received message passes through the attestation kernel for verification before it is delivered to the application. Specifically, the \texttt{Verify} function checks the authenticity and the integrity of the received message by re-calculating the {\em expected} attestation ($\alpha$') based on the message payload and comparing it with the received attestation ($\alpha$) of the message (Algorithm~\ref{algo:primitives}:~L7---8). Following that, the verification also ensures that the received counter matches the expected counter for that connection to ensure \emph{continuity} (Algorithm~\ref{algo:primitives}:~L8). 
+
+%\myparagraph{Security analysis} This simple attestation kernel achieves to ensure the properties of non-equivocation and transferable authentication. First, \projecttitle{} attestation kernel prevents equivocation by ensuring that two attestations of different messages
+%will never be assigned identical {\tt send\_cnts}. The property is ensured because the {\tt send\_cnts} are never decremented. Secondly the \projecttitle{} ensures the transferable authentication because the cryptosystem is not broken, the keys are secret and each \projecttitle{} device has unique identifier.
+
+
+\subsection{RoCE Protocol Kernel}
+\label{subsec:roce_protocol_kernel}
+
+\begin{figure}[t!]
+    \centering
+    %\includegraphics[width=.27\textwidth]{figures/trusted-nic-single-node-overview.drawio-1.pdf}
+    %\includegraphics[width=0.45\textwidth]{figures/hw-implementation.drawio.pdf}
+    %\caption{\projecttitle{} hardware architecture.}
+     \includegraphics[width=\linewidth]{figures/hardware-implementation-colored.drawio.pdf}
+    \caption{\projecttitle{} hardware architecture.}
+     \label{fig:hardware-design}
+\end{figure}
+
+
+\myparagraph{Overview} The RoCE protocol kernel implements a reliable transport service on top of the IB Transport Protocol with UDP/IPv4 layers (RoCE v2)~\cite{infiniband} (transport and network layers) and it is connected to the attestation kernel as discussed in $\S$~\ref{subsec:nic_attest_kernel}. As shown in Figure~\ref{fig:hardware-design}, to send data at the transmission path, the {\tt Req handler} module in the RoCE kernel receives the request opcode (metadata) issued by the host. The message to be sent is then fetched through the PCie DMA engine and passes through the attestation kernel for processing. The request opcode and the attested message are forwarded to the {\tt Request generation} module that constructs the network packet. %This module retrieves and updates the metadata while it also appends the attested message at the end. %This module updates the State tables with specific-to-the-RoCE protocol important metadata such as the network packets sequence numbers, the re-transmission tables, etc.
+%, specifically it appends the corresponding headers, i.e., RETH (RDMA Extended Transport Header), AETH (ACK Extended Transport Header) and BTH (Base Transport Header)
+
+Upon a message's reception from the network, the RoCE kernel parses the packet headers and updates the state of the protocol (stored in State tables). The attested message is then forwarded to the attestation kernel. Upon a successful verification, the message is delivered to the application memory. 
+
+%\atsushi{We can definitely shorten the following paras, as they are either public IPs or already presented by prior studies (i.e., Coyote). What is important here is to explain how the attestation kernel (what we propose) corporates with the existing RDMA HW stack. Can we highlight this point?} The RoCE kernel implements a reliable connection transport service based on IB Protocol (including the UDP/IPv4 layers).  As shown in Figure~\ref{fig:hardware-design}, the attestation kernel and the RoCE protocol kernel are wired to the XDMA IP that allows for Direct Memory Access (DMA) over PCIe~\cite{Sidler2019InNetworkDP, fpga_dma} between the host and \projecttitle{}. 
+
+\myparagraph{Hardware design} The RoCE protocol kernel is additionally connected to a 100Gb MAC IP and an ARP server IP. 
+
+\noindent{\underline{100Gb MAC.}} The 100Gb MAC kernel implements the link layer connecting \projecttitle{} to the network fabric over a 100G Ethernet Subsystem~\cite{license}. The  kernel also exposes two interfaces to the RoCE protocol kernel for transmitting (Tx) and receiving (Rx) network packets. %\atsushi{Here is also specific to the implementation (on Xilinx FPGAs) rather than the design.}
+
+\noindent{\underline{ARP server.}} The ARP server contains a lookup table with the correspondences
+between MAC and IP addresses. Right before the transmission, the RDMA packets at the {\tt Request generation} first pass through a MAC and IP encoding phase. At this encoding phase, the {\tt Request generation} module extracts from the lookup (ARP table) in the ARP server the remote MAC address.
+
+%\noindent{\underline{CMAC kernel:}} The CMAC kernel implements the link layer connecting the \projecttitle{} to the outside network fabric. It contains an IP block for the 100G Ethernet Subsystem~\cite{license} that needs to be configured for each board. This kernel bridges the whole infrastructure to the GT pins, which are the I/O pins towards the QSFP network interfaces. It also exposes two 512-bit AXI4-Stream interfaces to the RoCE protocol kernel for transmitting (Tx) and receiving (Rx) network packets. 
+
+%The ARP server is also responsible for generating the ARP requests at the initialization before any RDMA operations are executed.
+%\noindent{\underline{ARP server:}}  The ARP server contains a lookup table with the correspondences
+%between MAC and IP addresses.  On the rising edge of the start signal for the \projecttitle{} RoCE kernel, the ARP server generates an ARP request with the remote IP address and forwards it to the CMAC kernel. Upon the reception of the ARP request, the recipient \projecttitle{} device responds with its MAC address. The ARP server of the sender creates an entry with the current IP---MAC pair.
+
+%Upon a packet reception the {\tt Request decoder} module examines it and forwards it to the ARP server or the RoCE stack based on the headers. Similarly, right before the transmission, the RDMA packets at the {\tt Request generation} first pass through a MAC and IP encoding phase. At this encoding phase the {\tt Request generation} module will extract from the lookup (ARP table) in the ARP server the remote MAC address. Then, the RDMA packet is generated according to the IB protocol (discussed below) and forwarded to the CMAC kernel.
+%then insert that generates and encodes the RoCE packets (with the UPD header), the IPv4, and the Ethernet header forward this RDMA packet to the CMAC kernel. 
+
+%At the decoding phase, the {\tt Request decoder} will analyse the IP and input Ethernet packets and distribute them to either the RoCE kernel or arp\_server based on their header fields.
+
+
+%\begin{figure}[t!]
+%    \centering
+%    \includegraphics[width=.45\textwidth]{figures/net-stack-implementation.drawio.pdf}
+%    \caption{\projecttitle{} RoCE protocol kernel stack.}
+%    \label{fig:ib_protocol}
+%\end{figure}
+%
+%\begin{figure}[t!]
+%    \centering
+%    \includegraphics[width=.45\textwidth]{figures/trusted-nic-message_format.drawio.pdf}
+%    \caption{\projecttitle{} message format.}
+%    \label{fig:message_format}
+%\end{figure}
+
+\noindent{\underline{IB protocol.}} The RoCE protocol kernel implements the reliable version of the IB protocol. Similarly to its original specification~\cite{rdma_specification}, the kernel implements the State tables to store the protocol queues QPs (i.e., receive queue, send queue, completion queue, etc.). The State tables also store important metadata such as (1) the packet sequence numbers (PSNs) to distinguish valid, invalid, and duplicate PSN regions, (2) the message sequence numbers (MSNs) to reconstruct fragmented network messages, and (3) a Retransmission Timer to detect packet losses.
+
+The transmitting path is shown in Figure~\ref{fig:hardware-design} with the blue-colored axes. The {\tt Req handler} receives the requests issued by the host and initializes a DMA command to fetch the payload data from the host (DMA-ed) memory to the attestation kernel. Once the attestation kernel forwards the attested message to the {\tt Req handler}, the module passes the message from several states to append the appropriate headers along with metadata (e.g., RDMA op-code, the PSN and the QP number, etc.). The last part of the processing generates and appends the UDP/IP headers (e.g., IP address, UDP port, and packet length). The message is then forwarded to the CMAC module. Similarly, on the reception path (shown in the red-colored axes), the {\tt Request decoder} extract the headers, metadata, and attested message. The later is forwarded for verification and finally copied to the host memory.
+
+%Similarly, on the reception path, the message passes through different processing stages to extract the current protocol header, all relevant metadata and further validate the attested message. After decoding, checking and extracting the IP checksum, UDP port and other metadata in the IP/UDP decoder module, the remaining part of message is forwarded to the next stage. The BTH and RETH/AETH module extracts further metadata such as the RDMA op-code, the packet sequence number (PSN) and the queue pair number (QPN) from the header. These metadata are checked against the protocol state in the State tables and if needed they are updated. Lastly, the final stage processes the RETH/AETH headers (implemented as finite-state-machine) and executes the operation based on the RDMA op-code.
+
+%Figure~\ref{fig:ib_protocol} shows the architecture RoCE protocol kernel that implements the IB protocol~\cite{rdma_specification}.  We show both the transmission and reception data paths that can be processed independently (for performance). The dashed lines show the control path (requests and metadata) and the bold lines show the payload workflow.
+
+
+%The state of the protocol is stored in the State tables structures in the device memory and are similar to the original IB protocol specification~\cite{rdma_specification}. Specifically, the State tables store the network messages and protocol queue pairs (QPs), i.e., receive queue, send queue, completion queue, etc., the packet sequence numbers (PSNs), the message sequence numbers (MSNs) and the Retransmission Timer (RT). The PSNs are needed to define the valid, invalid, and duplicate PSN regions. The MSNs store the message sequence numbers along with the current
+%(DMA) address of the messages because due to packet fragmentation in large messages the remote (host) address is only part of the first packet. Lastly, the Retransmission Timer implements one timer per queue pair to detect packet loss. %The timers are
+%implemented as an array of time intervals stored in on-chip
+%memory. The Retransmission Timer module is continuously
+%iterating over this array and decreasing the time intervals of all
+%active timers. If any timer reaches zero an event is triggered
+%and forwarded to the transmitting data path to retransmit the
+%lost packet(s).
+
+\myparagraph{{Message format:}} The IB protocol in \projecttitle{} processes the following headers: IP, UDP, BTH (Base Transport Header), RETH (RDMA Extended Transport Header) and AETH (ACK Extended Transport Header) as defined in the RDMA Protocol Specification~\cite{rdma_specification, storm}.  The RoCE kernel adds the Ethernet header (L2 header), the IPv4/UDP headers (L3 headers) and the IB headers (L4 headers). It also adds a 32b end-to-end CRC (ICRC) that covers all invariant fields of the packet and offers protection beyond the coverage of the Ethernet Frame Checksum (FCS). The difference of our \projecttitle{} messages compared with the original RDMA messages is that for each transmitted packet, the attestation kernel {\em extends} the payload by appending a 64B attestation $\alpha$ and the metadata. The metadata include a 4B id for the session id of the sender, a 4B id for the device id (unique per device) and the appropriate {\tt send\_cnt}. %As explained in $\S$~\ref{subsec:nic_attest_kernel}, the $\alpha$ is calculated as the HMAC of the original payload concatenated with the previous metadata. 
+
+%\noindent{\underline{IB Protocol:}} The IB Protocol is executed as follows (Figure~\ref{fig:hardware-design}). On the transmitting data path, the {\tt Request hdlr} module receives requests issued by the host. For sending data (i.e., remote writes) it further instructs the DMA engine to forward the payload data from the host (DMA-ed) memory to the attestation kernel. The request is then forwarded to the next stage where the RETH/AETH and BHT corresponding headers (RDMA op-code, the packet sequence number and the queue pair number, etc.) are generated and appended to the attested message (if applicable). The module is implemented as a finite-state-machine that retrieves and updates the protocol state in the State tables. At the last state of the transmission the stack generates the UDP/IP headers (e.g., IP address, UDP port, and packet length) and appends it to the message.
+
+%Similarly, on the reception path, the message passes through different processing stages to extract the current protocol header, all relevant metadata and further validate the attested message. After decoding, checking and extracting the IP checksum, UDP port and other metadata in the IP/UDP decoder module, the remaining part of message is forwarded to the next stage. The BTH and RETH/AETH module extracts further metadata such as the RDMA op-code, the packet sequence number (PSN) and the queue pair number (QPN) from the header. These metadata are checked against the protocol state in the State tables and if needed they are updated. Lastly, the final stage processes the RETH/AETH headers (implemented as finite-state-machine) and executes the operation based on the RDMA op-code. %and if required
+%issues DMA commands and requests to generate response
+%packets.
+
+%Figure 3 illustrates how the extracted PSN is checked
+%against the expected PSN: (1) requesting the State Table entry
+%using the QPN as a key, (2) the State Table returns the corresponding entry, (3) checking if the expected PSN in the entry
+%matches the extracted PSN, and (4) instructing the Packet
+%Dropper module to either drop the packet or forward it to the
+%next stage. In case of a match the state machine concurrently
+%writes the updated, expected PSN back to the State Table.
+%These steps take around 5 cycles per packet, given that the
+%smallest possible Ethernet frame is 64 B corresponding to 8
+%cycles, we can guarantee that the hardware pipeline can sustain line-rate processing at 10 Gbit/s. At 5 cycles, the update
+%step is a potential bottleneck for small packets at higher band-
+%widths. However, in Section 7 we show that the message rate
+%at higher bandwidths is limited by the host issuing commands
+%and not by the packet processing. 
+
+
+
+%After going through the merger, the packet
+%will be sent out with the net_tx AXI Stream port. The RX path for RDMA packets is the same as that
+%of ARP packets. Ingress packets will be diverted to the rocev2 IP rather than the ARP server by the
+%IP handler according to their packet headers.
+
+%To achieve this, the {\tt Request generation} and {\tt Request decoder} modules are connected. First, it is connected to an IPv4 decoder component that, upon reception of a packet, extracts the Ethernet header and distributes it to the RoCE kernel or the lookup (ARP) table accordingly. Additionally the stack contains a MAC/IPv4 encoder that generates and encodes the RoCE packets (with the UPD header), the IPv4, and the Ethernet header. The MAC addresses are extracted from the lookup (ARP) table that stores the IPs along with the corresponding MAC addresses. The MAC/IPv4 encoder is also responsible for handling the ARP request/response packets.
+
+
+%A memory mapped interface is also used for the RoCE kernel to communicate with the HBM on FPGA. It is an AXI4 memory-mapped Master interface. The HBM on Alveo U280 FPGAs is divided into 32 segments with 256 MB each. The
+%segments are called pseudo channels (PCs).
+
+%The RoCE kernel input and output data cables, e.g., \texttt{axis\_rdma\_sink} and \texttt{axis\_host\_sink}, are connected through the Attestation kernel through 64B data paths (512-bit AXI4-Stream interfaces). Then, the Attestation kernel and the host memory communication are achieved through an AXI4 memory-mapped Master interface. It is the responsibility of the host code to allocate and initialize host memory. Further, the kernel is connected to a 32B bus to receive the parameters, a 20 B bus to issue RDMA write operations, and a 12 B bus to issue local DMA commands.
+
+
+
+%The parameters for each kernel should be set and passed to the kernels on FPGAs. The RoCE kernel requires many parameters to establish an RDMA connection. These parameters include the queue pair numbers, message sequence numbers, IP address, and UDP ports for both the local and remote sides. The local virtual address and the rKey are also part of parameters that need to be written to the RoCE kernel by the host. Third, to communicate with the memory on FPGAs, host memory should also be allocated and initialized. This is done by the host executable codes. 
+
+%Finally, the CMAC kernel is hooked to the GT pins provided by
+%the Vitis shell and then connected to a QSFP port. The network stack is then connected to the outside
+%network fabric.
+%\noindent {\underline{CMAC kernel.}} 
+
+
+
+%\noindent {\underline{Workflow}} Figure~\ref{fig:tRDMA} shows the workflow of the secured transmission and reception data paths. The data paths are pipelined to achieve line-rate bandwidth. At an RDMA operation (RDMA\_WRITE) the Request hdlr module receives the request issued by the host. The payload is then fetched from the DMA engine through the XDMA AXI stream interface and passes through the attestation kernel which generates the cryptographic signature of the message. Then the request is forwarded to the next module that generates the corresponding RETH (RDMA Extended Transport Header), AETH (ACK Extended Transport Header) and BTH (Base Transport Header) headers. This module deploys a state machine to retrieve and update the metadata and finally append the attested payload. This stage requires updating the State Tables (yellow colored box) that include the message sequence numbers, the packet sequence numbers, the retransmission tables, etc.
+
+%Upon the reception of a message, the protocol parses the headers (IP$\rightarrow$UDP$\rightarrow$BTH$\rightarrow$RETH/AETH) and updates the metadata at the State Tables. The attested payload is then passed to the verification kernel. Upon successful verification, the message is then forwarded to the application memory.
+
+
+%\dimitra{write about opennic tradeoffs -- say here that the opennic is more suitable for SN1000 where the DPDK is offloaded to the embedded cores. "A Simpler and Faster NIC Driver Model for Network Functions"}
+
+%\myparagraph{Message Format} %The counter ID not only safeguards against equivocation but imposes a total ordering, allowing for the verification process to detect stale, re-ordered, or missed messages.
+
+
+
+%\begin{figure}[t!]
+%    \centering
+%    \includegraphics[width=.4\textwidth]{figures/bootstrapping.drawio.pdf}
+%    \caption{\trustednic{} bootstrapping process.}
+%    \label{fig:bootstrapping}
+%\end{figure}
+
+
+
+\begin{figure}[t!]
+    \centering
+    \includegraphics[width=.45\textwidth]{figures/remote_attestation.drawio.pdf}
+    \caption{\trustednic{} remote attestation protocol.}
+    \label{fig:remote_attestation}
+\end{figure}
+
+\subsection{Remote Attestation Protocol} 
+\label{subsec:nic_controller}
+We design a remote attestation protocol for the \projecttitle{} to ensure that the \projecttitle{} device is genuine and the \projecttitle{} bitstream is flashed securely in the device along with the designer's configuration data (IPs, secrets, etc.).
+
+\myparagraph{Design assumptions} We base our design for the remote attestation protocol on the NIC Controller, a hardware component that drives the device initialization as in~\cite{10.1145/3503222.3507733}. The Controller can be implemented as a static bitstream (a soft CPU~\cite{microblaze, nios, 10.1145/3503222.3507733}) with no access to confidential information. After the initialization process, the Controller monitors the JTAG/ICAP ports to ensure that the bitstream is not modified before use and prevent physical attacks as commercial IPs~\cite{secMon}.
+%\atsushi{It is not clear to me what/where the NIC controller is. According to the texts, maybe you want to explain an execution flow of secure boot and remote attestation? If so, it might be better to change the Subsection title. }
+
+
+
+
+
+
+%The Manufacturer manufactures the physical FPGA chips that are installed in the cloud infrastructure and are managed and owned by the cloud provider. The IP Vendor is a trusted entity that has synthesized the actual bitstreams for the \projecttitle{} and distributes them to the Protocol Designers. 
+%The Protocol Designers are the users: they  each equipped with an FPGA-based NIC. Then, they flush the \projecttitle{} IP into the devices to use them. 
+
+%\myparagraph{Device and \projecttitle{} manufacturing} To support remote attestation, there are three key parties that need to cooperate: the Manufacturer of the silicon (e.g., FPGA-based NICs on top of which \projecttitle{} runs), the IP Vendor that is responsible to implement and distribute the \projecttitle{} bitstream and, lastly, the Protocol Designer who builds distributed protocols leveraging \projecttitle{}. We assume that the Protocol Designers source \projecttitle{} bitstreams only from trusted IP Vendors (The Protocol Designer and the IP Vendor can be the same entity.). In addition, the Manufacturer and the IP Vendor are trusted. 
+
+%Figure~\ref{fig:bootstrapping} shows the bootstrapping process in \projecttitle{}.
+\myparagraph{Boostrappng} We next describe the bootstrapping phase of the device and the remote attestation mechanism in \projecttitle{}. At the manufacturing construction, the Manufacturer burns a secret device key (HW$_{key}$) that is unique to the device~\cite{secure_FPGAs}. At the \projecttitle{} initialization, the Protocol designer instructs the cloud provider to load the FPGA the (encrypted) firmware from the storage medium using the embedded code in the BootROM device (2). The firmware is then decrypted using the HW$_{key}$.  %, a static bitstream containing a soft CPU~\cite{microblaze, nios, 10.1145/3503222.3507733} that contains no confidential information. The Controller, along with the IP Vendor, prior to flushing the \trustednic{} bitstream to the device, performs remote attestation to prove to the Protocol Designer the authenticity of the device and the bitstream. During normal execution, the Controller operates independently within the FPGA~\cite{secMon} and continuously monitors (post-initialization) JTAG activity to ensure that the bitstream is not modified before use and to prevent any physical attacks.
+
+The firmware loads the controller binary Ctrl$_{bin}$ (3), generates a key pair Ctrl$_{pub, priv}$ that is bound to the specific device and binary (4), and lastly, generates and signs the measurement of the Ctrl$_{bin}$ producing Ctrl$_{bin}$cert (5). %It also generates a Controller key pair, \texttt{Controller}$_{pub, priv}$ which is bound to this specific device and Controller binary as in~\cite{10.1145/3503222.3507733}. The key pair is later used to establish secure communication with the Vendor and sign the measurement of the \projecttitle{} bitstream.% and prove the authenticity of the code and the device.
+
+In addition, the Protocol designer establishes a TLS/SSL connection with the trusted IP vendor and sends the list of the participating machines and any configuration data. Before the remote attestation protocol is initialized, the IP vendor and the Controller establish a secure communication channel (7)---(8). The IP vendor generates a random nonce n (for freshness) and an asymmetric key pair, V$_{pub, priv}$ (for secure communication with the Controller) and  sends the n and the public key \texttt{V}$_{pub}$ to the Controller. The Controller uses the \texttt{Vendor}$_{pub}$ and his own \texttt{Controller}$_{priv}$ to perform Diffie–Hellman key exchange with the Vendor and establish a shared secret key S$_{key}$ (8) which allows them from now on to securely communicate over insecure channels.
+
+\myparagraph{Remote attestation} The Controller is now ready to execute the remote attestation as shown in Figure~\ref{fig:remote_attestation}, (9)---(17). First, it receives the encrypted bitstream \projecttitle{}$_{enc}$ from the vendor (9) and computes its measurement h (10). Next, it generates an attestation report m that contains the following data: the nonce n, the measurement of the \projecttitle{}$_enc$ h, the Ctrl$_{pub}$, the measurement of the Ctrl$_{bin}$ and its signature with the device key Ctrl$_{bin}$cert (11). The Controller signs the attestation report m with its private key and sends the attestation report along with its signature to the vendor.%(12) \texttt{Controller}$_{priv}$ generating $\sigma$$_{msr}$~\circled{5}. The Controller sends to the IP Vendor\circled{6} the $msr$, the $\sigma$$_{msr}$ and the signature of the generated \texttt{SKey} (with its \texttt{Controller}$_{priv}$). 
+
+The IP vendor verifies the authenticity of the attestation report by completing the remote attestation process (13)---(15) and, upon a successful attestation, it shares the vendor encryption key VE$_{key}$ with the Controller (16). First, the vendor the authenticity of the attestation report m with the Ctrl$_{pub}$ that is included in the message to verify that a genuine Ctrl$_{bin}$ has signed m (13). Afterward, the vendor ensures that the Ctrl$_{bin}$ runs in a genuine \projecttitle{} device by verifying that the measurement of the Ctrl$_{bin}$ has been signed with an appropriate device key that has been installed by the Manufacturer (14). Lastly, the vendor verifies the nonce for freshness and that the measurement of the loaded encrypted bitstream h is as expected. 
+%Finally, theIP Vendor establishes a secure channel to the Security Kernel by
+%first generating the same SessionKey as the Security Kernel using
+%AttestKey pub and VerifKey priv , and verifying that σ SessionKey
+%was signed by AttestKey priv .
+
+When all the verifications pass successfully, the remote attestation is completed. The IP vendor securely shares the VE$_{key}$ with the Controller by encrypting it with the previously established shared secret key S$_{key}$ (16).  The Controller decrypts the \projecttitle{} bitstream and loads it onto the FPGA (17). Similarly, the vendor shares any configuration data. Finally, the IP vendor notifies the Protocol designer about the result of the remote attestation.
+
+
+%\myparagraph{Hardware design} The last component of the \projecttitle{} design is the Controller which enables the remote attestation and initialization of the \projecttitle{}. The Controller is a static bitstream, e.g., a soft CPU~\cite{microblaze, nios, 10.1145/3503222.3507733} with no access to confidential information that drives the remote attestation protocol to achieve three goals. First, it proves to the Protocol Designer the genuineness of the \projecttitle{}. Secondly, it guarantees that the \projecttitle{} bitstream is flashed securely in the device and, lastly, it allows the Protocol Designer to securely load configuration data (IPs, membership list, etc.) to \projecttitle{}. Finally, during normal execution, the Controller operates independently within the FPGA and continuously monitors the post-initialization JTAG activity to ensure that the bitstream is not modified before use and to prevent any physical attacks~\cite{secMon}. \atsushi{Monitoring JTAG is not sufficient to track the bitstream state because JTAG is not a universal way to reconfigure FPGA. ICAP (Internal Configuration Access Port) might be better, but I'm not sure}
+
+%, ensuring that the plaintext bitstream containing sensitive IP and Shield Keys are only handled in secure on-chip memory\circled{8}. Lastly, using the same \texttt{SKey} the IP Vendor distributes the configuration data to the \trustednic{} instances.
+
+%The IP Vendor will now notify the Protocol Designer that the machine has been attested and configured successfully~\circled{9}.
+
+%\dimitra{explain how the designer publishes the configuration and the public keys of the participant FPGAs.}
+
+\subsection{Formal Verification of \projecttitle{} Operations}
+\label{subsec::formal_verification_remote_attestation}
+We formally verify the security and safety properties of \projecttitle{} hardware. First, we verify the bootstrapping and the remote attestation protocol of \projecttitle{} ensuring that the correct bitstream has securely flushed to a genuine SmartNIC device. Secondly we verify that the properties of the non-equivocation and the transferable authentication are met under normal operation. 
+
+We use Tamarin~\cite{tamarin-prover}, a security protocol verification tool that analyzes symbolic models of protocols specified as multiset rewriting systems. This model imposes the following assumptions: \emph{(i)}~all messages are composed of atomic terms using predefined functions \dimitra{What does that mean :) ?} \emph{(ii)}~these cryptographic functions are perfect with no side-effects \dimitra{are not compromised?} \emph{(iii)}~attackers can read and delete all messages that are sent on the network and modify them in accordance with the set of available functions.
+
+\myparagraph{Remote Attestation} We model the bootstrapping and remote attestation protocols as described in Figure~\ref{fig:remote_attestation}.
+
+%using Tamarin~\cite{tamarin-prover}. Tamarin is a security protocol verification tool that analyzes symbolic models of protocols specified as multiset rewriting systems. This model imposes the following assumptions: \emph{(i)}~all messages are composed of atomic terms using predefined functions \emph{(ii)}~these cryptographic functions are perfect with no side-effects \emph{(iii)}~attackers can read and delete all messages that are sent on the network and modify them in accordance with the set of available functions.
+
+Our verification work relies on properties of the already analyzed TLS handshake~\cite{tamarin_tls_proof} and proofs the desired security properties of the \projecttitle{} bootstrapping and attestation protocol.  The desired properties are modeled as lemmas that define valid and invalid system states. Tamarin then verifies the specified lemmas, by \emph{(i)} finding at least one trace  (series of state transitions) for the valid control states and \emph{(ii)} showing that there exists no trace leading to invalid states.
+
+We define multiple lemmas to ensure the secrecy of the private secrets involved in the protocol as well as the main attestation lemma which holds if and only if: once the last step of the remote attestation protocol is completed, the \projecttitle{} device is in a valid, expected state. 
+
+In our model, Tamarin found at least one trace for every control state and proved that there is no trace to any state where our lemmas are violated. Thus, our attestation lemmas hold for our model.
+
+
+
+%\julian{The following is my addition, using the Tamarin proofs - I don't know how to integrate them, feel free to rephrase/delete if required}
+
+\myparagraph{Network operations} We extend the analysis of the bootstrapping and attestation protocol in Tamarin with models for the network operations that upon the message transmission and reception execute the {\tt Attest} and {\tt Verify} functions (Algorithm~\ref{algo:primitives}), respectively. In simple words we prove that  \projecttitle{} attestation kernel prevents equivocation by ensuring that two attestations of different messages will never be assigned identical message sequencers ({\tt send\_cnts}) and secondly, the transferable authentication is met because each generated attestation is is uniquely verified by the secret keys jointly with the unique sender's \projecttitle{} device identifier.
+ %since valid attestations can only be generated by \projecttitle{} with access to the secret key(s), and since the hardware  includes the ID in any attestation, no other party can have generated the attestation. because each device is uniquely idetified the keys are secret and each \projecttitle{} device has unique identifier.
+
+Formally, we define the following lemmas: \emph{(i)} this message was sent by an authentic \projecttitle{} device in a valid configuration \emph{(ii)} there is no message that was sent before, but not accepted \emph{(iii)} there is no message that was sent after, but accepted before this one \emph{(iii)} this message has not been accepted before.
+
+Tamarin, again, found at least one trace for every control state and proved that there is no trace to any illegal state in this extended model. Hence transferable authentication holds for our model and the counters behave as expected to ensure non-equivocation. 
+
+
+%This simple attestation kernel achieves to ensure the properties of non-equivocation and transferable authentication. First, \projecttitle{} attestation kernel prevents equivocation by ensuring that two attestations of different messages
+%will never be assigned identical {\tt send\_cnts}. The property is ensured because the {\tt send\_cnts} are never decremented. Secondly the \projecttitle{} ensures the transferable authentication because the cryptosystem is not broken, the keys are secret and each \projecttitle{} device has unique identifier.

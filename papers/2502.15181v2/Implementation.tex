@@ -1,0 +1,60 @@
+\section{Integration with \duckdb}
+\label{sec:impl}
+
+We describe how to integrate the \emph{\RPT} (\rpt) algorithm into \duckdb (v0.9.2)~\cite{2019duckdb}, a fast data analytics system, in this section. We first describe \duckdb's execution model and its optimizer briefly in \cref{sec:impl:duckdb}. We next introduce the new \BF operators in \cref{sec:impl:bf}. Finally, we introduce the new \RPT module that inserts the \BF operators into the query plan based on the transfer schedule obtained by running the \TreeStruct algorithm in \cref{sec:modeling:transfer}.
+
+
+% As discussed in the previous study~\cite{yang2023PT}, \PT has demonstrated superior performance compared to the default FlexPushDownDB~\cite{fpdb}. However, the extent of this performance improvement hinges on the effectiveness of the Bloom filter relative to the hash join, suggesting potential variability when applied to more advanced database systems. Furthermore, like the \YannAlg, \PT is expected to be insensitive to join order, which is discussed only to a limited extent in prior research.
+
+% Therefore, in this paper, we implement \PT in the advanced database system DuckDB~\cite{duckdb} and re-evaluate its performance. This section provides a detailed explanation of our approach to integrating \PT into DuckDB.
+
+\subsection{\duckdb Preliminaries}
+\label{sec:impl:duckdb}
+
+\duckdb is a state-of-the-art in-process analytical database management system. It adopts a push-based vectorized execution engine, where each pipeline (i.e., a sequence of physical operators) processes tuples in batches (i.e., a data chunk, default batch size = 2048) to amortize the interpretation overhead and improve CPU parallelism. As shown in \cref{fig:duckdb-pipeline}, each physical operator can be in one of the following three roles: \emph{source}, \emph{operator}, and \emph{sink}, depending on its position within the pipeline. The source implements the \texttt{GetData} function to retrieve a new data chunk at the beginning of a pipeline. Intermediate operators implement the \texttt{Execute} interface that computes on an input data chunk and then outputs the result chunk. The sink operator is located at the end of a pipeline and is typically a pipeline breaker. Its interface consists of three functions: \texttt{Sink}, \texttt{Combine}, and \texttt{Finalize}. \texttt{Sink} is called to receive and buffer the data chunks until incoming data is exhausted. Next, \texttt{Combine} and \texttt{Finalize} are called to perform some final computations to get ready to distribute data to the next pipeline (or final output). \texttt{Combine} is called once per thread, while \texttt{Finalize} is called when all threads are finished.
+
+
+\begin{figure}[t!]
+    \centering
+    \includegraphics[width=\linewidth]{pic/duckdb-pipeline.pdf}
+    \caption{Example pipelines \& operator roles in \duckdb~\cite{2023DuckDBPPT}}
+    \label{fig:duckdb-pipeline}
+\end{figure}
+
+
+\duckdb's optimizer includes separate logical and physical optimization phases, as shown in \cref{fig:duckdb-optimizer}. Logical optimization performs a sequence of steps such as expression rewrite and filter pushdown, each of which is a separate submodule in the logical optimizer. \duckdb's join order submodule uses dynamic programming for join order optimization~\cite{2008dphyper} and falls back to a greedy algorithm for large/complex join graphs.
+
+\begin{figure}[t!]
+    \centering
+    \includegraphics[width=\linewidth]{pic/duckdb-optimizer.pdf}
+    \caption{Workflow of \duckdb's optimizer}
+    \label{fig:duckdb-optimizer}
+\end{figure}
+
+%==============================================================================================
+\subsection{Bloom Filter Operators}
+\label{sec:impl:bf}
+
+To implement \RPT in \duckdb, we introduce two new physical operators based on \BFs: \CreateBF and \UseBF. We use the \BF implementation from Apache Arrow 16.0~\cite{Arrow}. It is a blocked \BF~\cite{putze2007cache} with operations accelerated using AVX2 instructions. Because a vectorized probe to the \BF returns a bit vector while \duckdb uses a selection vector to mark valid entries in a data chunk, we implemented an efficient bit-to-selection vector conversion according to~\cite{bitvector2selvec}.
+
+\CreateBF is a physical operator that gathers/buffers the input data chunks and creates one or more \BFs on given columns. Its logical counterpart \LogicalCreateBF will be used in the logical optimization. \CreateBF can act as both a \emph{sink} and a \emph{source} (more about this in \cref{sec:impl:rpt}). In the \texttt{Sink} function, we receive input data chunks and keep them in thread-local buffers. No computation is needed for \texttt{Combine}. At \texttt{Finalize}, we traverse each thread-local data buffer to create a \BF for each given column. The false positive rate (FPR) of the \BF is set to $2\%$ (Arrow's default). When using \CreateBF as a source, we implement \texttt{GetData} by assigning each thread a disjoint range of chunk IDs in the data buffers for parallel scanning.
+
+\UseBF is another physical operator that outputs the \BF result for each tuple in the input data chunk. Similarly, it has a logical counterpart \LogicalUseBF. \UseBF is used as an intermediate operator. The \texttt{Execute} function takes in a data chunk, uses the tuples to probe the Bloom filter(s) in a vectorized fashion, and outputs the data chunk with an updated selection vector.
+
+%==============================================================================================
+
+\subsection{\RPT Module}
+\label{sec:impl:rpt}
+
+\begin{figure}[t!]
+    \centering
+    \includegraphics[width=\linewidth]{pic/PT-Plan-DuckDB.pdf}
+    \caption{Query plan of JOB 3a with \RPT integrated \textnormal{-- red denotes forward pass while blue denotes backward pass.}}
+    \label{fig:pt-plan}
+\end{figure}
+
+We introduce the \RPT module in \duckdb's logical optimizer to insert \LogicalCreateBF and \LogicalUseBF operators into the query plan, as shown in \cref{fig:duckdb-optimizer}. The RPT module constructs a join graph from the input plan and runs the \TreeStruct algorithm to obtain a transfer schedule (including forward and backward passes). For each semi-join $R \Semijoin S$ in the transfer schedule, we insert a \LogicalCreateBF for $S$ and a \LogicalUseBF for $R$ using $S$'s \BF. These logical operators are later replaced by \CreateBF and \UseBF in the physical plan generator.
+
+Take the query plan for JOB 3a as an example. Suppose the transfer schedule generated by \TreeStruct is the same as that in \cref{fig:yannakakis-semi-join}. Then \cref{fig:pt-plan} shows the physical plan after inserting \CreateBF and \UseBF. The solid black lines represent the flow of data chunks (from the bottom up) while the dashed red/blue arrows indicate the transfer of \BFs (via shared memory). Each \CreateBF first acts as a \emph{sink} operator that buffers the data chunks at the end of the pipeline and creates a \BF. Then \CreateBF functions as the \emph{source} operator of the next pipeline, where it feeds the buffered data chunks to subsequent operators such as \UseBF and hash join.
+
+We also implemented optimizations to prune unnecessary \BF operations. In particular, if the build-side relation in a primary-foreign-key join has not been filtered before, we can omit the pair of \CreateBF and \UseBF because the semi-join is trivial (i.e., it does not eliminate any tuple). We can also skip the entire backward pass if the transfer order aligns with the join order in the join phase.

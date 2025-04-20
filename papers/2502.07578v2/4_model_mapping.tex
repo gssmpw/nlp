@@ -1,0 +1,113 @@
+\section{Model Mapping} \label{model mapping}
+
+The ever-increasing parameter size of the LLMs, coupled with the lower memory density of PIM, necessitates the distribution of the LLM inference on a scalable network of PIM modules.
+In this section, we introduce the mapping of various LLM parallelization strategies on \att{}'s CXL-based network architecture using the proposed collective and peer-to-peer communication primitives.
+
+\subsection{Pipeline-Parallel Mapping (PP)}
+
+Cloud providers serve a large user base, where inference throughput is crucial.
+To improve throughput, PP~\cite{gpipe} assigns each transformer block to a pipeline stage.
+The individual queries in a batch are simultaneously processed in different stages of the pipeline.
+Figure~\ref{fig:Pipeline_Parallelism} shows that we map multiple pipeline stages (\textit{e.g.,} \texttt{T0-3}) to a CXL device (\textit{e.g.,} \texttt{D0}).
+Each stage requires multiple PIM channels, depending on the memory requirements of the decoder block.
+To prevent excessive communication and keep the latency of pipeline stages identical, we avoid splitting a pipeline stage between the PIM channels of two CXL devices.
+
+In each iteration, the output of each transformer block is transferred to the next pipeline stage.
+\att{} performs this data transfer using intra-device communication for pipeline stages within the same CXL device, and using peer-to-peer \textit{send} and \textit{receive} primitives for those in different CXL devices.
+This CXL data transfer contains only an 8K embedding vector (\texttt{16KB} data) in Llama2-70B.
+The CXL transfer latency of PP is negligible compared to PIM and PNM latencies.
+
+Note that \att{} does not support batch processing within a single pipeline stage because of two primary reasons:
+First, batching requires a significantly larger Global Buffer and \rf{} (Section~\ref{subsec:pim_pnm_arch}) to concurrently store the embedding vectors of multiple queries.
+Second, batching enhances the operational intensity and compute utilization (Section~\ref{sec:motivation}), while PP fully utilizes PIM compute resources.
+Therefore, applying batching on top of PP only increases the latency.
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=8cm]{Figure/Pipeline_Parallelism_new.pdf}
+    % \includegraphics[width=\columnwidth]{Figure/Pipeline_Parallelism_new.pdf}
+    \caption{Pipeline parallelism: (a) Transformer decoder blocks are distributed across CXL devices and form the pipeline stages. Each block is mapped to multiple GDDR6-PIM channels. (b) Multiple prompts are executed in different stages of the pipeline.}
+    \label{fig:Pipeline_Parallelism}
+\end{figure}
+
+\subsection{Tensor-Parallel Mapping (TP)}
+
+Inference latency is critical in real-time applications to provide a smooth user experience~\cite{fowers2018configurable}.
+To enhance the latency, TP~\cite{alpa, megatron} uses all compute resources to process decoder blocks one at a time.
+To implement TP, Figure~\ref{fig:Model_Parallelism}(a) shows that \att{} assigns each transformer decoder block across all CXL devices.
+Figure~\ref{fig:Model_Parallelism}(b) illustrates the detailed mapping of a transformer block using TP.
+The infrequent residual connection and normalization layers are confined within a single master CXL device.
+Distributing the attention layer requires the frequent use of expensive \textit{AllReduce} collective communication primitive, which significantly increases the CXL communication overhead~\cite{megatron}.
+Consequently, the attention layer is mapped to the master CXL device.
+
+\begin{figure}[h]
+    \centering
+    % \includegraphics[width=\columnwidth]{Figure/Model_Parallelism.pdf}
+    \includegraphics[width=8cm]{Figure/Model_Parallelism.pdf}
+    \caption{(a) Tensor parallelism: each transformer block is assigned to multiple CXL devices. Prompts are processed sequentially. (b) In a transformer block, fully connected layers are spread across CXL devices, while other operations are confined to a single device.}
+	\label{fig:Model_Parallelism}
+\end{figure}
+
+Prior to the execution of an FC layer, the embedding vector (\texttt{16KB} for Llama2-70B) is \textit{broadcast} from the master CXL device to all devices via the CXL switch.
+This enables each device to locally perform GEMV on multiple rows of the weight matrix.
+Following the execution of an FC layer, partial result vectors are \textit{gathered} to the master CXL device.
+This approach optimizes the execution of FC layers across multiple devices, while reducing the communication overhead of TP through the CXL switch to only \texttt{135KB} data transfer for each transformer block of the Llama2-70B model.
+
+\subsection{Hybrid Tensor-Pipeline Parallel Mapping}~\label{subsec:hybrid_parallel}
+
+The TP and PP mappings focus either on inference latency or throughput.
+However, balancing both can be crucial in real-world deployment scenarios when considering Quality of Service (QoS) requirements~\cite{mlperf-sla}.
+We explore a hybrid TP-PP strategy to achieve this balance, where each transformer decoder is allocated to multiple consecutive CXL devices. For example, among $32$ devices, mapping each decoder to $32/4=8$ devices enables TP=8 and PP=4.
+The embedding vectors are \textit{multicast} and \textit{gathered} by the master CXL device of each pipeline stage.
+This configuration effectively reduces token decoding latency by utilizing compute resources from multiple CXL devices (TP), while also improving the throughput by processing multiple prompts in parallel (PP).
+
+\subsection{Transformer Block Mapping} \label{subsec:block_mapping}
+
+\att{} involves a fine-grained mapping of the transformer block onto CXL devices, PNM accelerators, and PIM channels.
+This technique permits the complete execution of a transformer block within the CXL device, thereby eliminating the necessity for any interaction with the host system.
+Figure~\ref{fig:LLaMA_mapping}(a) illustrates the operations within a Llama2 transformer block. 
+Operations within the blue blocks are assigned to PIM channels, including GEMV in fully connected layers, vector dot product in RMSNorm, and element-wise multiplication in RMSNorm, SiLU, Softmax and Rotary Embedding, as detailed in Figure~\ref{fig:LLaMA_mapping}(b), (c), (d), and (e), respectively.
+On the other hand, model-specific operations marked in orange, such as square root, division, Softmax, and vector addition in residual connections, are handled by the PNM's RISC-V cores and accelerators.
+\att{} supports \textit{Grouped-Query Attention}~\cite{gqa} in Llama2-70B by unrolling GEMM to GEMV.
+
+\begin{figure}[h]
+	\centering
+    \includegraphics[width=\columnwidth]{Figure/LLaMA_mapping_new.pdf}
+    \caption{(a) Llama2-70B Transformer Block. Blue and orange operations are mapped to PIM and PNM PUs, respectively.
+    (b)$\sim$(e) Operation mapping for RMSNorm, SiLU, SoftMax and Rotary embedding.}
+	\label{fig:LLaMA_mapping}
+\end{figure}
+
+In Figure~\ref{fig:LLaMA_mapping}(d), the score dimension varies between $1$ and $4k$, accommodating the 4K sequence length in this example.
+The embedding dimensions, as shown in Figure~\ref{fig:LLaMA_mapping}(b) and (c), are set to $8K$.
+The rotary embedding process, depicted in Figure~\ref{fig:LLaMA_mapping}(e), begins with the RISC-V PNM cores transforming an attention head of dimension $128$ into $64$ groups of the complex number representations (\textit{e.g.,} $[a, b, c, d]$ to $[(a+jb), (c+jd)]$).
+The PIM PUs within memory chips then multiply complex values and pre-loaded weights.
+Finally, RISC-V PNM cores convert the computed results back to their real value representations.
+
+\att{}'s PIM computations include three key operations.
+This paragraph explains the execution of each operation within a GDDR6-PIM channel.
+(a) \textit{GEMV}: The matrix is partitioned along its rows and distributed across all 16 banks. The vector is transferred to the Global Buffer. \texttt{MAC\_ABK} instructions then broadcast 256-bit vector segments from the Global Buffer to all near-bank PUs, retrieve 256-bit segments of the matrix rows from the banks, and perform MAC operations.
+(b) \textit{Vector dot product}: In this operation, input vectors are stored in neighboring banks. \texttt{MAC\_ABK} instructions retrieve 256-bit segments from these banks and perform MAC operations. Throughout this process, only one of the two neighboring near-bank PUs is utilized.
+(c) \textit{Element-wise multiplication}: Before this operation, input vectors are stored in two banks within each bank group, which consists of four banks. \texttt{EW\_MUL} instructions then retrieve 256-bit segments from these two banks, perform the multiplication, and store the results in another bank within the same bank group.
+
+\subsection{End-to-End Model Mapping}~\label{subsec:e2e_model_mapping}
+
+\att{} supports the end-to-end query execution in LLM inference tasks. In the prefill stage, \att{} processes tokens in the prompt one after another to fill out KV caches, using a similar approach to that in the decoding stage. 
+Within each token, both input embeddings and transformer blocks are mapped to CXL devices using the mapping techniques introduced in Section~\ref{subsec:block_mapping}. In the decoding stage, after a series of transformer blocks, the top-k sampling operations are executed on the host CPU.
+
+\subsection{Programming Model}
+
+Users can specify the \att{} hardware configuration, including the number of PIM channels to utilize, and the number of pipeline stages. The tensor mapping strategy is determined by this configuration. \att{} library provides Python APIs to allocate memory space and load model parameters according to the model mapping strategy. 
+These APIs also support commonly used LLM operations, such as \texttt{GEMV}, \texttt{LayerNorm}, \texttt{RMSNorm}, \texttt{RoPE}, \texttt{SoftMax}, \texttt{GeLU}, \texttt{SiLU}, \textit{etc.} 
+\att{} uses an in-house compiler to generate arithmetic and data movement instructions illustrated in Section~\ref{ISA_Summary}. 
+
+
+\begin{figure}[h]
+    \centering
+    % \includegraphics[width=\columnwidth]{Figure/Programming_model_code.pdf}
+    \includegraphics[width=8cm]{Figure/Programming_model_code.pdf}
+    \caption{Vector-matrix multiplication compilation}
+    \label{fig:Programming_model_code}
+\end{figure}
+
+Figure~\ref{fig:Programming_model_code} shows an example of compiling \texttt{GEMV} to \att{} instructions. Initially, the operands are designated to particular memory spaces, \textit{i.e.}, the vector operands in the \rf{} and the matrix operands in PIM channels (lines 1 and 2). \att{} instructions are then generated based on input operands' dimensions and memory addresses. Subsequently, the vector is copied to the Global Buffers in the PIM channels with \texttt{WR\_GB} instructions (line 5). This is followed by a sequence of operations for each matrix row within the near-bank PIM PUs. The \texttt{WR\_BIAS} instruction sets up the accumulation registers (line 7). \texttt{MAC\_ABK} performs the multiply-accumulate operations across all near-bank PUs in the PIM channel (line 8). Finally, \texttt{RD\_MAC} retrieves the results from the accumulation registers (line 9).

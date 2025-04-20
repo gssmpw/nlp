@@ -1,0 +1,273 @@
+\section{Evaluation}
+\label{sec:evaluation}
+We aim to answer the following questions:
+\begin{denseenum}
+\item[{\bf Q1:}] Is \name flexible enough to implement a variety of eviction policies? Can \name policies improve application performance with low developer effort? (\S\ref{subsec:eval-custom-eviction-policies})
+\item[{\bf Q2:}] Can different applications use different policies without interfering with each other? (\S\ref{subsec:eval-isolation})
+\item[{\bf Q3:}] What is the overhead of \name? (\S\ref{subsec:eval-overhead})
+\end{denseenum}
+
+\paragraph{System configuration.}
+We conduct our experiments on Cloudlab~\cite{cloudlab} c6525-25g machines, with a 16-core AMD Rome CPU, 128GB of memory and a 480GB SSD drive. We use CPU-pinning and disable SMT, swap, and address space randomization to make our results more reproducible. We also drop the page cache before each test. We run Ubuntu 22.04 with Linux v6.6.8 as the kernel.
+
+
+\subsection{Case Studies: Custom Policies (Q1)}
+\label{subsec:eval-custom-eviction-policies}
+
+In this section, we describe several case studies on how applications can utilize \name to achieve better performance. First, we show how \name can be used to implement a wide range of eviction policies, tailored to different applications: from simple ``classic'' policies (MRU and LFU) to state-of-the-art policies such as LHD~\cite{lhd}, which uses conditional probabilities to model different page features (\eg age, frequency), and S3-FIFO~\cite{s3-fifo}.
+ We then explore how an application can make its eviction policy \emph{aware} of application-specific information, such as assigning different priorities to specific types of requests. %
+
+\subsubsection{Most-Recently Used (MRU)}
+Scan-like workloads do not perform well under LRU-like policies when the scan length is larger than the size of the LRU list. For example, one such scan-heavy workload is searching through files in a codebase. Consider a developer working on a large codebase, such as the Linux kernel, and continuously searching for certain terms. %
+In such a scenario, an LRU-like policy would evict the files that were least-recently searched, but those are precisely the files that are required at the start of the next search. While readahead can help mitigate this issue for single-file scans by prefetching sequential blocks, it cannot predict which blocks to fetch across files.
+
+
+\begin{figure}[t!]
+  \centering
+  \includegraphics[width=0.33\textwidth]{figures/filesearch_results}
+  \caption{File search workload results (MRU policy).}
+  \label{fig:eval-mru-filesearch}
+\end{figure}
+
+\begin{figure*}[!t]
+    \centering
+    \begin{subfigure}[t]{0.37\textwidth}
+        \centering
+        \includegraphics[width=\columnwidth]{figures/leveldb_ycsb_throughput}
+        \caption{Throughput.}
+        \label{subfig:ycsb-results-throughput}
+    \end{subfigure}
+    ~~~~~~~~~~~~~~~~~~~~~
+    \begin{subfigure}[t]{0.37\textwidth}
+        \centering
+        \includegraphics[width=\columnwidth]{figures/leveldb_ycsb_latency}
+        \caption{P99 latency.}
+        \label{subfig:ycsb-results-latency}
+    \end{subfigure}
+    \caption{YCSB workload results (LFU policy).}
+    \vspace{-0.5em}
+    \label{fig:eval-lfu-ycsb}
+\end{figure*}
+
+We use \name to develop an MRU eviction policy for this use case. In contrast to LRU, MRU will evict the folios that were most recently searched, and will be used again furthest in the future.
+In order to facilitate this, our policy adds folios to the head of the list on insertion, and moves them back to the head on access. No metadata is required, as nodes are stored in the correct order in the eviction list. In a simplified version of the policy, when eviction is triggered, the first 32 nodes in the list are selected as eviction candidates using \name's iterate interface.
+However, if the policy decides to evict folios right after they were added to the page cache, they may still be in use by the kernel to service the I/O request. This would lead to the kernel refusing to evict the folios and resorting to the fallback path to evict folios. Therefore, we skip a small fixed number of folios when iterating the eviction list before proposing eviction candidates.
+
+
+
+\vspace{-1em}
+\paragraph{Evaluation.} To evaluate the policy, we construct a file search workload that searches the Linux kernel codebase (v6.6), using the multi-threaded \emph{ripgrep} CLI tool~\cite{ripgrep}. More specifically, we perform 10 searches within a 1GiB cgroup, which is roughly 70\% the size of the codebase (excluding Git history). We compare the \name MRU policy with the default Linux kernel policy as well as the kernel's experimental MGLRU policy. The results in Figure~\ref{fig:eval-mru-filesearch} show that \name is almost 2$\times$ faster than both baseline and MGLRU, since both policies suffer from the scan ``pathology'' of LRU.
+
+
+\subsubsection{Least-Frequently Used (LFU)}
+\label{subsubsec:LFU}
+An additional disadvantage of LRU-like algorithms is that they only take into account a single feature (recency) when making eviction decisions.
+However, other features, such as access frequency, may be better suited for certain workloads, especially skewed workloads where the access distribution is static or slow-changing. One such workload is the popular YCSB benchmark, made to model cloud OLTP applications, in which the probability of each key being requested is drawn independently from a static distribution (by default, Zipfian).
+
+We use \name to implement an LFU policy, which takes access frequency into account when evicting folios by evicting those with the lowest access frequency among the eviction candidates. Our LFU policy is an \emph{approximate} LFU policy, as it does not evict the global least-frequently used folio, but only the least-frequently ones among the current batch of folios considered for eviction. An exact policy would either yield higher overhead or require more complex data structures, which eBPF does not yet support. %
+We described the implementation of our LFU policy in \S\ref{subsubsec:design_mru_example}.
+
+
+\vspace{-1em}
+\paragraph{Evaluation.} We evaluate our LFU policy by running LevelDB~\cite{leveldb}, a popular key-value store, on the YCSB (Zipfian) workloads, as well as against uniform and uniform-read-write workloads. We compare this custom policy against both the default and MGLRU Linux policies, using a 100GiB database with a 10GiB cgroup. 
+Our results in Figure~\ref{fig:eval-lfu-ycsb} show that \name's LFU policy outperforms both the default and MGLRU, for all the YCSB Zipfian workloads and the uniform workloads, except for YCSB D, which only uses the latest key-value pairs and as such is cached entirely in-memory. \name achieves up to 37\% better throughput than the default Linux policy, and interestingly, it outperforms MGLRU by an even greater margin. We also measure the P99 read latency, for which \name beats the default policy by up to 55\%. Note that YCSB D's tail latency barely registers in the figure due to its lack of disk accesses. %
+We also evaluated the YCSB workload with our other policies, but LFU outperformed those policies as well, so we omit those results.
+
+\vspace{0.5em}
+\noindent\fbox{%
+    \parbox{0.97\columnwidth}{%
+        \textbf{Takeaway 1:}
+        \name can significantly improve application performance even with simple policies (\eg MRU, LFU) that match the application's access patterns. 
+    }%
+}
+
+\subsubsection{S3-FIFO}
+S3-FIFO~\cite{s3-fifo} is a recent caching policy designed for key-value caches, which uses three FIFO queues to quickly remove ``one-hit wonders'' (keys that are accessed only once). It has been shown to yield significant throughput gains on a number of workloads. We implement S3-FIFO using \name and evaluate it on Twitter production cache traces below.
+
+S3-FIFO uses a main FIFO and a small FIFO to hold $\sim$90\% and 10\% of the objects, respectively. Upon insertion, objects are typically added to the small FIFO. It uses a ghost FIFO to track recently-evicted objects, in order to promote them quickly to the main FIFO on readmission. The small FIFO is used to filter out short-lived objects, while objects that are accessed more often are promoted from the small FIFO to the main FIFO. The access frequency of the objects is tracked, but is capped at a maximum of 3, in order to ensure that a burst of accesses does not prevent objects from being evicted.
+
+We implement the main and small FIFOs as two eviction lists, and the ghost FIFO as a \texttt{BPF\_MAP\_TYPE\_LRU\_HASH} map.
+The map will then automatically remove entries from the ghost FIFO in LRU order when it hits capacity.
+When a folio is evicted, we create a ghost entry using a pointer to its \texttt{struct address\_space} (which represents a file's contents), along with the folio's offset in the file, as the key. Note that we cannot use folio pointers as the key, as they are not persistent across evictions. While we cannot implement the ghost FIFO as an eviction list (as they operate on \emph{valid} folios), it is more performant and simpler to use an existing eBPF map. We find that the combination of existing eBPF features and \name is sufficiently flexible to implement complex eviction policies.
+
+On folio addition, we set its access frequency in an eBPF map, and update it on access. We use eviction candidate requests to evict folios, but also to maintain the 90\%-10\% ratio between the main and small lists. If the small list is over-represented, we evict from it. We use \name's eviction iteration interface: if a folio's access frequency is greater than 1, we move it to the tail of the main list, balancing the lists. Otherwise, we propose the folio for eviction, and move it to the tail of the small list so that it isn't considered again before it is evicted. When evicting from the main list, we use the iteration interface to find folios with access frequency of 0. %
+If we cannot find enough of those, we search for folios with access frequency of 1, and then 2, and so on. All folios that are considered for eviction have their access frequency decremented and are moved to the tail of the main list.
+
+\subsubsection{Least Hit Density (LHD)}
+LHD is a relatively sophisticated eviction policy that uses conditional probabilities to predict which objects are most likely to be accessed in the future~\cite{lhd}. LHD uses a metric called \emph{hit density} in order to determine which objects should be evicted, along with a \emph{dynamic ranking} approach which allows it to automatically tune its eviction policy over time. We implement LHD using \name, based on the implementation in libcachesim~\cite{twittertraces,s3-fifo,sieve}.
+
+Our implementation only uses one eviction list. However, folios are divided into \emph{classes} partially based on when they were last accessed and their age at that time. Each class stores its own statistics (\eg hits, evictions, hit densities) for different folio ages. Folios are not explicitly ``owned'' by classes -- instead, they use metadata from classes based on which class they most closely correspond to at a given time. When a folio is added, we store its metadata, such as its last access time and age at that time, in an eBPF map. That metadata is updated on folio access, and removed when the folio is evicted.
+
+Folios are selected as eviction candidates based on their hit density (or more accurately, the hit density of the class and age they most closely correspond to). LHD iterates over the list and selects the folios with the lowest hit density as eviction candidates. While this process is fairly straightforward, it is enabled by accurate computation of hit densities over time. LHD requires periodically ``reconfiguring'' its hit densities and other statistics in order to ensure that its probability distributions are accurate and aged appropriately over time using an exponentially weighted moving average (EWMA).
+
+This reconfiguration process needs to run every $N$ folio admissions or insertions (where $N$ is a relatively large number -- \eg $2^{20}$). However, reconfiguration is a relatively expensive process, requiring iterating over all of the policy's metadata and adjusting it. In order to avoid performing this operations in the page cache's insertion or access hot paths, we use an eBPF ring buffer to notify userspace that reconfiguration needs to take place. Userspace then calls an eBPF program of type \texttt{BPF\_PROG\_TYPE\_SYSCALL}, which allows running an eBPF program without attaching it to a specific hook. This program then performs the required reconfiguration, including computing updated hit densities, and scaling or compressing distributions as necessary. We use atomic operations to ensure that the page cache can continue using these values, albeit with some potential inaccuracy, which we permit for the sake of performance. While we could implement this reconfiguration step in userspace, doing so would have required numerous syscalls to interact with eBPF maps, and atomic updates would not have been possible. Additionally, we note that in a standard LHD policy, hit densities and other parameters are stored as floating-point values. However, eBPF does not support floating-point operations, so we resort to scaling values by a large constant in order to approximate such calculations.
+
+\vspace{-1em}
+\paragraph{Evaluation.}
+For many real-world workloads, it may not be obvious in advance which policy works best for a given workload. \name makes experimentation easy, allowing developers to implement a set of policies and \emph{empirically} choose the best one for each workload.
+
+We evaluate our LHD, LFU, and S3-FIFO policies on production traces taken from the Twitter cache workloads~\cite{twittertraces}. The workloads divide the traces by cluster ID. We compare these policies to Linux's default and MGLRU policies. Each cluster was evaluated with a cgroup size set to 10\% of the cluster's data size using LevelDB. As shown in Figure~\ref{fig:eval-twitter}, we find that, in general, there is no single policy that is best for all workloads. While LHD beats the default and MGLRU policies by 13\% and 30\%, respectively, on cluster 34, and LFU beats them by 13\% and 34\% on cluster 52, MGLRU dominates on clusters 17 and 18. In cluster 24, the default policy is best, while MGLRU consistently resulted in out-of-memory errors, hence its 0 throughput result. Meanwhile, S3-FIFO beats or matches the baseline on clusters 34 and 52, but does not outperform the other \name policies.
+
+\begin{figure}[t!]
+    \centering
+    \includegraphics[width=0.4\textwidth]{figures/leveldb_twitter_traces_throughput.pdf}
+    \caption{Twitter workload results (LHD, S3-FIFO, and LFU policies) using LevelDB. No one policy performs best across the different clusters.}
+    \label{fig:eval-twitter}
+\end{figure}
+
+\begin{figure}[t!]
+    \centering
+    \includegraphics[width=0.4\textwidth]{figures/cache_ext_mixed_get_scan.pdf}
+    \caption{Overview of GET-SCAN policy implementation.}
+    \label{fig:mixed-get-scan-system}
+\end{figure}
+
+\vspace{0.5em}
+\noindent\fbox{%
+    \parbox{0.97\columnwidth}{%
+        \textbf{Takeaway 2:}
+        There is no one-size-fits-all policy that performs best for all workloads. Customization and experimentation are necessary to maximize performance.
+    }%
+}
+
+\subsubsection{Application-Informed Policy (GET-SCAN)}
+\label{sec:app-informed}
+In addition to enabling the implementation of a variety of general eviction algorithms, \name enables applications to use eviction algorithm tailored to their design. In other words, the eviction algorithm can be made \emph{aware of application-level abstractions} and uses this information to make better decisions.
+To illustrate the value of application-informed policies, consider the case of heterogeneous queries in databases. For example, a database serving financial transactions could see many small queries for individual payments, while also performing slower scan-like queries in the background to conduct fraud detection, reconciliation, and other business processes. While these scan-like queries are important, they typically have more relaxed service-level objectives. However, these large scan-like requests can ``pollute'' the page cache and degrade the performance of the smaller requests, as generic eviction algorithms struggle to isolate the folios used by these requests. Ideally, the page cache should prioritize the small requests over the large ones in the presence of memory pressure. Using \name, we can build an application-informed policy that fulfills this requirement.
+
+To simulate the application we describe above, we run LevelDB with a mixed SCAN/GET workload. This workload is highly skewed and is composed of 99.95\% GET requests with a small amount of SCANs (0.05\%). We use a separate thread-pool for SCAN requests to avoid head-of-line blocking at the scheduling level, as per prior work~\cite{syrup}, with a disjoint set of threads handling GET requests. While the workload exhibits good cache locality for GETs, it has poor locality for SCANs, which span a large number of folios and exhibit high reuse distance. The existing kernel eviction policy cannot handle this scenario well, leading to cache pollution due to a large number of SCAN folios.
+
+Using \name, we design a policy that is aware of the different request types. We observe that a folio accessed by a SCAN should not be worth the same as a folio accessed by a GET. To implement prioritization, the policy uses two eviction lists: one for folios inserted by GET requests, and the other for those inserted by SCAN requests. When loading the policy, the application initializes an eBPF map with the PIDs of the SCAN threads. When a folio is inserted, the policy checks whether the PID of the current task is present in the map to determine which eviction list to add the folio to. Each eviction list independently maintains an approximate LFU policy, as described in \S\ref{subsubsec:LFU}. When the kernel requests eviction candidates, the policy prioritizes evicting folios from the SCAN list. Figure~\ref{fig:mixed-get-scan-system} illustrates this policy.
+
+\vspace{-1em}
+\paragraph{Evaluation.} To evaluate the policy, we compare against Linux's default and MGLRU policies, and various \texttt{fadvise()} options: \texttt{FADV\_DONTNEED}, \texttt{FADV\_NOREUSE} and \texttt{FADV\_SEQUENTIAL} (on top of the default policy). We apply these \texttt{fadvise()} options to files used by SCAN requests, in order to inform the kernel in advance that we plan to read the files sequentially or only once (\texttt{SEQUENTIAL} and \texttt{NOREUSE}) or that we no longer need the folios after their use (\texttt{DONTNEED}).
+As shown in Figure~\ref{fig:mixed-get-scan-results}, \name's application-informed policy achieves 1.70$\times$ the throughput and 57\% lower P99 latency for GET requests, while SCAN requests experience an 18\% throughput decrease. In addition, the \texttt{fadvise()} options do not help much, demonstrating the inadequacy of existing kernel page cache interfaces compared to \name. MGLRU performs even worse than the default LRU.
+
+\begin{figure}[t]
+    \centering
+    \begin{subfigure}[b]{0.49\columnwidth}
+        \centering
+        \includegraphics[width=\textwidth]{figures/get_scan_throughput.pdf}
+        \caption{GET throughput.}
+        \label{subfig:mixed-get-scan-results-throughput}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[b]{0.49\columnwidth}
+        \centering
+        \includegraphics[width=\textwidth]{figures/get_scan_latency.pdf}
+        \caption{GET P99 latency.}
+        \label{subfig:mixed-get-scan-results-latency}
+    \end{subfigure}
+    \caption{Mixed GET-SCAN workload results.}
+    \label{fig:mixed-get-scan-results}
+\end{figure}
+
+\vspace{0.5em}
+\noindent\fbox{%
+    \parbox{0.97\columnwidth}{%
+        \textbf{Takeaway 3:}
+        Even very simple application-aware eviction policies can significantly improve performance.
+    }%
+}
+
+\noindent\fbox{%
+    \parbox{0.97\columnwidth}{%
+        \textbf{Takeaway 4:}
+        Existing Linux page cache customization interfaces are ineffective.
+    }%
+}
+
+\vspace{-1em}
+\subsubsection{Implementation Complexity}
+
+Table~\ref{tab:loc-per-policy} shows the lines of eBPF and userspace loader code necessary to implement each of the aforementioned policies, along with a simple FIFO policy.
+The policies are all implemented in at most a few hundred lines of code, a much smaller amount than would be necessary to implement them within the kernel (or even in userspace).
+We find that \name reduces the complexity of developing new policies, by using the pre-defined list and policy function abstractions, as well as by relying on the kernel's existing page cache to actually store the folios. In addition, developer experience and velocity is greatly improved, since eBPF prevents kernel crashes and many types of bugs, enabling developers to focus on the policy logic. Thus, \name allows developers to accelerate their applications with a relatively modest amount of effort.
+
+Additionally, we plan to open source all of our policies, allowing developers to easily try them with their applications, lowering the barrier to entry for using \name.
+
+\begin{table}
+\centering
+\footnotesize
+\begin{tabular}{lrr}
+\toprule
+Policy & eBPF LoC & Userspace LoC \\
+\midrule
+FIFO & 56 & 118 \\
+MRU & 101 & 87 \\
+LFU & 221 & 107 \\
+S3-FIFO & 287 & 139 \\
+GET-SCAN & 324 & 107 \\
+LHD & 366 & 152 \\
+\bottomrule
+\end{tabular}
+\caption{Lines of eBPF and userspace loader code in \name policies.}
+\label{tab:loc-per-policy}
+\end{table}
+
+\begin{figure}[t!]
+    \centering
+    \includegraphics[width=0.38\textwidth]{figures/per_cgroup.pdf}
+    \caption{Using \name, multiple applications can run different eviction policies, yielding better performance for all.}
+    \label{fig:eval-isolation}
+\end{figure}
+
+
+\subsection{Isolation (Q2)}
+\label{subsec:eval-isolation}
+
+The Linux page cache already provides a measure of isolation by giving each cgroup its own set of LRU lists. \name takes advantage of this design by enabling each cgroup to have its own custom policy. We demonstrate that this is a useful capability by simulating and comparing against ``global'' policies, as opposed to \name's per-cgroup policies. We create two cgroups, one running a YCSB C workload with LevelDB, and the other running a file search workload with ripgrep. The YCSB cgroup is allocated 10GiB and the file search cgroup is allocated 1GiB. We run these workloads under four configurations: both cgroups using the default policy, both using LFU, both using MRU, and a ``tailored'' setup: YCSB with LFU and file search with MRU.
+
+\vspace{-1em}
+\paragraph{Evaluation.} Figure~\ref{fig:eval-isolation} shows that the tailored setup beats the other three configurations, yielding 49.8\% and 79.4\% improvements for YCSB and file search, respectively, over the baseline configuration. While the other two \name configurations provide performance improvements for the workloads corresponding to their policy, they can significantly degrade the performance of the other workload, demonstrating that global policies are indeed not a viable solution. Note that YCSB improves further in the tailored setup compared to the LFU configuration (and vice versa for file search compared to the MRU configuration). This is due to improved caching of the workloads yielding reduced disk contention. Additionally, the file search workload improves in the LFU configuration for the same reason.
+
+
+\vspace{0.5em}
+\noindent\fbox{%
+    \parbox{0.97\columnwidth}{%
+        \textbf{Takeaway 5:}
+        Using \name with per-cgroup policies allows for fine-grained control and improved performance.
+    }%
+}
+
+\subsection{Memory and CPU Overhead (Q3)}
+\label{subsec:eval-overhead}
+
+The advent of faster and larger storage devices means that the page cache (and \name) must be able to handle millions of events per second. We run a number of micro-benchmarks to investigate \name's memory and CPU overhead.
+
+
+\vspace{-1em}
+\subsubsection{Memory Overhead}
+\name's primary memory usage is the valid folios registry hash table (\S\ref{subsec:design_safe_memory_referencing}).
+In the worst case, we set up the hash table with as many buckets as there are 4KiB pages in the cgroup (based on its configured size). Each bucket requires 16 bytes to store the hash table's internal list pointers. Thus, the memory overhead for an empty registry is:
+$$\frac{\left(\frac{\text{cgroup\_size}}{\text{page\_size}}\right) \times 16}{\text{cgroup\_size}} = 0.4\%$$
+Each filled entry in the hash table uses 32 bytes for the \name list node. The full registry memory overhead is:
+$$\frac{\left(\frac{\text{cgroup\_size}}{\text{page\_size}}\right) \times (16 + 32)}{\text{cgroup\_size}} = 1.2\%$$
+Therefore, the memory overhead for \name's registry is between 0.4\%-1.2\% of a policy's cgroup's memory. We believe that this overhead could be significantly reduced with recent improvements to eBPF's handling of kernel objects, allowing eBPF to directly ensure that some pointers are trusted.
+
+\subsubsection{CPU Overhead}
+To measure the CPU overhead, we run the fio micro-benchmark~\cite{fio} with 8 threads on a \emph{randread} workload and record the IOPS and CPU usage. We do this for both the default Linux policy and a \name no-op policy, meaning that it uses the default eviction policy while still maintaining \name data structures. Then, we calculate and compare the CPU usage per I/O operation (measured in $\mu$CPUs, \ie one-millionth of a CPU). Table~\ref{tab:eval-cpu-overhead} shows that the CPU overhead of \name is at most 1.7\%.
+
+\begin{table}
+\centering
+\footnotesize{}
+\begin{tabular}{lrrr}
+\toprule
+Cgroup Size & Baseline &     \name & Overhead (\%) \\
+\midrule
+      5 GiB &   234.80 &    236.51 &        0.72\% \\
+     10 GiB &   217.48 &    221.14 &        1.66\% \\
+     30 GiB &   197.67 &    198.01 &        0.17\% \\
+\bottomrule
+\end{tabular}
+\caption{\name $\mu$CPU usage per I/O operation using fio.}
+\label{tab:eval-cpu-overhead}
+\end{table}
+
+\vspace{0.5em}
+\noindent\fbox{%
+    \parbox{0.97\columnwidth}{%
+        \textbf{Takeaway 6:}
+        \name incurs relatively low CPU and memory overhead, while improving performance.
+    }%
+}

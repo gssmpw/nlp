@@ -1,0 +1,73 @@
+\begin{figure}[tbp]
+    \centering
+    \includegraphics[width=0.45\textwidth]{figs/gigl_system.pdf}
+    \vspace{-0.1in}
+    \caption{GiGL framework components; {\color{purple}magenta} items are work-in-progress.}
+    \label{fig:gigl}
+    \vspace{-0.1in}
+\end{figure}
+
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=0.96\textwidth]{figs/gigl_nablp.pdf}
+    \vspace{-0.1in}
+    \caption{A example GiGL workflow with tabularized subgraph sampling for the task of link prediction, in which the model is trained with triplet-style contrastive loss on a set of anchor nodes along with their positives and (in-batch) negatives. The intermediate results of each component are stored on a cloud storage service such as GCS.}
+    \label{fig:framework}
+    \vspace{-0.05in}
+\end{figure*}
+
+GiGL is designed with horizontal scaling across many compute resources in mind, making it well-suited for deployment on both custom compute clusters and cloud environments. While vertically-scaled GNN solutions (hosting graph and training on one very large machine) are viable to an extent, their scalability is inherently limited\footnote{We discuss our experience moving away from a vertically-scaled approach in \cref{sec:lesson-infra}.}, and is a bottleneck in environments where data volume can fluctuate across tasks, and grow rapidly with user growth. 
+
+\cref{fig:gigl} provides an overview of the GiGL architecture. As discussed earlier and illustrated in the graph data handling components of \cref{fig:gigl}, GiGL is designed to support two strategies for managing industry-scale graph data: tabularization, and real-time subgraph sampling. Since both workflows share the same orchestration framework and most core components, we begin by introducing GiGL through the tabularization workflow in \cref{sec:components}. We then discuss an in-memory implementation of the real-time subgraph sampling workflow in \cref{sec:glt}, followed by an overview of the shared user interface used across both in \cref{sec:interface}.
+
+\subsection{Components and Orchestration}
+\label{sec:components}
+We begin by introducing the tabularization scheme, which has been a core part of GiGL and has been in use in multiple domains inside Snapchat with significant success over the past two years. \cref{fig:framework} provides a visual overview of GiGL’s workflow for a sample link prediction task, trained with a triplet-style contrastive loss.
+We next outline the design of GiGL pipelines, which are comprised of five main components and orchestration capabilities\footnote{Detailed documentation of each component can be found at \url{https://snap-research.github.io/GiGL/\#gigl-components}}:
+
+\paragraph{Data Preprocessor} (DP)
+is a distributed feature transformation pipeline backed by TensorFlow Transform (TFT)\footnote{\url{https://www.tensorflow.org/tfx/transform}},  leveraging the Beam\footnote{\url{https://beam.apache.org}} runner.  TFT is widely used in industry for large-scale data preprocessing, encompassing feature scaling, normalization, handling of categorical features, and more.  DP reads and transforms input graph topology (edge-lists) and raw node and edge features from relational data sources (in our case, BigQuery or Google Cloud Storage) into the \texttt{TFRecord} format.  Users are able to define distributed transforms like one-hot-encoding, normalization, scaling,   imputation and filtering over the graph.  We provide bindings to run DP on Google Cloud Dataflow\footnote{\url{https://cloud.google.com/products/dataflow}} (with AWS support planned).
+
+\paragraph{Subgraph Sampler} (SGS)
+is a distributed batch workflow which enables custom graph sampling logic to facilitate tasks like node classification and link prediction. At its core, SGS generates $k$-hop subgraphs for each node in an input graph, with added sampling flexibility.  Since training GNNs requires message-passing subgraph topology and feature data for \emph{all} nodes involved in the loss calculation, SGS supports workflows which also require added positive/negative sampling to generate complete training examples.  For node-level tasks, each sample contains the $k$-hop subgraph and node label. For edge-level tasks like link prediction, SGS generates samples with anchor, positive and negative nodes' subgraphs. Notably, label nodes can also be custom or user-defined, as shown in the second block of \cref{fig:framework}.
+
+GiGL has two separate tabularization backends \emph{Pure-ETL} and Graph Database (\emph{GraphDB}) backed. The Pure-ETL backend strictly takes advantage of constructs in batch-processing pipelines like {\small\texttt{Join}} and {\small\texttt{GroupByKey}}. We implemented this in Apache Spark~\cite{salloum2016big} on Scala. The method leverages repeated joins on edge-list data, with a hydration step to enrich node and edge features.  Notably, our Spark implementation is a re-write of a previous Beam on Dataflow version, which resulted in huge (${\geq}80\%$) cost and runtime improvements.  The GraphDB backend uses an Apache Spark on Scala job which queries a graph DB instance post-ingestion of DP output. Internally, we leveraged {\small\texttt{NebulaGraph}} \cite{wu2022nebula}.  Currently, we utilize the GraphDB backend for internal heterogeneous GNN workflows to support most-flexible neighbor sampling (via imperative graph query language) and compatibility with internal graph infrastructure, but our abstracted design enables easy vendor-swapping.  The Pure-ETL backend is mainly used for simpler homogeneous GNN workflows with limited sampling complexity.  Careful partitioning, caching and resource-management ensure this job's reliability. Aligning support across the backends is work-in-progress.
+
+\paragraph{Split Generator} (SG)
+is a distributed data splitting routine to generate globally consistent train/validation/test splits according to flexible split strategies (transductive, inductive, and custom user-defined).  SG also uses Spark on Scala, which was a re-write from Beam on Dataflow for cost and runtime reasons (similar to SGS). 
+
+\paragraph{Trainer}
+is a distributed model training job that consumes data from SG for model training, validation, and test loss computation. % to generate model artifacts. 
+For each training batch, workers fetch multiple SG output samples and collate them into a single batch subgraph, which is 
+fed into user-defined training logic written in familiar modeling code (e.g., PyG). Collation is abstracted-away, such that users can operate directly with simple full-batch training loops.  Moreover, collation can be modified through a translation layer to support other modeling frameworks (e.g., DGL, TF-GNN) -- this is planned work. Trainer outputs a model artifact which can be used in Inferencer, along with relevant evaluation metrics. 
+
+\paragraph{Inferencer}
+is a distributed inferencing component which generates embeddings and/or class predictions dictated by user code. Unlike Trainer, Inference uses Beam on Dataflow for parallel CPU/GPU inference. Interestingly, we found that CPU inference offers easier scaling with GNN models given their light parameter footprint. 
+
+\paragraph{Orchestration.}
+A common practitioner workflow is the configuration of an end-to-end pipeline which runs components in sequence (see \cref{fig:framework}) to power batch inference.  
+GiGL leverages workflow management software to schedule the component jobs in order. GiGL currently provides tooling to launch pipelines on Kubeflow\footnote{\url{https://www.kubeflow.org}} and VertexAI\footnote{\url{https://cloud.google.com/vertex-ai}}. For easier orchestration, we introduce two additional mini-components which run before pipeline-start: \emph{(i)} a Validation Checker which verifies input configuration correctness and path-existence to avoid wasting development and compute cycles, and \emph{(ii)} a Config Populator, which takes template configurations, and populates it with frozen asset paths (transformed data, splits, model artifact, inferences) to simplify and centralize asset tracking. Path persistence prior to pipeline execution enables retrying individual components idempotently, fault tolerance, and amortization of individual component outputs for other runs: e.g., multiple Trainers using the same SG output during hyperparameter tuning.
+
+\subsection{Real-time Subgraph Sampling}
+\label{sec:glt}
+While tabularization provides a scalable and effective approach for subgraph generation, it has some limits (discussed in \cref{sec:lesson-infra}) when greater flexibility and adaptive use of a graph is required during training.  Real-time subgraph sampling workflows enable this flexibility for speed, at the expense of amortization potential.  To enable such workflows, we integrate and build from a custom version of {\small\texttt{GraphLearn-for-PyTorch}}\footnote{\url{https://github.com/alibaba/graphlearn-for-pytorch}} (GLT).  While sharing the same orchestration, data reading and transformation (DP) logic, our customized GLT backend partitions the graph into a distributed in-memory dataset across machines.  The graphs are semi-randomly partitioned: nodes are shuffled across machines, and adjacent edges are collocated based on (customizable) adjacent source or destination node.  Hence, all nodes are able to access all 1-hop neighbors within-machine, and the associated node and edge features are also collocated.  Once this dataset is established, training and inference workflows are able to generate subgraphs via gRPC calls across machines for multi-hop sampling.  During training, we adopt a similar strategy as in SG to enable globally consistent distributed splits to mask out relevant data, and can flexibly use CPU or GPU training.  This logic operates within the logical scope of the Trainer and Inferencer components, and similar to the tabularization scheme: trainer outputs a model artifact and inference outputs final embeddings or predictions to a sink (BigQuery, or Google Cloud Storage, internally). We have successfully used this scheme internally, and open-source support is currently work-in-progress. 
+
+
+\input{tables/scale}
+
+\subsection{User Interface}
+\label{sec:interface}
+Apart from the raw relational data, users are asked to specify two configuration files which dictate the GiGL workflow which runs: a \emph{Resource Config} and a \emph{Task Config}; see \cref{appx:config} for links to examples of them, respectively, and our official user guide\footnote{\url{https://snap-research.github.io/GiGL/\#configuration}} for further details and guidelines.
+
+\paragraph{Resource Config.} This configuration specifies the underlying compute resource details which GiGL components should aim to provision, including number of machines, machine spec, disk, memory, CPU and GPU requests.
+
+\paragraph{Task Config.} GiGL is designed with modeling flexibility in mind, enabling users to customize key components through a dependency injection-like paradigm.  Users can provide or override core logic by implementing custom interfaces across various components:
+
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Data Preprocessor.} Users can define a custom class with data transformation logic using TFT preprocessing functions for features, or use common defaults within GiGL.
+    \item \textbf{Split Generator.} Users can define custom data splitting strategies or use common defaults within GiGL.
+    \item \textbf{Trainer and Inferencer.} Users can easily define custom model definitions as in PyG or use common defaults within GiGL.
+\end{itemize}
+
+We provide working examples of component logic to guide users while maintaining flexibility for extensive customization.  
+

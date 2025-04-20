@@ -1,0 +1,134 @@
+\section{Discussion about Design Choices} \label{sec:design}
+
+% \begin{figure}[ht]
+% \vskip 0.2in
+% \begin{center}
+% \centerline{\includegraphics[width=\columnwidth]{icml2024/images/channel_var.pdf}}
+% \caption{MSE error vs Number of Iterations/Samples}
+% \label{icml-historical}
+% \end{center}
+% \vskip -0.2in
+% \end{figure}
+
+In this section, we discuss various design choices in the \FWName framework, as well as system and hardware support. 
+
+\subsection{Insights behind \FWName{} Design Choices} \label{sec:designchoices}
+
+
+\paragraph{Per-Output-Channel Quantization} 
+In LLMs, linear layers often exhibit substantially more variation across output channels than across input channels. For instance, in Llama2-7b \cite{touvron2023llama}, the average standard deviation along the output channel is 2.20× higher than along the input channel (see Appendix~\ref{app:channel_var}). As a result, grouping parameters by output channel and assigning a unique precision to each group—i.e., per-output-channel quantization—more effectively captures their diverse distributions.
+
+\paragraph{Groupwise Normalization} 
+Each output channel may still exhibit significant internal variability even with per-output-channel quantization. 
+To address this, groupwise normalization is often used to allow each group of elements share a separate scale. 
+We follow QLoRA's design of using 64-element normalization scaled by the absmax (i.e., maximum absolute value) in each group \cite{dettmers2024qlora}. \label{sec:groupnorm}
+
+\paragraph{Data-Free Post-Training Quantization} Unlike quantization-aware training (QAT) \cite{esser2019learned,yang2021bsq,jeon2024l4q,savarese2022not}, our approach adds no overhead to fine-tuning. By automatically searching for quantization mappings and thresholds, it frees users from manual tuning \cite{savarese2022not,zhou2023sysmol}, saving both development and computation resources. Moreover, contrary to some methods that vary compression ratios over time \cite{savarese2022not,yang2021bsq}, \FWName maintains a consistent compression ratio, ensuring persistent memory savings during fine-tuning. 
+
+\paragraph{Per-Output-Channel Thresholds and Mappings} 
+Figure \ref{fig:mappingthreshold} visualizes the roles of thresholds and mappings in the process of quantization. Thresholds refer to the boundary points (``bin edges") that partition the continuous domain of normalized parameters into discrete intervals and thus specific bitstring encodings. 
+Mappings, on the other hand, specify the representative values assigned to each encoded bitstring and thus the intervals. As discussed in \S\ref{sec:limitations}, fine-grained designs of quantization mappings and thresholds could lead to significantly more accurate approximation and reconstruction of parameters. 
+\FWName{} allows each output channel to adopt a different combination of mappings and thresholds for more precise fine-grained quantization.
+
+\begin{figure}[ht]
+% \vskip 0.2in
+\begin{center}
+\centerline{\includegraphics[width=0.7\columnwidth]{images/mappingthreshold.pdf}}
+\vspace{-10pt}
+\caption{Roles of \textbf{mappings} and \textbf{thresholds} in quantization. Circles represent thresholds whereas crosses represent mappings. Colored Triangles represent the process of converting a range of original/unquantized real values - partitioned by thresholds - to the mapped values corresponding to each quantization level. 
+}
+\label{fig:mappingthreshold}
+\end{center}
+\vspace{-20pt}
+\end{figure}
+
+
+\paragraph{Data-Free One-Shot Post-Training Quantization}
+Most quantization-aware training (QAT) techniques achieve higher task performance
+by incurring additional training overhead and learning task-specific quantization 
+parameters~\cite{esser2019learned,yang2021bsq,jeon2024l4q,savarese2022not}.
+Similarly, many post-training quantization methods require a calibration set 
+for quantization scheme learning~\cite{liao2024apiq,hubara2021accurate}.
+In contrast, \FWName{} uses \emph{data-free one-shot post-training quantization}, 
+enabling reusable quantization schemes and quantized parameters, minimal hyperparameter 
+tuning, and negligible fine-tuning overhead.
+This design is particularly suited to LoRA fine-tuning because: (1) Task-dependent learning is confined to the adapters, (2) LoRA base weights are often shared across multiple adapters, and (3) LoRA primarily targets resource-constrained fine-tuning scenarios. 
+% \cyrus{This paragraph requires restructuring}
+
+% Unlike existing work in quantization-aware training (QAT),
+% %\textbf{(R1)} Memory savings should not come at a cost of more compute during fine-tuning, 
+% our quantization framework does not introduce additional overhead to the fine-tuning process.
+
+\paragraph{User-Defined Compression Ratios} 
+Quantized LoRA methods see heavy use in tight resource settings - \eg limited-memory GPUs or on-device scenarios - where specifying a precise compression ratio is pivotal. By tailoring each parameter’s bit precision, thresholds, and mappings, \FWName directly aligns compression with real-world resource budgets, ensuring feasibility and efficiency even under strict constraints. Furthermore, because \FWName fixes the ratio in a single pass, it obviates the extensive hyper-parameter tuning needed by alternative methods to find acceptable compression–accuracy trade-offs \cite{savarese2022not,zhou2023sysmol}.
+
+
+\paragraph{Using LoftQ as Low-Rank Intializer}
+Researchers have found that the initialization of low-rank tensors is crucial to the effectiveness of LoRA fine-tuning, especially when it comes to ultra-low-bit quantized base weight \cite{li2023loftq, meng2024pissa,wang2024lora}. LoftQ \cite{li2023loftq} and PiSSA \cite{meng2024pissa} are two notable initialization techniques for quantized LoRA (see Appendix \ref{app:lowrankinit} for a detailed introduction).  While PiSSA  purports faster convergence than LoftQ, our experiments consistently show LoftQ outperforming PiSSA. As illustrated by the sample data points in Table \ref{tab:init_compare}, PiSSA fails to achieve reasonable task performance at lower bit ranges. This aligns with our intuition that performing quantization rather than SVD first allows the low-rank tensors to better absorb quantization errors. Our findings also corroborate points raised in the LoftQ appendix. Since our main objective is to enable lower-precision fine-tuning and deployment, we opt to use LoftQ as our low-rank initializer. Following the recommendation from LoftQ, we use five alternating steps for initialization.
+
+\begin{table}[ht]
+    \centering
+    % \vspace{-5pt}
+    \resizebox{0.6\columnwidth}{!}{%
+    \begin{tabular}{llcccc}
+        \toprule
+        \multicolumn{2}{l}{\textbf{Setup}} 
+        & \multicolumn{2}{c}{\textbf{Llama-7b}} 
+        & \multicolumn{2}{c}{\textbf{Llama-13b}}\\
+        \cmidrule(lr){1-2} \cmidrule(lr){3-4} \cmidrule(lr){5-6}
+        \textbf{Method} & \textbf{Dataset} & \textbf{2-bit} & \textbf{4-bit} & \textbf{2-bit} & \textbf{4-bit} \\
+        \midrule
+        PiSSA & \multirow{2}{*}{WikiText-2 (↓)} & 1919.63 & 5.53 & 1825.68 & 5.05 \\
+        LoftQ &                                & 8.63 & 5.26 & 7.27 & 4.79 \\
+        \bottomrule
+    \end{tabular}%
+    }
+    % \vspace{-5pt}
+    \caption{Perplexities of PiSSA and LoftQ as initialization methods on WikiText-2. 
+    Quantization is performed at 2 bits or 4 bits per parameter. Lower values indicate better performance ($\downarrow$).}
+    % \vspace{-5pt}
+    \label{tab:init_compare}
+\end{table}
+
+
+
+
+% Many mixed precision training/finetuning techniques rely on hyperparameter-based learning  to determine the final compression ratio \textit{vs} performance tradeoff \cite{zhou2023sysmol,savarese2022not}. Such approaches would fail to retain the gains from LoRA finetuning because (1) 
+
+\paragraph{Adapting \FWName{} to Production Use Cases} 
+Many production use cases, \eg batched inference in data centers, require fixed quantization mappings \cite{li2024svdqunat,zhao2024atom}. 
+\FWName{} can be adapted to such scenarios by keeping only the thresholds learnable, which is shown to be useful in enhancing model performance \cite{liu2022nonuniform}. 
+To maximize performance with task-agnostic reusable base weight, \FWName{} can be extended to use the same set of thresholds for multiple adapters but learn mappings for each downstream task. 
+In other words, each adapter can be connected to the base weight together with a dedicated base weight decoding mapping for that downstream task. 
+% We present an example on how this can be achieved in Appendix \ref{app:stemappingsearch}. 
+Nevertheless, this would demand higher development and computation costs. 
+In our implementation and experiments, we adopt the same set of learned thresholds and learned mappings for a single base weight for the proof of concept. 
+
+% The design of QLoRA yields itself very natural to output-channel-wise quantization. This is because the normalization group in QLoRA is chosen as 64 consecutive elements within an output channel. For the ease of packing and unpacking, elements within the same group should share the same precision. As a result, it is more system-friendly to share one precision per output channel than doing so per input channel. \cyrus{Other parameter distribution analysis for seeing why outputchannelwise quantization is better than input channelwise quantization?}
+
+% Furthermore, as per-element quantization is done through a decision tree and per-element dequantization is done through a lookup table, we can make the thresholds in the decision tree and the mapped values in the lookup table flexible (i.e., to be passed in as a list). Furthermore, we can have separate decision trees and mapped values for each output channel to better approximate the distribution in each output channel.
+
+% \subsection{Practical Benefits Enabled by Design Choices}
+
+% \qz{Consider removing this subsection. Only need to keep the QAT part somewhere.}
+
+% The design choices of \FWName{} enable a number of additional benefits in practice. 
+% First, unlike existing work in quantization-aware training (QAT)~\cite{esser2019learned,yang2021bsq,jeon2024l4q,savarese2022not},
+% %\textbf{(R1)} Memory savings should not come at a cost of more compute during fine-tuning, 
+% our quantization framework does not introduce additional overhead to the fine-tuning process.
+% Next, automated search for quantization parameters, \ie mappings and thresholds, relieves users from the burden of finding optimal quantization parameters via manual exploration or heuristics search~\cite{savarese2022not,zhou2023sysmol},.
+% Finally, different from some existing methods~\cite{savarese2022not,yang2021bsq}, the compression ratio of the base model weight would remain consistent under \FWName{}, thus enabling persistent memory saving during fine-tuning. 
+% \qz{Cyrus, please take a look at this to see if they make sense. We will need citations to existing work for attacking them.}
+
+% \paragraph{No Additional Overhead for Fine-Tuning}
+% As compared to quantization-aware training (QAT) methods~\cite{?}, ...
+
+% \paragraph{Automated Quantization Parameter Search}
+% We ...
+
+% \paragraph{Consistent Compression Ratio during Fine-Tuning}
+% We ...
+
+\subsection{System and Hardware Support}
+
+Building on the limitations noted in \S\ref{sec:primlimit}, we implement practical CUDA-based primitives that support both low-bit and mixed-precision LoRA fine-tuning with maximum flexibility (details in Appendix~\ref{app:systemsupport}). Notably, the added kernel generalization incurs only negligible overhead in end-to-end inference, as quantization/dequantization constitutes a minimal portion of the total compute cost.

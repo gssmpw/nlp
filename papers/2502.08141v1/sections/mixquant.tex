@@ -1,0 +1,132 @@
+\section{Mixed-Precision Quantization: Channelwise Precision Assignment} \label{sec:assigner}
+
+
+In this section, we present how mixed-precision quantization assignment is conducted in \FWName. In light of the aforementioned task-agnostic requirement, a simple yet effective objective for defining this problem is the minimization of the overall \textit{Summed Square Error}\footnote{We define \textbf{SSE} (\textbf{S}ummed 
+\textbf{S}quare \textbf{E}rror) as the sum of the squared differences between 
+the original values and their quantized counterparts, i.e., 
+$\sum_{i} \bigl(x_i - \widehat{x}_i\bigr)^2$.} (\textit{SSE}) considering the regular structure of transformer-based architectures \cite{waswani2017attention,dubey2024llama,touvron2023llama}. Such formulation can serve as an effective proxy to retain more information for the harder-to-quantize channels in weights.
+
+One can observe that finding the optimal mixed-precision scheme (w.r.t. SSE) can be formulated as an ILP. However, due to the large number of output channels in LLMs, a direct solver-based approach becomes prohibitively expensive. For instance, solving more than five layers of LLaMA-2-7B fails to finish within ten hours. To address this limitation, we propose a two-level ILP workflow (Figure~\ref{fig:twostepilp}, Algorithm~\ref{alg:twostepilp}) that retains the benefits of ILP-based methods while ensuring reasonable complexity.
+
+
+% \qz{Need a one-sentence conclusion of what the assigner does, and how the solver math is relevant}
+
+
+\begin{algorithm}[ht]
+\setlength{\abovecaptionskip}{-8pt}
+\setlength{\belowcaptionskip}{-10pt}
+\caption{Channelwise Precision Assignment}
+\begin{algorithmic}[1]
+  \STATE \textbf{Input}: $N$, distinct $w^{(1)},\dots,w^{(K)}$, partition $\{I_k\}$, MSE$(i,p)$, total budget $B_{\text{total}}$
+  \STATE \textbf{Step 1.} Compute $W_k = \sum_{i\in I_k} w_i$, then $W_{\text{sum}} = \sum_{k=1}^K W_k$
+  \STATE \textbf{Step 2.} $B_k \leftarrow B_{\text{total}} \times \frac{W_k}{W_{\text{sum}}}$ for $k=1,\dots,K$
+  \FOR{$k = 1$ to $K$}
+    \STATE \textbf{Step 3.} Cluster channels in $I_k$ (e.g.\ K-Means on MSE features) into $K_k$ clusters
+    \STATE \textbf{Step 4.} \emph{Cluster-Level ILP}: decide how many channels in each cluster get each bitwidth, subject to $B_k$
+    \STATE \textbf{Step 5.} \emph{Intra-Cluster ILP}: within each cluster, assign specific channels to bitwidths
+  \ENDFOR
+  \STATE \textbf{Step 6.} Combine final bitwidths into $b_1, \ldots, b_N$
+  \STATE \textbf{Output:} $(b_1,\dots,b_N)$, total SSE, actual bits used
+\end{algorithmic}
+\label{alg:twostepilp}
+
+\end{algorithm}
+
+
+
+\subsection{Preprocessing for the Pipeline (Step 1-3)}
+
+To preprocess channels for the hierarchical ILP pipeline, we first compute each channel’s MSE under 1-, 2-, and 4-bit quantization. Next, we split channels by parameter count, which in LLMs typically yields two distinct sizes (\eg 4096 and 11008 for LLaMA-2-7B). Within each group, we then apply three-dimensional K-Means clustering\footnote{We use 300 as the maximum number of iterations} (based on the three computed MSE values), forming 128 clusters per group in our implementation.
+
+
+\subsection{Cluster-Level ILP (Step 4)}
+Formed clusters first go through the following cluster-level ILP to be assigned budgets of 1-bit, 2-bit, and 4-bit channels.
+
+Consider \(C\) clusters, each with \(S_c\) channels \(\bigl(c = 1,\dots,C\bigr)\). Let \(\mathcal{P} = \{1,2,4\}\) be the available bit-precisions\footnote{For LLaMA, restricting to 2 and 4 bits outperformed including 1 bit for bpp $\geq$2.0, so we adopt this configuration.}. For each cluster \(c\) and precision \(p \in \mathcal{P}\), define:
+\begin{packeditemize}
+    \item \(\text{cost}_{c,p}\): mean quantization error (e.g., mean-squared error) \emph{per channel} in cluster \(c\) if all channels in that cluster are assigned to precision \(p\), scaled by the number of weight parameters per channel in that cluster \footnote{Contrary to LoftQ’s suggestion, per-layer cost weighting based on layer index proved suboptimal in our experiments.}.
+    \item \(y_{c,p} \in \mathbb{Z}_{\ge 0}\): decision variable representing the number of channels in cluster \(c\) that will be assigned precision \(p\).
+\end{packeditemize}
+
+We define a global bit-budget \(B\) (i.e., total permissible bits across all clusters). 
+Let \(\beta(p)\) be the bit-precision value (e.g., \(\beta(1)=1\), \(\beta(2)=2\), \(\beta(4)=4\)). 
+To enforce the bit budget, we multiply \(\beta(p)\) by the channel parameter count \(\omega_c\) for cluster \(c\), and then by the number of channels \(y_{c,p}\). As we split channels based on the number of parameters within each channel, each channel in a cluster \(c\) shares the same \(\omega_c\). 
+
+\begingroup
+% \setlength{\abovedisplayskip}{-12pt}%
+% \setlength{\abovedisplayshortskip}{-12pt}%
+% \setlength{\belowdisplayskip}{-2pt}%
+% \setlength{\belowdisplayshortskip}{-2pt}%
+\[
+\begin{aligned}
+  &\text{Minimize} 
+  && \sum_{c=1}^C \sum_{p \in \mathcal{P}} \bigl(\text{cost}_{c,p}\bigr)\,y_{c,p} \\
+  &\text{subject to} 
+  && \sum_{p \in \mathcal{P}} y_{c,p} = S_c, \quad c = 1,\dots,C,\\
+  &&& \sum_{c=1}^C \sum_{p \in \mathcal{P}} \bigl(\beta(p)\,\omega_c\bigr)\;y_{c,p} 
+      \le B,\\
+  &&& y_{c,p} \in \mathbb{Z}_{\ge 0}, \quad 0 \le y_{c,p} \le S_c.
+\end{aligned}
+\]
+\endgroup
+
+
+This formulation seeks to minimize the total weighted quantization error by choosing, for each cluster \(c\), how many of its channels \(y_{c,p}\) are assigned to each precision level \(p\). The constraints ensure that every channel of a cluster is allocated exactly once, the total bits used do not exceed the overall budget \(B\), and that the decision variables remain non-negative integers and do not exceed the number of channels in their respective clusters.
+
+
+%------------------------------------------------
+\subsection{Intra-Cluster ILP (Step 5)}
+Once the cluster-level ILP decides how many channels \(\{y_{c,p}\}\) in each cluster \(c\) should be assigned to each bit precision \(p\), a second ILP distributes these assignments to each channel within each cluster.
+
+Let \(S_c\) denote the total number of channels in cluster \(c\). For channel \(i \in \{1,\dots,S_c\}\) in cluster \(c\), we define the precomputed mean-squared error at precision \(p\) as
+\(\text{MSE}(i,p) = \) (precomputed quantization  error of channel \(i\) at precision \(p\)).
+We define binary decision variables \( x_{i,p} = 1 \) if channel \( i \) is assigned bit precision \( p \); otherwise, \( x_{i,p} = 0.\)  
+
+
+
+\begingroup
+% \setlength{\abovedisplayskip}{-12pt}%
+% \setlength{\abovedisplayshortskip}{-12pt}%
+% \setlength{\belowdisplayskip}{-2pt}%
+% \setlength{\belowdisplayshortskip}{-2pt}%
+\[
+\begin{aligned}
+&\text{Minimize} && 
+\sum_{i=1}^{S_c} \sum_{p \in \mathcal{P}} \text{MSE}(i,p)\, x_{i,p}
+\\
+&\text{subject to} &&
+\sum_{p \in \mathcal{P}} x_{i,p} \;=\; 1 
+\quad \forall\, i \in \{1,\dots,S_c\},
+\\
+&&& \sum_{i=1}^{S_c} x_{i,p} \;=\; y_{c,p}
+\quad \forall\, p \in \mathcal{P},
+\\
+&&& x_{i,p} \in \{0,1\}
+\quad \forall\, i \in \{1,\dots,S_c\},\; p \in \mathcal{P}.
+\end{aligned}
+\]
+\endgroup
+
+
+
+This formulation constitutes the intra-cluster ILP. The objective minimizes the total quantization error, where \(\text{MSE}(i,p)\) is the precomputed mean-squared error for channel \(i\) at bit precision \(p\). The first constraint ensures that each channel is assigned to exactly one precision. The second constraint enforces that the number of channels assigned to each precision \(p\) matches the counts \(y_{c,p}\) determined by the cluster-level ILP. Finally, the binary constraint stipulates that each decision variable \(x_{i,p}\) is either 0 or 1.
+
+
+\noindent
+This intra-cluster ILP enforces that the required number of channels (from the cluster-level ILP) is assigned to each bit precision and minimizes local MSE within the cluster.
+
+
+\begin{figure}[ht]
+% \vspace{-10pt}
+\begin{center}
+\centerline{\includegraphics[width=0.7\columnwidth]{images/two_step_ilp.pdf}}
+% \vspace{-10pt}
+\caption{Two-step ILP-based Workflow for Channelwise Precision Assignment}
+\label{fig:twostepilp}
+\end{center}
+% \vspace{-20pt}
+\end{figure}
+
+
+
+\textbf{Efficiently Leveraging ILP Solvers.} In Step 6, we collect the assigned per-channel precisions. By employing this two-step hierarchical approach, we capitalize on the strengths of ILP solvers while maintaining minimal computational overhead.

@@ -1,0 +1,122 @@
+
+\section{Training and searching partitions}
+\label{sec:method}
+
+In this section, we present more details how our \OURS method assigns keys and queries to buckets. %
+%
+%
+Note already, a key will be assigned to a single partition bucket (unlike LSH). 
+Queries are assigned to the $\nprobe$ most promising buckets, in a multi-probe fashion.
+%
+%
+
+\subsection{Partitioning functions}
+
+\newcommand{\nq}{n_{\mathrm{q}}}
+\newcommand{\nk}{n_{\mathrm{k}}}
+
+The assignment function aims at assigning key vectors  to a relevant bucket and finding the top-$\nprobe$ best buckets for the queries.
+A common solution is to partition the data with LSH or clustering. 
+Clustering is more effective than LSH variants (see Appendix~\ref{app:lshvariants}), that are not data-adaptive. 
+%
+Thus, we use the standard k-means partition~\citep{jegou2010product} by clustering $K\in \mathbb{R}^{\nk \times d}$ keys into $\nlist$ centroids. 
+K-means has the advantage to produce relatively balanced clusters. 
+%
+
+\paragraph{Assigning with RoPE. }
+The first issue we run into with this approach is the temporal OOD behavior, meaning that long-range lookups that are relatively independent of position are hard to match.  
+A large part of this is due to the RoPE transformation of vectors. 
+Therefore, we apply the k-means clustering on vectors \emph{before} transforming them with RoPE (Section~\ref{sec:derope}). 
+The keys and queries from which the attention is computed are still transformed with RoPE. 
+
+\paragraph{Asymmetric assignment.} 
+The second adaptation we do is to address the key-query OOD setting (see Section~\ref{sec:motivation}). 
+For this we separate the assignment function for keys and queries: for queries we train a classifier $f_\mathrm{q}$ that  outputs a probability distribution over $[0,1]^C$. 
+At search time, for query $q$, we compute the attention only for the keys in the clusters given by $\mathrm{argmax}_{\nprobe} f_\mathrm{q}(q)$. 
+
+
+
+
+\subsection{Query assignment function}
+\label{sec:qpart}
+
+Here we assume that k-means is already trained.
+We use a training set of queries $Q\in \mathbb{R}^{\nk \times d}$ and keys $K\in \mathbb{R}^{\nk \times d}$. 
+The hard assignment is represented as a binary matrix $H_\mathrm{k} = \{0, 1\}^{\nk \times C}$,  where entry $(i, j)$ is set to 1 if key $i$ was assigned to bucket $j$.
+
+Entry $(i, j)$  of the matrix $A \times H_\mathrm{k}$ represents the fraction of attention weight for query $i$ contained in bucket $j$.
+Therefore, the output distribution of $f_\mathrm{q}$ should be as similar as possible to row $i$ of $A \times H_\mathrm{k}$. 
+This yields the following loss: 
+\begin{equation}
+    \mathcal{L}_\mathrm{q} = 
+    \mathrm{KLDiv}\left(f_\mathrm{q}(Q), A H_\mathrm{k}\right), 
+\end{equation}
+where $\mathrm{KLDiv}$ is the Kullback-Leibler divergence between distributions, $\mathrm{KLDiv}$ and $f_\mathrm{q}$ are applied row-wise on their matrix arguments. 
+%
+We optimize this function using AdamW \cite{loshchilov2017fixing}.  
+Each training batch comes from a separate prompt. 
+We sample $\nq$ queries $Q$ and $\nk$ keys $K$ uniformly from the prompt. 
+Since short-term queries are taken into account by the ``1+2047'' dense part, we force the training to focus on long range queries by sampling only (key, query) pairs that are more than 2047 steps apart. 
+
+
+\subsection{Beyond top-k}
+\label{sec:beyondtopk}
+
+The standard IVF approach retrieves only the top-$k$ keys that have the largest dot product with the query. 
+However, collecting the top-$k$ results in vector search is surprisingly slow~\citep{johnson2019billion}, especially on GPUs. 
+Besides, retrieving the top $k$ does require to compute the dot products \wrt \emph{all} keys within a matching bucket anyways. 
+Therefore, we aggregate \emph{all} the corresponding values into the attention result on-the-fly.
+%
+
+
+\subsection{Implementation}
+\label{sec:implem}
+
+\OURS focuses on the decoding phase of the generation because this is when the computation is most egregiously slowed by memory access times. 
+An efficient implementation requires batched queries and balanced clusters. 
+
+\paragraph{Batched queries.}
+Llama 3 8B models use group query attention~\citep{ainslie2023gqatraininggeneralizedmultiquery}, where four heads from one layer share the same KV cache. 
+At search time, for each token, we need to perform 4 searches for queries $\{q_1, q_2, q_3, q_4\}$. 
+For efficiency, we perform the 4 searches jointly by combining the outputs of the query assignment model as follows: 
+\begin{equation}
+\mathrm{argmax}_{\nprobe} \sum_{i=1}^4 f_\mathrm{q}(q_i) .   
+\end{equation}
+This approximation converts a matrix-vector into a matrix-matrix multiplication (albeit with a small batch size of 4). 
+In Section~\ref{sec:ablations} we measure the impact of this approximation.
+
+%
+
+%
+
+%
+
+%
+
+%
+%
+
+\vspace{-0.2em}
+\paragraph{On GPU.}
+
+The \OURS kernel follows an implementation similar to the Triton-based Flash-Decoding~\citep{dao2023flash} included in xFormers~\citep{xFormers2022}. Contrary to Flash-Decoding, which splits the keys and values uniformly across different CUDA blocks, in our implementation each CUDA block computes the partial attention for a single cluster assignment, with the dense local attention (Section~\ref{sec:densepart}) happening on its own CUDA block.
+%
+The custom kernel is necessary in order to limit expensive synchronizations between CPU and GPUs due to the variable sizes of the visited clusters. 
+It could benefit from further optimizations as devised by \citet{shah2024flashattention3}.
+
+The issue with this approach is that the runtime for one layer depends on the largest cluster that is accessed by any of the heads in the layer (\ie. the maximum over 
+$8\times\nprobe$ clusters). 
+Therefore, we rely on the key partitioning to produce balanced clusters. 
+The approach chosen by KDEFormer and Reformer is to artificially force the clusters to be balanced, but with a significant impact on accuracy (see Appendix~\ref{app:lshvariants}). 
+
+
+%
+%
+
+%
+%
+
+
+%
+
+

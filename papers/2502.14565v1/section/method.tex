@@ -1,0 +1,91 @@
+\input{resource/fig_method}
+\section{\lname} \label{sec:method}
+
+
+In this section, we present \mname, an LLM reasoning framework that self-verifies and refines the reasoning trajectory based on the verification. We first introduce the problem of interest and a special token coined \rethink, which is used for refining the LLM's generation (in Section \ref{sec:problem_setup}). Then, we present the core training method, namely the two-stage curricula (in Section \ref{sec:method_rethink}) and the test-time inference strategy (in Section \ref{sec:method_scale}). The overview of \sname is depicted in Figure \ref{figure:method}.
+
+\subsection{Problem setup: Learning to Verify and Refine} 
+\label{sec:problem_setup}
+
+We describe the problem setup of our interest, i.e., self-verification and refinement. Given an input $x$, the initial output $y_\mathtt{init}$ is sampled from the LLM $\mathcal{M}$, i.e., $y_\mathtt{init} \sim \mathcal{M}(\cdot|x)$, where the reasoning path is included in $y_\mathtt{init}$. The goal is to train an LLM that verifies the correctness of $y_\mathtt{init}$ and decides whether to terminate generation or continue generating by refining its reasoning. To this end, we introduce a special token \rethink that determines whether to proceed with refinement. Specifically, given $y_\mathtt{init}$, the model verifies its correctness by predicting $v \sim \mathcal{M}(\cdot|y_\mathtt{init},x)$, where $v \in$ \rethinkeos, allowing it to either terminate generation by predicting \eos or continue generating by refining its reasoning by outputting \rethink. If refinement is needed, the model generates a revised response $y_\text{refined} \sim \mathcal{M}(\cdot|\mathtt{[refine]},y_\mathtt{init},x)$, completing the correction cycle. Note that this modeling has distinct advantages as one can access the model's verification confidence of $v$.
+
+\subsection{\sname: \mmname}
+\label{sec:method_rethink}
+
+
+
+We first describe our core training pipeline of \sname, namely the structured curriculum based on online preference learning.  As \sname involves two challenging tasks (i.e., self-verification and refinement), we propose two-stage curricula. In the first stage, we train the LLM to intrinsically self-verify its generation by predicting the \eos or \rethink tokens. Then, at the second stage, we continually train this LLM to correct the generation when the output reasoning is wrong. For efficient and stable training, we employ preference optimization (i.e., learning from preference-based positive and negative pairs) based on our proposed preference data collection strategy. This allows us to perform structured preference learning without relying on reinforcement learning (RL), which can be computationally extensive and unstable \citep{rafailov2023DPO}.
+
+
+\textbf{Stage 1: Learning to verify self-generations.} 
+Given an initial LLM $\mathcal{M}_0$ and a supervised fine-tuning dataset $\mathcal{D}=\{(x_i, y_i)\}_{i}$ consisting of input-label pairs (including reasoning traces), our goal is to construct preference pairs for training $\mathcal{M}_0$. Specifically, for each input $x$, we generate a positive output $y^{+}$ and a negative output $y^{-}$.
+To achieve this, we first sample multiple responses from $\mathcal{M}_0$. This allows us to obtain both correct reasoning outputs $y_{\mathtt{correct}}$ and incorrect ones $y_{\mathtt{wrong}}$, which are identified using the ground-truth answer $y$. Using these outputs, we construct a preference dataset by distinguishing two cases: (i) when the model generates the correct answer $y_{\mathtt{correct}}$, predicting \eos is preferred over \rethink, and (ii) vice versa for incorrect answers.
+Concretely, given an input $x$ with its correct reasoning output $y_{\mathtt{correct}}$ and an incorrect output $y_{\mathtt{wrong}}$, we define the preference triplets $(x, y^+, y^-)$ as:
+\[
+\begin{cases}
+\big(x, \hat{y}\oplus[\mathtt{eos}], \hat{y}\oplus[\mathtt{refine}]\big), & \text{if } \hat{y}=y_{\mathtt{correct}}\\
+%
+\big(x\oplus\hat{y}, [\mathtt{refine}], [\mathtt{eos}]\big), & \text{if } \hat{y}=y_{\mathtt{wrong}}\\
+\end{cases} 
+\]
+where $\oplus$ is the concatenation operator.
+Based on the proposed collection strategy, we generate a preference dataset $\mathcal{D}_\mathtt{verify}$ for training the intrinsic verification of the LLM. 
+To this end, we jointly optimize the supervised fine-tuning loss with the direct preference optimization (DPO; \citealp{rafailov2023DPO}) loss. Specifically, for a given preference dataset $\mathcal{D}$, the SFT and DPO preference losses are defined as:
+\begin{align*}
+    \mathcal{L}_{\mathtt{SFT}}(\mathcal{D}):=-
+    %
+    &\mathbb{E}_{(x,y^{+})\sim\mathcal{D}}\log\mathcal{M}(y^{+}|x)\\
+    \mathcal{L}_{\mathtt{Pref}}(\mathcal{D}) := - 
+    %
+    &\mathbb{E}_{(x,y^{+},y^{-})\sim \mathcal{D}} \Big[ \sigma\big( r(x,y^{+}) - r(x,y^{-})\big)\Big] 
+    \\
+    &\text{where} ~~~~~r(x,y)= \beta\log\frac{\mathcal{M}(y \mid x)}{\mathcal{M}_{0}(y \mid x)},
+\end{align*}
+where $\beta\in\mathbb{R}^{+}$ is hyper-parameter controlling proximity to the base model $\mathcal{M}_{0}$ and $\sigma$ is the logistic function. It is worth noting that SFT loss only focuses on minimizing the negative log-likelihood of the positive output, i.e., enforcing the model to predict the correct reasoning and answer.
+
+Then, our training objective for self-verification is as:
+\begin{equation}
+    \mathcal{L}_{\mathtt{verify}} := \mathcal{L}_{\mathtt{SFT}}(\mathcal{D}_{\mathtt{verify}}) + \lambda ~ \mathcal{L}_{\mathtt{Pref}}(\mathcal{D}_{\mathtt{verify}}) 
+\end{equation}
+where $\lambda\in\mathbb{R}^{+}$ is a loss balancing hyperparameter. Here, we denote the initial model $\mathcal{M}_0$ trained with $\mathcal{L}_{\mathtt{verify}}$ as $\mathcal{M}_1$, which is the output model of first curricula. 
+
+\textbf{Stage 2: Learning to correct self-generations.} We now describe how to train \sname to acquire another core ability: self-correction. Similar to self-verification, we perform preference learning using the same loss function. To this end, we aim to construct a new preference dataset, denoted as $\mathcal{D}_{\mathtt{correct}}$. The core idea consists of two main components. First, the curriculum learning: we utilize outputs generated by the model $\mathcal{M}_1$ and initialize stage 2 training from $\mathcal{M}_1$. Second, to learn how to correct incorrect outputs, we repurpose the wrong reasoning paths $y_{\mathtt{wrong}}$ used in stage 1 to construct the dataset.
+
+Concretely, we consider two possible cases: whether the initial response is correct $y_{\mathtt{correct}}$ or incorrect $y_{\mathtt{wrong}}$. If the initial response is correct $y_{\mathtt{correct}}$, we construct preference data as same as stage 1, i.e., discouraging the generation of \rethink and encouraging \eos. The key case is when the initial response is incorrect $y_{\mathtt{wrong}}$. In this case, we need to have a positive preference sample that refines the incorrect reasoning $y_{\mathtt{wrong}}$ with the correct reasoning. To achieve this, we concatenate the ground-truth label $y$ to the response. Formally, the preference pairs are defined as:
+\[
+\begin{cases}
+\big(x, \hat{y}\oplus[\mathtt{eos}], \hat{y}\oplus[\mathtt{refine}]\big), & \text{if } \hat{y}=y_{\mathtt{correct}}\\
+\big(x \oplus \hat{y}, [\mathtt{refine}]\oplus\textcolor{blue}{y},  [\mathtt{eos}]\big), & \text{if }  \hat{y}=y_{\mathtt{wrong}}\\
+\end{cases} 
+\]
+where $\textcolor{blue}{y}$ is the ground-truth label. Using the self-correction preference dataset $\mathcal{D}_{\mathtt{correct}}$, we train the final model $\mathcal{M}_{2}$ from $\mathcal{M}_{1}$ with the following correction loss:
+\begin{equation}
+    \mathcal{L}_{\mathtt{correct}} := \mathcal{L}_{\mathtt{SFT}}(\mathcal{D}_{\mathtt{correct}}) + \lambda ~ \mathcal{L}_{\mathtt{Pref}}(\mathcal{D}_{\mathtt{correct}}).
+\end{equation}
+It is worth noting that stage 2 explicitly defines when and how refinements should be applied, preventing overgeneration and improving response accuracy. By distinguishing between necessary and unnecessary refinements, the model ensures efficient self-correction while simulating multi-step reasoning for complex scenarios.
+
+Furthermore, our dataset collection strategy shares similarities with recent backtracking methods in that incorrect initial generations are utilized to create negative pairs \citep{zhang2024backtracking}. We also observe that leveraging past failure trajectories aids in ultimately achieving successful reasoning. In this regard, we believe that applying \sname to safety-critical applications, akin to backtracking, is an interesting future direction, where our proposed curriculum learning and explicit self-verification stage can contribute to developing safer models.
+
+
+\subsection{Verification Confidence-Aware Sampling}
+\label{sec:method_scale}
+
+We propose an inference method for models trained with \sname. The key idea is to calibrate the standard sampling-based scoring approach using the self-verification confidence. Specifically, we apply this method to majority voting, where $N$ samples are generated, and the most frequent prediction is selected. Unlike conventional approaches, our method explicitly accesses the self-verification confidence, as our model not only generates an answer but also determines its correctness by producing either an \eos or \rethink token. This allows us to directly obtain the probability associated with self-verification, enabling confidence-weighted aggregation for more reliable predictions.
+
+\input{resource/tab_main}
+
+Concretely, given an input $x$, we generate $N$ candidate answers $\mathcal{Y} = \{y_1, y_2, \dots, y_N\}$ from the LLM at stage 2, denoted as $\mathcal{M}$ for simplicity, where each $y_i$ is sampled as $y_i \sim \mathcal{M}(\cdot | x)$. To refine the selection process, we leverage the softmax probability of the verification (i.e., the probability of \eos token), denoted as follows:  
+\[
+c_i = \mathcal{M}([\mathtt{eos}] | y_i, x),
+\]  
+as a confidence score. Instead of selecting the most frequent prediction, we accumulate these scores by summing the confidence values of identical answers, leading to the final prediction as follows:  
+\[
+y^* = \arg\max_{y \in \mathcal{Y}} \sum_{i: y_i = y} c_i.
+\]  
+This approach calibrates the traditional majority voting method by weighting predictions based on their model-derived confidence, showing effective scaling at test time.
+
+
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%

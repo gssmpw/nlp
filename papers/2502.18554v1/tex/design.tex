@@ -1,0 +1,579 @@
+\section{{\pname} Design and Optimization}
+\label{sec-design_and_optimizations}
+
+Figure \ref{fig:architecture} presents the overall design architecture of {\pname}. We highlight the newly designed modules as green boxes. The primary contributions lie in the performance optimization layer and the middleware layer. We carefully characterize the performance of multiple state-of-the-art error-bounded lossy compressors in the context of MPI collectives and select the best-qualified compressor -- {\fzlight}, which will be detailed in Section \ref{sec:high-speed-compressor}. We also propose a series of performance optimization strategies specifically for both of the two collective types (data movement and collective computation), as indicated in the figure. The corresponding details will be discussed in Sections \ref{sec-data-movement-framework}, \ref{sec-collective-computation}, and \ref{sec:Customize-fzl-reduce}. 
+
+\begin{figure}[ht]
+    \centering
+    {\includegraphics[width=1\linewidth]{./picture/architecture.eps}}
+    % \vspace{-5mm}
+    \caption{Design architecture (yellow box: applications; green box: new contributed modules; purple box: third-party).} 
+    \label{fig:architecture}
+    % \vspace{-4mm}
+\end{figure}
+
+% \vspace{-2mm}
+
+\subsection{Two Novel Frameworks for Compression-enhanced Collectives}
+To integrate lossy compression into MPI collective communication, at least two important aspects must be considered: performance and accuracy. In general, MPI collective operations can be divided into two groups: collective data movements, and collective computation. Instead of directly using the CPRP2P method, we propose two frameworks to implement collective communication for each group, which can maximize the collective operation performance.
+
+
+
+%\vspace{-2mm}
+
+\subsubsection{Collective data movement framework}
+\label{sec-data-movement-framework}
+
+In this subsection, we detail our strategies for addressing the issues of communication imbalance and compression overhead in our optimized collective data movement framework.
+% In this subsection, we describe how we resolve the communication unbalance issue and compression overhead issue in our optimized collective data movement framework.  
+For collective data movement operations, each process in the same communicator needs to communicate with each other to exchange data. If we directly use the CPRP2P method, the sender needs to compress the data every time before sending it, and the receiver is required to decompress the data upon the data arrival. Most of the compression and decompression overheads in CPRP2P, actually, can be avoided by carefully setting the timing of compression operations, as the original data have not been modified during the intensive communication. Besides, the CPRP2P can cause unbalanced communication in that input data on different processes have various compressed data sizes. Such unbalanced communication will slow down the overall collective performance, resulting in a sub-optimal performance. With our framework, we can balance the communication with a fixed pipeline size as the compressed data sizes are decided at the beginning of the intensive communication. In the following text, we illustrate our idea with two examples: a ring-based allgather algorithm and a binomial tree broadcast algorithm. The same philosophy can be easily extended to other collective algorithms in this category.
+\begin{figure}[ht]
+    \centering
+    {\includegraphics[width=0.9\linewidth]{./picture/compression-p2p.eps}}
+    % \vspace{-4mm}
+    \caption{High-level design of our collective data movement framework in the ring-based allgather algorithm to mitigate compression error propagation. $A$ means the original data and $A_c$ means the compressed data. This rule applies to other data chunks as well. This algorithm completes in $N$$-$1 rounds, where $N$ is the number of processes.} 
+    \label{fig-allgather-design}
+    % \vspace{-2mm}
+\end{figure}
+
+
+
+Figure \ref{fig-allgather-design} shows the high-level comparison of our proposed framework versus the CPRP2P in the ring-based allgather algorithm. In this algorithm, $N$$-$1 rounds are required to get the gathered results on every process, where $N$ is the number of processes in the communicator. In order to use lossy compression to reduce communication cost in the ring-based algorithm, the straight-forward idea is performing compression and decompression at each round. Instead, our design does not decompress the received data until the last round, thus significantly decreasing the compression overhead from ($N$$-$1)$\cdot$$T_{chunk}$ to $T_{chunk}$, where $T_{chunk}$ is the compression cost of one chunk. When $N$ is large, our novel framework could have nearly $N$$\times$ better performance compared with CPRP2P in terms of compression. Note that the decompression cost remains the same. 
+
+Figure \ref{fig-broadcast-design} presents a similar comparison in the binomial tree broadcast algorithm. There are $log_2 N$ rounds before the completion, where $N$ refers to the total process count. We notice that our proposed framework could reduce the compression and decompression costs from $log_2$$N$$\cdot$($T_{comp}$+$T_{decom}$) to $T_{comp}$+$T_{decom}$ and the performance improvement is $log_2 N$$\times$, where $T_{comp}$ and $T_{decom}$ are the compression time and decompression time of the data at the root process, respectively. 
+
+
+Besides the compression cost, the CPRP2P method can lead to an undesirable error propagation issue during collective sends and receives, as the same data chunk undergoes multiple rounds of compression and decompression. Our framework also solves this issue by compressing the same data chunk for only one time. Similar to the analysis of compression overhead, for the absolute error bounded compression, our proposed framework can decrease the worst case accuracy loss by ($N$$-$1)$\times$ and ($log_2 N$)$\times$ in the ring-based allgather and binomial tree broadcast algorithm, respectively.
+
+
+
+% \vspace{-1.8mm}
+\subsubsection{Collective computation framework}
+\label{sec-collective-computation}
+For collective computation routines, the data entries from all processes in the same communicator need to collectively compute with each other. Unlike in the case of collective data movement, the data transferred in this communication pattern can be updated. As a result, the previous framework cannot be utilized here thus we need to propose a new framework. Despite the updated transferred data precluding us from diminishing compression, we find an opportunity to hide communication inside the compression and decompression.
+To clearly elaborate our proposed design, we use the ring-based reduce\_scatter algorithm as an instance. Note that this framework can be easily extended to other collective computation operations. 
+
+\begin{figure}[ht]
+    \centering
+    % \vspace{-2mm}
+    {\includegraphics[width=0.9\linewidth]{./picture/binomial-tree-broadcast-cpr-p2p.eps}}
+    % \vspace{-1mm}
+    \caption{High-level design of our collective data movement
+    framework in the binomial tree broadcast algorithm. It completes in $log_2{N}$ rounds, where $N$ is the number of processes.} 
+    \label{fig-broadcast-design}
+\end{figure}
+
+
+
+Our proposed framework for collective computation is depicted in Figure \ref{fig-reduce-scatter-design}. It employs a ring-based reduce\_scatter algorithm, where each process is required to exchange message chunks with its neighboring processes. For large datasets, these chunk sizes become substantial as they are determined by dividing the size of the input data by the number of processes. In the initial CPRP2P model, compression and decompression occur before and after any communication, respectively. Consequently, a single round incurs three types of overhead: compression/decompression for one message chunk, send/receive operations for the compressed message chunk, and reduction operation for one message chunk. Typically, the compression-related overhead is more significant than the send/receive overhead, as compressed data sizes are considerably smaller than their original counterparts. In our redesigned approach, we significantly mitigate the send/receive overhead by actively pulling communication progress within the compression and decompression phases. This substantially reduces the overall communication time.
+
+
+\begin{figure}[ht]
+    \centering
+    % \vspace{-1mm}
+    {\includegraphics[width=0.9\linewidth]{./picture/ring-based-reduce-scatter.eps}}
+    % \vspace{-4mm}
+    \caption{High-level design of our collective computation framework in the ring-based reduce-scatter algorithm.} 
+    \label{fig-reduce-scatter-design}
+    % \vspace{-3mm}
+\end{figure}
+
+% \vspace{-2mm}
+
+\subsection{Theoretical Analysis of Error Propagation in {\pname}}
+In this section, we prove the error-bounding nature of our {\pname} framework mathematically. In the following analysis, we assume the lossy compression error $e$ for data $x$ follows a normal distribution, without loss of generality. Specifically, the normal distribution is represented as $e \sim N(\mu, \sigma^{2})$ within the range of $[x- \widehat{e}, x+\widehat{e}]$, where $\widehat{e}$ is the compression error bound. This is exemplified in Figure \ref{fig:normal-distri}, in which we compress climate, weather, seismic wave datasets by SZ3 and ZFP. It clearly shows the normal distribution curve generated by Maximum Likelihood Estimation (MLE) fits the measured compression error values very well for different application datasets. 
+
+
+\vspace{-3mm}
+\begin{figure}[ht]
+    \centering
+        \subfloat[SZ3(Climate)]        {\includegraphics[width=0.275\linewidth]{./picture/AEROD_v_1_1800_3600-error-SZ31E-3.f32.pdf}}
+        \subfloat[SZ3(Weather)]        {\includegraphics[width=0.35\linewidth]{./picture/Pf48.bin.f32-error-SZ3REL1e-2.f32}}
+        \subfloat[SZ3(Seismic Wave)]   {\includegraphics[width=0.35\linewidth]{./picture/aramco-snapshot-0720.f32-error-SZ3REL1e-2.f32.pdf}}
+        \hspace{3mm}
+        \subfloat[ZFP(Climate)]{\includegraphics[width=0.275\linewidth]{./picture/AEROD_v_1_1800_3600-error-zfp1E-3.f32.pdf}}
+        \subfloat[ZFP(Weather)]
+        {\includegraphics[width=0.35\linewidth]{./picture/Pf48.bin.f32-error-zfpREL1e-2.f32.pdf}}
+        % \hspace{3mm}
+        \subfloat[ZFP(Seismic Wave)]
+        {\includegraphics[width=0.35\linewidth]{./picture/aramco-snapshot-0720.f32-error-zfpREL1e-2.f32.pdf}}
+        \caption{Exemplifying the normal distribution property of compression errors.}
+        \label{fig:normal-distri}
+\end{figure}
+
+
+
+
+For the collective communication primitive in MPI, the data will be aggregated gradually from each node during the communication process, which is shown in Fig. \ref{fig-allgather-design}, Fig. \ref{fig-broadcast-design} and Fig. \ref{fig-reduce-scatter-design}. With lossy compression integrated, the compression error will also be aggregated in the data aggregation stage. In the collective data movement framework of {\pname}, each data chunk is compressed only once. Thus, the final error for each data point is within $\widehat{e}$. Unlike the data movement framework, the compression error is aggregated in the collective computation framework of {\pname}, and the aggregation function often involves the \textit{Sum, Average, Max, Min} operations for the floating point data. We further illustrate the error propagation for these operations. For the collective computation framework, we assume there are $n$ data that are collected from $n$ nodes, and the compression error for each of them is $e_{i}$, which follows the normal distribution $e_{i} \sim N(\mu_{i}, \sigma_{i}^{2})$.
+
+\begin{theorem}
+Based on the above analysis, the final aggregated error for \textit{Sum} operation falls into the interval $[-2\sqrt{n}\sigma, 2\sqrt{n}\sigma]$ with the probability of $95.44\%$, where $n$ is the number of computing nodes in MPI and $\sigma$ is the variance of the error bound of the lossy compressor.
+\end{theorem}
+
+\begin{proof}
+The linear combination (e.g., \textit{Sum} in MPI) of normally distributed random variables also follows a normal distribution that is shown in the formula (\ref{norm_distribution}), where $a_{i}$ denotes various constants for $n$ data.
+
+
+\begin{equation}
+\sum\nolimits_{i=0}^{n} a_{i}e_{i} \sim N (\sum\nolimits_{i=0}^{n} a_{i}\mu_{i}, \sum\nolimits_{i=0}^{n} a_{i}^{2} \sigma_{i}^{2})
+\label{norm_distribution}
+\end{equation}
+
+For the \textit{Sum} operation in the collective computation framework, the compression error will be involved gradually with the aggregation chain, which is shown in the formula (\ref{sum_aggregation}):
+
+\begin{equation}
+\begin{aligned}
+x_{sum} & = \big(\big(\big((x_{1} + e_{1})+x_{2}\big)+e_{2}\big)+...+e_{n}\big) \\
+& = (x_{1}+e_{1})+(x_{2}+e_{2})+...+(x_{n}+e_{n})
+\end{aligned}
+\label{sum_aggregation}
+\end{equation}
+
+Where $x_{i}$ indicates the data collected from node $i$ and $x_{sum}$ represents the final aggregated data. We further demonstrate that the compression error $e_2$ remains to follow the normal distribution after compression through Figure \ref{fig:e2-normal-distri}, which illustrates the probability of the measured compression error ($e_2$) with the fitted MLE curve. The same property also holds for subsequent compression errors in the aggregation chain such as $e_3$, $e_4$, and so on.
+
+\vspace{-3mm}
+\begin{figure}[ht]
+    \centering
+        \subfloat[SZ3($e_2$)]        {\includegraphics[width=0.35\linewidth]{./picture/AEROD_v_1_1800_3600-error2-SZ31E-3.f32.pdf}}
+        \hspace{3mm}
+        \subfloat[ZFP($e_2$)]
+        {\includegraphics[width=0.35\linewidth]{./picture/AEROD_v_1_1800_3600-error2-zfp1E-3.f32.pdf}}
+        \caption{Exemplifying the normal distribution property of compression error $e_2$.}
+        \label{fig:e2-normal-distri}
+\end{figure}
+
+
+From the formula (\ref{sum_aggregation}), we can calculate the aggregated compression error as $\widetilde{e}_{sum} = \sum_{i=0}^{n} e_{i}$. The aggregated error $\widetilde{e}_{sum}$ follows the normal distribution as formula (\ref{error_distribution}):
+
+\begin{equation}
+\widetilde{e}_{sum} \sim N(\sum\nolimits_{i=0}^{n} \mu_{i}, \sum\nolimits_{i=0}^{n} \sigma_{i}^{2})
+\label{error_distribution}
+\end{equation}
+
+The formula (\ref{error_distribution}) indicates that the variance $\sigma^{2}$ of the aggregated error $\widetilde{e}_{sum}$ will be restricted well. When we utilize the same compression error bound across various nodes, the aggregated error conforms to a normal distribution represented as $\widetilde{e}_{sum} \sim N(0, n\sigma^{2})$. Therefore, the final aggregated error falls within the interval $[-2\sqrt{n} \sigma, 2\sqrt{n} \sigma]$ with the probability of $95.44\%$ according to the properties of normal distribution. 
+
+\end{proof}
+
+Since the compression error is bounded by the error bound $\widehat{e}_{i}$ and the error follows the norm distribution, we can assume that $\widehat{e}_{i} \approx 3 \sigma_{i}$ ($\widehat{e}_{i}$ bounded to $3 \sigma_{i}$ with probability of $99.74\%$).
+
+
+\begin{corollary}
+Based on the above assumption, the final aggregated error falls within the interval $[-\frac{2}{3}\sqrt{n} \widehat{e}, \frac{2}{3}\sqrt{n} \widehat{e}]$ with the probability of $95.44\%$. For example, if there are $100$ nodes, the final aggregated error will be bounded within the range $[-\frac{20}{3} \widehat{e}, \frac{20}{3} \widehat{e}]$ with a probability of $95.44\%$.
+
+%according to the properties of normal distribution.
+\end{corollary}
+
+
+
+\begin{corollary}
+Being similar to the \textit{Sum} operation, the final aggregated error for the \textit{Average} operation in collective computation framework follows the normal distribution $\widehat{e}_{avg} \sim N(0, \frac{\sigma^{2}}{n})$. The final aggregated error will be reduced extremely compared to the original error by $n$ times. 
+\end{corollary}
+
+\begin{theorem}
+For the \textit{Max, Min} operations, the final error follows the normal distribution $ \widetilde{e}_{max, min} \sim N (0, (2-\frac{n+2}{2^{n}})\sigma^{2})$.
+\end{theorem}
+
+\begin{proof}
+Since we need to compare the data from the neighbored node gradually, there is a $\frac{1}{2}$ probability that we can choose the non-compressed data. Otherwise, the selected data will contain an error within the error bound $\widehat{e}$. Therefore, the variance of the final aggregated error can be calculated as following formula (\ref{max_min}):
+\begin{equation}
+\vspace{-3mm}
+\frac{1}{2^{n}}n\sigma^{2} + \frac{1}{2^{n-1}}(n-1)\sigma^{2} +...+\frac{1}{2}\sigma^{2} = (2-\frac{n+2}{2^{n}}) \sigma^{2}
+\label{max_min}
+\end{equation}
+\end{proof}
+
+
+\subsection{Identify Best-qualified High-speed Error-bounded Lossy Compressor}
+\label{sec:high-speed-compressor}
+
+
+
+In this section, we compare various lossy compressors to identify the most suitable one for MPI collectives. As highlighted in previous analysis, along with controlling data distortion through error bounds, two critical metrics are compression throughput and compression ratio. Prior literature \cite{Di2016SZ,Liang2018SZ,sz3,Zhao2020SZauto,Yu2022SZx} shows that SZx achieves significantly higher compression speed than other compressors, including SZ2 \cite{Liang2018SZ}, SZ3 \cite{sz3}, FPZIP \cite{Lindstrom2006FPZIP}, Auto-SZ \cite{Zhao2020SZauto}, and ZFP \cite{Lindstrom2014ZFP}. Another high-speed compressor, {\fzlight}, is optimized for multi-core CPU architectures, though its performance compared to SZx remains unclear. Therefore, we focus on SZx and {\fzlight} to determine the best compressor for compression-enabled collective communication.
+
+We introduce SZx and {\fzlight} as follows. SZx divides the input data into small blocks (e.g., 128 floating point values) and calculates the mean $\mu$ of the maximum and minimum values for each block. If all data points within a block fall within the interval $(\mu-e,\mu+e)$, where e is a user-defined compression error bound, the block is labeled as a `constant block', and SZx uses the mean $\mu$ to represent the entire block. If some data points fall outside this interval, the block is classified as a `non-constant block', and SZx applies IEEE 754 analysis to compress the data block. These operations primarily involve bitwise operations, addition, or subtraction, making SZx extremely fast. In contrast, {\fzlight} employs a multi-layer block partitioning approach. It first divides the input data into larger thread-blocks, each handled by a single thread, and then further subdivides these thread-blocks into smaller blocks. Next, {\fzlight} performs fused quantization and Lorenzo prediction on each thread-block, converting data values into integers, with the first value stored as an outlier (occupying four bytes). It then obtains the sign-bits and code-length $\log max$, where $max$ is the maximum integer within the small block, for each block. Finally, {\fzlight} applies an ultra-fast bit-shifting encoding scheme to compress the integers. If the code-length is 0, the block is considered to be a `constant block', and only the one-byte code-length is stored in the compressed bytes. Otherwise, the code-length and other fixed-length encoded bits are stored. While {\fzlight}’s operations are also lightweight, the multiplication involved in the quantization stage may lead to higher computational costs compared to SZx.
+
+We compare SZx and {\fzlight} in terms of compression throughput, ratio, and compression quality across four different application datasets. The details of these application datasets are summarized in Table~\ref{tab:application-datasets} in Section~\ref{sec:setup}. All experiments were conducted on a node with two Intel Xeon E5-2695v4 CPU sockets. The performance of compression-enabled collectives is closely tied to the compression throughput and ratio of the chosen compressor, while the data quality of the collective output depends on the compression quality of the selected compressor. For compression throughput, we start with the single-thread performance. As shown in Table \ref{tab:Single-thread-compression}, SZx outperforms {\fzlight} in the RTM application dataset, while {\fzlight} is faster than SZx in most cases of the Hurricane application dataset. For the Nyx and CESM-ATM datasets, SZx and {\fzlight} exhibit comparable compression and decompression throughputs. Overall, SZx and {\fzlight} demonstrate similar compression performance in single-thread mode. Since both SZx and {\fzlight} are optimized for multi-core CPU architectures, we also evaluate their multi-thread compression throughput, as shown in Table \ref{tab:Multi-thread-compression}. In contrast to the single-thread scenario, {\fzlight} consistently outperforms SZx across all relative error bounds and application datasets in multi-thread mode. The superior performance of {\fzlight} in this mode is attributed to its lightweight computational costs and efficient memory access pattern, enabled by the multi-layer block partitioning approach, along with fused quantization and Lorenzo prediction, and the ultra-fast bit-shifting encoding scheme. In summary, {\fzlight} demonstrates significantly better compression performance than SZx in multi-thread mode. 
+
+
+Apart from compression performance, another critical factor influencing collective performance is the compression ratio. In table \ref{tab:compression_ratio_cb_percent}, we present the compression ratios and percentages of constant blocks for SZx and {\fzlight} when compressing four distinct application datasets. We observe that {\fzlight} consistently outperforms SZx in compression ratio across different application datasets. This advantage is due to {\fzlight}'s quantization and Lorenzo prediction stages, which significantly reduce the entropy of the original data, making it easier to compress. In contrast, SZx operates directly on the higher entropy original data. We also notice that within the same application dataset, a smaller relative error bound leads to a lower percentage of constant blocks for both {\fzlight} and SZx. This reduction in the percentage of constant blocks results in a lower compression ratio, as non-constant blocks require more space in the compressed format compared to constant ones. Based on this analysis, we conclude that {\fzlight} achieves a higher compression ratio than SZx.   
+
+
+
+Apart from performance factors, compression quality is crucial for achieving accurate collective output. Normalized Root Mean Square Error (NRMSE) is a widely used metric for evaluating the accuracy of reconstructed data. In Table \ref{tab:compression_nrmse}, we assess the NRMSE and its standard deviation for SZx and {\fzlight} across four different application datasets under four relative error bounds. The results show that SZx consistently achieves slightly lower NRMSE in all cases. This can be attributed to SZx's approach of using the median value to represent entire constant data blocks, resulting in extremely low variance. However, although SZx demonstrates better numeric compression accuracy than {\fzlight}, this does not necessarily imply superior actual compression quality, warranting further investigation. Peak Signal-to-Noise Ratio (PSNR) is another important metric for evaluating compression accuracy. The rate-distortion graphs in Figure \ref{fig:PSNR-rate} compare the compression bit rate ($32/compression\_ratio$) and PSNR of SZx and {\fzlight}. The results indicate that, for the same bit rate, {\fzlight} achieves higher PSNR than SZx across the RTM, NYX, and Hurricane application datasets. In the CESM-ATM application dataset, {\fzlight} slightly underperforms SZx at very low bit rates but outperforms SZx when the bit rate exceeds 1. This rate-distortion analysis demonstrates that {\fzlight} offers better numeric compression accuracy than SZx at equivalent compression ratios. To further understand the difference in compression quality, we visualize the reconstructed data from both compressors in Figure \ref{fig:vis-szx-vs-fzl}. When compressing the CLOUD field of the CESM dataset to a compression ratio of 8.3, the reconstructed data from SZx displays horizontal stripe artifacts compared to the original data, while {\fzlight} maintains visual quality consistent with the original one. These artifacts in SZx arise because it flattens entire constant data blocks into a single median value, losing the variance within the block. In contrast, {\fzlight} utilizes Lorenzo prediction to preserve data variance, leading to superior compression quality. In conclusion, {\fzlight} demonstrates better overall compression quality than SZx.
+
+Through comprehensive analysis, we conclude that {\fzlight} is generally the better compressor for compression-enabled collective communication. Thus, we decide to customize {\fzlight} for accelerating collective communication. For comparison, we also implemented compression-enabled point-to-point communication-based collectives using the fixed-rate mode and fixed-accuracy mode of ZFP, which serve as baselines in our evaluation.
+
+
+% Please add the following required packages to your document preamble:
+% \usepackage{booktabs}
+% \usepackage{multirow}
+% \usepackage{graphicx}
+% \usepackage[normalem]{ulem}
+% \useunder{\uline}{\ul}{}
+\begin{table}[ht]
+\caption{Single-thread compression throughput (GB/s). The higher throughput is underlined.}
+\label{tab:Single-thread-compression}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{@{}cc|cc|cc|cc|cc@{}}
+\toprule
+\multicolumn{2}{c|}{\textbf{Throughput (GB/s)}} &
+  \multicolumn{2}{c|}{\textbf{RTM}} &
+  \multicolumn{2}{c|}{\textbf{Nyx}} &
+  \multicolumn{2}{c|}{\textbf{CESM-ATM}} &
+  \multicolumn{2}{c}{\textbf{Hurricane}} \\ \midrule
+                                   & \textbf{REL} & \textbf{COM} & \textbf{DEC} & \textbf{COM} & \textbf{DEC} & \textbf{COM} & \textbf{DEC} & \textbf{COM} & \textbf{DEC} \\ \midrule
+\multirow{4}{*}{\textbf{{\fzlight}}} & 1E-1         & 2.97         & 6.25         & 2.87         & 5.89         & 2.46         & 7.73         & {\ul 2.51}   & 5.21         \\
+                                   & 1E-2         & 2.80         & 5.80         & {\ul 1.97}   & 3.93         & 1.22         & {\ul 2.75}   & {\ul 1.60}   & {\ul 3.15}   \\
+                                   & 1E-3         & 2.68         & 5.47         & {\ul 1.33}   & 2.68         & 0.75         & {\ul 1.58}   & {\ul 1.23}   & {\ul 2.31}   \\
+                                   & 1E-4         & 2.61         & 5.39         & {\ul 0.99}   & {\ul 1.83}   & 0.71         & {\ul 1.30}   & {\ul 1.10}   & 1.93         \\ \midrule
+\multirow{4}{*}{\textbf{SZx}}      & 1E-1         & {\ul 3.78}   & {\ul 6.98}   & {\ul 3.60}   & {\ul 7.52}   & {\ul 4.77}   & {\ul 11.23}  & 2.46         & {\ul 6.02}   \\
+                                   & 1E-2         & {\ul 3.67}   & {\ul 6.61}   & 1.78         & {\ul 4.34}   & {\ul 1.57}   & 2.25         & 1.36         & 2.82         \\
+                                   & 1E-3         & {\ul 3.55}   & {\ul 6.26}   & 1.13         & {\ul 2.76}   & {\ul 1.03}   & 1.37         & 1.15         & 2.28         \\
+                                   & 1E-4         & {\ul 3.51}   & {\ul 6.22}   & 0.83         & 1.82         & {\ul 0.93}   & 1.23         & 1.05         & {\ul 1.97}   \\ \bottomrule
+\end{tabular}%
+}
+\end{table}
+
+
+% Please add the following required packages to your document preamble:
+% \usepackage{booktabs}
+% \usepackage{multirow}
+% \usepackage{graphicx}
+% \usepackage[normalem]{ulem}
+% \useunder{\uline}{\ul}{}
+\begin{table}[ht]
+\caption{Multi-thread compression throughput (GB/s). The higher throughput is underlined.}
+\label{tab:Multi-thread-compression}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{@{}cc|cc|cc|cc|cc@{}}
+\toprule
+\multicolumn{2}{c|}{\textbf{Throughput (GB/s)}} &
+  \multicolumn{2}{c|}{\textbf{RTM}} &
+  \multicolumn{2}{c|}{\textbf{Nyx}} &
+  \multicolumn{2}{c|}{\textbf{CESM-ATM}} &
+  \multicolumn{2}{c}{\textbf{Hurricane}} \\ \midrule
+ &
+  \textbf{REL} &
+  \textbf{COM} &
+  \textbf{DEC} &
+  \textbf{COM} &
+  \textbf{DEC} &
+  \textbf{COM} &
+  \textbf{DEC} &
+  \textbf{COM} &
+  \textbf{DEC} \\ \midrule
+\multirow{4}{*}{\textbf{{\fzlight}}} &
+  1E-1 &
+  {\ul 54.10} &
+  {\ul 53.46} &
+  {\ul 52.13} &
+  {\ul 52.39} &
+  {\ul 39.50} &
+  {\ul 103.65} &
+  {\ul 51.38} &
+  {\ul 79.34} \\
+                              & 1E-2 & {\ul 50.19} & {\ul 52.58} & {\ul 38.42} & {\ul 46.42} & {\ul 19.97} & {\ul 41.91} & {\ul 26.52} & {\ul 47.86} \\
+                              & 1E-3 & {\ul 47.36} & {\ul 50.95} & {\ul 28.45} & {\ul 38.33} & {\ul 14.26} & {\ul 28.98} & {\ul 20.15} & {\ul 34.18} \\
+                              & 1E-4 & {\ul 44.09} & {\ul 48.26} & {\ul 22.13} & {\ul 31.85} & {\ul 14.61} & {\ul 26.08} & {\ul 18.02} & {\ul 27.79} \\ \midrule
+\multirow{4}{*}{\textbf{SZx}} & 1E-1 & 31.90       & 45.97       & 34.20       & 46.04       & 20.38       & 69.87       & 22.61       & 62.04 \\
+                              & 1E-2 & 28.77       & 45.09       & 16.82       & 34.88       & 4.97        & 23.88       & 8.04        & 33.25       \\
+                              & 1E-3 & 27.06       & 43.19       & 9.16        & 30.75       & 2.97        & 24.16       & 5.51        & 30.13       \\
+                              & 1E-4 & 26.99       & 43.52       & 5.93        & 24.66 & 2.78        & 22.76       & 4.97        & 26.54       \\ \bottomrule
+\end{tabular}%
+}
+\end{table}
+
+% Please add the following required packages to your document preamble:
+% \usepackage{booktabs}
+% \usepackage{multirow}
+% \usepackage{graphicx}
+% \usepackage[normalem]{ulem}
+% \useunder{\uline}{\ul}{}
+\begin{table}[]
+\caption{Compression ratio and percentage of constant blocks. The higher ratio is underlined.}
+\label{tab:compression_ratio_cb_percent}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{@{}cc|cc|cc|cc|cc@{}}
+\toprule
+\multicolumn{2}{c|}{\textbf{C.B. = Constant Block}} &
+  \multicolumn{2}{c|}{\textbf{RTM}} &
+  \multicolumn{2}{c|}{\textbf{Nyx}} &
+  \multicolumn{2}{c|}{\textbf{CESM-ATM}} &
+  \multicolumn{2}{c}{\textbf{Hurricane}} \\ \midrule
+ &
+  \textbf{REL} &
+  \textbf{Ratio} &
+  \textbf{C.B.\%} &
+  \textbf{Ratio} &
+  \textbf{C.B.\%} &
+  \textbf{Ratio} &
+  \textbf{C.B.\%} &
+  \textbf{Ratio} &
+  \textbf{C.B.\%} \\ \midrule
+\multirow{4}{*}{\textbf{{\fzlight}}} &
+  1E-1 &
+  {\ul 129.64} &
+  98.91\% &
+  {\ul 107.83} &
+  96.65\% &
+  {\ul 69.45} &
+  89.30\% &
+  {\ul 73.74} &
+  90.99\% \\
+                              & 1E-2 & {\ul 107.06} & 97.54\% & {\ul 27.00} & 57.44\% & {\ul 21.76} & 45.30\% & {\ul 25.76} & 62.45\% \\
+                              & 1E-3 & {\ul 81.04}  & 96.09\% & {\ul 14.97} & 34.64\% & {\ul 12.61} & 19.55\% & {\ul 13.65} & 48.64\% \\
+                              & 1E-4 & {\ul 61.51}  & 95.49\% & {\ul 7.81}  & 21.37\% & {\ul 7.18}  & 12.84\% & {\ul 8.12}  & 44.68\% \\ \midrule
+\multirow{4}{*}{\textbf{SZx}} & 1E-1 & 82.72        & 97.68\% & 107.58      & 99.02\% & 68.63       & 95.46\% & 59.89       & 93.50\% \\
+                              & 1E-2 & 60.14        & 96.03\% & 11.12       & 55.58\% & 9.29        & 48.65\% & 10.61       & 59.72\% \\
+                              & 1E-3 & 45.98        & 94.88\% & 5.76        & 37.49\% & 4.39        & 19.57\% & 6.10        & 43.58\% \\
+                              & 1E-4 & 37.60        & 94.52\% & 3.62        & 18.55\% & 3.10        & 12.07\% & 4.59        & 38.82\% \\ \bottomrule
+\end{tabular}%
+}
+\end{table}
+
+
+% Please add the following required packages to your document preamble:
+% \usepackage{booktabs}
+% \usepackage{multirow}
+% \usepackage{graphicx}
+% \usepackage[normalem]{ulem}
+% \useunder{\uline}{\ul}{}
+\begin{table}[]
+\caption{NRMSE and its standard deviation. The lower NRMSE is underlined.}
+\label{tab:compression_nrmse}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{@{}cc|cc|cc|cc|cc@{}}
+\toprule
+\multicolumn{2}{c|}{}      & \multicolumn{2}{c|}{\textbf{RTM}} & \multicolumn{2}{c|}{\textbf{Nyx}} & \multicolumn{2}{c|}{\textbf{CESM-ATM}} & \multicolumn{2}{c}{\textbf{Hurricane}} \\ \midrule
+                                   & \textbf{REL} & \textbf{NRMSE}   & \textbf{STD}   & \textbf{NRMSE}   & \textbf{STD}   & \textbf{NRMSE}      & \textbf{STD}     & \textbf{NRMSE}      & \textbf{STD}     \\ \midrule
+\multirow{4}{*}{\textbf{{\fzlight}}} & 1E-1         & 4.62E-03         & 3E-03          & 2.17E-02         & 2E-02          & 3.74E-02            & 2E-02            & 2.29E-02            & 2E-02            \\
+                                   & 1E-2         & 6.41E-04         & 5E-04          & 3.20E-03         & 3E-03          & 4.88E-03            & 1E-03            & 3.07E-03            & 2E-03            \\
+                                   & 1E-3         & 8.12E-05         & 7E-05          & 4.03E-04         & 3E-04          & 5.30E-04            & 9E-05            & 3.43E-04            & 2E-04            \\
+                                   & 1E-4         & 8.85E-06         & 7E-06          & 4.69E-05         & 2E-05          & 5.36E-05            & 8E-06            & 3.57E-05            & 2E-05            \\ \midrule
+\multirow{4}{*}{\textbf{SZx}}      & 1E-1         & {\ul 3.22E-03}   & 2E-03          & {\ul 1.19E-02}   & 1E-02          & {\ul 1.76E-02}      & 5E-03            & {\ul 1.71E-02}      & 6E-03            \\
+                                   & 1E-2         & {\ul 3.34E-04}   & 2E-04          & {\ul 1.40E-03}   & 8E-04          & {\ul 2.11E-03}      & 4E-04            & {\ul 1.75E-03}      & 5E-04            \\
+                                   & 1E-3         & {\ul 3.29E-05}   & 2E-05          & {\ul 1.89E-04}   & 1E-04          & {\ul 1.62E-04}      & 4E-05            & {\ul 1.37E-04}      & 3E-05            \\
+                                   & 1E-4         & {\ul 3.04E-06}   & 2E-06          & {\ul 1.77E-05}   & 6E-06          & {\ul 1.38E-05}      & 3E-06            & {\ul 1.37E-05}      & 3E-06            \\ \bottomrule
+\end{tabular}%
+}
+\end{table}
+
+% Please add the following required packages to your document preamble:
+% \usepackage{booktabs}
+% \usepackage{multirow}
+% \usepackage{graphicx}
+% \usepackage[normalem]{ulem}
+% \useunder{\uline}{\ul}{}
+% \begin{table}[]
+% \centering
+% \caption{Compression ratio. The higher throughput is underlined.}
+% \label{tab:compression_ratio}
+% \resizebox{0.7\columnwidth}{!}{%
+% \begin{tabular}{@{}cc|cccc@{}}
+% \toprule
+%                                   &              & \textbf{RTM}   & \textbf{Nyx}   & \textbf{CESM.} & \textbf{Hurri.} \\ \midrule
+%                                   & \textbf{REL} & \textbf{Ratio} & \textbf{Ratio} & \textbf{Ratio}    & \textbf{Ratio}     \\ \midrule
+% \multirow{4}{*}{\textbf{{\fzlight}}} & 1E-1         & {\ul 129.64}   & {\ul 107.83}   & {\ul 69.45}       & {\ul 73.74}        \\
+%                               & 1E-2 & {\ul 107.06} & {\ul 27.00} & {\ul 21.76} & {\ul 25.76} \\
+%                               & 1E-3 & {\ul 81.04}  & {\ul 14.97} & {\ul 12.61} & {\ul 13.65} \\
+%                               & 1E-4 & {\ul 61.51}  & {\ul 7.81}  & {\ul 7.18}  & {\ul 8.12}  \\ \midrule
+% \multirow{4}{*}{\textbf{SZx}} & 1E-1 & 82.72        & 107.58      & 68.63       & 59.89       \\
+%                               & 1E-2 & 60.14        & 11.12       & 9.29        & 10.61       \\
+%                               & 1E-3 & 45.98        & 5.76        & 4.39        & 6.10        \\
+%                               & 1E-4 & 37.60        & 3.62        & 3.10        & 4.59        \\ \bottomrule
+% \end{tabular}%
+% }
+% \end{table}
+
+\begin{figure*}[ht]
+\centering
+\includegraphics[width=0.8\linewidth, trim={0 3mm 0 1mm}, clip]{picture/rate_distortion.pdf}
+% \vspace{-6mm}
+\caption{Rate-distortion graphs on four application datasets.}
+\label{fig:PSNR-rate}
+\end{figure*}
+
+\begin{figure}[ht]
+    \centering
+    % \vspace{-2mm}
+    % \subfloat[Original Data]{\includegraphics[width=.4455\linewidth]
+    \subfloat[Original Data]{\includegraphics[width=0.8\linewidth]{./picture/CLOUD_25.eps}}
+    
+    \subfloat[SZx]{\includegraphics[width=0.8\linewidth]{./picture/CLOUD_25_SZx_2e-2.eps}}
+    
+    \subfloat[{\fzlight}]{\includegraphics[width=0.8\linewidth]{./picture/CLOUD_25_fzl_6.3e-4.eps}}    
+
+    % \vspace{-2mm}
+    \caption{Visualization of reconstructed data for SZx vs. {\fzlight} with the same compression ratio of 8.3.}
+    \label{fig:vis-szx-vs-fzl}
+    % \vspace{-2mm}
+\end{figure}
+
+% In this section, we compare various lossy compressors and select the most suitable one for MPI collectives. As shown in the previous analysis, in addition to controlling the data distortion by error bounds, the compression throughput and compression ratio are two critical metrics to consider. According to the prior literature \cite{Di2016SZ,Zhao2020SZauto,sz3,Liang2018SZ,Yu2022SZx}, ZFP and SZx exhibit much higher compression speed than other compressors, including SZ2 \cite{Liang2018SZ}, SZ3 \cite{sz3}, FPZIP \cite{Lindstrom2006FPZIP}, and Auto-SZ \cite{Zhao2020SZauto}. Therefore, we focus on ZFP and SZx in particular and select the best-qualified one for compression-enabled collective communication. 
+
+% In ZFP, users can set a fixed compression rate in the fixed-rate (FXR) mode or a fixed absolute error bound in the fixed-accuracy (ABS) mode. The two modes have their particular pros and cons. The advantage of the FXR is that it brings up substantial convenience in some use cases that require knowing the compressed data size in advance. In comparison with FXR mode, ZFP's ABS mode features a much higher compression quality on scientific datasets (i.e., higher compression ratio with the same reconstructed data quality), as verified in \cite{fraz}. We briefly analyze the key reason why ZFP's ABS mode has higher compression quality than its FXR mode in the following text. ZFP divides the dataset into small data blocks during the compression. Unlike ZFP(ABS) which allows variable compressed size for each block, ZFP(FXR) strictly forces each block to have the same compression ratio, which may inevitably degrade the quality of reconstructed data in turn. Moreover, the FXR mode cannot control the error bound, which may cause fairly high compression errors on some data points unexpectedly. Compared with ZFP, SZx is an ultra-fast error-bounded compressor driven by the fixed-accuracy mode. 
+
+% \begin{table} [ht]
+% \centering
+% % \vspace{2mm}
+% \caption{OVERALL COMPRESSION/DECOMPRESSION THROUGHPUT (MB/S)}
+% % \vspace{-1mm} 
+% \label{tab:compression-speed}
+% \resizebox{0.8\columnwidth}{!}{%
+% \begin{tabular}{|c|c|cc|cc|cc|}
+% \hline
+% \textbf{Datasets} & \textbf{} & \multicolumn{2}{c|}{\textbf{RTM}} & \multicolumn{2}{c|}{\textbf{Hurricane}} & \multicolumn{2}{c|}{\textbf{CESM-ATM}} \\ \hline\hline
+% \multirow{4}{*}{\textbf{SZx}}  & \textbf{ABS} & \multicolumn{1}{c|}{Com} & Decom & \multicolumn{1}{c|}{Com} & Decom & \multicolumn{1}{c|}{Com} & Decom \\ \cline{2-8}
+%  & 1E-2 & \multicolumn{1}{c|}{1742} & 3309 & \multicolumn{1}{c|}{1687} & 3640 & \multicolumn{1}{c|}{666} & 1251 \\ \cline{2-8} 
+%  & 1E-3 & \multicolumn{1}{c|}{1479} & 2723 & \multicolumn{1}{c|}{895} & 1659 & \multicolumn{1}{c|}{533} & 918 \\ \cline{2-8} 
+%  & 1E-4 & \multicolumn{1}{c|}{1288} & 2215 & \multicolumn{1}{c|}{644} & 1168 & \multicolumn{1}{c|}{526} & 822 \\ \hline\hline
+  
+% \multirow{4}{*}{\textbf{ZFP(ABS)}} & \textbf{ABS} & \multicolumn{1}{c|}{Com} & Decom & \multicolumn{1}{c|}{Com} & Decom & \multicolumn{1}{c|}{Com} & Decom \\ \cline{2-8}
+% & 1E-2 & \multicolumn{1}{c|}{1383} & 1444 & \multicolumn{1}{c|}{492} & 634 & \multicolumn{1}{c|}{240} & 273 \\ \cline{2-8} 
+%  & 1E-3 & \multicolumn{1}{c|}{1082} & 1141 & \multicolumn{1}{c|}{307} & 397 & \multicolumn{1}{c|}{170} & 191 \\ \cline{2-8} 
+%  & 1E-4 & \multicolumn{1}{c|}{783} & 811 & \multicolumn{1}{c|}{170} & 209 & \multicolumn{1}{c|}{128} & 136 \\ \hline\hline
+% \multirow{4}{*}{\textbf{ZFP(FXR)}}& \textbf{FXR} & \multicolumn{1}{c|}{Com} & Decom & \multicolumn{1}{c|}{Com} & Decom & \multicolumn{1}{c|}{Com} & Decom \\ \cline{2-8} 
+% & 4 & \multicolumn{1}{c|}{610} & 601 & \multicolumn{1}{c|}{251} & 319 & \multicolumn{1}{c|}{335} & 397 \\ \cline{2-8} 
+%  & 8 & \multicolumn{1}{c|}{438} & 413 & \multicolumn{1}{c|}{129} & 142 & \multicolumn{1}{c|}{200} & 203 \\ \cline{2-8} 
+%  & 16 & \multicolumn{1}{c|}{324} & 311 & \multicolumn{1}{c|}{82} & 81 & \multicolumn{1}{c|}{119} & 112 \\ \hline
+% \end{tabular}%
+% }
+% % \vspace{-4mm}
+% \end{table}
+
+% \begin{table} [ht]
+% \centering
+% \caption{COMPRESSION RATIOS (ORIGINAL DATA SIZE / COMPRESSED DATA SIZE)}
+% % \vspace{-2mm}
+% \label{tab:COMPRESSION-RATIOS}
+% \resizebox{1\columnwidth}{!}{%
+% \begin{tabular}{|c|c|ccc|ccc|ccc|}
+% \hline
+% \textbf{Datasets} & \textbf{} & \multicolumn{3}{c|}{\textbf{RTM}} & \multicolumn{3}{c|}{\textbf{Hurricane}} & \multicolumn{3}{c|}{\textbf{CESM-ATM}} \\ \hline\hline
+% \multirow{4}{*}{\textbf{SZx}}  & \textbf{ABS} & \multicolumn{1}{c|}{min} & \multicolumn{1}{c|}{avg} & max & \multicolumn{1}{c|}{min} & \multicolumn{1}{c|}{avg} & max & \multicolumn{1}{c|}{min} & \multicolumn{1}{c|}{avg} & max \\ \cline{2-11}
+%  & 1E-2 & \multicolumn{1}{c|}{88} & \multicolumn{1}{c|}{116.3} & 124.1 & \multicolumn{1}{c|}{121} & \multicolumn{1}{c|}{123.1} & 124.1 & \multicolumn{1}{c|}{4.9} & \multicolumn{1}{c|}{8.5} & 22.8 \\ \cline{2-11} 
+%  & 1E-3 & \multicolumn{1}{c|}{26.1} & \multicolumn{1}{c|}{49.4} & 115.1 & \multicolumn{1}{c|}{14.9} & \multicolumn{1}{c|}{17.4} & 29.1 & \multicolumn{1}{c|}{3.3} & \multicolumn{1}{c|}{5.1} & 13.1 \\ \cline{2-11} 
+%  & 1E-4 & \multicolumn{1}{c|}{9.5} & \multicolumn{1}{c|}{30.4} & 111.3 & \multicolumn{1}{c|}{6.9} & \multicolumn{1}{c|}{7.2} & 8.8 & \multicolumn{1}{c|}{2.4} & \multicolumn{1}{c|}{3.4} & 8 \\ \hline\hline
+% \multirow{4}{*}{\textbf{ZFP(ABS)}}  & \textbf{ABS} & \multicolumn{1}{c|}{min} & \multicolumn{1}{c|}{avg} & max & \multicolumn{1}{c|}{min} & \multicolumn{1}{c|}{avg} & max & \multicolumn{1}{c|}{min} & \multicolumn{1}{c|}{avg} & max \\ \cline{2-11} 
+% & 1E-2 & \multicolumn{1}{c|}{67.7} & \multicolumn{1}{c|}{87.6} & 125.2 & \multicolumn{1}{c|}{18.1} & \multicolumn{1}{c|}{18.3} & 18.6 & \multicolumn{1}{c|}{4.7} & \multicolumn{1}{c|}{8.1} & 23.1 \\ \cline{2-11} 
+%  & 1E-3 & \multicolumn{1}{c|}{30.6} & \multicolumn{1}{c|}{58.4} & 123.2 & \multicolumn{1}{c|}{10.5} & \multicolumn{1}{c|}{10.7} & 11 & \multicolumn{1}{c|}{3.4} & \multicolumn{1}{c|}{5.6} & 15 \\ \cline{2-11} 
+%  & 1E-4 & \multicolumn{1}{c|}{13.4} & \multicolumn{1}{c|}{38} & 120.1 & \multicolumn{1}{c|}{5.4} & \multicolumn{1}{c|}{5.5} & 5.8 & \multicolumn{1}{c|}{2.4} & \multicolumn{1}{c|}{3.8} & 9.7 \\ \hline\hline
+% \multirow{4}{*}{\textbf{ZFP(FXR)}}  & \textbf{FXR} & \multicolumn{1}{c|}{min} & \multicolumn{1}{c|}{avg} & max & \multicolumn{1}{c|}{min} & \multicolumn{1}{c|}{avg} & max & \multicolumn{1}{c|}{min} & \multicolumn{1}{c|}{avg} & max \\ \cline{2-11}
+% & 4 & \multicolumn{1}{c|}{8} & \multicolumn{1}{c|}{8} & 8 & \multicolumn{1}{c|}{8} & \multicolumn{1}{c|}{8} & 8 & \multicolumn{1}{c|}{8} & \multicolumn{1}{c|}{8} & 8 \\ \cline{2-11} 
+%  & 8 & \multicolumn{1}{c|}{4} & \multicolumn{1}{c|}{4} & 4 & \multicolumn{1}{c|}{4} & \multicolumn{1}{c|}{4} & 4 & \multicolumn{1}{c|}{4} & \multicolumn{1}{c|}{4} & 4 \\ \cline{2-11} 
+%  & 16 & \multicolumn{1}{c|}{2} & \multicolumn{1}{c|}{2} & 2 & \multicolumn{1}{c|}{2} & \multicolumn{1}{c|}{2} & 2 & \multicolumn{1}{c|}{2} & \multicolumn{1}{c|}{2} & 2 \\ \hline
+% \end{tabular}%
+% % \vspace{-2mm}
+% }
+% \end{table}
+% % \vspace{1mm}
+% \begin{table} [ht]
+% \centering
+% \caption{COMPRESSION QUALITIES (PSNR)}
+% % \vspace{-2mm}
+% \label{tab:compression-quality}
+% \resizebox{1\columnwidth}{!}{%
+% \begin{tabular}{|c|c|ccc|ccc|ccc|}
+% \hline
+% \textbf{Datasets} & \textbf{} & \multicolumn{3}{c|}{\textbf{RTM}} & \multicolumn{3}{c|}{\textbf{Hurricane}} & \multicolumn{3}{c|}{\textbf{CESM-ATM}} \\ \hline\hline
+% \multirow{4}{*}{\textbf{SZx}}  & \textbf{ABS} & \multicolumn{1}{c|}{min} & \multicolumn{1}{c|}{avg} & max & \multicolumn{1}{c|}{min} & \multicolumn{1}{c|}{avg} & max & \multicolumn{1}{c|}{min} & \multicolumn{1}{c|}{avg} & max \\ \cline{2-11}
+% & 1E-2 & \multicolumn{1}{c|}{31.2} & \multicolumn{1}{c|}{37.3} & 61.5 & \multicolumn{1}{c|}{25.2} & \multicolumn{1}{c|}{26.2} & 26.8 & \multicolumn{1}{c|}{46} & \multicolumn{1}{c|}{50.6} & 55.9 \\ \cline{2-11} 
+%  & 1E-3 & \multicolumn{1}{c|}{40.6} & \multicolumn{1}{c|}{51.4} & 80.9 & \multicolumn{1}{c|}{40.3} & \multicolumn{1}{c|}{42} & 42.8 & \multicolumn{1}{c|}{64.2} & \multicolumn{1}{c|}{70.3} & 73.4 \\ \cline{2-11} 
+%  & 1E-4 & \multicolumn{1}{c|}{60.2} & \multicolumn{1}{c|}{72} & 102.6 & \multicolumn{1}{c|}{62.4} & \multicolumn{1}{c|}{63.6} & 64.3 & \multicolumn{1}{c|}{82.8} & \multicolumn{1}{c|}{93.5} & 97.2 \\ \hline\hline
+% \multirow{4}{*}{\textbf{ZFP(ABS)}}  & \textbf{ABS} & \multicolumn{1}{c|}{min} & \multicolumn{1}{c|}{avg} & max & \multicolumn{1}{c|}{min} & \multicolumn{1}{c|}{avg} & max & \multicolumn{1}{c|}{min} & \multicolumn{1}{c|}{avg} & max \\ \cline{2-11} 
+% & 1E-2 & \multicolumn{1}{c|}{36.6} & \multicolumn{1}{c|}{45.7} & 71.8 & \multicolumn{1}{c|}{33} & \multicolumn{1}{c|}{34} & 34.3 & \multicolumn{1}{c|}{52.6} & \multicolumn{1}{c|}{56.8} & 61 \\ \cline{2-11} 
+%  & 1E-3 & \multicolumn{1}{c|}{49.2} & \multicolumn{1}{c|}{59.5} & 88.2 & \multicolumn{1}{c|}{47.8} & \multicolumn{1}{c|}{49} & 50 & \multicolumn{1}{c|}{69.1} & \multicolumn{1}{c|}{73.2} & 77.6 \\ \cline{2-11} 
+%  & 1E-4 & \multicolumn{1}{c|}{69.3} & \multicolumn{1}{c|}{80.1} & 111 & \multicolumn{1}{c|}{68.5} & \multicolumn{1}{c|}{69.7} & 70.4 & \multicolumn{1}{c|}{92.2} & \multicolumn{1}{c|}{96.6} & 100.6 \\ \hline\hline
+% \multirow{4}{*}{\textbf{ZFP(FXR)}} \textbf{} & \textbf{FXR} & \multicolumn{1}{c|}{min} & \multicolumn{1}{c|}{avg} & max & \multicolumn{1}{c|}{min} & \multicolumn{1}{c|}{avg} & max & \multicolumn{1}{c|}{min} & \multicolumn{1}{c|}{avg} & max \\ \cline{2-11}
+% & 4 & \multicolumn{1}{c|}{41.9} & \multicolumn{1}{c|}{46.4} & 56.1 & \multicolumn{1}{c|}{30.9} & \multicolumn{1}{c|}{31.6} & 32.3 & \multicolumn{1}{c|}{30.3} & \multicolumn{1}{c|}{34} & 39.9 \\ \cline{2-11} 
+%  & 8 & \multicolumn{1}{c|}{66.7} & \multicolumn{1}{c|}{71.6} & 80.1 & \multicolumn{1}{c|}{56} & \multicolumn{1}{c|}{57.8} & 64.9 & \multicolumn{1}{c|}{58.8} & \multicolumn{1}{c|}{60.5} & 62.9 \\ \cline{2-11} 
+%  & 16 & \multicolumn{1}{c|}{113.8} & \multicolumn{1}{c|}{118.5} & 127.3 & \multicolumn{1}{c|}{103.7} & \multicolumn{1}{c|}{105.5} & 113 & \multicolumn{1}{c|}{106.4} & \multicolumn{1}{c|}{108.1} & 110.6 \\ \hline
+% \end{tabular}%
+% }
+% % \vspace{-2mm}
+% \end{table}
+
+% In addition to the above analysis, we also compare SZx, ZFP(ABS), and ZFP(FXR) regarding the compression throughput, ratio, and quality, using different datasets with various error bounds or rates, as shown in Table \ref{tab:compression-speed}, \ref{tab:COMPRESSION-RATIOS}, and \ref{tab:compression-quality}. To ensure a fair evaluation, all compression and decompression processes were executed using a single thread on an Intel Xeon E5-2695v4 CPU. We adopt the 1D compression mode in that the dimensional information will have to be skipped due to the 1D chunk-wise design in most of the MPI collectives. The information about the datasets we used here is detailed in Table \ref{tab:datasets}, which will be found in Section \ref{sec:setup}. Because of the space limit, we use the QVAPORf and CLOUD fields in the Hurricane and CESM-ATM dataset, respectively, in our experiments, and other fields exhibit very similar results. We observe that SZx is much faster than ZFP(ABS) by up to 4.1$\times$ in compression and 5.7$\times$ in decompression with similar compression ratios and qualities. Additionally, with similar compression qualities, ZFP(FXR) has the lowest compression speed and compression ratio compared to both ZFP(ABS) and SZx. Therefore, we develop our customized compressor based on SZx in terms of the context of MPI collectives. For the purpose of comparison, we also implement compression-enabled point-to-point communication-based collectives based on both ZFP(FXR) and ZFP(ABS), which serve as baselines.
+
+
+
+
+% \vspace{-2mm}
+\subsection{Characterization of Performance Bottlenecks}
+\label{sec:Characterization}
+
+
+
+% We integrate different compressors into point-to-point communication of the ring-based allreduce algorithm, in order to understand the key bottlenecks of the collective performance, which will be a fundamental work to guide our optimization strategies. In this characterization, we use ring-based allreduce which serves as a very good example, because it consists of both collective data movement (allgather) and collective computation (reduce\_scatter). Figure \ref{fig-original-naive} in Section xxx presents the detailed performance breakdown for direct integration of different high-speed compressors using the CPRP2P method. The execution time for each baseline is nomalized using the total running time of the original MPI\_Allreduce without compression. With {\fzlight} integrated, the CPRP2P method can reach a similar overall performance as the original MPI. The major bottleneck of this integration is compression cost, which takes 66.42\% of the normalized execution time. Another bottleneck is the communication, which still takes 24.58\%. Therefore, we need to optimize on both the compression and communication parts of the {\fzlight} integrated baseline.
+
+We integrate various high-speed compressors into the point-to-point communication of the ring-based Allreduce algorithm to identify key bottlenecks in collective performance, which will guide our optimization strategies. The ring-based Allreduce is an ideal example as it involves both collective data movement (allgather) and collective computation (reduce\_scatter). Figure \ref{fig-original-naive} in Section \ref{sec:evaluate_different_compression-integrated_baselines} shows the detailed performance breakdown for the direct integration of high-speed compressors using the CPRP2P method. Execution times are normalized to the total runtime of the original MPI\_Allreduce without compression. With {\fzlight} integrated, the CPRP2P method achieves similar overall performance to the original MPI. However, the main bottleneck becomes compression, accounting for 66.42\% of the normalized execution time, followed by communication, which takes 24.58\%. Therefore, optimizing both compression and communication is essential for improving the {\fzlight} integrated baseline.
+
+% Our analysis reveals that in the original ring-based allreduce algorithm, the all-gather operation accounts for approximately 60\% of the overall execution time, as the communication are not overlapped at all with each other, unlike the reduce-scatter stage. The Wait operation is the second most time-consuming one, which waits for the completion of non-blocking send and receives before conducting the reduction operation. The remaining operations in the original allreduce algorithm include Memcpy (local data copies), Reduction (Reduce operations), and Others (data allocations and other calculations), which together constitute about 20\% of the overall execution time. After integrating the SZx, the bottleneck turns into the ComDecom (compression and decompression) as the data needs to be compressed before being sent out and needs to be decompressed every time the receiver receives them. We also observe a reduction in Allgather and Wait times, suggesting a decrease in transferred data, and both of the MPI-related time can be further optimized. However, the Others part also takes a significant amount, specifically 23\% in the 278MB case. This is because the SZx requires users to free compression-generated buffers after the compressor is called, resulting in a significant overhead.
+
+% \vspace{-2mm}
+
+
+
+% \begin{figure}[ht]
+%     \centering
+%     % \vspace{1mm}
+%     {\includegraphics[width=0.9\linewidth]{./picture/fig-direct-integration.pdf}}
+%     % \vspace{-2mm}
+%     \caption{Compare the performance of Allreduce(Original MPI\_Allreduce) and the DI(Direct Integration) of SZx from 78MB to 678MB with 200MB step.} 
+%     \label{fig-original-naive}
+%     \vspace{-3mm}
+% \end{figure}
+
+\subsection{Step-wise Optimizations}
+% In this subsection, we describe our step-wise optimization strategies, which is a key contribution of this paper.
+% For the convenience of description, we present our implemented ring-based allreduce that enables lossy compression, and the optimization strategies are also applied to other collectives. What is more, the data \textcolor{blue}{transfer} for each process is only $\frac{2(N-1)}{N}$$\cdot$$D_{input}$ in the ring-based allreduce algorithm, where $D_{input}$ is the input data size and $N$ is the process count. Such a design is supposed to be very efficient for long messages. Moreover, our enabled lossy compression capability can also significantly benefit the collective communication with long messages. We name our designed lossy-compression enabled MPI\_Allreduce as Z-Allreduce, where C means compression. In the following text, we discuss our design and implementation details of the proposed Z-Allreduce in a step-wise manner.
+
+In this subsection, we detail our stepwise optimization strategies, a principal contribution of this paper. To facilitate explanation, we present our implementation of a ring-based Allreduce algorithm accelerated by the {\pname} framework. These optimization strategies are applicable to other collective operations as well. We use {\fzlight} as an exemplar to explain our optimization strategies, which are also applicable to other compressors. Notably, in the ring-based Allreduce, the data transfer required for each process is just $\frac{2(N-1)}{N}$$\cdot$$D_{input}$, where $D_{input}$ represents the input data size and $N$ is the number of processes. Thus, this design is highly efficient for processing long messages. Furthermore, our integration of lossy compression significantly enhances the efficiency of collective communication involving long messages. We have termed our {\pname}-accelerated MPI\_Allreduce as Z-Allreduce, with `Z' denoting compression. Subsequently, we will discuss the design and implementation specifics of Z-Allreduce in a structured, step-by-step approach.
+
+% We compare the sequential performance and compression quality of state-of-the-art lossy compressors -- SZx and ZFP. The ZFP lossy compressor includes the fixed accuracy mode and the fixed rate mode, denoted as ZFP-ABS and ZFP-FXR in this section. We integrate these lossy compressors with the ring-based all-reduce algorithm to enable lossy compression inside point-to-point communication. We adopt the RTM-678 dataset \textcolor{red}{(citation)} in the benchmark.
+ % Figure \ref{fig-ZFP-SZX-compare} (a) compares the sequential performance of different lossy compressors. Sicne    Figure \ref{fig-ZFP-SZX-compare} (b) shows the compression quality of these lossy compressors. %the ZFP(FXR) has the worst PSNR(38.1), which is siginificantly lower than that of ZFP(ABS) at 70.3 and SZx at 61.7. Thus, even though the ZFP(FXR) and ZFP(ABS) have similar compression speed, ZFP(FXR) can not ensure a acceptable compression quality for many sictific applications.
+
+
+% \begin{figure}[ht]
+%     \centering
+%     \vspace{-20pt}
+%     \subfloat[Compressor Performance]{\includegraphics[width=.5\linewidth]{./picture/ZFP-SZX-performance.pdf}}
+%     \hfill
+%     \subfloat[Compression Quality]{\includegraphics[width=.45\linewidth]{./picture/ZFP-SZX-quality.pdf}}
+%     \caption{Compare the compression performance and quality of three types of lossy compressors.} 
+%     \label{fig-ZFP-SZX-compare}
+% \end{figure}
+
+% Please add the following required packages to your document preamble:
+% \usepackage{multirow}
+% \usepackage{graphicx}
+% Different MPI\_Allreduce algorithms are used for different message sizes and ring-based allreduce algorithm is considered to be the state-of-the-art solution for large messages as it has significantly reduced the transferred data volume for each process. As a result, we decide to integrate the error-bounded lossy compressor SZx into the ring-based allreduce algorithm. In this initial implementation, we compress the data before the sender sends the compressed data, and we decompress the compressed data after the receiver receives it. In a nutshell, we implement the MPI\_Allreduce with compression-enabled point-to-point communication. From Figure \ref{fig-original-naive}, we could notice that, regardless of the workloads, though a direct integration of MPI can effectively reduce the data transcation volume, the actual performance of end-to-end software remains bounded by the bottleneck module --- compression and decompression.
+
+\subsubsection{Utilize our collective data movement framework}
+\label{sec:Utilize-data-move}
+To reduce the compression overhead and balance communication, we utilize the data movement framework that we presented in Section \ref{sec-data-movement-framework}. At the beginning, every process compresses its local data and stores the compressed data size. Then, every process synchronizes with each other to collect the compressed data sizes in a local integer array $compressed\_sizes$. As the compressed data size only has four bytes, this step is very fast. After that, all processes get the sum of all the compressed data sizes, noted as $total\_count$. Then, each process communicates with each other with a fixed pipeline size until every process has sent $to\_send = total\_count - compressed\_sizes[send\_rank]$ and received $to\_recv = total\_count - compressed\_sizes[self\_rank]$ from other processes in a ring communication pattern. After all communication ends, every process starts to decompress all the received compressed data and store the decompressed data in the receive buffer. Note that they do not need to decompress the data that are compressed by themselves. After this step, we can significantly decrease the time spent by compression and Allgather communication compared with the direct integration of {\fzlight}. Besides, our solution can also preserve the quality/accuracy of the data very well because of the error-bounding feature, which will be demonstrated later in Section \ref{sec-image-stacking}.         
+
+% \subsubsection{\textbf{Redesign buffer allocation and data initialization}}
+% \label{sec:Redesign-buffer}
+% \newtext{To meet the requirements of collective communication, we need to optimize and customize SZx to have better performance. In SZx, the original data and its size information are passed into the compression kernel, in which a set of buffers (such as stateArray, medianArray, and radiusArray) are created to process the original data. After the compression, the kernel returns a pointer to the compressed data buffer, which is also initialized inside of SZx. Even worse, the compressed data needs to be freed in time for each compression  (otherwise, the whole memory would be used up very quickly, leading to a crash), which also introduces a certain cost. Since SZx needs to be called multiple times in the entire collective operation, there would be many redundant buffer allocations and data initialization, which may significantly delay the overall performance unexpectedly. 
+% To verify the potentially huge cost of memory allocation and data initialization in SZx, we perform a performance breakdown. We find that the buffer allocation and data initialization may take over 50\% of the overall execution time of single-threaded SZx. The situation could be even worse for a multi-threaded SZx as the buffer allocation and data initialization cannot be parallelized. 
+% %Furthermore, during the environment of collective communication, especially in collective computation, a single process may need to call the compression kernel many times, which suffers even more from the current compression kernel layout. 
+% To solve this issue, we carefully remove most of the compression-related buffer allocations and data initialization inside of SZx and pre-allocate them only once in the entire collective algorithm and reuse them upon need. We call this solution \textit{optimized SZx} (\textit{OPT-SZx}), based on which we can enormously boost the compression kernel and meanwhile resolve the  memory and performance issue caused by the compression buffers.}       
+
+\subsubsection{Customize {\fzlight} to reduce communication overhead with our collective computation framework}
+% \subsubsection{\textbf{Customize an optimized version based on SZx to reduce communication overhead with our collective computation framework}}
+\label{sec:Customize-fzl-reduce}
+In order to use our collective computation framework in the reduce-scatter stage of the ring-based Allreduce algorithm, we need to redesign the compression workflow of {\fzlight} so that we can consistently poll the progress of the Isend and Irecv inside of the compression and decompression. Therefore, we design and implement the PIPE-{\fzlight} (pipelined {\fzlight}) based on the original {\fzlight}. Instead of compressing the original data as a whole, we divide the compression process into small chunks, each of which handles 5120 data points. Between the compression of two adjacent chunks, we actively poll the communication progress of the non-blocking receive. However, the compressed data of each chunk cannot be simply combined together, otherwise the compressed data cannot be correctly decompressed because each compressed chunk is of variable uncertain length. To solve this problem, we decide to store the compressed data of all chunks in the same output buffer and pre-allocate enough memory space (four bytes per chunk, small memory consumption) at the front of the buffer for storing the compressed data sizes of those chunks together (essentially a kind of index), instead of storing them along with the compressed data chunks. Such a design is more cache-friendly, thus having lower overhead. During the decompression, we maintain a chunk-starting-location pointer based on the recorded compressed chunk sizes to tell the algorithm where the decompression operation should start for each chunk. We repeat this process chunk by chunk and poll the progress of the non-blocking send between decompression chunks. Through this optimization, we can hide the communication in the reduce-scatter stage inside of compression, which further improves the performance of our Z-Allreduce design.
+
+% In order to use our collective computation framework in the reduce-scatter stage of the ring-based allreduce algorithm, we need to redesign the compression workflow of SZx so that we can consistently poll the progress of the Isend and Irecv inside of the compression and decompression. Therefore, we design and implement the PIPE-SZx (pipelined SZx) based on the OPT-SZx. Instead of compressing the original data as a whole, we divide the compression process into small chunks, each of which handles 5120 data points. Between the compression of two adjacent chunks, we actively poll the communication progress of the non-blocking receive. However, the compressed data of each chunk cannot be simply combined together, otherwise the compressed data cannot be correctly decompressed because each compressed chunk is of variable uncertain length. To solve this problem, we decide to store the compressed data of all chunks in the same output buffer and pre-allocate enough memory space at the front of the buffer for storing the compressed data sizes of those chunks together (essentially a kind of index), instead of storing them along with the compressed data chunks. Such a design is more cache-friendly, thus having lower overhead. During the decompression, we maintain a chunk-starting-location pointer based on the recorded compressed chunk sizes to tell the algorithm where the decompression operation should start for each chunk. 
+% We repeat this process chunk by chunk and poll the progress of the non-blocking send between decompression chunks. Through this optimization, we can hide the communication in the reduce-scatter stage inside of compression, which further improves the performance of our Z-Allreduce design.
+
+% \subsubsection{\textbf{Improve compression performance with multithreading}}
+% \label{sec:improve-compression-perf}
+% \newtext{As modern CPUs are mainly multi-core machines, the single-thread compression cannot fully utilize the available resources and has a limited throughput. To solve this issue, we decide to further increase the compression performance by utilizing the multi-threade mode of SZx and {\fzlight}. In order to mitigate the possible conflicts between the MPI and OpenMP runtime environment, we map one process to one socket and only allow the main thread to do the MPI calls. On the Intel Xeon E5-2695v4 machine that we are testing, there are 18 physical cores per socket. We observe that the performance enhancement brought by the multi-threaded OPT-SZx almost saturates with 15 threads (15 physical cores), so we set the concurrently running threads in the omp parallel region as 15. With this optimization, we are able to better utilize the modern hardware and achieve a higher compression throughput.}
+
+
+% \newtext{As modern CPUs are mainly multi-core machines, the single-thread compression cannot fully utilize the available resources and has a limited throughput. To solve this issue, we decide to further increase the compression performance by utilizing the multi-threaded OPT-SZx, which has a much better scalability than the original SZx because of our improved buffer allocation and data initialization method. In order to mitigate the possible conflicts between the MPI and OpenMP runtime environment, we map one process to one socket and only allow the main thread to do the MPI calls. On the Intel Xeon E5-2695v4 machine that we are testing, there are 18 physical cores per socket. We observe that the performance enhancement brought by the multi-threaded OPT-SZx almost saturates with 15 threads (15 physical cores), so we set the concurrently running threads in the omp parallel region as 15. With this optimization, we are able to better utilize the modern hardware and achieve a higher compression throughput.}
+% % To simplify our cost analysis, we assume that all communication go through the network. In other words, there is only one process on each node.
+% % For original collective communication without any compression integrated, the cost can be described by 
+% % To mitigate the network congestion, 

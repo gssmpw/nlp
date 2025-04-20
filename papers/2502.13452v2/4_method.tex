@@ -1,0 +1,202 @@
+\section{METHOD}
+\label{sec:method}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{System Overview}
+\label{subsec:system_overview}
+
+%%%%%%%%% Figure 2 %%%%%%%%%
+\begin{figure}[!t]
+    \centering
+    \includegraphics[width=0.95\linewidth]{figs/pipeline_test.pdf}
+    \caption{Overview of the ELite system pipeline. Given multiple input sessions, ELite updates the map by estimating local ephemerality within each session and updating global ephemerality across sessions. The system operates through three modules: multi-session map alignment, dynamic object removal, and map update. Additionally, the system manages three types of maps: a lifelong map, a delta map, and a static map.}
+    \label{fig:system_overview}
+    \vspace{-5mm}
+\end{figure}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+ELite manages two stages of ephemerality: \emph{local ephemerality} ($\epsilon_{l}$) and \emph{global ephemerality} ($\epsilon_{g}$).
+Here, $\epsilon_{l}$ reflects the probability of a point being dynamic within a single session (\eg, moving cars have higher $\epsilon_{l}$ than parked cars), while $\epsilon_{g}$ captures the long-term likelihood of a point being transient (\eg, a car repeatedly parked in the same location exhibits a higher $\epsilon_{g}$ than a permanent building).
+
+\figref{fig:system_overview} provides an overview of the system.
+Starting from the base map $\mathcal{M}_1$, which is built directly from the first session $\mathcal{S}_1$ (see \secref{subsec:dynamic_removal}), our lifelong mapper $L(\cdot)$ incrementally updates the previous lifelong map $\mathcal{M}_{t-1}$ using the new session $\mathcal{S}_t$:
+\begin{equation}
+\mathcal{M}_{t}= \left\{
+\begin{aligned}
+&{\hat{\mathcal{M}}_{S_t}}, \quad &t=1 \\
+&L(\mathcal{M}_{t-1}, S_{t}), \quad &t>1 \\
+\end{aligned}
+\right.
+\end{equation}
+
+The \emph{lifelong map} is a point cloud in which each point contains $(x,y,z, \epsilon_{g})$.  
+A session $\mathcal{S} = \left\{ \left( \mathcal{P}_i, \mathbf{T}_i \right) \right\}_{i=1}^N$ is a set of scans and their corresponding poses in a local coordinate frame, obtained from any positioning system (\eg. LiDAR odometry \cite{xu2022fast} or SLAM \cite{shan2020lio}).
+
+First, ELite aligns the new session to the existing lifelong map by finding the scan-wise optimal transformations (\secref{subsec:map_alignment}).  
+Next, it estimates local ephemerality $\epsilon_{l}$ for each point via point-wise ephemerality propagation in the \emph{dynamic object removal} module and then discards dynamic points (\secref{subsec:dynamic_removal}).  
+Finally, leveraging the estimated local ephemerality, the \emph{map update} module classifies map points into multiple categories and applies category-specific update rules to compute the new global ephemerality $\epsilon_{g}$ (\secref{subsec:map_update}).  
+Over repeated updates, $\epsilon_{g}$ acts as a reliable weight for aligning newly acquired sessions, thereby enhancing system robustness during extended operation.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Multi-session Map Alignment}
+\label{subsec:map_alignment}
+
+%%%%%%%%% Figure 3 %%%%%%%%%
+\begin{figure}[!t]
+    \centering
+    \includegraphics[width=0.95\linewidth]{figs/zipper3.pdf}
+    \caption{
+    Illustration of our map alignment module, which begins by aligning poses using the initial transform from the first loop closure candidate. It then refines alignment in two stages: forward and backward. By iterating through scans in both directions, the module updates poses via scan-to-map ICP registration, ensuring global and local consistency in the final pose estimates.
+    }
+    \label{fig:zipper}
+    \vspace{-3mm}
+\end{figure}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+The goal of an alignment module is to find the optimal transformation \( \mathbf{T}'_i \) for each scan $\mathcal{P}_i$ in a session and pass the aligned session \(\mathcal{S'} = \left\{ \left( \mathcal{P}_i, \mathbf{T}'_i \right) \right\}_{i=1}^N\) to subsequent modules.
+
+\figref{fig:zipper} illustrates our alignment pipeline. 
+We first select a loop pair $(\mathcal{P}^{t-1}_{m}, \mathcal{P}^{t}_{s})$ from two sessions ($\mathcal{S}_{t-1}$ and $\mathcal{S}_{t}$) via Scan Context \cite{kim2021scan} to estimate an initial transformation \( \mathbf{T}^{\text{init}} \).  
+We then refine \( \mathbf{T}^{\text{init}} \) in a \emph{forward} pass over indices \(i \in [s, N]\) using \ac{GICP} \cite{koide2021voxelized}:
+\begin{equation}
+\vspace{-1mm}
+\mathbf{T}^{\text{fwd}}_i = 
+\prod_{j=s}^{i} \mathbf{T}_j^{\text{ICP}} \cdot \mathbf{T}^{\text{init}} \cdot \mathbf{T}_i  \quad \text{if} \ i \in [s, N].
+\vspace{-1mm}
+\end{equation}
+After each \ac{GICP} step at $i$, \(\mathbf{T}_i^{\text{ICP}}\) is also applied to subsequent point clouds to provide better initial guesses.
+Since point clouds prior to index \( s \) may remain misaligned and there could be accumulated errors, we perform a \emph{backward} pass from \(i=N\) down to \(s\). This yields:
+\begin{equation}
+\mathbf{T}'_i = \prod_{k=i}^{N} \mathbf{T}_k^{\text{ICP,rev}} \cdot \prod_{j=s}^{i} \mathbf{T}_j^{\text{ICP}} \cdot \mathbf{T}^{\text{init}} \cdot \mathbf{T}_i.
+\vspace{-1mm}
+\end{equation}
+Working in both directions---similar to ``zipping up'' two maps---improves overall alignment consistency and compensates the trajectory drift.
+
+During scan-to-map registration, points with low $\epsilon_g$ (permanent) have higher weight in \ac{GICP}, while points with high $\epsilon_g$ (ephemeral) have less influence.  
+% \rd{The optimization objective is:}
+\begin{equation}
+    \mathbf{T}^{\text{ICP}} = \underset{\mathbf{T}}{\mathrm{argmin}} \sum\limits_{i} \left( 1 - \epsilon_{g,i} \right) \lVert \mathbf{d}_i(\mathbf{T}) \rVert^2_{\mathbf{\Sigma}_i},
+\label{eq:4}
+\end{equation}
+\(\epsilon_{g,i}\) is the global ephemerality of the $i$th map point, and \(\mathbf{d}_i(\mathbf{T})\) is the residual error under transformation \(\mathbf{T}\).
+Detailed explanation of \(\epsilon_{g}\) will be provided in \secref{subsec:dynamic_removal} and \secref{subsec:map_update}.
+As the system incorporates more sessions, the $\epsilon_g$ distribution in the lifelong map becomes more reliable, steadily improving alignment robustness.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Dynamic Object Removal}
+\label{subsec:dynamic_removal}
+
+%%%%%%%%% Figure 4 %%%%%%%%%
+\begin{figure}[!t]
+    \centering
+    \includegraphics[width=0.95\linewidth]{figs/method_dynamic_removal.pdf}
+    \caption{When voxelizing space, as indicated by the green square, the occupied area is inflated and errors can occur when a single voxel mixes static and dynamic points. Our method updates point-wise ephemerality based on ray information, enabling more precise removal of dynamic objects.}
+    \label{fig:method_dynamic}
+    \vspace{-3mm}
+\end{figure}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+The dynamic object removal module first aggregates all scans in the aligned session to form \(\mathcal{M}_{\mathcal{S}'_{t}} = \cup_{i=1}^{N} \mathbf{T}'_i \mathcal{P}_i\). Its goal is to produce a \emph{cleaned} session map \( \hat{\mathcal{M}}_{S'_t} \) by discarding dynamic points from \(\mathcal{M}_{\mathcal{S}'_{t}}\).
+
+Treating each scan as a set of rays, we iteratively update the local ephemerality $\epsilon_{l}$ of points in \(\mathcal{M}_{\mathcal{S}'_{t}}\).  
+A local ephemerality of a point should decrease if it is near an \emph{occupied} space (the endpoint of a ray) and increase if it lies in \emph{free} space (the path along a ray).
+We propagate ephemerality across space by modeling a function of the distance $x$ from a ray:
+\begin{equation}
+\resizebox{0.91\linewidth}{!}{$
+f(x)= \left\{
+\begin{array}{lll}
+\min \Bigl(\alpha \cdot \bigl(1 - \exp\{-x^2/{\sigma_\mathbf{o}}^2\}\bigr) + \beta,\ \alpha\Bigr) 
+& \text{if} & \mathbf{o}_i \in \mathcal{O}_i \\[7pt]
+\max \Bigl(\alpha \cdot \bigl(1 + \exp\{-x^2/{\sigma_\mathbf{f}}^2\}\bigr) - \beta,\ \alpha\Bigr) 
+& \text{if} & \mathbf{f}_i \in \mathcal{F}_i \\
+\end{array}
+\right.
+$}
+\label{eq:5}
+\end{equation}
+\(\mathcal{O}_i\) is the set of endpoints in scan \(\mathcal{P}_i\) and \(\mathcal{F}_i\) consists of sampled points along the rays that approximate free space \cite{zhong2023shine}. 
+\(\alpha\) and \(\beta\) are scale parameters (fixed to 0.5 and 0.1, respectively), while \(\sigma_{\mathbf{o}}\) and \(\sigma_{\mathbf{f}}\) are standard deviations.
+
+Starting from an initial value \(\epsilon_{l} = 0.5\), each point in \(\mathcal{O}_i\) or \(\mathcal{F}_i\) retrieves its k-nearest neighbors in \(\mathcal{M}_{\mathcal{S}'_t}\) and updates their $\epsilon_{l}$ via Bayesian inference:
+\begin{equation}
+\epsilon_{\mathrm{l,new}} = \frac{f(x) \cdot \epsilon_{\mathrm{l,prev}}}{f(x) \cdot \epsilon_{\mathrm{l,prev}} + (1 - f(x)) \cdot (1 - \epsilon_{\mathrm{l,prev}})}.
+\label{eq:6}
+\end{equation}
+
+As shown in \figref{fig:method_dynamic}, leveraging the actual rays rather than voxelization prevents the artificial inflation of occupied regions and leads to more precise ephemerality propagation.  
+After several updates, points in \(\mathcal{M}_{\mathcal{S}'_t}\) with \(\epsilon_{l} < \tau_l\) are deemed static and pushed into \(\hat{\mathcal{M}}_{S'_t}\).
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Long-term Map Update}
+\label{subsec:map_update}
+
+The map update module merges the previous lifelong map \(\mathcal{M}_{t-1}\) with the cleaned session map \(\hat{\mathcal{M}}_{S'_t}\) to form the new lifelong map \(\mathcal{M}_{t}\):
+\[
+\mathcal{M}_{t} = \mathcal{M}_{t-1} \cup \hat{\mathcal{M}}_{S'_t}.
+\]
+It then classifies the points into five categories based on their nearest neighbors (NNs), as shown in \figref{fig:method_c}: 
+(i) Coexisting points \( \mathcal{C}_t \),
+(ii) Deleted points \( \mathcal{D}_t \) from \( \mathcal{M}_{t-1} \),
+(iii) Emerged points \( \mathcal{E}_t \) in \( \hat{\mathcal{M}}_{S'_t} \).
+Points in either \( \mathcal{D}_t \) or \( \mathcal{E}_t \) are further classified into:
+(iv) Previously explored points, and 
+(v) Newly explored points, if they are located in areas not explored by both the previous and current sessions.
+
+For each point in $\mathcal{C}_t$, we update its $\epsilon_{g}$ via Bayesian inference using the previous $\epsilon_{g}$ (from $\mathcal{M}_{t-1}$) and the current $\epsilon_{l}$ (from $\hat{\mathcal{M}}_{S'_t}$):
+\begin{equation}
+\epsilon_{\mathrm{g_t}} = 
+\frac{\epsilon_{\mathrm{g_{t-1}}} \cdot \epsilon_{l_t}}
+{\epsilon_{\mathrm{g_{t-1}}} \cdot \epsilon_{l_t} + (1 - \epsilon_{\mathrm{g_{t-1}}}) \cdot (1 - \epsilon_{l_t})}.
+\label{eq:7}
+\end{equation}
+
+The set \(\mathcal{D}_t\) can include truly removed objects as well as spurious points from sensor noise or pose errors.  
+To emphasize meaningful changes and suppress noise, we introduce an \emph{objectness} factor $\gamma$, which prioritizes object-like clusters.  
+We find that the local density $\rho$ of points effectively distinguishes object-level changes from noise and leverage it to define $\gamma$.
+\begin{equation}
+\gamma_i = \rho_i^{1/3}, \quad \rho_i \propto \{ \mathbf{p}_j \in \mathcal{D} \mid \|\mathbf{p}_j - \mathbf{p}_i\| \leq r, j \neq i \} 
+\label{eq:8}
+% \vspace{-3mm}
+\end{equation}
+
+% We find that the local density \(\rho\) of points effectively distinguishes object-level changes from noise.  
+% (proportional to the number of neighbors within a radius \(r\))
+% Therefore, we set \(\gamma = \rho^{\tfrac{1}{3}}\) and update each deleted point’s $\epsilon_{g}$ with it through Bayesian inference, similar to \eqref{eq:7}:
+
+Each deleted point’s $\epsilon_{g}$ are updated through Bayesian inference between previous $\epsilon_{g}$ and $\gamma$, similar to \eqref{eq:7}:
+
+\begin{equation}
+\epsilon_{\mathrm{g_t}} = 
+\frac{\epsilon_{\mathrm{g_{t-1}}} \cdot \gamma}
+{\epsilon_{\mathrm{g_{t-1}}} \cdot \gamma + (1 - \epsilon_{\mathrm{g_{t-1}}}) \cdot (1 - \gamma)}.
+\label{eq:9}
+\end{equation}
+
+Meanwhile, emerged points \(\mathcal{E}_t\) comprise both newly built structures and ephemeral objects, introducing uncertainty of their permanence.
+We thus scale their local ephemerality by an uncertainty factor \(k\) along with the objectness factor:
+\begin{equation}
+    \epsilon_{\mathrm{g,i}} = k \cdot \bigl(2-\gamma\bigr) \cdot  \epsilon_{\mathrm{l,i}} \quad \forall i \in \mathcal{E}_t.
+    \label{eq:10}
+\end{equation}
+Points in category (iv) inherit their previous $\epsilon_g$ unchanged, while those in category (v) initialize $\epsilon_g$ directly from their $\epsilon_l$.
+
+Over multiple sessions, truly static points accumulate enough observations for their $\epsilon_g$ to decrease and stabilize, distinguishing them from highly ephemeral objects.  
+Changes in $\mathcal{M}_{t}$ are recorded in a \emph{delta map} for session $\mathcal{S}_t$, which continuously tracks and logs changes (\(\Delta \epsilon_g\)).  
+Unlike LT-mapper’s \emph{diff map} \cite{kim2022lt}, this delta map captures the magnitude of change, enabling fine-grained analysis of environmental variation.  
+Finally, a \emph{static map} can be retrieved by filtering $\mathcal{M}_t$ with a user-defined threshold \(\tau_g\) on $\epsilon_g$.
+
+%%%%%%%%% Figure 5 %%%%%%%%%
+\begin{figure}[!t]
+    \centering
+    \includegraphics[width=0.95\linewidth]{figs/method_c_classification.pdf}
+    \caption{
+    In our map update module, points are classified into five categories. 
+    Coexisting points ($\mathcal{C}_t$) are shown in grey. 
+    Deleted points ($\mathcal{D}_t$) are red if they truly disappeared and pink if they belong to previously visited regions only. 
+    Emerged points ($\mathcal{E}_t$) are blue if newly added and sky blue if observed only in the current session. 
+    Each category follows a specific update strategy for robust map maintenance.
+    }
+    \label{fig:method_c}
+    \vspace{-3mm}
+\end{figure}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%

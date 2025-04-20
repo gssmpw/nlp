@@ -1,0 +1,155 @@
+\section{Understanding Transformer's Attention}
+
+
+\begin{figure*}[ht]
+    \hfill
+    \includegraphics[width=\linewidth]{imgs/figure2.pdf}
+    \caption{The $\log_{10}$ perplexity of four LLMs (Llama-2-7b, Llama-3.1-8B, Qwen2-7B and Mistral-7B-v0.1) on the third book of PG-19 test set using SWA inference. The window sizes are set not to exceed their respective training sequence lengths. The x-axis represents the sliding window size, and the y-axis represents the evaluation sequence length. For a fixed window size, perplexity increases (color shifts to blue) as the evaluation length grows.}
+    \label{fig:open-llms}
+\end{figure*}
+
+\begin{figure*}[ht]
+    \centering
+    \includegraphics[width=\linewidth]{imgs/figure3.pdf}
+    \caption{Heatmaps of attention scores (top four squares) and token embedding variance (bottom four lines) across different layers of Qwen2-7B. Higher token variance corresponds to stronger attention, highlighting their correlation. The two color bars indicate respective scales.}
+    \label{fig:variance}
+\end{figure*}
+
+This section introduces concepts of the SWA mechanism and its potential capability in handling long sequences. We then analyze why current LLMs with SWA inference fail to achieve the expected theoretical advantages. 
+% fail to perform SWA inference despite its theoretical advantages.
+
+\subsection{Sliding Window Attention}
+
+The self-attention layer in Transformers typically has $O(N^2)$ computational complexity, where $N$ is the input sequence length. 
+To reduce this complexity while preserving the sequential information, sliding window attention (SWA) is introduced in Longformer~\cite{Longformer}. 
+SWA restricts each token to only attend the attention calculation of its neighboring tokens within a fixed-size window.
+% SWA restricts each token to attend only to its neighboring tokens within a fixed-size window.
+With a window size of $\omega \ll N$, the computation cost per token is reduced to $O(\omega)$, leading to an overall linear complexity $O(N \cdot \omega)$, which is more efficient than vanilla attention.
+
+We visualize the SWA mechanism in Figure~\ref{fig:swa}, where the window size is three ($\omega=3$) and the depth is two ($L=2$).
+We define the tokens that are visible to the current window as active tokens (the red block in the figure, corresponding active tokens are ``a dear little'').
+For invisible tokens, also referred to as evicted tokens, we further categorize them as residual and past tokens. 
+Residual tokens are not visible to the sliding window at the embedding layer. However, their information will passed to the neighboring $\omega -1$ tokens with a transformer layer (this information transition is represented as yellow lines in the figure), thus partially preserved for the prediction. For example, the information of the token `a' (the orange ball at the embedding layer) can be retained in the other token `a' (the red ball at the second transformer layer) in our visualization. Theoretically, the information range of a single token at the $l^{th}$ transformer layer is $1+(\omega-1) \cdot l$ and the maximum range is $1+(\omega-1) \cdot L$, i.e., $1+2\cdot2=5$ in the figure.
+
+% Among them, the information on the active tokens is fully accessible to the model since their embeddings are still within the attention window. For the latter two categories, referred to as evicted tokens, their embeddings have been discarded and are no longer visible to the model. However, residual tokens' information is preserved in the higher transformer layers, allowing the model to utilize this retained information during inference. With each additional transformer layer, the residual tokens retained in the higher layers expand by $(\omega-1)$ tokens. Therefore, the theoretical maximum range of information coverage in a SWA-based transformer is $(\omega-1) \cdot L + 1$, where $L$ denotes the number of transformer layers.
+
+% Therefore, theoretically, evicted tokens (i.e., tokens whose key-value cache is discarded) are not indispensable for maintaining the model's performance as long as their information is effectively retained and propagated through the higher layers of the transformer. Empirically, larger window sizes, deeper models, and longer training sequences result in better performance.
+
+\subsection{LLMs with SWA Inference}
+%\subsection{Why current LLMs fail using SWA?}
+\label{ssec:why}
+
+
+Although current open-source LLMs are structurally capable of conducting SWA inference, they fail to achieve stable improved results. As shown in Figure~\ref{fig:open-llms}, we analyzed the perplexity (PPL) of four open-source LLMs~\cite{llama2,llama3,mistral-7b,qwen2} using different sliding window sizes on the PG-19~\cite{pg19} test set. The experimental results reveal that these LLMs achieve optimal performance only when operating within their training sequence length. For instance, for Llama-2-7b model in Figure~\ref{fig:open-llms}(a), when the window size is fixed at 1,024, the perplexity gradually increases as the evaluation length grows, as indicated by the color transition from blue to red in the heatmap.
+This suggests that Transformers inherently learn contextual patterns specific to their training length and fail to extend to variable-length texts during inference.
+% This limitation suggests that transformers inherently learn attention patterns specific to their training context length, making them poorly suited for processing variable-length texts during inference.
+
+We suggest that this failure can be attributed to two major issues:
+(1) the attention sink phenomenon, where models become overly dependent on initial tokens, 
+and (2) information loss that past tokens are discarded.
+
+The attention sink phenomenon~\cite{streamingllm}, where LLMs allocate excessive attention to initial tokens in sequences, has emerged as a significant challenge for SWA inference in Transformer architectures. Previous work has made two key observations regarding this phenomenon. First, the causal attention mechanism in Transformers is inherently non-permutation invariant, with positional information emerging implicitly through token embedding variance after softmax normalization~\cite{variance}. Second, studies have demonstrated that removing normalization from the attention mechanism can effectively eliminate the attention sink effect~\cite{whensinkemerge}.
+
+% \textbf{Lemma 1:} The causal attention in Transformers is not permutation invariant inherently. The positional information emerges from the variance of token embeddings after the normalization operation of the softmax function~\cite{variance}.
+
+% \textbf{Lemma 2:} \citet{whensinkemerge} demonstrates that removing normalization from attention eliminates the attention sink phenomenon~\cite{streamingllm}.
+
+Based on these insights, we analyze the attention patterns and hidden state statistics of Qwen2-7B, as shown in Figure~\ref{fig:open-llms}. Our results reveal a strong correlation between token variance and attention sink magnitude---the variance of hidden states for the first token is significantly higher than for subsequent tokens. \textit{This finding provides strong evidence that attention sink manifests through variance propagation via normalization.} Notably, even though models like Qwen2 incorporate explicit relative position embeddings (e.g., RoPE), they still learn and rely on this implicit absolute positional information through the normalization mechanism.
+
+Beyond the attention sink problem, softmax also leads to significant information loss during sliding window inference. Consider the following example of how softmax transforms attention scores:
+\begin{equation}
+\begin{bmatrix}
+1.5 \\
+5.0 \\
+2.4 \\
+0.5 \\
+1.3
+\end{bmatrix}
+\to \text{Softmax}(x_i) = \frac{e^{x_i}}{\sum_{j} e^{x_j}} \to
+\begin{bmatrix}
+0.03 \\
+0.88 \\
+0.07 \\
+0.01 \\
+0.02
+\end{bmatrix}
+\end{equation}
+As shown above, the exponential nature of softmax dramatically amplifies differences between logits, causing most of the probability mass to concentrate on the highest-scoring token (0.88 in this case) while severely suppressing other tokens (all below 0.07). A detailed mathematical proof of this sparsification property is provided in Appendix~\ref{app:sparsity}.
+% Although this sparsity can help the model achieve high prediction accuracy when no tokens are dropped, it results in severe information loss in the context of SWA.
+
+In summary, while softmax's sparsification is beneficial for full-context Transformers, it becomes limiting in SWA scenario where the aggressive filtering impedes the model's ability to retain historical information within the sliding window.
+
+% In summary, while softmax's aggressive filtering mechanism proves effective in vanilla Transformers with full context access, it becomes problematic in sliding window attention. During SWA inference, where context is inherently limited, softmax's strong normalization hinders the model's ability to retain historical information within the constrained window. This suggests that effective sliding window attention requires a more balanced approach to information filtering, especially when operating with limited context.
+
+
+\section{Sliding Window Attention Training}
+
+In this section, we explore the advantages of SWA training over traditional Transformer training with a new paradigm for processing long sequences. Additionally, we provide a detailed explanation of our proposed SWAT attention layer. This simple yet effective attention layer combines Sigmoid~\cite{sigmoid}, ALiBi, and RoPE to address the information retention challenges of SWA.
+
+\subsection{Information Transmission}
+
+Traditional Transformer training involves processing entire sequences of tokens, allowing the model to capture long-range dependencies through global attention mechanisms. In contrast, SWA operates within a limited context, necessitating new approaches to preserve information continuously. As shown in Figure~\ref{fig:att}, SWA training enables two distinct learning paradigms for LLMs, short and long sequence attentions.
+
+In conventional Transformer training, the sequence length is smaller than the window size. New tokens can acquire and integrate information from all tokens, even the very first tokens in the text. Therefore, the model keeps essential information in each token embedding and enhances the ability to extract information, which is also strengthened by the softmax function.
+
+SWA training introduces a new training paradigm, where each window shift requires careful historical context management. In particular, the old token embedding is discarded after sliding. However, in the upper layers of the Transformer, the new token's embedding still retains the old token's embedding with a certain weight. Hence, the model tends to retain all past embeddings in the upper-level model to prevent information loss caused by sliding windows, strengthening the model's ability to compress information. The experimental results demonstrating how SWA training enhances the model's capabilities are presented in Sections~\ref{ssec:swat} and \ref{ssec:ablation}.
+
+
+\subsection{Attention Computation}
+\label{ssec:Attention-Computation}
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{imgs/figure4.pdf}
+    \caption{The demonstration of the SWA mechanism in Transformers, where the model's information coverage includes residual and active tokens, depending on the model depth and window size.}
+    \label{fig:att}
+\end{figure}
+
+In this subsection, we propose SWAT, a modified attention mechanism that combines sigmoid activation with integrated position embeddings. The input consists of queries, keys, and values with dimension of $d$. Instead of using softmax normalization, we apply sigmoid activation to the scaled dot products to obtain attention weights, preventing mutual suppression between tokens:
+\begin{equation}
+\text{Attention}(\boldsymbol{Q}, \boldsymbol{K}, \boldsymbol{V}) = \sigma (\frac{\boldsymbol{Q}\boldsymbol{K}^T}{\sqrt{d}})\boldsymbol{V}
+\end{equation}
+where $\boldsymbol{Q} \in \mathbb{R}^{N \times d}$, $\boldsymbol{K} \in \mathbb{R}^{N \times d}$, and $\boldsymbol{V} \in \mathbb{R}^{N \times d}$ are packed matrices of queries, keys, and values, respectively; $\sigma ( \cdot )$ is the sigmoid function. More detailed analysis can be found in Appendix~\ref{app:density}.
+
+
+To introduce discriminative bias in the dense attention patterns of sigmoid activation and better differentiate token representations within sliding windows, we propose balanced ALiBi, a bidirectional extension of the original ALiBi mechanism. For an input subsequence within a window, we add position-dependent biases to the attention scores:
+\begin{equation}
+\text{Attention}(\boldsymbol{Q}, \boldsymbol{K}, \boldsymbol{V}) = \sigma (\frac{\boldsymbol{Q}\boldsymbol{K}^T}{\sqrt{d}} + s \cdot (m-n))\boldsymbol{V}
+\end{equation}
+where $m$ and $n$ ($m >le n$) denote the index of tokens in the sequence and $s$ denotes the slope.
+Unlike the original ALiBi, which uses only negative slopes to enforce a directional inductive bias, we use both positive and negative slopes across different attention heads. For a model with $h$ heads, we assign positive slopes to $h/2$ heads and negative slopes to the remaining heads. The magnitude of slopes follows a geometric sequence similar to ALiBi, but in both directions:
+\begin{equation}
+s_k = \begin{cases}
+-2^{-k} & \text{for forward-looking heads} \\
+2^{-k} & \text{for backward-looking heads}
+\end{cases}
+\label{eq:-+}
+\end{equation}
+where $k$ ranges from 1 to $h/2$ for each direction. This bidirectional slope design allows attention heads to specialize in different temporal directions, with forward-looking heads focusing on recent context and backward-looking heads preserving historical information.
+
+
+
+After replacing softmax with sigmoid, the implicit position information through normalization is lost, leading to training instability. Furthermore, while balanced ALiBi provides positional variance through attention weights, its positional signals remain weak. To address this issue, we further incorporate RoPE to enhance explicit positional information. Finally, SWAT attention calculates the attention output as follows:
+\begin{equation}
+    \begin{aligned}
+        & \text{Attention}(\boldsymbol{Q}, \boldsymbol{K}, \boldsymbol{V})_m = {\textstyle \sum_{n=m-\omega+1}^{m}}  \\
+        & \sigma \Bigg( 
+        \frac{(\boldsymbol{R}_{\Theta, m}^d \boldsymbol{q}_m)^T (\boldsymbol{R}_{\Theta, n}^d \boldsymbol{k}_n)}
+        {\sqrt{d_k}}  \quad + s \cdot (m-n) \Bigg) \boldsymbol{v}_n
+    \end{aligned}
+\end{equation}
+where $\boldsymbol{R}_{\Theta, m}^d$ and $\boldsymbol{R}_{\Theta, n}^d$ are the same rotation matrices as Equation 15 in \cite{rope}. To ensure SWA training, note that $m-n < \omega$.
+
+This combination of sigmoid activation, balanced ALiBi, and RoPE makes up for the sparsity of the vanilla Transformer. It ensures the stability of training and strengthens the information contained in a single token embedding.
+
+
+\subsection{Network Efficiency}
+
+Since SWAT's architecture is nearly identical to a standard attention layer, the per-token computation cost remains almost the same under an equivalent attention length—apart from the additional overhead of computing the ALiBi. However, the overall computation becomes linear due to the use of a sliding window. Thus, the inference computational complexity can be expressed as:
+\begin{equation}
+\mathrm{Cost} =N  \omega \times ( 1+\delta_{\text{ALiBi}}), 0 < \delta_{\text{ALiBi}} \ll 1
+\end{equation}
+where $\delta_{\text{ALiBi}}$ represents the extra cost of ALiBi.
+
+
+

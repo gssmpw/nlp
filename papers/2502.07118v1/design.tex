@@ -1,0 +1,246 @@
+\section{Extracting \& Using Multilevel Configuration Dependencies}
+\label{sec:design-extract}
+
+ Based on the study, we built an extensible framework called \textsc{ConfD} to leverage the  dependency information to address configuration-related issues. 
+As shown in Figure~\ref{fig:overview},   \textsc{ConfD}   consists of two main  parts:  (1) \textit{ConfD-core} (yellow box) for extracting multilevel  configuration dependencies and generating critical configuration states, which further contains three sub-modules (i.e., \textit{Taint Analyzer}, \textit{Dependency Analyzer}, and \textit{State Generator});
+(2) \textit{ConfD-plugins} (green box) for detecting various  configuration-related issues based on the generated configuration states. We elaborate on the two parts in subsections \S\ref{sec:extraction} and  \S\ref{sec:leverage} respectively. Moreover, we further discuss optimizations for reducing false positive rates of plugins (\S\ref{sec:reducefalsepositives}) and  extensions for databases (\S\ref{sec:DBextension})  in the rest of the section.
+ 
+ \begin{figure}[tb]
+	\centering
+    \includegraphics[width=3.3in]{./overview}
+    \vspace{-0.1in}
+	\caption{  {\bf Overview of \textsc{ConfD}}. {There are two parts: (1) ConfD-core (yellow) for extracting  configuration dependencies and generating critical states; (2) ConfD-plugins (green) for detecting various configuration-related issues.} 
+	}
+	\label{fig:overview}
+\end{figure}
+
+
+
+ \subsection{Extracting Configuration Dependencies for File Systems}
+ \label{sec:extraction}
+  
+
+\subsubsection{Metadata-assisted Taint Analysis}
+\label{sec:derive}
+
+As the first step, the \textit{Taint Analyzer} of  \textsc{ConfD} performs metadata-assisted taint analysis and generates taint traces to capture the propagation flow of configuration parameters in the target FS ecosystem.
+
+ It takes the source code of the target system as input, 
+and uses the LLVM compiler infrastructure~\cite{LLVM} 
+to generate intermediate representation (IR) of the source code.
+It then tracks the propagation of each configuration parameter  along the data-flow paths in IR based on the classic taint analysis algorithm~\cite{DrChecker}. 
+We maintain  a set to keep the initial configuration variables and any variables  derived from the initial configuration variables while traversing the IR. When a new variable is added to the set, we add the corresponding IR instruction to the taint trace. 
+We maintain a mapping between each configuration parameter and  the variables derived from it to enable tracking if a variable may be derived from multiple parameters, which is essential for establishing the correlation across parameters.
+Our taint analysis is context-sensitive and can handle both intra-procedural and inter-procedural analysis. Context-sensitivity is important  for inter-procedural analysis because one function can be called from different contexts, which is also crucial for deriving accurate dependency across different taint traces (\S\ref{sec:dependencyAnalysis}).
+ 
+
+One unique challenge we encounter is how to establish the mapping between  parameters of different components of the FS ecosystem.
+As mentioned in \S\ref{sec:findings},
+the components in the FS ecosystem tend to load configurations in different ways and process equivalent FS information using different variables or functions. We address this challenge based on one key observation: all  components need to access the same FS metadata structures. We can leverage  shared metadata structures   to connect relevant  parameters of different components. 
+
+More specifically, the parameter values relevant to the FS configuration are (eventually) stored in the superblock structure of the file system. 
+For example, the parameter \texttt{-I inode-size} from \texttt{mke2fs} is stored as the {27th} member of   the superblock (\texttt{s\_inode\_size}). When another component (e.g., \texttt{e2fsck}) loads the  \texttt{s\_inode\_size}   from the superblock to access it, it is essentially dependent on the \texttt{-I inode-size} parameter of  \texttt{mke2fs}.
+We map the \texttt{mke2fs} parameter values to  relevant superblock fields by tracking where the parameter value is being written in the superblock. Similarly, the accesses to the superblock in other components are also tracked. Based on the mapping to the same superblock fields (e.g., \texttt{s\_inode\_size}), we can establish the connection between  taint traces from different components. 
+
+{Note that since \textsc{ConfD} implements the taint analysis at the LLVM IR level, any file system that can be compiled to LLVM IR may benefit from it for configuration dependency analysis. The current prototype uses the Clang frontend of LLVM which supports C/C++/Objective-C languages~\cite{LLVM}.}
+
+
+
+\subsubsection{Multilevel Dependency Analysis}
+\label{sec:dependencyAnalysis}
+Given the taint trace of every configuration parameter, the \textit{Dependency Analyzer} further analyzes the potential correlations between   parameters based on the multilevel dependencies  derived from our study  (\S\ref{sec:bugstudy}). 
+
+Specifically,  
+the self-dependency (SD) for each parameter is derived from their individual taint traces based on the data type and value range of the  variables. We also examine the  error statement immediately following a range check based on the observation that an error statement may indicate an invalid range. 
+For CPD and CCD, we  compare taint traces of multiple parameters.
+If there are common lines   (which are context-sensitive), we consider them to be dependent. 
+
+Moreover, 
+after getting the dependent parameters, we also leverage the subsequent error statements to further analyze the specific types of dependency (e.g.,  should be enabled or disabled together).  For example, the two parameters  \texttt{resize\_inode} and \texttt{meta\_bg} from \texttt{mke2fs}  cannot be enabled together, so there must be a common error statement immediately following the condition check shared by the two taint traces.
+
+All of the extracted dependencies are stored in the JSON format~\cite{JSON} to describe both the parameters and the corresponding dependent relations concisely.
+
+\subsubsection{Dependency-guided State Generation}
+\label{sec:stategenerator}
+
+With the dependency information, the \textit{State Generator} generates concrete configuration states for further analysis.  Instead of randomly generating combinations of configurations which may easily lead to useless states (\S\ref{sec:state-generation-vs-fb-hydra}), 
+ it leverages the 
+extracted multilevel  dependencies to generate states selectively.
+ 
+Specifically, the \textit{State Generator}  uses a tree structure to maintain different configuration states. The root of the tree represents a default configuration state, and each child node on the tree represents a configuration state with exactly one modification made from its parent.
+The module operates similar to a Depth First Search (DFS) on a tree, except it leverages the dependency information to guide which children nodes are worth pursuing. For example, given the cross-parameter dependency (CPD) between the \texttt{bigalloc} and \texttt{blocksize} parameters of \texttt{mke2fs}, if the current node modifies  \texttt{bigalloc}, then the child node to consider will be a state with a modification to \texttt{blocksize}.
+
+Moreover, the module has a number of options that allow for tuning based on  needs. The first option is `depth',  which dictates how deep the DFS is allowed to go.  A larger value results in a greater number of  states being generated. The default `depth' is 3 which worked well in our experiments. 
+Another option is the `policy' under which the State Generator operates. There are two basic policies as follows:
+
+\smallskip
+\noindent
+   \textbf{Following Dependency}. Under this policy, we always honor the extracted multilevel dependencies when creating a configuration state. For example, \texttt{sparse\_super} should always be enabled if \texttt{resize\_inode} is enabled for~\texttt{mke2fs} according to the multilevel dependency, so the module may generate a   state with both parameters (i.e., `\texttt{mk2fs -O resize\_inode,sparse\_super}').
+ 
+Essentially, this policy only generates  \textit{valid} configuration states involving critical  parameters for the target FS ecosystem, which is  the basic requirement for running many FS applications or tools properly.
+Note that this policy is consistent with recent work on testing configuration changes which shows that \textit{valid} configuration changes may induce production failures~\cite{ctest-OSDI20}. 
+
+
+\smallskip
+\noindent
+   \textbf{Violating Dependency}. Under this policy, we intentionally violate   the multilevel dependencies when creating a configuration state. For example,
+   the \texttt{resize\_inode}  and  \texttt{sparse\_super} parameters of \texttt{mke2fs} have  a cross-parameter dependency (CPD):  \texttt{sparse\_super} must be enabled if we want to enable \texttt{resize\_inode}. To violate the CPD, the module may intentionally generate a state which disables the \texttt{sparse\_super} parameter while enabling \texttt{resize\_inode} (i.e., `\texttt{mke2fs -O resize\_inode,\^{}sparse\_super}').
+   
+By generating \textit{invalid} configuration states on purpose, we enable  examining the (mis)configuration handling of the target system. Note that this policy is inspired by the previous work on simulating human errors in configuration~\cite{Conferr-DSN08}. However, different from the relatively shallow violations (e.g., typos) which have been largely handled in matured systems, we consider more subtle violations that involve non-trivial dependencies.  
+
+\smallskip
+In addition, to provide more flexibility for different use cases, the \textit{State Generator} supports customizing the two basic policies further with different tradeoffs (e.g.,  the number of parameters  to consider, the type of dependency (i.e., SD/CPD/CCD) to use).  
+As mentioned, a key challenge with analyzing configurations  of file systems is that the space is too huge to exhaust. For example, \texttt{mke2fs} itself has more than 8 trillion possible parameter combinations. With the dependency guidance, \textsc{ConfD} can reduce the space to hundreds or tens of thousands depending on the use case (\S\ref{sec:plugins}), which makes the configuration testing much more manageable in practice. And as will be shown in \S\ref{sec:dependency-aware-vs-agnostic}, the dependency-guided state generation will be more effective than dependency-agnostic alternatives for exposing configuration issues.
+
+
+\subsubsection{{User Input}}
+\label{sec:annotation}
+
+\textit{ConfD-core} needs three types of input information 
+from the user, which can be specified in one single JSON file.
+First, to start the taint analysis, the \textit{Taint Analyzer} needs a function name as the entry point. In the case of a utility program, the function (which may invoke sub-functions) is expected to be the major function for processing configurations. In the case of the file system itself, the function can be either a function for processing configurations, or a function that is interesting (e.g., a newly added FS function). 
+
+Second, the taint analysis also requires the names of the variables representing the configurations and the superblock in the source code, which are often different across programs based on our experience on Ext4 and XFS ecosystems. Third, to generate valid configuration states, the \textit{State Generator} needs the command-line syntax of FS configurations. Note that all the input  can be specified in the JSON format, and it is a one-time effort for each program to be analysed.
+
+
+
+\subsection{Leveraging Configuration Dependencies}
+\label{sec:leverage}    
+\label{sec:plugins}
+
+
+
+\begin{table*}[t]
+	\small
+	\begin{center}
+		\begin{tabular}{ c | c | c | l  }
+ 	\textbf{Plugin ID}  & \textbf{Description}  & \textbf{Base Tool (type)}  & \textbf{\textsc{ConfD} Plugin} \\
+ 	\hline
+ 	\#1   & Configuration specification checker for Linux file systems   & N/A &  \texttt{ConfD-specCk} \\
+ 				\hline
+	\#2     & Misconfiguration handling checker for Linux file systems     & N/A & \texttt{ConfD-handlingCk}\\
+				\hline
+			\#3    & An open-source fault injector for file system  utilities & 
+ \texttt{rfsck}~\cite{OmFAST18} (R) & \texttt{ConfD-rfsck}   \\
+          \hline
+\#4   & An open-source fuzzer for file systems & \texttt{gt-hydra}~\cite{hydra-2019} (R)  & \texttt{ConfD-gt-hydra}  \\
+
+	\hline
+	
+ \#5  &  Regression test suite for Linux file systems (including Ext4, XFS)  & \texttt{xfstests}~\cite{xfstest} (S)  & \texttt{ConfD-xfstests}\\
+			\hline
+\#6    & Regression test suite for Ext4 utilities & \texttt{e2fsprogs/tests}~\cite{e2fsprogs-test} (S)  & \texttt{ConfD-e2fsprogs}  \\
+			\hline
+\#7    & Regression test suite for ZFS file system & \texttt{zfs/tests}~\cite{zfs} (S)  & \texttt{ConfD-zfstests}  \\
+                \hline
+		\end{tabular}
+	\end{center}
+	\caption{ {\bf Summary of \textsc{ConfD} Plugins.} `Base Tool'  means existing tools that have been integrated with \textsc{ConfD} through the corresponding plugins; `R' means open-source Research prototype, `S' means Standard test suites for file systems and utilities.
+}
+	\label{tab:plugins}
+\end{table*}
+
+The dependency information and the dependency-guided configuration states may be used in different ways  to address different issues~\cite{Conferr-DSN08,spex,cdep}.  
+As mentioned in \S\ref{sec:related},    there are existing efforts to improve FS ecosystems which cover a wide range of techniques including fault injection~\cite{iron05,OmFAST18}, fuzzing~\cite{xu2019fuzzing,hydra-2019}, regression test suites~\cite{xfstest,e2fsprogs-test},  etc.
+While these tools are excellent for their original design goals, they are mostly agnostic to configuration dependencies and thus cannot address tricky configuration-related issues  effectively. 
+The \textsc{ConfD} plugin interface is designed to bridge the gap by introducing dependency awareness to the traditional methodologies and thus amplify the effectiveness.
+
+The current prototype of \prj includes seven plugins for file systems.
+As   summarized in Table~\ref{tab:plugins},  the first two plugins (\#1 and \#2) are built from scratch, the next two plugins  (\#3 and \#4) are based  on open-source research prototypes (R), and the last three (\#5, \#6 and \#7) are designed for enhancing standard regression test suites (S). We discuss them in more details below:  
+
+\smallskip
+\noindent
+\textbf{Plugin \#1: Configuration Specification Checker.}
+The specifications for the configurations of Linux file systems are maintained through the Linux man-pages project~\cite{linuxmanpage}.
+Unfortunately, due to a variety of reasons (e.g., constant system upgrades, feature additions, bug fixes),  the specifications may become inaccurate easily,  which may confuse end users and/or lead to configuration-induced failures~\cite{ctest-OSDI20,maintaininglinuxmanpage}.
+The \texttt{ConfD-specCk} plugin is designed to mitigate the problem. It parses the Linux man-pages related to the file system configurations (e.g., \texttt{mke2fs}, \texttt{mkfs.xfs}) and checks a subset of multilevel dependencies (Table~\ref{tab:dependencies}) based on keywords. For example, \texttt{resize\_inode} and \texttt{meta\_bg} cannot be enabled together for \texttt{mke2fs} (i.e., CPD),  so  \texttt{meta\_bg} should appear in the description of \texttt{resize\_inode} with `disable' (or similar keywords) and vice versa. Similarly,   value ranges (i.e., SD) and other value dependencies (e.g., \texttt{cluster\_size} needs to be `equal' or `greater' than \texttt{block\_size}) should also be specified in the descriptions accordingly. Such  dependencies from man-pages are stored in the JSON format for further comparison with the dependencies extracted from the source code by \textit{ConfD-core} (\S\ref{sec:extraction}). A mismatch implies a potential specification issue.
+
+\smallskip
+\noindent
+\textbf{Plugin \#2: Misconfiguration Handling Checker.}
+A well designed  file system should be able to handle wrong configurations  from end users (either by mistake or by intention) gracefully.
+Failing to handle misconfigurations elegantly implies \textit{misconfiguration vulnerabilities}  that could hurt system reliability and/or security~\cite{spex}. 
+The  \texttt{ConfD-handlingCk} plugin is designed to expose the potential issues in misconfiguration handling. 
+Thanks to the built-in `Violating Dependency' policy (\S\ref{sec:stategenerator}),  the plugin can directly leverage the {invalid} configuration states generated by   \prj which violate inherent configuration dependencies. It applies such automatically generated misconfigurations to drive the target file systems and utilities, and records  the symptoms accordingly for post-moterm analysis. 
+
+\smallskip
+\noindent
+\textbf{Plugin \#3: Dependency-aware Fault Injector.}
+Fault injection techniques have  been applied to improve both file systems and utilities~\cite{iron05,OmFAST18,Thanu-OSDI14-Crash,ShehbazJaffer-ATC19-StudyFSonSSD,e2fsprogs-test}. 
+By systematically generating corrupted file system states, they enable analyzing the robustness of FS ecosystems thoroughly. 
+However, given the complexity of file system metadata, 
+one open challenge is how to generate vulnerable states efficiently.
+
+To mitigate the challenge,
+we integrate one open-source fault injector \texttt{rfsck}~\cite{OmFAST18} with \textsc{ConfD} through the \texttt{ConfD-rfsck} plugin.
+Instead of relying on the default configuration, \texttt{ConfD-rfsck} leverages  dependency-guided configurations  to generate  input  images to initiate the fault injection campaign. Since the input images are configured with dependent parameters identified by \textsc{ConfD}, they represent more complicated states that are more difficult to remain consistent under fault. 
+Note that the plugin only needs to provide an FS image with a different configuration as input to \texttt{rfsck}. No modification to the source code of  \texttt{rfsck} is required. 
+As will be shown in~\S\ref{sec:results-issues}, this simple strategy can help trigger vulnerabilities  effectively.
+
+\smallskip
+\noindent
+\textbf{Plugin \#4: Dependency-aware FS Fuzzer.}
+Fuzzing techniques have also been applied to improve the reliability of file systems~\cite{Janus,hydra-2019}. 
+Nevertheless, fuzzing file systems is still challenging due to  
+the lengthy  state exploration time needed to exercise a practical file system under each configuration  (e.g., it may take multiple weeks to trigger one  bug~\cite{hydra-2019}). 
+In other words,
+the time penalty for exploring a less interesting configuration state is high.
+
+To mitigate  the challenge,
+we integrate one open-source fuzzer \texttt{gt-hydra}~\footnote{To avoid confusion, we use \texttt{gt-hydra} to refer to the Hydra fuzzing framework created by GaTech researchers~\cite{hydra-2019}, and use  FB-HYDRA to refer to the Hydra configuration management framework created by Facebook~\cite{Yadan2019Hydra}.}
+with \prj through the \texttt{ConfD-gt-hydra} plugin.   
+Similar to 
+plugin \#3,
+\texttt{ConfD-gt-hydra} leverages dependency-guided configurations generated by \textsc{ConfD} to create  FS images with more complicated dependencies and thus more chances of vulnerability for fuzzing. 
+The plugin only changes the configurations of the input images for \texttt{gt-hydra}; no modification to the source code of the base tool is needed. 
+
+
+
+\smallskip
+\noindent
+\textbf{Plugin \#5, \#6, \#7: Dependency-aware Regression Test Suites}.
+Besides research prototypes, there are  standard regression test suites developed for file systems (e.g., \texttt{xfstests}~\cite{xfstest} and \texttt{e2fsprogs/tests}~\cite{e2fsprogs-test}), which include carefully designed workloads and test oracles to ensure the quality of the target.
+Nevertheless, existing test suites 
+only use a subset of configuration parameters  and they are mostly  dependency-agnostic.
+To address the limitation,  we first create two plugins (\#5, \#6) for enhancing the testing of Linux file systems and utilities:  \texttt{ConfD-xfstests} and \texttt{ConfD-e2fsprogs}, for  \texttt{xfstests} and \texttt{e2fsprogs/tests} respectively.  
+The plugins  scan the test scripts and {automatically} replace the built-in FS configurations of the test cases with the configuration states generated by \textsc{ConfD}. The two plugins use the `Follow Dependency' policy of  \textsc{ConfD}  to drive the test cases deeply into the target functionalities without early termination due to superficial configuration errors.  In doing so, we reuse the well designed test logic and enhance the test suites with dependency awareness. 
+If any test case fails with the \textit{valid}  configurations provided by \textsc{ConfD}, the result is saved for postmortem analysis. 
+ 
+In addition to Linux file systems, there are other popular file systems which include sophisticated features and configurations. One representative example is ZFS~\cite{zfs}, which was originally built on Solaris and has been ported to many Unix-like systems. To explore the extensibility of  \textsc{ConfD}, we create  the plugin \#7 for ZFS based on the ZFS test suite. Different from  traditional Linux file systems which include a unified test suite (i.e., \texttt{xfstest} for Ext4, XFS, etc.), ZFS includes a dedicated test suite for testing  ZFS only (i.e.,  \texttt{zfs/test}~\cite{zfs}). The ZFS test suite consists of test cases for both ZFS file system and ZFS utilities, and the testing logic  may cover both functional correctness and system performance. 
+Since our focus is to identify configuration related correctness issues, we only consider functionality testing in this paper, and leave performance testing  as future work.
+To test ZFS with dependency aware configuration states, we introduced plugin \#7 ConfD-zfstests. 
+Similar to plugins \#5 and \#6, this ZFS plugin  scans the testing script of ZFS test suite and automatically replaces the existing configuration state with a dependency-aware configuration state for testing. The testing output, including any error logs, is saved in a separate directory for further investigation. 
+ 
+\smallskip    
+Note that \textsc{ConfD} plugins are not limited to the seven examples above. By modularizing the core module of  \textsc{ConfD} (Figure~\ref{fig:overview}), we expect that other software may benefit from  \textsc{ConfD} conveniently via plugins (see \S\ref{sec:discussion} for more discussion). \\
+
+\subsection{Optimization for Reducing False Positive Rate of Dependency-Aware Regression Testing}
+\label{sec:reducefalsepositives}
+
+In our early experimentation~\cite{mahmud2023confd} with \textsc{ConfD}-enhanced  regression test suites for Linux file systems (i.e.,  \texttt{ConfD-xfstests} and \texttt{ConfD-e2fsprogs}), we observed that the test cases may fail  due to various reasons including timing at \texttt{mount}, bugs in FS source code, incompatible environmental variables, etc.
+Besides these typical reasons, 
+the dependency awareness introduced by \textsc{ConfD} 
+adds another potential source of failure: 
+as  the plugins need to modify the source code of test cases to change the  built-in configurations (\S\ref{sec:plugins}), the modification itself might cause unexpected failures. 
+We found that this was mainly caused by the irregularity of syntax and function invocations used in the test suites, which makes it difficult to change existing configuration parameters automatically and perfectly without breaking the test cases. For clarity, we call this type of undesirable failures as \textit{plugin-caused failures}.
+
+The \textit{plugin-caused failures} may contribute to a non-negligible percentage of  false positives of regression testing (e.g., 30.43\% for Ext4 based on our measurement). 
+One  challenge with identifying configuration issues using  regression test suites is the large number of test results that need manual  analysis and validation with strong domain knowledge.
+This is exacerbated by the fact that running a complete set of vanilla tests  with individual configurations (e.g., default ones) is time-consuming (e.g., it may take hours or even a full day for Ext4, depending on the compute resources available\cite{storagetesting}). In other words, \textit{plugin-caused failures}  may lead to substantial waste of time and resources for regression testing of file systems~\cite{howtofindExt4bugs}, and thus they should be avoided as much as possible.
+
+To reduce \textit{plugin-caused failures}, we analyzed the source code of the regression test suites in depth.
+In terms of \texttt{ConfD-xfstests} (which includes test cases for both Ext4 and XFS), we identified three common patterns for causing \textit{plugin-caused failures}:
+(1) The original test relied on a specific configuration parameter which is not presented in the dependency-aware configuration state; (2) The original test invoked a specialized function expecting a specific size parameter; and (3) corner cases of  syntax which were not recognized by \textsc{ConfD}. Based on these observations, we optimized the  plugin to handle tests with existing parameters  by adding a new mode: besides replacing existing parameters with dependency-aware configurations, the plugin may generate a new test case by  appending non-conflicting configurations (based on the dependency information extracted by \prj) to the existing parameters. 
+In addition, we also enhanced \texttt{ConfD-xfstests}  to handle additional  functions and special syntax. As we will show in \S\ref{sec:FalsePositiveExp}, these simple optimizations can reduce the false positive rate of \texttt{ConfD-xfstests}  effectively.
+
+In terms of \texttt{ConfD-e2fsprogs},  the test cases are grouped based on the feature being tested. For example, the "f" series test the \texttt{e2fsck} utility of Ext4 for various \texttt{mkfs}
+features and corruption scenarios. We found that 8.7\% of the tests failed after adding dependency awareness, but none of 
+them belonged to {plugin-caused failures}.   
+Therefore,  no further optimization is needed to reduce the false positive rate of  \texttt{ConfD-e2fsprogs}.
+
+
+\subsection{Extending \prj for Other Storage Systems}
+\label{sec:DBextension}
+Besides file systems, there are many other data management systems (e.g., databases) which also contain a rich set of tunable features and configuration parameters. To explore   configuration dependency in the broader context beyond file systems, we have analyzed the configurations of  WiredTiger~\cite{wt}, the default NoSQL storage engine for MongoDB~\cite{mongodb}. Similar to file systems,  WiredTiger stores a set of initial configuration parameters along with other  metadata  in a dedicated file. 
+Different from file systems, WiredTiger maintains much  dependency information in a dedicated array data structure. Configuration parameters specified by the end users  as input may be validated against the dependency information stored in the  array before creating a database instance. Moreover, the dependencies may be extracted and used at runtime (e.g., opening database, creating a table or transaction). 
+Based on this  observation, we extended \prj-core  to parse  the configuration array and extract the self and cross-parameter dependencies automatically. Note that due to the complex usage of configuration parameters throughout the source code of WiredTiger, our current extension  only works for a limited subset of configurations related to database creation. We leave the  extraction  of other database configurations  (and the corresponding plugin)  as future work.

@@ -1,0 +1,654 @@
+
+\section{Introduction}
+% This paper focuses specifically on weight quantization. 
+Quantization is the mapping of continuous values to discrete values. In neural networks, quantization reduces the computational complexity and memory requirements by representing weights and/or activations with fewer bits~\cite{gupta15limited}. In the case of weight only quantization, this means applying a quantizer \( q(\cdot) \) to the network's weights \( \w \), with an additional implicit goal of maintaining the original performance i.e. \( \loss(q(\w)) \approx \loss(\w) \), where $\loss(\cdot)$ is a loss function.
+
+When training neural networks intended for quantization, an essential step during optimization is accounting for the effects of applying a quantizer to the weights. Quantization introduces a perturbation to the weights. For uniform quantizers, this is bounded by \( \frac{s}{2} \), where \( s \) is the scale factor. At higher bit widths (\( \geq 8 \) bits), this perturbation is small, and standard training procedures often yield weights that are resilient to quantization noise \cite{nagel2021white}. In such cases, applying quantization after training, known as Post-Training Quantization (PTQ), is sufficient to maintain acceptable performance levels \cite{nagel2021white}.
+
+However, as we reduce the bit width to lower precision (\( \leq 4 \) bits), the quantization perturbation becomes more significant, and the model's performance tends to degrade substantially after quantization. This is because the increased perturbation can lead to larger discrepancy between \( q(\w) \) and \( \w \). To address this challenge, much research has gone into finding strategies to mitigate the effects of quantization on model accuracy, ensuring that the network remains accurate even after low-bit quantization.
+
+\begin{figure}[t]
+    \centering
+\includegraphics[width=0.49\textwidth]{figures/qat_osc.pdf}
+    \caption{Oscillatory behavior in Quantization-Aware Training (QAT) for a simple linear model. The figure shows a quantized linear model $f(x) = q(w)x$ with a single weight $w$, where $x = 1$ and target output $y = 0.75$. When doing squared loss with QAT an additional term is introduced to the gradient (Eq.~\ref{eq:qat_gradient_term}), 
+    % which maximizes the quantization error, causing 
+    which causes
+    w to oscillate around the quantization threshold. This oscillation results in $q(w)$ alternating between the 0 and 1 quantization bins.
+    %The arrow length corresponds to the magnitude of the gradient term. Additionally we note that the magnitude of the regularization term increases from epoch 0 as we approach the threshold at 0.5
+    }
+    \label{fig:intro}
+\end{figure}
+
+Though many methods have been proposed for mitigating the accuracy degradation due to quantization, Quantization-Aware Training (QAT)~\cite{jacob2017quantization} remains one of the most widely adopted approaches. QAT works by incorporating quantization effects directly into the training process - quantizing weights in the forward pass while using the Straight-Through Estimator (STE)~\cite{bengio2013ste} for gradient approximation during backpropagation. Research has identified an interesting phenomenon in QAT with the STE, known as weight oscillations, where the quantized weights alternate between two adjacent quantized states during training \cite{pseudoQuantNoise, nagel2022overcoming}. While traditionally viewed as a detrimental effect that should be suppressed through dampening or weight freezing techniques, there also exists evidence suggesting these oscillations might play a more nuanced role in the training dynamics of QAT.
+
+% \todo[inline]{finish introduction}
+
+
+
+We claim that weight oscillations during training are beneficial and that indeed they are the driving mechanism behind QAT. Our primary contributions that support this claim are:
+\begin{enumerate}
+   \item we isolate the mechanism that leads to weight oscillations during QAT (Sec.~\ref{sec:motivation});
+   \item we develop a regularization method that induces weight oscillations during training using this mechanism (Sec.~\ref{sec:method});
+   \item we show experimentally that weight oscillations are sufficient for preserving performance after quantization on small-scale computer vision tasks (Sec.~\ref{sec:experiments}).
+\end{enumerate}
+
+Since previous results have shown that weights oscillations are also necessary for good quantization performance with QAT (see Sec.~\ref{sec:discussion} for details), and extrapolating from our experiments, our results suggest that weight oscillations capture all the beneficial effects of QAT while avoiding unintended side-effects. For instance, in our experiments our method avoids overfitting to the bit-width used during training, resulting in superior cross-quantization performance compared to QAT.
+
+% Our contributions are following:
+% \begin{enumerate}
+%     %\item We identify the mechanism by which QAT causes weight oscillations during training (Sections~\ref{sec:motivation} and~\ref{sec:method}).
+%     %\item We show empirically that inducing weight oscillations during training is sufficient for training a model that preserves performance after quantization
+%     \item We propose for the first time the hypothesis that weight oscillations seen during training with QAT are beneficial for model robustness, motivated through a combination of theoretical and empirical arguments (Section~\ref{sec:motivation}).
+%     \item We show that explicitly maximizing the quantization error in the loss function is sufficient to induce oscillations in deep neural networks (Section~\ref{sec:method}).
+%     \item We then introduce a novel regularization method for neural networks that increases the robustness of models to weight quantization by inducing weight oscillations through quantization error maximization (Section~\ref{sec:method}).
+%     \item We show experimentally that our method achieves similar performance to QAT above ternary quantization, while increasing robustness to cross-bit quantization compared to QAT at bits ranging from ternary to 4-bit (Section~\ref{sec:experiments}).
+% \end{enumerate}
+
+
+\section{Related Work}
+
+
+The most used strategy to minimize the impact of quantization on model accuracy is to minimize the quantization error. This can be achieved by adjusting the granularity of the quantizer—for instance, using per-channel~\cite{Nagel_2019_ICCV} or block-wise quantization~\cite{dettmers2022bit} instead of per-tensor quantization. While these methods reduce quantization error without additional training, they come with increased storage requirements due to extra quantization parameters and may still fall short at very low bit widths, necessitating the combination with other approaches.
+
+Consequently, extensive research has been dedicated to developing techniques that explicitly minimize the quantization error during optimization \cite{BridgeDeepLearning, minimizeQuantError, APTQ, Choi_2020, ImprovingLowBit, zhong2024mbquantnovelmultibranchtopology}. Given a model $\w$ the hope is that by ensuring \( q(\w) \approx \w \), we likely also have \( \loss(q(\w)) \approx \loss(\w) \), thereby preserving model accuracy after quantization.
+
+ 
+An alternative and less explored approach involves training models to be robust to quantization perturbations without necessarily minimizing the quantization error itself. This means finding weights \( \w \) such that \( \loss(q(\w)) \approx \loss(\w) \) even if \( q(\w) \) is not close to \( \w \) \cite{alizadeh2020gradient, OneModelRobust}. Such methods focus on enhancing the robustness of the model to the quantization error, leading to better performance at bits different than the ones used in the quantizer, which we will refer to as cross-bit quantization.
+
+A third approach is to train supernets on the desired configurations of the quantizers \cite{ijcai2022p504, Xu_2023_ICCV}. This approach increases the training complexity and cost, which is not incurred by explicit regularization. 
+
+Despite these efforts, the aforementioned strategies often fall short of the accuracy obtained with QAT~\cite{jacob2017quantization} at individual bits or indirectly rely upon QAT themselves. In short, QAT integrates the quantization process into the training loop allowing the model to adapt to the quantization effects directly. This is done by quantizing the weights during the forward pass and using techniques like the Straight-Through-Estimator (STE) to approximate the gradient of the quantizer (Which has a derivative of zero almost everywhere) during backpropagation~\cite{bengio2013ste}.
+
+Yet, there is limited understanding of how QAT affects model optimization and why it outperforms other methods. One phenomenon observed during QAT is weight oscillations \cite{pseudoQuantNoise, nagel2022overcoming}, which are periodic changes in the value of the quantized weight between two adjacent quantization levels. It is speculated in these works that that the abrupt changes in values caused by oscillations can interfere negatively with optimization. Oscillations are assumed to be undesirable side effects caused by the use of the STE during backpropagation, as the STE allows gradients to pass through the rounding operation in the quantizer, which has a gradient of zero almost everywhere \cite{pseudoQuantNoise, nagel2022overcoming}.
+
+Several approaches have been suggested to mitigate oscillations, such as dampening or freezing the oscillating weights, which have shown improved accuracy \cite{nagel2022overcoming, gupta2023reducing}. However, the reported gains are sometimes marginal, and these methods may inadvertently also hinder the optimization process. For instance, \citet{nagel2022overcoming} notes that freezing or dampening weights too early during training can hurt optimization, indicating that oscillations might contribute to finding better quantized minima. \citet{vitoscillations} propose that weights with low oscillation frequency should be frozen, where as high-frequency ones should be left unfrozen, under the rational that high frequency means the network has little confidence in what value to quantize the weight to, where as low frequency means the optimal weight lies close to a quantization level.
+
+Though QAT often provides the best accuracy for a given target bit, degradation to a lesser or greater extent exists when the bit of the quantizer is different to the one seen during training, ie. cross-bit quantization \cite{alizadeh2020gradient, OneModelRobust}. This means QAT requires training and storing of weights for each desired bit width. This specialization can also pose challenges when deploying models across different hardware platforms, each potentially using different quantization schemes~\cite{inferenceBenchmark}, making it difficult to develop models which can be easily quantized at deployment according to end-user requirements.
+
+This makes robust quantization methods an interesting research avenue, especially if they could be improved to match the individual bit performance of QAT. In this work, we aim to deepen the understanding of how QAT influences model optimization, particularly focusing on the role of weight oscillations and their relation to robustness. 
+
+\section{Preliminaries}
+\subsection{Quantization}
+A quantizer divides a continuous input range into quantization bins, where each bin is represented by a specific quantization level. The boundaries between bins are called quantization thresholds. During quantization, any value within a bin is mapped to that bin's quantization level. With a uniform quantizer, the step size (the distance between two adjacent quantization levels) is equal to the scale factor $s$.
+
+We consider a uniform symmetric quantizer with a max-range scale factor. The quantization operation $q(\cdot)$ can then be expressed as
+\begin{align}
+    q(\w) &= s \cdot \left\lceil \frac{\w}{s} \right\rfloor
+    \label{eq:quantizer}
+\end{align}
+
+Here, $s$ represents the scale factor and $\left\lceil \cdot \right\rfloor$ denotes the rounding operation.
+
+The scale factor $s$ is set to cover the range of $\w$ as this removes the need for the usual clamping operation in the quantizer, while keeping the number of bins symmetric around 0:
+\begin{align}
+    s &= \frac{\max(\lvert \alpha \rvert, \lvert \beta \rvert)}{2^{b-1}-1}
+    \label{eq:scale_factor}
+\end{align} 
+
+Where $b$ is the bit in the quantizer and $\alpha, \beta$ are the min. and max. values respectively of the layer wise weight $\w$.
+
+The quantization process introduces quantization error $\error$, defined as the difference between the original and quantized values:
+\begin{align}
+    \error(\w) &= \w - q(\w)
+\end{align}
+Due to the uniform quantizer, for all bins the absolute error is bounded between $0 \leq |\error| \leq s/2$, which is maximized at quantization thresholds and 0 at quantization levels.
+
+\subsection{Quantization-Aware Training}
+While there exist many variants of QAT, fundamentally the forward pass is performed using the quantized weights $q(\w)$ in most variants of QAT~\cite{jacob2017quantization,krishnamoorthi2018quantizing}, simulating the effect of using low-precision weights. In principle the gradient for the weights during QAT is given by:
+\begin{equation}
+\begin{aligned}
+    \label{eq:qat_ste}
+    \frac{\partial \loss(q(\w))}{\partial\w}  = \frac{\partial \loss(q(\w))}{\partial q(\w)} \cdot \frac{\partial q(\w)}{\partial\w}
+\end{aligned}
+\end{equation}
+A problem with the above formulation is that the gradient of the rounding operation used in the quantizer is zero almost everywhere, causing the last term to interrupt gradient-based learning. A popular solution to this problem is to use the so-called Straight-Through Estimator (STE) \cite{bengio2013ste}. We define the STE to be the operator $\frac{\hat\partial}{\hat\partial \mathbf{x}}$ such that $\frac{\hat\partial f}{\hat\partial x}$ is obtained by computing $\frac{\partial f}{\partial x}$ and in the resulting expression replacing $q'$ (the derivative of $q$) by the constant function equal to $1$. In other words, if $\frac{\partial f}{\partial x} = g(\ldots, q', \ldots)$ then $\frac{\hat\partial f}{\hat\partial x} = g(\ldots, 1, \ldots)$.
+% \begin{equation}
+%     \frac{\hat\partial q(\w)}{\hat{\partial} \w} = 1
+% \end{equation}
+%Formally we define the STE operator $\frac{\hat{\partial}}{\hat{\partial \mathbf{w}}}$ such that for any function $f$,
+%\begin{gather}
+%  \frac{\hat\partial f}{\hat{\partial} \w} = \begin{cases}
+%        \frac{\partial f}{\partial \w} \textrm{ if } f \neq q, \\
+%      1 \textrm{ if } f = q.
+%    \end{cases}
+%\end{gather}
+
+
+\section{Oscillations in QAT}
+\label{sec:motivation}
+
+% \begin{figure}
+% \centering
+% \begin{subfigure}
+%   \centering
+%   \includegraphics[width=0.45\textwidth]{figures/qat_conv.pdf}
+%   \caption{$y=1$}
+%   \label{fig:w_star_1}
+% \end{subfigure}
+% \begin{subfigure}
+%   \centering
+%   \includegraphics[width=0.45\textwidth]{figures/qat_osc.pdf}
+%   \caption{$y=0.75$}
+%   \label{fig:w_star_075}
+% \end{subfigure}
+% \caption{We consider a linear model \( f(x) = q(w) x \) with a single weight \( w \). We set different targets \( y \) and analyze the behavior of \( w \) during training under quantization. \( x \) is set to 1. The reg. gradient is Equation~\ref{eq:qat_gradient_term}. The arrow length corresponds to the magnitude of the gradient term. In \ref{fig:w_star_1}, we observe how the full precision weight $w$ stays in the quantization bin for 1 when $y=1$. In \ref{fig:w_star_075}, we see how $w$ oscillates around the threshold causing \( q(w) \) to change between the 0 and 1 bin when $y=0.75$.  Additionally we note that the magnitude of the regularization term increases from epoch 0 as we approach the threshold at 0.5.}.
+% \label{fig:toy_reg}
+% \end{figure}
+
+Previous studies have explored linear models to analyze the behavior of QAT and the phenomenon of weight oscillations \cite{pseudoQuantNoise, nagel2022overcoming, vitoscillations, gupta2023reducing}. Inspired by these works, we analyze a linear regression model to gain theoretical insights into the optimization dynamics during QAT.
+
+Consider a linear model with a single weight \( w \), input \( x \) and target \( y \) $\in \mathbb{R}$. The quantized version of this model is defined as \( f(x) = q(w) x \), where \( q(\cdot) \) is the quantizer from Eq.~\ref{eq:quantizer}. The quadratic loss for the quantized model is given by
+\begin{equation}
+   \mathcal{L}(q(w)) = \frac{1}{2}(q(w)x - y)^2.
+\end{equation}
+
+Our goal in this section is to understand how QAT affects the full precision optimization process. For a given loss function $\mathcal{L}(\cdot)$ with quantized weights, we have 
+\begin{align}
+    \mathcal{L}(q(w)) &= \mathcal{L}(w) + \mathcal{L}(q(w)) - \mathcal{L}(w)
+\end{align}
+
+We can then expand the difference caused by quantization as follows
+\begin{align}
+    \delta_{\text{$\loss$}} &= \loss(q(w))-\loss(w)\\
+    &= \frac{1}{2}\left( (q(w)x - y)^2 - (wx - y)^2 \right) \\
+    &= \frac{1}{2}\left( (q(w)x)^2 - (wx)^2 - 2 y (q(w)x - wx) \right) \\
+    &= \frac{1}{2}\left( x^2 \left( q(w)^2 - w^2 \right) \right) + \left( y x (w - q(w)) \right)
+    \label{eq:quad_term}
+\end{align}
+
+This expression decomposes the loss difference into a quadratic term \( \frac{1}{2} x^2 (q(w)^2 - w^2) \) and a linear term \( y x (w - q(w)) \).
+
+Next we derive the gradient of \( \delta_{\loss} \) wrt. \( w \):
+\begin{align}
+\frac{\partial \delta_{\loss}}{\partial w} &=\frac{\partial}{\partial w} \bigg( \loss(q(w)) - \loss(w) \bigg) \\
+     &= \frac{\partial}{\partial w} \left( \frac{1}{2} x^2 (q(w)^2 - w^2) + y x (w - q(w)) \right) \\
+    &= x^2 \left( q(w) \frac{\partial q(w)}{\partial w} - w \right) + y x \left( 1 - \frac{\partial q(w)}{\partial w} \right)
+\end{align}
+
+Using the STE and recalling that $\frac{\hat\partial q}{\hat\partial w} = 1$ the expression of the STE gradient simplifies to
+\begin{align}
+    \frac{\hat\partial \delta_{\loss}}{\hat\partial w} = x^2 (q(w) - w)     = - x^2 \error(w).
+    \label{eq:qat_gradient_term}
+\end{align}
+
+% Given a gradient based optimizer like SGD, we note that Eq.~\ref{eq:qat_gradient_term} causes the maximization of the quantization error and that this is the only difference in QAT compared to full precision optimization for our toy model. Furthermore, to 
+
+To see how this gives rise to oscillations, for an arbitrary $w$, denote $w_0$ the upper discretization threshold $w_0 = q(w) + s/2$. For $\varepsilon \in (0, s/2)$ note that we have $q(w_0 - \varepsilon) = q(w)$ and $q(w_0 + \varepsilon) = q(w) + s$ so that
+\begin{align}\label{eq:oscillations}
+    \error(w_0 + \varepsilon) &= q(w) + s/2 + \varepsilon - (q(w) + s) \\
+    &= -s/2 + \varepsilon, \\
+    \error(w_0 - \varepsilon) &= q(w) + s/2 - \varepsilon - q(w)\\
+    &= s/2 - \varepsilon.
+\end{align}
+
+Assuming $x \neq 0$, the negative STE gradient ``flips" from $-s/2$ to $s/2$ as the weight $w$ passes the quantization threshold $w_0$ from above, pushing the weight back towards the threshold. We note that the STE gradient is $0$ at the special value $w = q(w)$, but the preceding argument shows that this is an unstable critical point and gradient noise will immediately cause the weights to move away from it. When combined with (stochastic) gradient descent and a finite discretization timestep we can identify this as the driving mechanism behind oscillations during training with QAT (Fig.~\ref{fig:intro}). 
+
+We can also see how the dynamics lead to clustering around quantization thresholds by looking at the sign of $\error$ for different values of $w$. For a weight $w$ let $d_{\text{low}}(w)$ and $d_{\text{up}}(w)$ denote the distance from $w$ to the upper and lower thresholds,
+$d_{\text{low}}(w) = w - \bigl(q(w) - \frac{s}{2}\bigr) = \error(w) + \tfrac{s}{2}$ and 
+$d_{\text{up}}(w) = \bigl(q(w) + \frac{s}{2}\bigr) - w = \tfrac{s}{2} - \error(w)$ respectively.
+If $w$ is closest to the upper threshold we have 
+\begin{equation}
+d_{\text{up}} < d_{\text{low}}
+\Longrightarrow
+\tfrac{s}{2} - \error < \error + \tfrac{s}{2}
+\Longrightarrow
+\error > 0
+\end{equation}
+
+While if $w$ is closest to the lower threshold
+\begin{equation}
+d_{\text{low}} < d_{\text{up}}
+\Longrightarrow
+\error + \tfrac{s}{2} < \tfrac{s}{2} - \error
+\Longrightarrow
+\error < 0
+\end{equation}
+
+We emphasize that this mechanism causes the weights to move towards the quantization thresholds (the edges of quantization "bins") as opposed to the quantization levels (the centers of the quantization "bins").
+% We note how the behaviour of $\text{sign}(\error)$ points towards the nearest threshold, the opposite of pointing towards the quantization level.
+
+
+
+% From the above analysis, we propose the hypothesis that oscillations are a fundamental and necessary part of how QAT finds weights which are robust to quantization. So based on the analysis of our toy model we expect the weights to cluster around the quantization thresholds when maximizing the quantization error $\error$ and this is indeed the case. In Sec.~\ref{sec:method} we present empirical evidence showing that maximizing the quantization error results in an increase in the clustering of weights around the quantization thresholds.
+
+\section{Regularization Method}\label{sec:method}
+
+Based on our theoretical observations in the one weight linear model, we now investigate empirically if the mechanism in Eq.~\eqref{eq:qat_gradient_term} is sufficient to introduce weight oscillations in neural networks. 
+
+% Based on our theoretical observations in the one weight linear model in Sec.~\ref{sec:motivation}, we proposed that oscillations in deep neural networks is also caused by maximizing $\error$. To test this we investigate if the mechanism in Eq.~\eqref{eq:qat_gradient_term} is sufficient to introduce weight oscillations in deep neural networks, by explicitly maximizing $\error$ in the loss function.
+
+From the quantization difference in Eq.~\ref{eq:quad_term} and the STE gradient derived in Eq.~\ref{eq:qat_gradient_term}, we have:
+\begin{align}
+    \frac{\partial \mathcal{L}(q(w))}{\partial w} &= \frac{\partial \mathcal{L}(w)}{\partial w} - x^2 \error(w)
+\end{align}
+where the first term is the gradient of the original full-precision loss, and the second term 
+% maximizes the quantization error -- which we have argued 
+causes the quantization oscillations in QAT.
+
+In order to emulate the effects of QAT, we propose a regularization term so that the training objective becomes:
+\begin{equation}
+ \mathcal{L}(q(\w)) = \mathcal{L}(\w)  + \mathcal{R_\lambda}(\w)
+\end{equation}
+where we let the regularization term be similar to the quadratic term in Eq.~\eqref{eq:quad_term}:
+\begin{align}
+\mathcal{R_\lambda}(\w) = \frac{\lambda}{2} \sum_{\ell} \frac{1}{n_\ell} \sum_{i=1}^{n_\ell} \left( q(w^\ell_{i})^2 - (w^\ell_{i})^2 \right).
+\label{eq:regularization_equation}
+\end{align}
+Here $\lambda \geq 0$ is a hyperparameter that controls the amount of regularization, $\ell$ ranges over the layers in the model and $i$ over the weights in each layer.
+
+% By adding the mean of \( (q(w_i))^2 - (w_i)^2 \) to the loss and using the STE during the backwards pass, we encourage the weights to move towards values that increase the quantization error $\error$. 
+
+Using the STE, $\frac{\hat\partial q}{\partial \mathbf{w}}=1$, we have the following expression for the gradient:
+\begin{align}
+\frac{\hat\partial}{\hat\partial w^\ell_i}\mathcal{R_\lambda}(\w) = \frac{\lambda}{n_\ell} \left( q(w^\ell_{i}) - w^\ell_{i} \right) = -\frac{\lambda}{n_\ell} \error(w_i^\ell).
+\end{align}
+By the same reasoning as in Sec.~\ref{sec:motivation} this pulls the weight $w_i^\ell$ towards the quantization threshold and causes the gradient to ``flip" as $w_i^\ell$ crosses the threshold. We expect this to lead to oscillations based on the same mechanism as in the model from Sec.~\ref{sec:motivation}. 
+
+% For this we perform an experiment where we include an additional regularization term $R_\lambda$ with the goal to induce oscillations. For the rest of the section we refer to this specific regularization term simply as regularization. 
+% The training objective becomes
+% \begin{equation}
+ % \mathcal{L_R}(w) = \mathcal{L}(w)  + \mathcal{R_\lambda}(w)
+% \end{equation}
+% where $\mathcal{L}(w)$ is a given loss function and
+% \begin{align}
+% \mathcal{R_\lambda}(w) = \frac{\lambda}{2} \sum_{\ell} \frac{1}{n_\ell} \sum_{i=1}^{n_\ell} \left( q(w^\ell_{i})^2 - (w^\ell_{i})^2 \right).
+% \label{eq:regularization_equation}
+% \end{align}
+% Here $\lambda \geq 0$ is a hyperparameter that controls the amount of regularization, $\ell$ ranges over the layers in the model and $i$ over the weights in each layer. Note that the expression for $\mathcal{R}_\lambda$ involves a quantizer $q$ for which we have to choose a bit width. Using the STE we have the following expression for the gradient
+% \begin{align}
+% \frac{\hat\partial}{\hat\partial w^\ell_i}\mathcal{R_\lambda}(w) = \frac{\lambda}{n_\ell} \left( q(w^\ell_{i}) - w^\ell_{i} \right) = -\frac{\lambda}{n_\ell} \error(w_i^\ell)
+% \end{align}
+% which can be compared to~\eqref{eq:oscillations}. In particular we expect it to induce weight oscillations as the reasoning in~\eqref{eq:oscillations} stays valid.
+
+Figures~\ref{fig:weight_distributions} and ~\ref{fig:oscillation_frequency} show the results of an experiment where we observe the weight distributions, and measured the oscillations, during training of a neural network (ResNet-18) with varying degrees of regularization, respectively. For comparison purposes the figures also shows the weight distributions and oscillations observed during training with QAT. Using the definition of an oscillation established in~\citet{nagel2022overcoming}, we count an oscillation at epoch \( i > 1\) if $q(w_t) \neq q(w_{t-1})$ and the direction of the change in the quantized space is opposite to that of the previous change. We note though that this method of counting misses the first threshold crossing during an oscillation \ref{appendix:count_oscillations}
+% \todo[inline]{Should we mention the counting issue or not?}
+
+Our first observation is that QAT displays more oscillations -- also seen as clustering around the quantization threshold in Fig.~\ref{fig:weight_distributions}-a) -- than a baseline model without QAT or regularization (corresponding to $\lambda = 0$ in Fig.~\ref{fig:oscillation_frequency}-b)) . As we increase $\lambda$ we observe that the number of oscillations as well as the clustering increases. This confirms that our regularizer can indeed induce oscillations similar to QAT during the training of deep neural networks. At $\lambda = 1$ (Fig.~\ref{fig:oscillation_frequency}-c)) the number of oscillations observed with our regularizer is similar to the behaviour of QAT, lending support to our hypothesis that the 
+% maximization of quantization error 
+mechanism in~\eqref{eq:oscillations} is indeed at the root of the oscillations observed when training neural networks with QAT.
+
+% % \todo[inline]{Should we mention $x^2$? x=0 case, x always positive} 
+% Assuming an iterative optimizer such as SGD, we note that the gradient updates \( w \) in the direction that maximizes the quantization error \( \error \). Specifically, it encourages the weight \( w \) to move towards the nearest quantization threshold, thereby increasing \( \error \). 
+
+% Figure \ref{fig:toy_reg} shows the trajectories of \( w \) with \( y \) set to 1 and 0.75 respectively. When \( y \) aligns with a quantization level, \( w \) remains stable within that bin (Figure \ref{fig:w_star_1}). When \( y \) lies between quantization levels, \( w \) oscillates around the threshold due to the maximization of $\error$. This causes \( q(w) \) to change between 0 and 1 (Figure \ref{fig:w_star_075}). 
+% \todo[inline]{What is $w^*$ and what are we trying to show here?}
+% \todo[inline]{I have renamed to y. w* was for showing that oscillations depends on the optimal FP value (with x=1, w*=y)}
+
+% So when $\frac{\partial}{\partial w}\loss(w) \leq s/2$ \todo[inline]{almost everywhere? only when $q(w) != w$}, Equation~\ref{eq:qat_gradient_term} will dominate optimization, causing the oscillation phenomena. The cause is that as $w$ approaches its nearest quantization threshold, $\error$ approaches $s/2$. This causes the weight to overshoot the threshold (If we instead were minimizing $\error$, we have that as $w$ approaches $q(w)$, $\error$ approaches 0). 
+
+% While the derivation is for a linear model with a single weight, the same approach extends to 1-layer linear networks (See Appendix~\ref{appendix:multi_layer_qat}).
+
+% From the above analysis, we conjecture that maximizing $\error$ is the cause of oscillations observed in training deep neural networks with QAT and that oscillations are a fundamental part of QAT when used with the STE.
+
+% If this is indeed the case then based on the analysis of our toy model we expect the weights to cluster around the quantization thresholds. This is indeed the case: we empirically observe an increase in the clustering of weights as shown in Sec.~\ref{sec:experiments}.
+
+% as we increase $\lambda$ (see next section) from $0$ (corresponding to no regularization) to $10$ (Figure \ref{fig:weight_distributions}) in a ResNet-18 model. Moreover we also observe that the oscillation frequency increases as we increase $\lambda$, showing a strong link between  clustering and oscillation, consistent with our hypothesis.
+
+% Furthermore, if our oscillation hypothesis is correct then we would expect the trajectory of each weight to exhibit the characteristics of a random process, with a drift term that minimizes the unquantized loss and an additional noise term (on top of the usual SGD noise) corresponding to the oscillation around a quantization threshold. In particular the expected value of each weight at any given time point would be in-between the optimal unquantized weight and the quantization threshold. Therefore by an ergodic argument we would expect that in wider layers, that combine a large number of trajectories, the weight distribution 
+
+% While oscillations is most pronounced in smaller layers as also noted in \cite{nagel2022overcoming}, they are also present in wider layers, but they distort the distribution less \ref{appendix:wide_layers}.
+% \todo[inline]{This is consistent with dynamical explanation (oscillations and averaging) - Do we reference anything from the appendix here?}
+% \todo[inline]{Not sure anymore about the averaging explanation, need to think about that.}
+\begin{figure*}[htb]
+    \centering
+    \begin{minipage}{0.245\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{figures/weight_distribution_qat.pdf}
+    
+    (a)    
+    \end{minipage}
+    \begin{minipage}{0.245\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{figures/weight_distribution_l0.pdf}
+    
+    (b)    
+    \end{minipage}
+    \begin{minipage}{0.245\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{figures/weight_distribution_l1.pdf}
+    
+    (c)    
+    \end{minipage}
+    \begin{minipage}{0.245\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{figures/weight_distribution_l10.pdf}
+    
+    (d)    
+    \end{minipage}
+    % \includegraphics[width=0.245\textwidth]{figures/weight_distribution_l0.pdf}
+    % \hfill
+    % \includegraphics[width=0.245\textwidth]{figures/weight_distribution_l1.pdf}
+    % \hfill
+    % \includegraphics[width=0.245\textwidth]{figures/weight_distribution_l10.pdf}
+    \caption{Weight distribution analysis of ResNet-18's first convolutional layer after 50 epochs of training from scratch. a) Weight distribution under QAT with a 3-bit quantizer. b)-d) Our proposed regularization approach with a 3-bit quantizer at varying regularization strengths ($\lambda=0, 1, 10$, from left to right). When $\lambda=0$, the training reduces to standard optimization. The QAT distribution (leftmost) exhibits the characteristic threshold clustering behavior. As $\lambda$ increases, we observe progressively stronger clustering of weights around quantization thresholds, illustrating the relationship between regularization strength and weight clustering.}.
+    \label{fig:weight_distributions}
+\end{figure*}
+
+\begin{figure*}[t]
+    \begin{minipage}{0.245\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{figures/osc_count_qat.pdf}
+    
+    (a)    
+    \end{minipage}
+    \begin{minipage}{0.245\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{figures/osc_count_l0.pdf}
+    
+    (b)    
+    \end{minipage}
+    \begin{minipage}{0.245\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{figures/osc_count_l1.pdf}
+    
+    (c)    
+    \end{minipage}
+    \begin{minipage}{0.245\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{figures/osc_count_l10.pdf}
+    
+    (d)    
+    \end{minipage}
+    % \centering
+    % \includegraphics[width=0.245\textwidth]{figures/osc_count_qat.pdf}
+    % \hfill
+    % \includegraphics[width=0.245\textwidth]{figures/osc_count_l0.pdf}
+    % \hfill
+    % \includegraphics[width=0.245\textwidth]{figures/osc_count_l1.pdf}
+    % \hfill
+    % \includegraphics[width=0.245\textwidth]{figures/osc_count_l10.pdf}
+    % \hfill
+    \caption{The plots show the distribution of weights with oscillation counts $>0$ when training with a) QAT and b)-d) our regularizer for different values of $\lambda$. Here $\lambda = 0$ corresponds to a full precision model where our regularizer has no influence on training. The y-axis represents the percentage of total weights in the first convolutional layer of a ResNet-18 trained from scratch for 50 epochs, while the x-axis shows the oscillation count. Following the oscillation definition from \cite{nagel2022overcoming}, we count oscillations at each epoch during training.
+The results demonstrate that QAT produces a significantly higher proportion of oscillating weights compared to $\lambda=0$. Furthermore, we observe that as we increase $\lambda$ a greater percentage of weights oscillates.}
+    \label{fig:oscillation_frequency}
+\end{figure*}
+% \begin{figure}
+%     \centering
+%     \includegraphics[width=0.23\textwidth]{figures/lambda10.png}
+%     \hfill
+%     \includegraphics[width=0.23\textwidth]{figures/lambda100.png}
+%     \caption{Weight distribution of first convolutional layer in ResNet-18 after 30 epochs of regularization with a 3-bit quantizer. Left is regularized with lambda = 10, right is with lambda 100}
+%     \label{fig:lambda_distribution}
+% \end{figure}
+
+% \section{Regularization Method}\label{sec:method}
+
+
+% Using the analysis in Sec.~\ref{sec:motivation}, in particular, the quantization difference in Eq.~\ref{eq:quad_term} and the STE gradient derived in Eq.~\ref{eq:qat_gradient_term}, we have:
+% \begin{align}
+%     \frac{\partial \mathcal{L}(q(w))}{\partial w} &= \frac{\partial \mathcal{L}(w)}{\partial w} - x^2 \error(w)
+% \end{align}
+% where the first term is the gradient of the original full-precision loss, and the second term maximizes the quantization error -- which we have argued causes the quantization oscillations.
+
+% Following these observations, in order to emulate the effects of QAT, we propose a regularization term so that the training objective becomes:
+% \begin{equation}
+%  \mathcal{L}(q(w)) = \mathcal{L}(w)  + \mathcal{R_\lambda}(w)
+% \end{equation}
+% where the regularization term is similar to the quadratic term in Eq.~\eqref{eq:quad_term}: 
+% \begin{align}
+% \mathcal{R_\lambda}(w) = \frac{\lambda}{2} \sum_{\ell} \frac{1}{n_\ell} \sum_{i=1}^{n_\ell} \left( q(w^\ell_{i})^2 - (w^\ell_{i})^2 \right)
+% \label{eq:regularization_equation}
+% \end{align}
+% where $\ell$ ranges over the layers in the model and $i$ over the weights in each layer and $\lambda > 0$ is a hyperparameter.
+
+% By adding the mean of \( (q(w_i))^2 - (w_i)^2 \) to the loss and using the STE during the backwards pass, we encourage the weights to move towards values that increase $\error$.
+
+% Using the STE we have the following expression for the gradient
+% \begin{align}
+% \frac{\hat\partial}{\hat\partial w^\ell_i}\mathcal{R_\lambda}(w^\ell_i) = \frac{\lambda}{n_\ell} \left( q(w^\ell_{i}) - w^\ell_{i} \right).
+% \end{align}
+% By the same reasoning as in Section~\ref{sec:motivation} this pulls the weight $w_i^\ell$ towards the quantization threshold and causes the gradient to ``flip" as $w_i^\ell$ crosses the threshold. We expect this to lead to oscillations based on the same mechanism as in the model from Section~\ref{sec:motivation}. We provide further experimental support for this hypothesis in Section~\ref{sec:experiments}.
+
+
+
+% Figure \ref{fig:weight_distributions} shows the weight distributions of the first convolutional layer in ResNet-18 after 30 epochs of training. With a higher \( \lambda \), weights are pushed more aggressively towards the quantization thresholds. The results support our conjecture that the regularization effectively encourages weights to maximize quantization error causing oscillations, resulting in weight distributions that cluster at quantization thresholds.
+
+% Fig.~\ref{fig:oscillation_frequency}. 
+\section{Experiments \& Results}\label{sec:experiments}
+% Our analysis in the previous section led to two connected hypotheses: First, that oscillations during QAT enhance quantization robustness, and second, that the maximization of $\error$ drives oscillations in deep neural networks. By analyzing the weight distributions during training we found empirical evidence for the latter part of the hypothesis, that by introducing our regularization method which maximize $\error$, we induce weight oscillations during training of deep neural networks.
+In this section we empirically try to answer the question: is it sufficient to induce weight oscillations during training in order to get the benefits of QAT?
+
+We answer this question mostly affirmatively for ResNet and Vision Transformer architectures, based on the results of training ResNet-18 and Tiny ViT on the CIFAR-10 dataset. This is both in a training-from-scratch setting and when fine-tuning pretrained models. In all our experiments we use the regularizer $\mathcal{R}_\lambda$ defined in Eq.~\eqref{eq:regularization_equation} to induce oscillations.
+
+% , reported as OsciQuant, abbreviation for our regularization by quantization error maximization approach.
+
+%\begin{align}
+%\mathcal{R_\lambda}(w) = \frac{\lambda}{2} \sum_{\ell} \frac{1}{n_\ell} %\sum_{i=1}^{n_\ell} \left( q(w^\ell_{i})^2 - (w^\ell_{i})^2 \right)
+%\end{align}
+%where the symbols have the same meaning as in~\eqref{eq:regularization_equation}.
+
+In the following subsections we first describe the experimental setup, then we present the accuracy results from training-from-scratch and fine-tuning models trained with different quantization levels for the quantizer in $\mathcal{R}_\lambda$ or QAT and finally, we present the cross-bit accuracy of the fine-tuned models.
+We train models at ternary (3 possible values: -1, 0, 1), 3-bit and 4-bit. This is in line with contemporary research, where the emphasis lies on quantization at 4-bit and below since the challenges of maintaining accuracy are more significant compared to quantization at higher bit widths.
+
+\subsection{Experimental setup}
+We conducted our experiments using the CIFAR-10 dataset \cite{krizhevsky2009learning} without data augmentation. We evaluated three architectures; A multi-layer perceptron with 5 hidden layers and 256 neurons per layer (MLP5), ResNet-18 \cite{he2016deep} and Tiny Vision transformer (Tiny ViT) \cite{wu2022tinyvit}.
+
+For each architecture we used the Adam optimizer \cite{kingma2014adam} and tested multiple configurations: A baseline model to establish optimal floating-point accuracy and post-training quantization (PTQ) performance, a model with QAT and a model with our approach. The two latter configurations are trained using a ternary, 3-bit, and 4-bit quantizer.
+
+\textbf{Training from Scratch}
+For the MLP5 architecture, we used a learning rate of $10^{-3}$ and regularization parameter $\lambda$=1. The ResNet-18 was trained with a learning rate of $10^{-3}$ and $\lambda$=0.75 (see Appx.~\ref{appendix:hyperparameters} for our hyperparameter selection). We modified the ResNet-18 architecture by replacing the input layer with a smaller $3\times3$ kernel and adapting the final layer for 10-class classification of both ResNet-18 and Tiny ViT. Training proceeded for a maximum of 100 epochs with early stopping triggered after 10 epochs without improvement in validation performance. For quantized models, we monitored the quantized validation accuracy at the target bit precision, while for the baseline, we tracked floating-point accuracy.
+
+
+
+
+
+\textbf{Fine-tuning}
+We fine-tuned two ImageNet-1k~\cite{deng2009imagenet} pre-trained models on CIFAR-10: a Tiny ViT (learning rate: $10^{-4}$, $\lambda$=1) and a ResNet-18 (learning rate: $10^{-3}$, $\lambda$=1). 
+% Both models were initially pre-trained on ImageNet-1k \cite{deng2009ImageNet-1k}. 
+To maintain compatibility with the pre-trained architectures, we upsampled CIFAR-10 images to $224 \times 224$ pixels. The $\lambda$ parameter selection process for Tiny ViT is detailed in Appx.~\ref{appendix:hyperparameters}. Fine-tuning continued for up to 200 epochs, with early stopping after 30 epochs without improvement, using the same accuracy metrics as training from scratch.
+
+\textbf{Quantization}
+We implemented weight quantization using a per-tensor uniform symmetric quantizer as defined in Eq.~\ref{eq:quantizer}. The quantization range was determined by computing minimum and maximum values per layer. In our implementation of ResNet-18 (11M parameters) all layers except batch normalization were quantized, covering 99.96\% of parameters. For Tiny ViT (5.5M parameters) quantization was applied to MLP, Self-Attention, and key-query-value projection layers, encompassing 97.18\% of parameters. And lastly for the MLP5 model all layers were quantized.
+
+
+\subsection{Training-from-scratch}
+Table \ref{tab:training_scratch} shows the results from training an MLP and ResNet-18 from scratch on the CIFAR-10 dataset. Our regularization method (OsciQuant) demonstrates improvements compared to the PTQ baseline from ternary quantization. More importantly, it also matches the performance of QAT at bit widths of 3 and 4. 
+
+For both models we see that at 3-bit and 4-bit, our method exhibits similar performance as QAT but with less variability, while not differing significantly in the average number of training epochs required. With both models, QAT and OsciQuant are competitive with the full-precision baseline, although we observe an increased number of training epochs. Notably, both OsciQuant and QAT significantly outperform PTQ when applied to the full precision baseline.
+
+\begin{table}[t]
+\centering
+\scriptsize
+\begin{tabular}{llcc}
+\toprule
+{\bf Model} & {\bf Quantization method} & {\bf Accuracy} & {\bf Mean Epochs} \\
+\midrule
+\multirow{10}{*}{\bf MLP5} 
+ & Baseline FP32 & 51.43 $\pm$ 0.39 & 14 \\
+ \cmidrule(lr){2-4}
+ & Ternary PTQ & 10.00 $\pm$ 0.02 & 14 \\
+ & Ternary QAT & { 49.20 $\pm$ 1.34} & 24\\
+ & Ternary OsciQuant & 36.49 $\pm$ 0.51 & 14\\
+ \cmidrule(lr){2-4}
+ & 3-bit PTQ & 20.97 $\pm$ 5.64 & 14 \\
+ & 3-bit QAT & 50.53 $\pm$ 1.43 & 33\\
+ & 3-bit OsciQuant & 48.48 $\pm$ 0.29 & 15\\
+ \cmidrule(lr){2-4}
+ & 4-bit PTQ & 46.50 $\pm$ 0.76 & 14 \\
+ & 4-bit QAT & 51.39 $\pm$ 0.60 & 26\\
+ & 4-bit OsciQuant & 50.72 $\pm$ 0.47 & 19\\
+\midrule
+\multirow{10}{*}{\bf ResNet-18} 
+& Baseline FP32 & 83.26 $\pm$ 1.07 & 24 \\ 
+\cmidrule(lr){2-4}
+& Ternary PTQ & 10.00 $\pm$ 0.01 & 24 \\ 
+& Ternary QAT & 79.62 $\pm$ 6.42 & 42 \\
+& Ternary OsciQuant & 61.5 $\pm$ 1.82 & 56 \\
+\cmidrule(lr){2-4}
+& 3-bit PTQ & 77.79 $\pm$ 4.0 & 24 \\
+& 3-bit QAT & 82.51 $\pm$ 2.14 & 37 \\
+& 3-bit OsciQuant & 81.77 $\pm$ 0.46 & 41 \\
+\cmidrule(lr){2-4}
+& 4-bit PTQ & 82.11 $\pm$ 1.21 & 24 \\ 
+& 4-bit QAT & 82.66 $\pm$ 2.57 & 28 \\
+& 4-bit OsciQuant & 83.74 $\pm$ 0.59 & 32 \\
+\bottomrule
+\end{tabular}
+\caption{Comparison of accuracy when training from scratch on CIFAR-10. Results show classification accuracy and mean training epochs for MLP5 and ResNet-18 across different quantization approaches and bit-widths. Results is means and standard deviations over 5 random seeds.}
+\label{tab:training_scratch}
+\end{table}
+
+\begin{table}[t]
+\centering
+\scriptsize
+\begin{tabular}{llcc}
+\toprule
+{\bf Model} & {\bf Quantization method} & {\bf Accuracy} & {\bf Mean Epochs} \\
+\midrule
+\multirow{10}{*}{\bf ResNet-18} 
+ & Baseline FP32 & 88.50 $\pm$ 0.64 &  4\\
+ \cmidrule(lr){2-4}
+ & Ternary PTQ & 10.01 $\pm$ 0.01 & 4 \\
+ & Ternary QAT & 77.02 $\pm$ 7.57 & 47 \\
+ & Ternary OsciQuant & 44.59 $\pm$ 3.30 & 35 \\
+ \cmidrule(lr){2-4}
+ & 3-bit PTQ & 10.28 $\pm$ 0.48 & 4 \\
+ & 3-bit QAT & 85.69 $\pm$ 1.83 & 25\\
+ & 3-bit OsciQuant & 84.94 $\pm$ 1.59 & 27\\
+ \cmidrule(lr){2-4}
+ & 4-bit PTQ & 35.56 $\pm$ 9.05 & 4 \\
+ & 4-bit QAT & 87.71 $\pm$ 1.14 & 26\\
+ & 4-bit OsciQuant & 87.08 $\pm$ 0.72 & 24\\
+\midrule
+
+\multirow{10}{*}{\bf Tiny ViT}
+ & Baseline FP32 & 96.11 $\pm$ 0.31 &  6\\
+ \cmidrule(lr){2-4}
+ & Ternary PTQ & 9.39 $\pm$ 1.11 & 6 \\
+ & Ternary QAT & 73.53 $\pm$ 0.77 & 140 \\
+ & Ternary OsciQuant & 13.51 $\pm$ 1.32 & 28 \\
+ \cmidrule(lr){2-4}
+ & 3-bit PTQ & 11.56 $\pm$ 1.99 & 6 \\
+ & 3-bit QAT & 88.13 $\pm$ 0.60 & 131 \\
+ & 3-bit OsciQuant & 88.68 $\pm$ 1.08 & 108 \\
+ \cmidrule(lr){2-4}
+ & 4-bit PTQ & 21.57 $\pm$ 5.33 & 6 \\
+ & 4-bit QAT & 94.96 $\pm$ 0.33 & 57 \\
+ & 4-bit OsciQuant & 94.82 $\pm$ 0.51 & 90 \\
+\bottomrule
+
+\end{tabular}
+\caption{Comparison of accuracy when fine-tuning on models pre-trained on ImageNet-1k. Results show classification accuracy and mean training epochs for MLP5 and ResNet-18 across different quantization approaches and bit-widths. Results is means and standard deviations over 5 random seeds.}
+\label{tab:quant_results}
+\end{table}
+
+\subsection{Fine-tuning}
+Table \ref{tab:quant_results} summarizes the test accuracies for fine-tuning using our OsciQuant method and QAT on ResNet-18 and Tiny ViT architectures. The observations are roughly in line with the results observed for training from scratch in the previous section with the exception of the number of epochs required for fine-tuning.
+
+On the ResNet architecture both QAT and our model train for significantly longer than the full precision baseline. As is the case for training from scratch, we see an increase in ternary performance compared to PTQ, but QAT still ourperforms our method in the ternary setting. Our regularization and QAT show comparable performance when quantized at 3 bits and 4 bits, while achieving test accuracy close to the full precision model at 4-bits.
+
+The general trend regarding accuracy is identical for the vision transformer experiments, while we again note the high number of epochs require for both methods when fine-tuning, compared to the full precision baseline.
+
+
+\subsection{Robustness to cross-bit quantization}
+% \todo[inline]{Finish jonathan}
+
+As described above, the goal of our proposed regularization term is to train a model that maintains performance after quantization. Since the regularization term involves a quantization operator, we need to choose the quantization level in the regularization term. In this experiment we evaluated the robustness of our method and QAT towards quantization at levels different from the ones used during training. 
+
+For OsciQuant, we applied a regularization term with the training bit width during training and applied PTQ after training finished at a different quantization level. For QAT we trained using the training bit width and afterwards applied PTQ to the latent weights. For each method we also evaluated the corresponding model without PTQ, directly using the latent weights for inference (reported as FP32).
+
+Table~\ref{tab:robustness_results2} shows the results from the experiment. A first observation is that the models produced by our method consistently achieve nearly full-precision accuracy when quantized at 8-bit or when used without quantization, irrespective of the quantization level used during training. This contrasts with QAT, which produces a viable 8-bit or full-precision model only when trained with at least 4-bit.
+
+Furthermore we see that our method mostly maintains performance when trained at 3 or 4-bit and quantized at bit level of 3 or 4-bit. QAT also achieves this for Tiny ViT but for ResNet, the accuracy of QAT trained at 3-bit and quantized at other bit widths is barely above random guessing.
+% \todo[inline]{our 3-bit vit matches Baseline FP accuracy at 4,8-bit and FP, while QAT is approx 8\% lower at these}
+
+Regarding training with ternary quantization, we see that  our method produces models that achieve near full precision performance for ResNet when quantized at 3-bit or higher. Ternary training for ViT is somewhat peculiar in that it fails to produce a model that is viable when quantized to ternary, whereas the performance of the resulting models starts to show a high level of variability at 4-bit and finally reaches close to full-precision accuracy at 8-bit. In contrast, for both ResNet and ViT, the performance of QAT degrades completely to random guessing when trained with ternary quantization and evaluated at any other quantization level. 
+
+\begin{table*}[t]
+\centering
+\tiny
+\begin{tabular}{llcccccc}
+\toprule
+{\bf Model} & {\bf Train bit} $\downarrow$ / {\bf Eval. bit} $\rightarrow$ & {\bf FP32} & {\bf Ternary} & {\bf 3-bit} & {\bf 4-bit} & {\bf 8-bit} \\
+\midrule
+\multirow{8}{*}{\bf ResNet-18} 
+ & Baseline (PTQ) & \cellcolor{gray!25} 88.50 $\pm$ 0.64 & 10.01 $\pm$ 0.01 & 10.28 $\pm$ 0.48 & 35.56 $\pm$ 9.05 & 88.45 $\pm$ 0.64 \\
+ \cmidrule(lr){2-7}
+ & Ternary QAT & 10.39 $\pm$ 0.71 & \cellcolor{gray!25}\textbf{77.02 $\pm$ 7.57} & 9.75 $\pm$ 0.77 & 10.03 $\pm$ 0.51 & 10.35 $\pm$ 0.63 \\
+ & Ternary OsciQuant & \textbf{87.44 $\pm$ 0.56} & \cellcolor{gray!25}44.59 $\pm$ 3.30 & \textbf{85.42 $\pm$ 1.13} & \textbf{87.03 $\pm$ 0.65} & \textbf{87.42 $\pm$ 0.56} \\
+ \cmidrule(lr){2-7}
+ & 3-bit QAT & 16.89 $\pm$ 4.97 & 10.01 $\pm$ 0.04 & \cellcolor{gray!25}{85.69 $\pm$ 1.83} & 17.42 $\pm$ 4.96 & 16.56 $\pm$ 4.32 \\
+ & 3-bit OsciQuant & \textbf{87.86 $\pm$ 0.42} & \textbf{20.19 $\pm$ 10.74} & \cellcolor{gray!25}{84.94 $\pm$ 1.59} & \textbf{87.56 $\pm$ 0.38} & \textbf{87.86 $\pm$ 0.42} \\
+ \cmidrule(lr){2-7}
+ & 4-bit QAT & {87.75 $\pm$ 1.13} & {10.13 $\pm$ 0.29} & {82.08 $\pm$ 6.25} & \cellcolor{gray!25}{87.71 $\pm$ 1.14} & {87.76 $\pm$ 1.12} \\
+ & 4-bit OsciQuant & {87.85 $\pm$ 0.49} & {11.91 $\pm$ 0.87} & {85.57 $\pm$ 1.10} & \cellcolor{gray!25}{87.08 $\pm$ 0.72} & {87.87 $\pm$ 0.49} \\
+\midrule
+\multirow{8}{*}{\bf Tiny ViT}
+ & Baseline (PTQ) & \cellcolor{gray!25}96.11 $\pm$ 0.31 & 9.39 $\pm$ 1.11 & 11.56 $\pm$ 1.99 & 21.57 $\pm$ 5.33 & 96.03 $\pm$ 0.34 \\
+ \cmidrule(lr){2-7} 
+ & Ternary QAT & 10.62 $\pm$ 1.29 & \cellcolor{gray!25} {\bf 73.53 $\pm$ 0.77} & 11.52 $\pm$ 1.82 & 11.13 $\pm$ 1.75 & 10.61 $\pm$ 1.26 \\
+ & Ternary OsciQuant & {\bf 95.79 $\pm$ 0.58} & \cellcolor{gray!25} 13.51 $\pm$ 1.32 & 12.53 $\pm$ 3.66 & {\bf 54.93 $\pm$ 27.32} & {\bf 95.76 $\pm$ 0.59} \\
+ \cmidrule(lr){2-7}
+ & 3-bit QAT & 86.94 $\pm$ 0.91 & {\bf 19.78 $\pm$ 6.04} & \cellcolor{gray!25}88.13 $\pm$ 0.60 & 86.69 $\pm$ 0.62 & 86.95 $\pm$ 0.89 \\
+ & 3-bit OsciQuant & {\bf 96.47 $\pm$ 0.11} & 9.48 $\pm$ 1.64 & \cellcolor{gray!25}88.68 $\pm$ 1.08 & {\bf 95.35 $\pm$ 0.18} & {\bf 96.50 $\pm$ 0.11} \\
+ \cmidrule(lr){2-7}
+ & 4-bit QAT & 95.14 $\pm$ 0.29 & 11.11 $\pm$ 1.84 & 59.86 $\pm$ 19.95 & \cellcolor{gray!25}94.96 $\pm$ 0.33 & 95.13 $\pm$ 0.28 \\
+ & 4-bit OsciQuant & {\bf 96.54 $\pm$ 0.09} & 11.90 $\pm$ 1.29 & {70.23 $\pm$ 12.75} & \cellcolor{gray!25}94.82 $\pm$ 0.51 & {\bf 96.55 $\pm$ 0.09} \\
+\bottomrule
+\end{tabular}
+\caption{Cross-bit evaluation of pre-trained ImageNet-1k models fine-tuned on CIFAR-10. Grey background is the target-bit accuracy. Models are trained using different quantization methods (QAT and ours) and bit-widths (ternary, 3-bit, and 4-bit), then evaluated across various bit-widths ranging from ternary to FP32. The grey diagonal shows the results for the bit used during training. Results are means and standard deviations over 5 random seeds. All significant differences between QAT and OsciQuant are shown in bold face.}
+\label{tab:robustness_results2}
+% \vspace{-0.5cm}
+\end{table*}
+
+
+\section{Discussion}\label{sec:discussion}
+% \textbf{Why does maximizing error increase quantization performance?}
+% $E[q(w)] = w*$ \ref{appendix:oscillate_expected_value}. Confidence budget; Network has low confidence in which quantized value to assign a weight which oscillate a lot \cite{vitoscillations}. One can also argue for flatness; large oscillation amplitude encourage the network to find areas around w which can be perturbed by s/2 without affecting $\loss(w)$.
+
+% \todo[inline]{
+% why does our method give better robustness than QAT?\\
+% Modelling first term only which pertubs, vs second term which minimize
+% }
+% \todo[inline]{Something about long training times when fine-tuning?}
+
+We have shown that training with weight oscillations induced via regularization is sufficient in most cases to maintain performance after quantization for ResNet and Tiny ViT. This begs the question whether weight oscillations are also a necessary part of the QAT training process. Indeed, some previous work already points towards this. There are examples claiming that both dampening and/or freezing of oscillations too early in the training process is detrimental to performance after quantization \cite{nagel2022overcoming, ImprovingLowBit}. And in other case presented in~\citet{vitoscillations}, freezing only the low frequency oscillating weights improves performance.
+This suggests that weight oscillations are both a necessary and sufficient part of QAT, at least in the early phases of the training process. This further supports our hypothesis that oscillations in QAT have a positive effect on quantization robustness.
+
+Additionally, there might be further benefits to our regularization approach compared to QAT. Our method aims to isolate this crucial part of the training process. This is arguably a more principled approach compared to QAT, where quantization during training combined with STE can lead to a number of side-effects beyond oscillations, which can be highly non-intuitive. We present a simple example in the Appendix Sec.~\ref{appendix:multi_layer_qat} where replacing a single scalar weight by a product of two scalar weights leads to a non-trivial change in training dynamics when using QAT with the STE.
+
+On the other hand, while it is not clear what the additional effects are during QAT, we do note two consistent deviations from the QAT performance when using our regularization method: QAT outperforms regularization at ternary quantization, whereas our regularization method outperforms QAT in cross-bit accuracy for the ternary and 3-bit case. In \ref{appendix:robustness_convergence}, we see how it seems that the cross-bit performance for QAT is upper-bounded by the target-bit performance, which might explain the subpar QAT performance at cross-bit compared to our regularization method which seems bounded by the full precision accuracy. Additionally we can note that while it is stated in~\citet{alizadeh2020gradient, OneModelRobust} that QAT is not robust to cross-bit quantization,~\ref{appendix:robustness_convergence} shows that for some cases the robustness is tied closely to how long the model is trained after the target bit accuracy has converged. 
+
+Finally we note in \ref{appendix:hyperparameters} that in the ResNet-18 model, we see similar results for the hyperparameter sweep for different $\lambda$s, which might suggest that the key for robustness is the presence of oscillations and not their precise nature.
+
+{\bf Limitations} In our experiments we observed that the robustness to cross-bit quantization improves in later training epochs. In order to further improve robustness one might consider an early stopping criterion that evaluates the performance on cross-bit quantization, which was not done in this work. The same approach could also increase cross-bit quantization robustness of QAT although to a lesser degree than for our method. 
+% Additionally the robustness of these solutions should be tested on different types of quantizers to further show the generality of the method.
+
+We performed our experiments on the CIFAR-10 dataset which might make it more difficult to compare our results with other published works that provide benchmark results for other datasets such as ImageNet-1k.
+
+% Our method gives better robustness because the weights can spuriously change at any point in time on a scale of the quantization level, so that the model can achieve consistently low loss only by finding a set of parameters that is resistant to sudden changes of the weight values on the order of magnitude that results from quantization. % In contrast to QAT our model is not evaluated with quantized weights and thus cannot overfit as easily to a certain level of quantization. \todo[inline]{we do evaluate on the quantized model, that is how we track target bit performance}
+
+% \todo[inline]{
+% High std on some (non-target bit) results:\\
+%  	In the convergence plot we see that in later epochs the robustness to non target bit increases. So if the early stopping activates early in training, we dont get good robustness, hence the large std. Ex. 4bit eval on 3bit
+%     }
+
+
+
+% \todo[inline]{
+% Lambda works across a wide range:\\
+%     Would make sense if we just perturb the weights and induce robustness
+% }
+
+
+% \todo[inline]{For ternary quantization there is a large drop in accuracy with our method compared to QAT. For a single layer model we only have the oscillation term. But for a multi-layer the linear term is no longer 0 in the gradient \ref{appendix:multi_layer_qat}. The linear term mininmizes the quantization error, making the weights more specialized towards the configuration of the quantizer. We see in the results that the accuracy for ternary QAT on bits greater than ternary breaks. For such extreme quantization as ternary, the regularization likely needs the stabilizing effect of the linear error minimizing term in QAT.}
+
+% \todo[inline]{Spikes at extremes of QAT weight distribution - Why does QAT matter?}
+
+% \todo[inline]{Robustness of QAT is bound by the target bit it seems (Very clear in vit 3 bit convergence plot), where as our seems bound by the FP32 precision.}
+
+\section{Conclusion}
+% Based on the analysis of a toy model we proposed the hypothesis that maximizing quantization error also leads to weight oscillations during training in deep neural networks and that these oscillations make the model robust to quantization. 
+
+Based on the analysis of a toy model we proposed the hypothesis that weight oscillations during training in deep neural networks make the model robust to quantization. 
+
+% In Section~\ref{sec:motivation} we show in a toy model that clustering of weights around quantization thresholds leads to oscillations and propose a regularizer that encourages this clustering behaviour. We confirm that as we increase the strength of the regularization, we empirically observe the appearance of clustering together with oscillations. 
+
+In Sections~\ref{sec:motivation} and~\ref{sec:method} we explain on a toy model how training with QAT and STE leads to oscillations and propose a regularizer that encourages this oscillating behaviour. We confirm that as we increase the strength of the regularization, we empirically observe the appearance of clustering together with oscillations. 
+
+Finally we experimentally confirm that the regularizer indeed leads to consistent robustness towards quantization for quantization levels above ternary. Our regularization method achieves comparable performance to QAT above ternary quantization when quantizing to the target-bit seen during optimizing and shows increased robustness compared to QAT in cross-bit quantization with bits greater than the target-bit used in the quantizer during training. All this being evidence of our hypothesis.
+
+Our insights on weight oscillations and their role in quantization robustness open new horizons for model quantization approaches. Our regularization method especially creates interesting possibilities for cross-bit robustness, potentially making our regularization method more appealing than QAT when the goal is to deploy or relase a single set of weights that works across different bit widths or maybe even quantizers. While the regularizer used in our experiments should be viewed as an initial step, we expect that quantization robustness could be further improved by developing oscillation-inducing methods that are adaptive to different learning rates, layer statistics or phases of the training process.
+
+%Since we make the weights more robust, this puts the method in line with \cite{alizadeh2020gradient} \cite{OneModelRobust}, but now we actually match QAT performance unlike other methods, which might further open up for on the fly quantization based on power demands.
+

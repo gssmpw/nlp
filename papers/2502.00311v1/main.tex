@@ -1,0 +1,710 @@
+
+\documentclass[10pt]{article} % For LaTeX2e
+\usepackage[preprint]{tmlr}
+% If accepted, instead use the following line for the camera-ready submission:
+%\usepackage[accepted]{tmlr}
+% To de-anonymize and remove mentions to TMLR (for example for posting to preprint servers), instead use the following:
+%\usepackage[preprint]{tmlr}
+
+% Optional math commands from https://github.com/goodfeli/dlbook_notation.
+\input{math_commands.tex}
+
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{booktabs}
+\usepackage{adjustbox}
+\usepackage{multirow}
+\usepackage{amssymb}
+\usepackage{amsthm}
+\usepackage{subfigure}
+\usepackage{caption}
+\usepackage{titlesec}
+\usepackage{comment}
+\newtheorem{definition}{Definition}
+\newtheorem{theorem}{Theorem}
+\newtheorem{remark}{Remark}
+
+
+\title{Sparse Gradient Compression \\ for Fine-Tuning Large Language Models}
+
+% Authors must not appear in the submitted version. They should be hidden
+% as long as the tmlr package is used without the [accepted] or [preprint] options.
+% Non-anonymous submissions will be rejected without review.
+
+\author{\name David H. Yang \email yangd13@rpi.edu \\
+      \addr Department of Computer Science\\
+      Rensselaer Polytechnic Institute
+      \AND
+      \name Mohammad Mohammadi Amiri \email mamiri@rpi.edu \\
+      \addr Department of Computer Science\\
+      Rensselaer Polytechnic Institute
+      \AND
+      \name Tejaswini Pedapati \email tejaswinip@us.ibm.com \\
+      IBM Research
+      \AND
+      \name Subhajit Chaudhury \email subhajit@ibm.com \\
+      IBM Research
+      \AND
+      \name Pin-Yu Chen \email pin-yu.chen@ibm.com \\
+      IBM Research
+      }
+
+% The \author macro works with any number of authors. Use \AND 
+% to separate the names and addresses of multiple authors.
+
+\newcommand{\fix}{\marginpar{FIX}}
+\newcommand{\new}{\marginpar{NEW}}
+
+\def\month{MM}  % Insert correct month for camera-ready version
+\def\year{YYYY} % Insert correct year for camera-ready version
+\def\openreview{\url{https://openreview.net/forum?id=XXXX}} % Insert correct link to OpenReview for camera-ready version
+
+
+\begin{document}
+
+
+\maketitle
+
+\begin{abstract}
+Fine-tuning large language models (LLMs) for downstream tasks has become increasingly crucial due to their widespread use and the growing availability of open-source models. However, the high memory costs associated with fine-tuning remain a significant challenge, especially as models increase in size. To address this, parameter efficient fine-tuning (PEFT) methods have been proposed to minimize the number of parameters required for fine-tuning LLMs. However, these approaches often tie the number of optimizer states to dimensions of model parameters, limiting flexibility and control during fine-tuning. In this paper, we propose sparse gradient compression (SGC), a training regime designed to address these limitations. Our approach leverages inherent sparsity in gradients to compress optimizer states by projecting them onto a low-dimensional subspace, with dimensionality independent of the original model's parameters. By enabling optimizer state updates in an arbitrary low-dimensional subspace, SGC offers a flexible tradeoff between memory efficiency and performance. We demonstrate through experiments that SGC can decrease memory usage in optimizer states more effectively than existing PEFT methods. Furthermore, by fine-tuning LLMs on various downstream tasks, we show that SGC can deliver superior performance while substantially lowering optimizer state memory requirements, particularly in both data-limited and memory-limited settings.
+\end{abstract}
+
+
+\section{Introduction}
+Large language models (LLMs) are increasingly being used across various disciplines, achieving remarkable performance in a wide range of natural language processing tasks. With the release of more open-source models, demand is growing to adapt them to downstream tasks \citep{touvron2023llama2openfoundation,dubey2024llama3herdmodels}. This is typically achieved using full fine-tuning, where all the parameters of a model are updated. However, as LLMs scale to billions of parameters, fine-tuning all the parameters of a model becomes increasingly challenging, demanding substantial memory resources.
+
+Full fine-tuning requires not only storing billions of model weights, but also maintaining both the gradients and optimizer states needed during training, which can drastically increase the memory consumption \citep{chowdhery2022palmscalinglanguagemodeling,bai2023qwentechnicalreport}. For example, the Adam optimizer requires storing both the first-and second-order moments of the gradients, doubling the memory needed compared to storing the model's trainable parameters \citep{kingma2017adammethodstochasticoptimization}. These memory constraints limit the practical ability to fine-tune LLMs, particularly in resource-constrained environments such as edge devices or personal computing platforms.
+
+To address this problem, parameter efficient fine-tuning (PEFT) techniques have been introduced, to train a model using a significantly smaller number of parameters \citep{ding2023parameter,han2024parameterefficientfinetuninglargemodels}. However, many existing methods lack the ability to provide both \textit{flexible} and \textit{granular} control over the number of optimizer states used for fine-tuning. Flexibility refers to the capacity to accommodate a broad range in the number of optimizer states, while granular control refers to the precision with which the number of optimizer states can be adjusted in small increments. This limitation may hinder the realization of a broader range of memory-performance tradeoffs, thereby restricting the potential of PEFT methods to achieve further efficiency gains.
+
+On the one end, we have approaches like BitFit \citep{zaken2022bitfitsimpleparameterefficientfinetuning}, which fine-tune only the bias terms, using a minimal number of parameters, but is neither flexible nor offers granular control. On the other hand, the popular low-rank adaptation (LoRA) is a more flexible approach that provides some control over the number of trainable parameters \citep{hu2021loralowrankadaptationlarge}. However, there still exists limitations to both flexibility and granularity. LoRA reparameterizes the fine-tuned weight matrices $\mW^{(1)} \in \R^{m \times n}$ into $\mW^{(1)} = \mW^{(0)} + \mB\mA$, where $\mW^{(0)} \in \R^{m \times n}$ is the frozen pre-trained weight matrix, and $\mA \in \R^{r\times n}$ and $\mB \in \R^{m \times r}$ are two low-rank matrices of rank $r$ ($r \ll \text{min}\{m, n\}$) to be trained. However, with LoRA, the number of optimizer states is a function of the dimensions of $\mA$ and $\mB$, which are dependent on $n$ and $m$, respectively. The minimum number of trainable parameters (achieved when $r=1$) is equal to $n + m$, limited by the dimensions of $\mW^{(0)}$. Therefore, there exists a bound dependent on $n + m$ in which we cannot reduce the number of optimizer states during fine-tuning any further. Likewise, the granularity over parameters is also a function of $n$ and $m$, and notice that both flexibility and granularity are impacted negatively with larger models. A similar limitation exists with many other approaches using prefix-tuning \citep{li2021prefixtuningoptimizingcontinuousprompts} and gradient compression approaches, such as GaLore \citep{zhao2024galorememoryefficientllmtraining} (see Appendix \ref{galore_appendix}).
+
+To address the above limitation, we propose sparse gradient compression (SGC), a training regime that enables more flexible and granular control over the number of parameters to train during fine-tuning. SGC updates the optimizer states in a $k$-dimensional subspace, where $k$ is independent of the original parameters dimension and represents the number of optimizer states. This allows SGC to significantly reduce the number of optimizer states, irrespective of the pretrained model's size, with $k$ providing flexibility to balance performance and memory efficiency (see Figure \ref{fig:linenumber}). Importantly, this memory saving comes without sacrificing performance, as we will demonstrate in our experimental results.
+
+The key idea behind SGC is leveraging the inherent sparsity of gradients during fine-tuning. By linearly projecting the optimizer states onto an arbitrarily lower-dimensional subspace, we can perform updates in this compressed space instead of the original space. A sparse recovery algorithm is then used to project the result of the optimizer function back into the original space, estimating the full-dimensional sparse vector from its lower dimensional representation, with sparsity originating from the gradients. By fine-tuning LLaMA2-7B, LLaMA3-8B, and LLaMa2-13B \citep{touvron2023llama2openfoundation,dubey2024llama3herdmodels} on commonsense reasoning tasks, we show that SGC achieves comparable or better results than other PEFT methods while using a significantly smaller number of optimizer states. Additionally, we show that our approach yields improved fine-tuning performance in both data-limited and memory-limited scenarios.
+
+\begin{figure}[t!]
+    \centering   \includegraphics[width=\linewidth]{numberlinev4.png}
+    \caption{Diagram comparing SGC (green) and PEFT methods LoRA and GaLore (blue) in terms of the dimension of optimizer states compared to full fine-tuning. SGC enables a lower minimum and finer granularity for the number of optimizer states since it is independent of parameter dimensions.}
+    \label{fig:linenumber}
+\end{figure}
+
+\section{Related Works}
+\textbf{Parameter Efficient Fine-tuning}. PEFT methods are used to reduce the expensive memory requirements for fine-tuning large models. Existing techniques can be split into several categories. Adapter-based methods introduce additional trainable modules that are inserted into the original frozen model \citep{houlsby2019parameterefficienttransferlearningnlp,pfeiffer2021adapterfusionnondestructivetaskcomposition,he2022unifiedviewparameterefficienttransfer,mahabadi2021parameterefficientmultitaskfinetuningtransformers}. However, these approaches may increase latency during inference. Prompt tuning, on the other hand, adapts a model by adding learnable prefix tokens to the input \citep{li2021prefixtuningoptimizingcontinuousprompts,lester2021powerscaleparameterefficientprompt, liu2022ptuningv2prompttuning}. Despite their simplicity, these methods have structural limitations since they only train additional input tokens. LoRA is a widely used PEFT method that does not introduce additional inference latency \citep{hu2021loralowrankadaptationlarge}. LoRA employs low-rank matrices to approximate the updates in the parameters during fine-tuning. Several variants of LoRA have been developed to either improve performance or further reduce the number of trainable parameters \citep{zhang2023adaloraadaptivebudgetallocation,xia2024chainloraefficientfinetuning,liu2024doraweightdecomposedlowrankadaptation,kopiczko2024veravectorbasedrandommatrix}. Due to LoRA's popularity, extensive research has been conducted on both its theoretical foundations and empirical performance \citep{jang2024loratrainingntkregime,hayou2024loraefficientlowrank,mao2024surveyloralargelanguage}. Additionally, quantization-based methods have been proposed to further reduce memory overhead \cite{dettmers2023qloraefficientfinetuningquantized,qin2024accuratelorafinetuningquantizationllms}. 
+
+\textbf{Gradient Compression}. An area that has been relatively underexplored but is now gaining attention is gradient compression \citep{zhao2024galorememoryefficientllmtraining,hao2024floralowrankadapterssecretly,liang2024memoryefficientllmtrainingonline,wu2024cgfedllmcompressgradientsfederated,song2024sparsefinetuningpretrainedlarge}. These approaches selectively compress gradient information to reduce the size of optimizer states during training. One category of methods uses projection matrices to obtain a lower-rank gradients \citep{zhao2024galorememoryefficientllmtraining,hao2024floralowrankadapterssecretly,liang2024memoryefficientllmtrainingonline}. For instance, GaLore uses singular value decomposition (SVD) to obtain projection matrices \citep{zhao2024galorememoryefficientllmtraining}, while FLoRA utilizes random projection matrices \citep{hao2024floralowrankadapterssecretly}. \citet{liang2024memoryefficientllmtrainingonline} propose a method that updates the projection matrix in an online fashion using principal component analysis. Alongside projection matrices, gradient sparsity is another emerging factor. SIFT shows that gradients are approximately sparse, and achieves efficient fine-tuning by selecting parameters corresponding to the largest gradient magnitudes \citep{song2024sparsefinetuningpretrainedlarge}. However, a significant limitation of this approach is that the selected parameters remain static, failing to fully capture the dynamic nature of gradient sparsity patterns during training.
+
+\section{Problem Formulation}
+We investigate the task of updating the parameters of a neural network, $\mW \in \R^d$, focusing specifically on \textit{fine-tuning}, and without introducing any new weights into the model's architecture. The objective is to adapt pretrained weights $\mW^{(0)} \in \R^{d}$ to $\mW^{(1)} \in \R^{d}$ for a particular task.\footnote{Without loss of generality, we represent model parameters as vectors instead of matrices.} The transition from $\mW^{(0)}$ to $\mW^{(1)}$ is defined as follows:
+\begin{equation}
+    \mW^{(1)} = \mW^{(0)} + \Delta{\mW}.
+\label{addition}
+\end{equation}
+The parameter update process involves minimizing a loss function $\mathcal{L}$ with respect to $\mW$ as follows:
+\begin{equation}
+    \underset{\mW}{\min} \text{ } \mathcal{L}(\mW^{(0)} + \Delta\mW),
+\end{equation}
+where we change the parameters in $\mW$ minimizing $\mathcal{L}$ to achieve $\mW^{(1)}$ from $\mW^{(0)}$.
+With no closed-form solution, the above problem is solved iteratively using the gradient signal $\mG_t = \nabla_{\mW_t} \mathcal{L} \in \R^d$ at every time step $t$, where $\mW_t$ denotes the parameters in $\mW$ at time $t$. Typically, to improve fine-tuning performance, an optimizer function $\rho_t(\cdot)$ is applied to the gradient $\mG_t$, where $\rho_t$ requires storing and updating additional optimizer states, each with the same dimensions as $\mG_t$. Therefore, the computational complexity and the memory requirements of applying the optimizer function is directly dependent on $d$, the dimension of $\mG_t$.
+
+With the emergence of LLMs, $d$ has grown substantially, making execution of the optimizer function $\rho_t(\cdot)$ highly resource-intensive. To address this, we define a transformation function that reduces the dimension of $\mG_t$ before being used in the optimizer function $\rho_t$. Specifically, we define $f: \R^d \rightarrow \R^k$ as the transformation function applied to the gradient $\mG_t$ as $\hat{\mG}_t = f(\mG_t)$ for some $k \ll d$. Now we use $\hat{\mG}_t$ as the input to the optimizer function $\rho_t$, reducing the dimension of the operations in the optimizer from a $d$-dimensional space to a $k$-dimensional space. The parameter update $\mW$ for a single time step can be written as follows:
+\begin{equation}
+    \mW_{t+1} = \mW_{t} - \eta g(\rho_t(\hat{\mG}_t)),
+\label{updates}
+\end{equation}
+where $\eta$ is the learning rate, and $g: \R^{k} \rightarrow \R^{d}$ is a transformation function that brings the output of $\rho_t$ back into the original $d$-dimensional space. We then denote the total changes in the parameters $\mW$ after $T$ time steps as:
+\begin{equation}
+    \mW^{(1)} = \mW^{(0)} - \eta \sum_t g(\rho_t(\hat{\mG}_t)).
+\label{fullupdates}
+\end{equation}
+This formulation allows us to perform the optimizer state updates in a smaller subspace $\R^k$ instead of the original space $\R^d$, where $k \ll d$. In practice, tracking the optimizer states in $\rho_t$ can be memory intensive if $k$ is large. Thus, the goal is to reduce $k$ as much as possible while maintaining reasonable performance in minimizing $\mathcal{L}$.
+
+\section{Methodology}
+In this section, we introduce our proposed method for performing updates on a $k$-dimensional subspace. We begin by motivating our approach with an overview of the well-known AdamW optimizer \citep{kingma2017adammethodstochasticoptimization,loshchilov2019decoupledweightdecayregularization}, followed by a detailed description of the gradient compression and decomposition processes. In addition, we present two more efficient variants of the proposed approach along with an analysis of memory requirements.
+\subsection{Motivation}
+Full fine-tuning model parameters $\mW^{(0)}$ corresponds to the case where all parameters in $\mW^{(0)}$ are updated, i.e., $f$ is the identity function and $\hat{\mG}_t = \mG_t$. If $\rho_t$ is also the identity function, i.e. we use no optimizer function, the updates simplify to stochastic gradient descent (SGD), and calculating $\Delta{\mW}$ requires storing no optimizer states. However, using an optimizer function that makes use of momentum often yields better performance during fine-tuning. In this paper, we focus on the popular AdamW optimizer (see Algorithm \ref{ADAM}), while both our formulation and proposed approach can be applied to various other optimizers. For full fine-tuning, AdamW requires storing two states $\mM_t \in \R^d$ and $\mV_t \in \R^d$ corresponding to the first and second moments, whose updates are controlled with hyperparameters $\beta_1 \in [0, 1]$ and $\beta_2 \in [0, 1]$, respectively. Taking this into account, the parameter update requires $2d$ memory in total to store $\mM_t$ and $\mV_t$. We note that $(\cdot)^2$ and $\sqrt{\cdot}$ applied to vectors are element-wise square and square-root operations, and $\epsilon$ is a small constant to ensure numerical stability during division. With $g$ being the identify function, we have
+\begin{equation}
+    \mW_{t + 1} = \mW_t - \eta \mN_{t}, \quad \mN_t = \frac{\mM_t}{\sqrt{\mV_t} + \epsilon}.
+\end{equation}
+Optimizer functions like AdamW contribute a large proportion of memory consumption during fine-tuning, and we will show how our approach aims to tackle this.
+
+\begin{algorithm}[t]
+\caption{AdamW at timestep \textit{t}}
+\label{ADAM}
+\begin{algorithmic}[1]
+\Require $\mG_t, \beta_1, \beta_2, \epsilon$
+\State $\mM_t \gets \beta_1 \mM_{t-1} + (1 - \beta_1) \mG_t$
+\State $\mV_t \gets \beta_2 \mV_{t-1} + (1 - \beta_2) \mG_t^{2}$
+\State $\mM_t \gets \frac{\mM_t}{1 - \beta_1^t}$
+\State $\mV_t \gets \frac{\mV_t}{1 - \beta_2^t}$
+\State $\mN_t \gets \frac{\mM_t}{\sqrt{\mV_t} + \epsilon}$
+\State \Return $\mN_t$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Sparse Gradient Compression (SGC)}
+In full fine-tuning, the gradients that are used as input in the AdamW algorithm can have a large dimension $d$. We would like to modify Algorithm \ref{ADAM} to update $\mM_t$ and $\mV_t$ on a $k$-dimensional subspace rather than the $d$-dimensional space, for some $k \ll d$, while retaining performance. This would significantly enhance the memory and compute efficiency of the optimizer, improving the efficiency of fine-tuning. We highlight that $\mM_t$ and $\mV_t$ are functions of $\mG_t \in \R^d$ and $\mG^2_t \in \R^d$, respectively. Therefore, in order to perform the operations on $\mM_t$ and $\mV_t$ in a $k$-dimensional subspace, we need to represent $\mG_t$ and $\mG^2_t$ on that subspace. We make use of the observation that $\mG_t$ is a quasi-sparse vector \citep{song2024sparsefinetuningpretrainedlarge} and can be compressed to a lower dimensional subspace to reduce memory usage in the optimizer function since both $\mM_t$ and $\mV_t$ can also be represented in the lower dimensional subspace. This enables us to conduct fine-tuning with much greater efficiency and control over the memory usage.
+
+
+We first sparsify $\mG_t \in \R^d$ by keeping only \textit{s} non-zero elements corresponding to $s$ entries with largest magnitudes, and set all other elements to zero which is denoted by $\text{Sparsify}_s(\cdot)$. The sparsified gradient is then projected onto a lower dimensional subspace of an arbitrary dimension $k$ using a projection matrix $\mA \in \R^{k \times d}$ that is initialized before fine-tuning:
+\begin{equation}
+    \Tilde{\mG}_t = \text{Sparsify}_s(\mG_t) \in \R^d, \quad \bm{p}_t = \mA \Tilde{\mG}_t \in \R^k.
+\label{projection}
+\end{equation}
+To compress $\mG^2_t$, we use the fact that element-wise squares retain the sparsity pattern of $\mG_t$. Thus, similar to $\mG_t$, we can represent $\mG^2_t$ on the $k$-dimensional subspace through
+\begin{equation}
+    \bm{q}_t = \mA \Tilde{\mG}^2_t \in \R^k.
+\end{equation}
+With $\mG_t$ and $\mG^2_t$ represented in a compressed form with dimension $k$ as $\bm{p}_t$ and $\bm{q}_t$, respectively, we modify Algorithm \ref{ADAM} by representing $\mM_t$ and $\mV_t$ in this $k$-dimensional subspace as follows:
+\begin{align}
+    \mM_t \leftarrow \beta_1 \mM_{t-1} + (1-\beta_1) \bm{p}_t, \label{m_update}\\
+    \mV_t \leftarrow \beta_1 \mV_{t-1} + (1-\beta_1) \bm{q}_t. \label{v_update}
+\end{align}
+Accordingly, we can perform the updates on optimizer states $\mM_t$ and $\mV_t$ on a $k$-dimensional subspace since $\bm{p}_t$ and $\bm{q}_t$ are $k$-dimensional. However, we need to go back to the original $d$-dimensional space to perform the weight updates from $\mW_t$ to $\mW_{t+1}$. As indicated in \eqref{updates}, this transform is conducted using the function $g:\R^k\rightarrow\R^d$. Rewriting \eqref{fullupdates}, this problem is equivalent to finding a function $g(\cdot)$ to perform the update
+\begin{equation}
+    \mW^{(1)} = \mW^{(0)} - \eta \sum_t g(\rho_t(\bm{p}_t, \bm{q}_t)).
+\end{equation}
+Thus, this approach enables performing the updates on a $k$-dimensional subspace instead of the $d$-dimensional space using AdamW. The only missing part is how to define $g(\cdot)$ that enables going from a $k$-dimensional subspace back to the original $d$-dimensional space for the parameter updates. Next, we introduce an approach to achieve such $g(\cdot)$ functionality.
+
+\subsection{Compressed Sensing of Optimizer States}
+Ideally, we would like to use $\mG_t$ and $\mG^2_t$ or their respective sparse versions $\Tilde{\mG}_t$ and $\Tilde{\mG}^2_t$ for the optimizer algorithms; however, for enhancing efficiency we instead use $\bm{p}_t$ and $\bm{q}_t$. We note that $\bm{p}_t$ and $\bm{q}_t$ are the results of linear projection of sparse vectors $\Tilde{\mG}_t$ and $\Tilde{\mG}^2_t$, respectively, onto a $k$-dimensional subspace. Thus, function $g(\cdot)$ should provide a good estimate of $\Tilde{\mG}_t$ and $\Tilde{\mG}^2_t$ when applied to $\bm{p}_t$ and $\bm{q}_t$, respectively. As a result, the problem is to estimate the sparse vectors $\Tilde{\mG}_t$ and $\Tilde{\mG}^2_t$ from their compressed forms, $\bm{p}_t$ and $\bm{q}_t$, respectively, compressed with linear projection.
+
+
+We use a recovery algorithm from compressive sensing (CS) to achieve the function $g(\cdot)$, which aims to estimate a sparse vector from its compressed form, compressed through linear projection. CS is a signal processing technique used to recover signals using fewer measurements than the Nyquist rate, when the signals are sparse \citep{candes2004robustuncertaintyprinciplesexact,donoho2006compressed}. Consider an $s$-sparse signal $\bm{x} \in \R^d$  with \textit{s} non-zero entries. We can reconstruct $\bm{x}$ from a set of linear measurements $\bm{y} = \mA \bm{x}$, if the measurement matrix $\mA \in \R^{k \times d}$ satisfies the restricted isometry property (RIP) for some number of measurements $k \le d$ \citep{candes2005decodinglinearprogramming,candes2008restricted}. The RIP conditions can be satisfied with high probability if every element of $\mA$ is independent and identically distributed according to a zero-mean normal distribution with standard deviation $1/\sqrt{k}$, and $k \ge \kappa s$, where $\kappa$ is an algorithm dependent constant \citep{candes2004robustuncertaintyprinciplesexact}.
+
+
+There exist various recovery algorithms to recover the $d$-dimensional $s$-sparse signal $\bm{x}$ from measurements $\bm{y}$ \citep{marques2018review}. In this paper, we use a greedy algorithm named orthogonal matching pursuit (OMP) \citep{pati1993orthogonal}. To enhance efficiency, inspired by \citet{zhu2020efficient}, we have developed a GPU optimized version of OMP, enabling its seamless integration with fine-tuning (see Appendix \ref{omp_appendix} for details). The OMP algorithm reconstructs an $s$-sparse vector $\bm{x}$ from the measurements $\bm{y}$ having knowledge about the measurement matrix $\mA$ denoted as follows:
+\begin{equation}
+    \hat{\bm{x}} = \text{OMP}_{\mA}(\bm{y}).
+\label{OMP}
+\end{equation}
+We now apply the recovery algorithm OMP to map the updates $\mM_t$ and $\mV_t$, given in equations \ref{m_update} and \ref{v_update}, respectively, from the $k$-dimensional subspace back to the original $d$-dimensional space. With the initialization $\mM_0=\bm{0}$ and $\mV_0=\bm{0}$, we can rewrite the updates $\mM_t$ and $\mV_t$ as:
+\begin{equation}
+\mM_t = \mA \sum_{i=1}^t h_i(\beta_{1}) \Tilde{\mG_i}, \quad \mV_t = \mA \sum_{i=1}^t h_i(\beta_{2}) \Tilde{\mG^2_i}
+    \label{mv_decomposed}
+\end{equation}
+where $h_i(\cdot)$ is a constant only a function of $\beta_1$ or $\beta_2$. We observe that $\sum_{i=1}^t h_i(\beta_{1}) \Tilde{\mG_i}$ and $\sum_{i=1}^t h_i(\beta_{2}) \Tilde{\mG^2_i}$ are linear combinations of the first and second moments of the sparsified gradients, respectively. Assuming that the total changes in the sparsity of $\mG_t$ over all $t$ can be bounded by some constant $\Tilde{s} \ll d$, we can use the OMP algorithm as in \ref{OMP} to almost accurately recover the original $d$-dimensional representations of $\mM_t$ and $\mV_t$. After applying OMP to $\mM_t$ and $\mV_t$ separately, we obtain $\mN_t$ as follows:
+\begin{equation}
+    \mN_t = \alpha \frac{\text{OMP}_{\mA}(\mM_t)}{\sqrt{\text{OMP}_{\mA}(\mV_t)} + \epsilon},
+\label{n_recovery}
+\end{equation}
+where $\alpha$ is a scaling factor. We note that the feasibility of obtaining $\mN_t$, as in \eqref{n_recovery}, is ensured by the fact that $\Tilde{\mG}_t$ and $\Tilde{\mG}^2_t$, and thus $\mM_t$ and $\mV_t$, share the same sparsity pattern. Consequently, the indices of the non-zero entries in $\text{OMP}_{\mA}(\mM_t)$ and $\text{OMP}_{\mA}(\mV_t)$ are identical. Furthermore, the sparsity level $s$ provides a tradeoff between performance and efficiency. Clearly, a larger $s$ leads to better performance since $\Tilde{\mG}_t$ provides a better estimate for $\mG_t$; however, it increases the computational overhead with the OMP algorithm in recovering an $s$-sparse vector.
+
+
+Following compression, the optimizer states $\mM_t$ and $\mV_t$ are now $k$-dimensional vectors. Setting $k = \kappa s$ leads to a reasonable recovery of $\sum_{i=1}^t h_i(\beta_{1}) \Tilde{\mG_i}$ and $ \sum_{i=1}^t h_i(\beta_{2}) \Tilde{\mG^2_i}$ from $\mM_t$ and $\mV_t$ in \ref{mv_decomposed}, using OMP. Now, the size of the optimizer states in AdamW becomes purely a function of $k$, and can be controlled at a granular level.
+
+We refer to our proposed method as SGC, which uses the AdamW optimizer and is presented in Algorithm \ref{CSADAM}. For ease of presentation, we represent this algorithm with $\mN_t$ = SGC($\mG_t$), which takes the gradient vector $\mG_t \in \R^d$ as the input and outputs $\mN_t \in \R^d$, while the optimizer states $\mM_t$ and $\mV_t$ are $k$-dimensional. Incorporating this into our formulation in \eqref{fullupdates} yields:
+\begin{equation}
+    \mW^{(1)} = \mW^{(0)} - \eta \sum_{t} \text{SGC}(\mG_t).
+\end{equation}
+
+\begingroup
+\begin{algorithm}[t]
+\caption{SGC at timestep \textit{t}}
+\label{CSADAM}
+\begin{algorithmic}[1]
+\Require $\mG_t, \mA, s, \beta_1, \beta_2, \epsilon$
+\State $\bm{p}_t \gets \bm{A} \text{ Sparsify}_s (\bm{G}_t)$, \quad $\bm{q}_t \gets \bm{A} \text{ Sparsify}_s (\bm{G}_t^2)$ 
+\State $\mM_t \gets \beta_1 \mM_{t-1} + (1 - \beta_1) \bm{p}_t$
+\State $\mV_t \gets \beta_2 \mV_{t-1} + (1 - \beta_2) \bm{q}_t$
+\State $\mM_t \gets \frac{\mM_t}{1 - \beta_1^t}$
+\State $\mV_t \gets \frac{\mV_t}{1 - \beta_2^t}$
+\State $\mN_t \gets \alpha \frac{\text{OMP}_{\bm{A}}(\mM_t)}{\sqrt{\text{OMP}_{\bm{A}}(\mV_t)} + \epsilon}$
+\State \Return $\mN_t$
+\end{algorithmic}
+\end{algorithm}
+\endgroup
+
+\subsection{Efficient SGC}
+
+Here, we propose two efficient alternatives of the SGC algorithm.
+
+\textbf{Memory Efficient SGC (MESGC)}.
+Based on our observations, size of the projection matrix $\mA \in \R^{k \times d}$ may significantly contribute to the computation overhead. Although it is initialized only once before fine-tuning, the memory requirements can become substantial depending on the value of $s$, the sparsity level of $\Tilde{\mG}_t$, particularly when applying the OMP algorithm. To address this issue, we introduce the idea of chunking the gradient signals prior to applying a projection matrix. Specifically, we split $\mG_t$ into $c$ equal sized chunks before sparsifying and projecting each chunk. This enables the projection matrix $\mA$ to be much smaller in size from $k \times d$ to $(k \times d) / c$. We split $\mG_t$ to $c$ equal-size chunks $\mG_t = \left[\mG^1_t, \dots, \mG^c_t \right]$ and apply the SGC algorithm to each $\mG^i_t$. Accordingly, we have $\mN^i_t = \text{SGC}(\mG^i_t) \in \R^{\frac{d}{c}}$, and we concatenate all these outputs to obtain $\mN_t$ as $\mN_t=\left[\mN^1_t, \dots, \mN^c_t \right]$. We select $s_c = s / c$ non-zero elements per chunk to ensure $s$ non-zero entries overall. Since the projection matrix $\mA$ is the same for each chunk, we obtain efficiency by a factor of $c$ for storing $\mA$. However, we may not achieve an exact estimate of $\Tilde{\mG}_t$ and $\Tilde{\mG}^2_t$ when sparsifying and concatenating $\mG^i_t$'s because the sparsity pattern in $\mG_t$ is not truly uniform. This performance loss would be more severe with increasing $c$, while it enhances efficiency by reducing the dimension of the projection matrix $\mA$. We note that the chunking technique introduces more flexibility with the proposed SGC approach in realizing a more diverse spectrum of performance-efficiency tradeoff. 
+
+\textbf{Compute Efficient SGC (CESGC)}.
+The main tradeoff for our memory efficient approach is increased runtime attributed to OMP, which scales with $d$, the size of gradients $\mG_t$. Here, we present a computationally efficient alternative at the expense of slightly increased memory usage. For ease of presentation here, consider $\mG_t \in \R^{m \times n}$ to be in a matrix form. The main idea is to perform double compression, where we first compress $\mG_t$ once using a projection matrix $\mB_t \in \R^{r \times m}$, and then apply SGC to this compressed gradient of dimension $(r \times n) \ll d$, therefore reducing time complexity. The intuition behind this approach is that the resultant vector after the first compression is still quasi-sparse. The projection matrix $\mB_t$ should be selected such that as much information is retained after projection. For this purpose, we use the fact that SGC is orthogonal to many other approaches. Thus, we apply one of these methods, GaLore, to obtain $\mB_t$, which reduces the dimension of the vector entering the SGC algorithm. Specifically, we initialize the projection matrix $\mB_t$ every fixed number of iterations by applying truncated SVD on $\mG_t$:
+\begin{equation*}
+    \mU, \Lambda, \mV = \text{SVD}(\mG_t), \quad \mB_t = \mU[:,:r] \in \R^{r \times m},
+\end{equation*}
+where $\mB_t$ is set to be the first $r$ columns of the left-singular vectors of SVD of $\mG_t$. We then project the gradients $\mG_t$ using $\mB_t$ and apply SGC to the resultant vector, i.e., SGC($\mB_t \mG_t$). Finally, we project back the resultant updates from SGC($\mB_t \mG_t$) onto the original $d$-dimensional space using $\mB_t^T$ to update the parameters in $\mW$. Incorporating this into our formulation in \eqref{fullupdates} yields:
+\begin{equation}
+    \mW^{(1)} = \mW^{(0)} - \eta \sum_{t} \mB^T_t\text{SGC}(\mB_t\mG_t).
+\end{equation}
+We note that the dimension of the vector entering SGC is $r \times n$ rather than $d$, thus improving the compute efficiency with OMP. CESGC can be combined with our memory efficient implementation, where chunking is performed after the projection of $\mG_t$, and we assume this is performed by default for experiments using CESGC. In Appendix \ref{appendix_sgc}, we discuss some further extensions of SGC.
+
+\subsection{Memory Analysis}
+Here, we analyze the memory requirements of our efficient SGC implementations and compare it with popular gradient compression and PEFT methods, specifically GaLore and LoRA. The memory requirements of our approach, Galore, and LoRA to perform weight updates for a single vector are shown in Table \ref{compare_table}. Observe that the number of optimizer states in both Galore and LoRA are a function of $d$. On the other hand, the size of optimizer states for our memory efficient approach is independent of the weight dimensions, and only depends on $k=\kappa c s_c$, where $s_c$ is sparsity per chunk, $c$ is the number of chunks, and the constant $\kappa$ is to satisfy the RIP conditions for the OMP algorithm. This enables SGC to be significantly more memory efficient in the optimizer states.
+\begin{table}[t]
+\centering
+\caption{Comparison between our approach, GaLore, and LoRA for storing the trainable parameters during fine-tuning with AdamW. For simplicity, assume weight dimensions $d$ can be reshaped to $2$D matrix of size $\sqrt{d}\times\sqrt{d}$, $r \ll d$ is the chosen rank, $k \ll d$ is the dimension we want to compress each optimizer state to. The projection matrices refer to the costs of storing $\mB_t$ during fine-tuning.}
+\begin{tabular}{lcccc}
+\toprule
+& \textbf{MESGC} & \textbf{CESGC} & \textbf{GaLore} & \textbf{LoRA} \\
+\midrule
+Weights & $d$ & $d$ & $d$ & $d + 2r\sqrt{d}$ \\
+Optimizer States & $2 k$ & $2 k$ & $2r\sqrt{d}$ & $4r\sqrt{d}$ \\
+Projection Matrices & - & $r\sqrt{d}$ & $r\sqrt{d}$ & - \\
+\bottomrule
+\end{tabular}
+\label{compare_table}
+\end{table}
+
+\subsection{Convergence Analysis}
+Following \citet{stich2018sparsifiedsgdmemory}, it is possible to show that top-$ k $ sparsification leads to convergence at the same rate as vanilla SGD. The key difference in our algorithm is the use of chunking and sparsification applied to every chunk. Thus, the proof of convergence boils down to bounding the distance between the sparse form of gradient vector $\mG$ and the sparse form of every sub-vector after chunking the gradient vector $\mG$. 
+\begin{definition}[Chunk-based $s$-sparsification]
+\label{def:chunk_sparsification}
+Let $\mG \in \mathbb{R}^d$ be a gradient vector, partitioned into $c$ equally sized chunks:
+\[
+\mG 
+= \bigl[\mG^1, \dots, \mG^c\bigr], 
+\quad 
+\mG^i \in \mathbb{R}^{\frac{d}{c}}, \quad i=1,\dots,c.
+\]
+We define the \emph{chunk-based $s$-sparsified} vector $\tilde{\mG}'$ by applying an $s_c$-sparsification to each chunk, where $s = \sum_{i=1}^c s_c$. Concretely,
+\[
+\tilde{\mG}' 
+= \bigl[\tilde{\mG}^1, \dots, \tilde{\mG}^c\bigr],
+\quad
+\tilde{\mG}^i 
+= \mathrm{Sparsify}_{s_c}\bigl(\mG^i\bigr).
+\]
+That is, within each chunk $\mG_i$, we keep exactly the top $s_c$ magnitude entries and set the rest to zero.
+
+Separately, we define the \emph{global $s$-sparsified} vector
+\[
+\tilde{\mG} = \mathrm{Sparsify}_{s}\bigl(\mG\bigr),
+\]
+which keeps the top-$s$ entries from the entire vector $\mG$ rather than chunk-by-chunk.
+\end{definition}
+
+\begin{theorem}[Worst-case bound on chunk-based vs.\ global sparsification]
+\label{thm:worst_case_bound}
+Let $\mG, \tilde{\mG}'$ and $\tilde{\mG}$ be as in Definition~\ref{def:chunk_sparsification}.
+Then, it holds that 
+\[
+\mathbb{E}\bigl[\|\tilde{\mG}' - \tilde{\mG}\|_2^2\bigr]
+\;\le\;
+2\Bigl(1 - \frac{s}{d}\Bigr)\,G_{\text{max}},
+\]
+where $G_{\text{max}}$ is an upper bound on $\mathbb{E}\bigl[\|\tilde{\mG}'\|_2^2\bigr]$.
+\end{theorem}
+
+\begin{proof}
+
+The worst-case scenario corresponds to when all $s$ non-zero entries of $\tilde{\mG}'$ are contiguous, and without loss of generality, located in indices $1$ to $s$. Let $l = \bigl\lceil \tfrac{s}{d/c} \bigr\rceil$ be the number of chunks spanning these $s$ non-zero indices of $\tilde{\mG}'$. Decompose the total error:
+\[
+D_1 
+= \mathbb{E}\Bigl[\sum_{i=1}^l \|\tilde{\mG}'^i - \tilde{\mG}^i\|_2^2\Bigr]
+\quad \text{and} \quad
+D_2
+= \mathbb{E}\Bigl[\sum_{i=l+1}^c \|\tilde{\mG}'^i - \tilde{\mG}^i\|_2^2\Bigr].
+\]
+Intuitively, $D_1$ captures missing entries in the first $l$ chunks not selected by $\tilde{\mG}'$, while $D_2$ captures ``extra'' entries in the other $c - l$ chunks that are selected but should be zero.
+
+By bounding each term via
+\[
+D_1 \,\le\, (s - l s_c)\,\mathbb{E}\Bigl[\tfrac{\|\tilde{\mG}'\|_2^2}{s}\Bigr]
+\quad \text{and} \quad
+D_2 \,\le\, (c - l)\,s_c\,\mathbb{E}\Bigl[\tfrac{\|\tilde{\mG}'\|_2^2}{s}\Bigr],
+\]
+we obtain
+\[
+\mathbb{E}\bigl[\|\tilde{\mG}' - \tilde{\mG}\|_2^2\bigr]
+\;=\;
+D_1 + D_2
+\;\le\;
+2\Bigl(1 - \tfrac{s}{d}\Bigr)\,\mathbb{E}\bigl[\|\tilde{\mG}'\|_2^2\bigr]
+\;\le\;
+2\Bigl(1 - \tfrac{s}{d}\Bigr)\,G_{\text{max}},
+\]
+which completes the proof.
+\end{proof}
+We note that for the uniform case where the non-zero entries of $\tilde{\mG}'$ are uniformly distributed among the $d$ indices, each chunk $\mG_i$ is likely to contain about $s_c$ of those entries. Thus, $\tilde{\mG}' \approx \tilde{\mG}$ in expectation, and
+\[
+\mathbb{E}\bigl[\|\tilde{\mG}' - \tilde{\mG}\|_2^2\bigr] = 0.
+\]
+Using these results, it is possible to formulate the theoretical conditions for convergence, and we leave this as part of future work.
+
+
+\section{Experiments}
+We evaluate our approach on fine-tuning various large languages models, specifically on LLaMA2-7B, LLaMA3-8B, and LLaMA2-13B, and Mistral-7B. The results are compared with full fine-tuning, LoRA, and GaLore as baseline for all the setups. In addition, we demonstrate how our approach performs well in both small dataset and optimizer state sizes. The results show that SGC enables more granular control over the number of optimizer states and achieves comparable or better accuracy to baseline approaches while using a significantly smaller number of optimizer states.
+
+\subsection{Commonsense and Knowledge Evaluation}
+We evaluate LLaMA2-7B, LLaMA3-8B, and LLaMA2-13B on a set of commonsense reasoning tasks to demonstrate CESGC's effectiveness in fine-tuning. Commonsense reasoning tasks involve 8 subtasks and we follow \citet{hu2023llmadaptersadapterfamilyparameterefficient} to combine the training sets into a single dataset and evaluate on each of the individual tasks separately. Details of hyperparameters and training settings can be found in Appendix \ref{commonsense_details}. Results from Table \ref{commonsense} show that our approach achieves a comparable average accuracy compared to both GaLore and LoRA, while using a smaller number of optimizer state parameters. Notably, in the LLaMA3-8B model, CESGC performs the best, achieving a superior accuracy of $1\%$ over LoRA, while using less than half the number of optimizer state parameters. To further demonstrate the consistency of our approach, we fine-tune Mistral-7B on a subset of the cleaned Alpaca dataset \citet{alpaca}, and evaluate its performance on the MMLU benchmark (details can be found in Appendix \ref{knowledge_evaluation}). These results indicate that our approach achieves competitive performance across different model types and tasks.
+
+\begin{table}[t]
+\caption{LLaMA2-7B, LLaMA3-8B, and LLaMA2-13B on fine-tuning eight commonsense benchmarks (5 shots) using various PEFT methods. Average accuracy is reported in the final column. Note that \# Params refers to percentage of optimizer states, $\mM_t$ and $\mV_t$, relative to full fine-tuning.}
+\begin{adjustbox}{max width=\textwidth}
+\centering
+\begin{tabular}{c|c|c|c|c|c|c|c|c|c|c|c}
+\toprule
+Model & Method & \# Params (\%) & \textbf{ARC-e} & \textbf{ARC-c} & \textbf{BoolQ} & \textbf{HellaSwag} & \textbf{OBQA} & \textbf{PIQA} & \textbf{SIQA} & \textbf{WinoGrande} & \textbf{Average} \\
+\midrule
+\multirow{4}{*}{LLaMA2-7B} & Full Fine-tuning & 100 & 82.5 & 55.4 & 83.8 & 77.8 & 45.8 & 80.1 & 55.4 & 77.8 & 69.8\\
+& CESGC & 0.08 & 82.9 & 53.9 & 82.9 & 77.5 & 44.8 & 79.9 & 54.2 & 74.5 & 68.7\\
+& GaLore & 0.10 & 82.3 & 54.1 & 81.7 & 78.2 & 45.8 & 80.6 & 53.5 & 75.3 & \textbf{68.9}\\
+& LoRA & 0.20 & 82.1 & 53.2 & 84.3 & 76.2 & 44.0 & 80.4 & 54.0 & 76.5 & 68.8\\
+\midrule
+\multirow{4}{*}{LLaMA3-8B} & Full Fine-tuning & 100 & 85.8 & 62.5 & 86.6 & 81.2 & 51.4 & 82.3 & 59.5 & 81.9 & 73.9\\
+& CESGC & 0.08 & 83.9 & 57.8 & 85.2 & 81.0 & 46.2 & 82.0 & 53.4 & 77.8 & \textbf{70.9}\\
+& GaLore & 0.10 & 84.3 & 57.2 & 82.6 & 81.2 & 46.2 & 82.3 & 52.9 & 78.0 & 70.6\\
+& LoRA & 0.20 & 82.3 & 56.2 & 83.8 & 79.5 & 48.0 & 81.7 & 52.8 & 74.4 & 69.9\\
+\midrule
+\multirow{4}{*}{LLaMA2-13B} & Full Fine-tuning & 100 & 86.2 & 60.9 & 87.4 & 81.0 & 51.8 & 82.0 & 60.3 & 82.9 & 74.1\\
+& CESGC & 0.07 & 84.1 & 57.2 & 85.3 & 80.0 & 49.4 & 82.0 & 54.6 & 78.6 & 71.4\\
+& GaLore & 0.08 & 83.8 & 56.2 & 85.3 & 81.2 & 47.4 & 81.7 & 55.5 & 79.0 & 71.3\\
+& LoRA & 0.16 & 83.4 & 57.1 & 86.3 & 81.3 & 48.0 & 81.7 & 56.5 & 79.6 & \textbf{71.7}\\
+\bottomrule
+\end{tabular}
+\end{adjustbox}
+\label{commonsense}
+\end{table}
+
+\begin{table}[t]
+\centering
+\caption{Mistral-7B performance on the MMLU evaluation across various domains using different PEFT methods. Average accuracy is reported in the final column.}
+\label{tab:mistral7b_mmlu}
+\begin{adjustbox}{max width=\textwidth}
+\begin{tabular}{c|c|c|c|c|c}
+\toprule
+Method & \textbf{STEM} & \textbf{Social Science} & \textbf{Humanities} & \textbf{Other} & \textbf{Average} \\
+\midrule
+CESGC & 52.3 & 72.6 & 56.0 & 69.2 & \textbf{61.9} \\
+GaLore & 52.3 & 72.6 & 56.0 & 69.0 & 61.8 \\
+LoRA   & 52.1 & 72.8 & 55.9 & 68.9 & 61.8 \\
+\bottomrule
+\end{tabular}
+\end{adjustbox}
+\end{table}
+
+
+
+\subsection{Memory Efficiency and Throughput}
+Consider $r=1$, the minimum rank used for GaLore and LoRA. Based on Table \ref{compare_table}, we can calculate that GaLore and LoRA require $8192$ and $16384$ optimizer states, respectively. With $s_c=1$, $c=64$, and $\kappa=7$, MESGC requires only $896$ optimizer states, reducing the number of parameters by around $10$ times. To demonstrate how MESGC performs using a significantly lower number of optimizer states, we fine-tune LLaMA2-7B on a subset of the commonsense reasoning dataset, setting $k=2048$ (see Appendix \ref{appendix_memeff} for details). Table \ref{table:minsuperior} shows that MESGC achieves $0.6\%$ higher average accuracy than GaLore when fine-tuning LLaMA2-7B on commonsense reasoning while using only half the number of optimizer states. We also measure the throughput using wall clock time per iteration with the same fine-tuning task and compare our approaches with other methods (see Table \ref{table:superior}). In particular, MESGC introduces some additional latency, but CESGC is optimized to be competitive with the baseline approaches.
+
+\subsection{Small Datasets and Small Optimizer States}
+In this section, we analyze our approach in extreme scenarios, namely cases of extremely small datasets and optimizer states. To evaluate our approach's effectiveness on small datasets, we focus on fine-tuning LLaMA2-7B on subsets of the BoolQ \citep{clark2019boolqexploringsurprisingdifficulty} dataset while using a minimal number of optimizer states. Specifically, we split the full dataset into multiple subsets ranging from $500$ to $2000$ samples, and use an equal number of optimizer states across all methods (further details can be found in Appendix \ref{appendix_small}). From Figure \ref{fig:smallfigure}, it can be seen that CESGC performs strictly better using small dataset sizes. We observe that this may be task dependent, but for tasks such as BoolQ that rely on leveraging the pre-trained knowledge about facts and entities, our approach can provide a more targeted method for fine-tuning by greedily adjusting based on largest gradient magnitudes. On the other hand, LoRA at the lowest rank ($r=1$) struggles to learn under the limited dataset scenario, while GaLore with $r=1$ underperforms CESGC.
+
+By being independent of hidden dimension size, our approach enables fine-tuning using a smaller number of optimizer states than possible compared to both GaLore and LoRA (see Figure \ref{fig:increment}). With $\kappa=8$ and $c=64$, we can increase $s_c$ by $1$ at each increment to obtain the plot for CESGC. The granularity for CESGC is $512$, which is significantly less than both GaLore ($8192$) and LoRA ($16384$). This enables a finer sweep in the number of optimizer states to search for best hyperparameters to use. For instance, as shown in the figure, CESGC achieves $80.2\%$ accuracy with using just over $6000$ optimizer states, whereas both GaLore and LoRA are unable to obtain results since it is below the minimum number of optimizer state parameters they can support.
+
+\begin{table}[t]
+    \centering
+    \begin{minipage}[t]{0.48\linewidth} % Use [t] for top alignment
+        \centering
+        \caption{Comparison of wall clock time per iteration between methods.}
+        \label{table:superior}
+        \begin{tabular}{c c}
+          \toprule
+          Method & Time per iteration (s) \\
+          \midrule
+          Full Fine-tuning & 1.69 \\
+          LoRA & 1.51 \\
+          GaLore & 1.88 \\
+          MESGC & 7.52 \\
+          CESGC & 2.82 \\
+          \bottomrule
+        \end{tabular}
+    \end{minipage}%
+    \hfill
+    \begin{minipage}[t]{0.48\linewidth} % Use [t] for top alignment
+        \centering
+        \caption{Fine-tuning results using a minimum number of optimizer states. MESGC conducted with $c=256$, $s_c=1$, $\kappa=8$, while both GaLore and LoRA use rank $r=1$.}
+        \label{table:minsuperior}
+        \begin{tabular}{c c c}
+          \toprule
+          Method & \# Params & Accuracy \\
+          \midrule
+          MESGC & 4096 & 68.0 \\
+          GaLore & 8192 & 67.4 \\
+          LoRA & 16384 & 67.7 \\
+          \bottomrule
+        \end{tabular}
+    \end{minipage}
+\end{table}
+
+\begin{figure}[h!]
+    \centering
+    \subfigure[Small Dataset study]{
+        \includegraphics[width=0.48\linewidth]{smallv1.png}
+        \label{fig:smallfigure}
+    }
+    \hfill
+    \subfigure[Optimizer State study]{
+        \includegraphics[width=0.48\linewidth]{incrementv1.png}
+        \label{fig:increment}
+    }
+    \caption{\textbf{(a)}. CESGC outperforms both GaLore and LoRA when fine-tuning with limited data on BoolQ. \textbf{(b)}. Plot showing improvement of accuracy of CESGC when using a minimal number of optimizer states. Hollow blue points are interpolated values that indicate the granularity of CESGC across optimizer states.}
+\end{figure}
+
+\subsection{Ablation Study}
+Here, we investigate the effects of number of chunks $c$, total sparsity $s$, and the constant $\kappa$ on fine-tuning performance (details in Appendix \ref{appendix_ablation}). First, we set the total sparsity $s$, to be constant and vary $c$. Figure \ref{fig:ablationc} shows that increasing the number of chunks, while keeping the total $s$ constant decreases average accuracy across the commonsense reasoning evaluation. We attribute this to the uniform chunking, where the number of non-zero elements selected per chunk is $s_c =s / c$. However, in practice, the sparsity pattern of gradients may vary across the chunks, with certain parameter regions potentially requiring more attention than others. Therefore, we see higher accuracy corresponding to smaller chunk sizes. 
+
+For sparsity, there is a general increasing trend, as seen in Figure \ref{fig:ablations}. As the number of non-zero elements selected increases, so does the number of optimizer states $k$, we expect the accuracy to improve until $s$ is equal to the number of parameters, as in full fine-tuning. We observe that increasing $s$ after a certain point results in diminished returns seeing as the slope is most steep when $s$ is increased initially and is less steep afterwards. This can be explained by how a small percentage of parameters account for the majority of the gradient norms during fine-tuning, which is supported by the observations in \citet{song2024sparsefinetuningpretrainedlarge}. 
+%To obtain optimal performance, it would be ideal to select a small chunk size $c$ and a large sparsity $s$ value, but this comes at the cost of increased memory requirements. 
+%The ablation study demonstrates that our approach can be used to trade-off between memory cost and accuracy. \\
+
+
+
+Finally, we investigate the effect of $\kappa$, the constant to satisfy the RIP condition, with the goal of finding a lower bound such that performance is not negatively affected. Based on Figure \ref{fig:ablationk}, we see that if $\kappa$ is set to $6$, performance drops significantly. However, there is minimal gain from increasing $\kappa$ from $7$ to $8$, indicating a $\kappa$ value of $7$ should be sufficient.
+
+\begin{figure}[t!]
+    \centering
+    \subfigure[Number of chunks study]{
+        \includegraphics[width=0.31\linewidth]{chunksize.png}
+        \label{fig:ablationc}
+    }
+    \hfill
+    \subfigure[Sparsity study]{
+        \includegraphics[width=0.31\linewidth]{sparsity.png}
+        \label{fig:ablations}
+    }
+    \hfill
+    \subfigure[$\kappa$ study]{
+        \includegraphics[width=0.31\linewidth]{kappa.png}
+        \label{fig:ablationk}
+    }
+    \caption{Ablation study for effects of number of chunks $c$, sparsity $s$, and constant $\kappa$. \textbf{(a)}. Average accuracy with varying $c$ and constant $s$. \textbf{(b)}. Average accuracy with varying $s$ and constant $c$. \textbf{(c)}. Average accuracy with varying $\kappa$.}
+\end{figure}
+
+\section{Conclusion}
+In this work, we proposed a novel fine-tuning method, SGC, that enables flexible and granular control over the number of optimizer states. The key idea, leveraging the sparsity of the gradients, is to compress them through a linear projection onto a subspace of an arbitrary dimension $k$, which is independent of the original parameter dimensions. The updates are performed within this lower-dimensional subspace, and the results are projected back into the original $d$-dimensional space, effectively utilizing the gradient sparsity. This allows SGC to have significantly smaller and more granular number of parameters to train during fine-tuning compared to other PEFT approaches. We also provided two efficient implementations of SGC, MESGC and CESGC, and show through experiments that our approach can achieve comparable accuracy while being more memory efficient than other PEFT methods. Notably, we demonstrated that our approach achieves superior performance in data-limited settings, achieving higher accuracy than both LoRA and GaLore. Our approach is orthogonal to many gradient compression methods, opening opportunities for future work to integrate them and explore SGC's generalizability in domains like vision and audio.
+
+\textbf{Acknowledgement}\\ This work was supported by IBM through the IBM-Rensselaer Future of Computing Research Collaboration.
+
+%\clearpage
+
+%% Please note that we have introduced automatic line number generation
+%% into the style file for \LaTeXe. This is to help reviewers
+%% refer to specific lines of the paper when they make their comments. Please do
+%% NOT refer to these line numbers in your paper as they will be removed from the
+%% style file for the final version of accepted papers.
+
+
+\bibliography{main}
+\bibliographystyle{tmlr}
+
+\clearpage
+
+\appendix
+\section{GaLore Analysis}
+\label{galore_appendix}
+\vspace{-5pt} % Adjust this value as needed
+Rather than operating on the parameter space, GaLore saves memory by reducing the number of parameters in the optimizer states \citep{zhao2024galorememoryefficientllmtraining}. Specifically, it projects the gradient $\mG_t \in \R^{m \times n}$ at each time step $t$ to a lower-dimensional representation $\hat{\mG}_t = \mP_t \mG_t \in R^{r \times n}$ by using a projection matrix $\mP_t \in \R^{r \times m}$ that is set to the first $r$ columns of the left singular vectors of SVD of $\mG_t$. The size of the optimizer states, which are equal to the dimensions of the projected gradient $\hat{\mG}_t$ is then reduced, providing memory savings. However, observe that $\hat{\mG}_t$ is still dependent on $n$, meaning that, similar to LoRA, there exists a bound dependent on $n$ that we cannot reduce the number of optimizer states any further. Likewise, granularity over parameters is a function of $n$, and tied to the model's weight dimensions.  
+
+\section{Efficient Orthogonal Matching Pursuit} \label{omp_appendix}
+\vspace{-5pt} % Adjust this value as needed
+Our implementation of OMP is based on the inverse Cholesky factorization method \citep{zhu2020efficient}, see Algorithm \ref{omp_full}. We perform pre-calculation of the gram matrix $\mG$, to reduce computational costs, but introduce additional memory requirements. For memory efficiency, $\mG$ should not be pre-computed or alternatively, it is possible to implement a more memory efficient Algorithm \ref{omp_full} at the expense of additional runtime.
+
+\begin{algorithm}
+\caption{OMP by Inverse Cholesky Factorization}
+\begin{algorithmic}
+    \Require Measurements $\bm{y}$, projection matrix $\mA$, sparsity value $s$
+    \State \textbf{Initialize:} $\Lambda_0 = \emptyset$, the residual $\bm{r}^{(0)} = \bm{y}$, gram matrix $\mG = \mA^H \mA$, and the iteration counter $k = 1$.
+    \While{$k \le s$}
+    \State \textbf{Projection:} if $k=1$, compute $\bm{p}^{0} = \mA^H \bm{r}^{0}$, else
+    \[
+    \bm{p}^{(k-1)} = \bm{p}^{(k-2)} - \bm{b}_{:(k-1)}a_{k-1},
+    \]
+    where $\bm{b}_{:(k-1)}$ is the $(k-1)$-th column of $\mB_{k-1}$, and $\bm{a}_{k-1}$ is the $(k-1)$-th entry of $\bm{a}_{k-1}$.
+    \State \textbf{Select} $i^{(k)} = \arg\max_{i=1,2,...,d} \left(\frac{|p_i^{(k-1)}|}{\|\mA_{:i}\|}\right)$, where $p_i^{(k-1)}$ is the $i$-th entry of $\bm{p}^{(k-1)}$.
+    \[
+    \text{Let }\Lambda_k = \Lambda_{k-1} \cup \{i^{(k)}\}, \quad \text{i.e.,} \quad \lambda_k = i^{(k)} \text{ is the k-th entry of the set } \Lambda_k.
+    \]
+    \State \textbf{Obtain}
+    \[
+    \bm{c}_{k-1} = \left(\bm{b}_{\lambda_{k}, 1:\Lambda_{k-1}}^H\right)^H,
+    \]
+    where $\bm{b}_{\lambda_{k}, 1:\Lambda_{k-1}}$ is the $\lambda_{k}$-th row of $\mB_{k-1}$. Then compute $\gamma_k = \frac{1}{\sqrt{g_{\lambda_k, \lambda_k} - \bm{c}^H_{k-1}\bm{c}_{k-1}}}$,
+    \[
+    a_k = \gamma_k p^{k-1}_{\lambda_k},
+    \]
+    \[
+    \bm{a}_k = \begin{bmatrix}
+           \bm{a}_{k-1}^T \quad a_{:k} 
+         \end{bmatrix}^T,
+    \]
+    \[
+    \bm{b}_{:k} = \gamma_k\left(\bm{g}_{:\lambda_k} - \mB_{k-1}\bm{c}_{k-1}\right),
+    \]
+    \[
+    \mB_k = \begin{bmatrix}
+           \mB_{k-1}^T \quad b_{:k} 
+         \end{bmatrix},
+    \]
+    where $p_{\lambda_k}^{k-1}$ is the $\lambda_k$-th entry of $\bm{p}^{k-1}$, $\bm{g}_{:\lambda_k}^k$ is the $\lambda_k$-th column of $\mG$, and $\bm{c}_0 = \mB_0 = \bm{a}_0 = \emptyset$ is assumed for $k = 1$. Finally, if $k = 1$, compute $\mF_1=\sqrt{g_{\lambda_1, \lambda_1}}$, else
+    \[
+    \mF_k = \begin{bmatrix}
+                   \mF_{k-1} & -\gamma_k \mF_{k-1} \bm{c}_{k-1} \\
+                   \bm{0}_{k-1} & \gamma_k
+                 \end{bmatrix},
+    \]
+    
+    $k := k + 1$.
+    \EndWhile
+    \State \textbf{Output:} Compute $\hat{\bm{x}}_s = \mF_s\bm{a}_s$, \text{ } $\bm{r}^{(s)} = y - \mA_{\Lambda_s} \hat{\bm{x}}_s$, \text{ } and return $\bm{r}^{(s)}, \Lambda_s, \hat{\bm{x}}_s$.
+\end{algorithmic}
+\label{omp_full}
+\end{algorithm}
+
+\clearpage
+
+\section{Extensions of SGC}
+\label{appendix_sgc}
+In practice, having a static projection matrix $\mA$ is heavily dependent on the initialization, and can potentially lead to slower convergence. To address this, we can adjust $\mA$ every $T$ iterations, and modify SGC to obtain SGCA outlined in Algorithm \ref{SGCA}. Lines $9$ initializes a new random projection matrix $\mA'$ to enable future gradients $\mG_t$ to be projected into another subspace. Lines $10-11$ are necessary to ensure the current $\mM_t$ and $\mV_t$ terms are re-aligned using $\mA'$ such that we can perform OMP at the next time step. Algorithm \ref{SGCA} can improve performance but comes at a cost of increased runtime, since we need to run OMP two more times. Alternatively, it can be possible to store the results from first call but requires additional memory requirements.
+
+\begin{algorithm}[t]
+\caption{SGCA at timestep \textit{t}}
+\label{SGCA}
+\begin{algorithmic}[1]
+\Require $\mG_t, \mA, s, \beta_1, \beta_2, \epsilon$
+\State $\bm{p}_t \gets \bm{A} \text{ Sparsify}_s (\bm{G}_t)$
+\State $\bm{q}_t \gets \bm{A} \text{ Sparsify}_s (\bm{G}_t^2)$
+\State $\mM_t \gets \beta_1 \mM_{t-1} + (1 - \beta_1) \bm{p}_t$
+\State $\mV_t \gets \beta_2 \mV_{t-1} + (1 - \beta_2) \bm{q}_t$
+\State $\mM_t \gets \frac{\mM_t}{1 - \beta_1^t}$
+\State $\mV_t \gets \frac{\mV_t}{1 - \beta_2^t}$
+\State $\mN_t \gets \alpha \frac{\text{OMP}_{\bm{A}}(\mM_t)}{\sqrt{\text{OMP}_{\bm{A}}(\mV_t)} + \epsilon}$
+\If{$t \bmod T = 0$}
+    \State Sample $\mA' \sim \mathcal{N}\left(\bm{0}, \frac{1}{\sqrt{k}} \bm{1} \right)$
+    \State $\mM_t \gets \mA' \text{OMP}_{\mA}(\mM_t)$
+    \State $\mV_t \gets \mA' \text{OMP}_{\mA}(\mV_t)$
+    \State $\mA \gets \mA'$
+\EndIf
+\State \Return $\mN_t$
+\end{algorithmic}
+\end{algorithm}
+
+\section{Fine-Tuning Experiments}
+\subsection{Commonsense Reasoning} \label{commonsense_details}
+We fine-tune pretrained LLaMA2-7B, LLaMA2-13B, and LLaMA3-8B models obtained from Hugging Face. We trained each model for 1 epoch on the full commonsense dataset consisting of 170k examples. For consistency, we used a batch size of 16 across all experiments and train for $1$ epoch. Since the goal is to observe performance improvements with only training a limited number of parameters, we only fine-tune on two of the attention matrices, keeping everything else frozen. For LlaMA2-7B and LLaMA-2-13B, we target the query and value matrices, whilst for LLaMA3-8B, we targeted the query output matrices. For LLaMA3-8B, we select the output matrix instead of the value matrix to keep the dimensions consistent for comparison. Full details of hyperparameters can be found in Table \ref{commonsense_hyper}.
+
+\subsection{Knowledge Evaluation}
+\label{knowledge_evaluation}
+We fine-tune Mistral-7B model obtained from Hugging face using 1 epoch on a 10k subset of the cleaned Alpaca dataset. We only target the the query and value matrices and follow a similar selection policy as the commonsense reasoning task for the remaining hyperparameters (see Table \ref{alpaca_hyper} for details).
+
+\begin{table}[t]
+\caption{Hyperparameters used for commonsense reasoning experiments.}
+\begin{adjustbox}{max width=\textwidth}
+\centering
+\begin{tabular}{c|c|c|c|c|c|c|c}
+\toprule
+Model & Method & learning rate & rank $r$ & num. chunks $c$  & sparsity $s$ & $\kappa$ & $\alpha$ \\
+\midrule
+\multirow{4}{*}{LLaMA2-7B} & Full Finetuning & 1e-5 & - & - & - & - & -\\
+& CESGC & 2e-5 & 32 & 64 & 1984 & 7 & 2\\
+& GaLore & 2e-5 & 4 & - & - & - & 2\\
+& LoRA & 1e-4 & 4 & - & - & - & -\\
+\midrule
+\multirow{4}{*}{LLaMA3-8B} & Full Finetuning & 1e-5 & - & - & - & - & -\\
+& CESGC & 2e-5 & 32 & 64 & 1984 & 7 & 2\\
+& GaLore & 2e-5 & 4 & - & - & - & -\\
+& LoRA & 1e-4 & 4 & - & - & - & -\\
+\midrule
+\multirow{4}{*}{LLaMA2-13B} & Full Finetuning & 1e-5 & - & - & - & - & -\\
+& CESGC & 3e-5 & 32 & 64 & 2496 & 7 & 2\\
+& GaLore & 3e-5 & 4 & - & - & - & 2\\
+& LoRA & 1e-4 & 4 & - & - & - & -\\
+\bottomrule
+\end{tabular}
+\end{adjustbox}
+\label{commonsense_hyper}
+\end{table}
+
+\begin{table}[t]
+\centering % Move centering here
+\caption{Hyperparameters used for knowledge evaluation experiment.}
+\begin{adjustbox}{max width=\textwidth}
+\begin{tabular}{c|c|c|c|c|c|c|c}
+\toprule
+Model & Method & learning rate & rank $r$ & num. chunks $c$  & sparsity $s$ & $\kappa$ & $\alpha$ \\
+\midrule
+\multirow{3}{*}{Mistral-7B}
+& CESGC & 2e-5 & 32 & 64 & 1984 & 7 & 2\\
+& GaLore & 2e-5 & 4 & - & - & - & 2\\
+& LoRA & 1e-4 & 4 & - & - & - & -\\
+\bottomrule
+\end{tabular}
+\end{adjustbox}
+\label{alpaca_hyper}
+\end{table}
+
+\subsection{Memory Efficiency}
+\label{appendix_memeff}
+For this experiment, we apply the MESGC algorithm. First, we select a subset of $10$k examples from the full commonsense dataset and fine-tune the LLaMA2-7B model, evaluating on all commonsense reasoning tasks. We used a batch size of 16 across all experiments and train for 1 epoch is used. The full results can be found in Table \ref{commonsense_min} and hyperparameters in Table \ref{memefftable}.
+
+\begin{table}[t!]
+\caption{LLaMA2-7B results on commonsense reasoning for MESGC.}
+\begin{adjustbox}{max width=\textwidth}
+\centering
+\begin{tabular}{c|c|c|c|c|c|c|c|c|c}
+\toprule
+Method & \textbf{ARC-e} & \textbf{ARC-c} & \textbf{BoolQ} & \textbf{HellaSwag} & \textbf{OBQA} & \textbf{PIQA} & \textbf{SIQA} & \textbf{WinoGrande} & \textbf{Average} \\
+\midrule
+CESGC & 80.9 & 53.4 & 82.4 & 78.4 & 43.8 & 79.9 & 52.3 & 73.2 & \textbf{68.0}\\
+GaLore & 80.2 & 52.2 & 79.0 & 78.4 & 43.0 & 80.5 & 51.6 & 74.0 & 67.4\\
+LoRA & 80.9 & 52.2 & 79.5 & 78.5 & 44.6 & 80.0 & 51.7 & 73.9 & 67.7\\
+\bottomrule
+\end{tabular}
+\end{adjustbox}
+\label{commonsense_min}
+\end{table}
+
+\begin{table}[t!]
+\caption{Hyperparameters used for commonsense reasoning for MESGC.}
+\centering
+\begin{tabular}{c|c|c|c|c|c|c}
+\toprule
+Method & learning rate & rank $r$ & num. chunks $c$  & sparsity $s$ & $\kappa$ & $\alpha$ \\
+\midrule
+MESGC & 2e-5 & - & 256 & 256 & 8 & 2\\
+GaLore & 2e-5 & 1 & - & - & - & 2\\
+LoRA & 1e-4 & 1 & - & - & - & -\\
+\bottomrule
+\end{tabular}
+\label{memefftable}
+\end{table}
+
+\subsection{Fine-tuning on Small Datasets}
+\label{appendix_small}
+We first obtain a subset consisting of $2000$ samples from the BoolQ dataset. We then create four partitions of data ranging in size from $500$ to $2000$ examples, in increments of $500$. For this experiment, we are interested in comparing performance between our approach and baselines given equal optimizer state sizes. Thus, we set the total number of optimizer states to $8192$, and perform fine-tuning with batch size $16$ over $2$ epochs using LLaMA2-7B based on the settings shown in Table \ref{sd_finetuning}.
+
+\begin{table}[t!]
+\caption{Hyperparameters used for fine-tuning BoolQ.}
+\centering
+\begin{tabular}{c|c|c|c|c|c|c}
+\toprule
+Method & learning rate & rank $r$ & num. chunks $c$  & sparsity $s$ & $\kappa$ & $\alpha$ \\
+\midrule
+CESGC & 2e-5 & 8 & 64 & 64 & 8 & 2\\
+GaLore & 2e-5 & 1 & - & - & - & 2\\
+LoRA & 1e-4 & 1 & - & - & - & -\\
+\bottomrule
+\end{tabular}
+\label{sd_finetuning}
+\end{table}
+
+\subsection{Ablation Study}
+\label{appendix_ablation}
+For chunks $c$ and sparsity $s$ studies, we fine-tuned on the LLaMA2-7B model fine-tuned on a subset of $30$k examples using commonsense reasoning dataset. For the chunk size study, we performed the experiment based on our MESGC approach, while for sparsity, we used CESGC. Finally, different values of $\kappa$ was tested on the full commonsense dataset using CESGC. The same batch size of $16$, training epochs of $1$, learning rate, $\eta=2e^{-5}$ and alpha, $\alpha=2$ is used for all three studies. Other hyperparameter details are shown in Table \ref{ablationtable}.
+
+\begin{table}[t!]
+\caption{Hyperparameters used for ablation study.}
+\begin{adjustbox}{max width=\textwidth}
+\centering
+\begin{tabular}{c|c|c|c|c|c}
+\toprule
+Study & Method & rank $r$ & num. chunks $c$  & sparsity $s$ & $\kappa$\\
+\midrule
+Chunks $c$ & MESGC & - & 256, 512, 1024, 2048, 4096 & 4096 & 7\\
+Sparsity $s$ & CESGC & 32 & 64 & 64, 4096, 16384, 32768, 65536 & 7\\
+Kappa $\kappa$ & CESGC & 32 & 64 & 1984 & 6, 7, 8\\
+\bottomrule
+\end{tabular}
+\end{adjustbox}
+\label{ablationtable}
+\end{table}
+
+\end{document}

@@ -1,0 +1,206 @@
+%=========================================================================
+% SparseZipper: Background
+%=========================================================================
+
+%-------------------------------------------------------------------------
+% Background on SpGEMM
+%-------------------------------------------------------------------------
+% Take-aways:
+%   - Row-wise dataflow is efficient (time and space) and parallelizable
+%   - Different ways to implement the row-wise product dataflow
+%       + Using an accumulator
+%       + Using ESC method
+
+\section{Background: Sparse General Matrix Multiplication}
+\label{sec-spz-spgemm-background}
+
+Sparse general matrix multiplication (SpGEMM) is a commonly used building block
+in various application domains including graph
+analytics~\cite{davis-graphblas-tmos2019,hoefler2011generic,shun-multicore-tc-2015},
+machine
+learning~\cite{reddi-mlperf-isca2020,naumov-dnn-model-arxiv2019,han-deep-compress-arxiv2015,jouppi-datacenter-isca2017,wu-ml-facebook-hpca2019},
+and scientific computing~\cite{canning-sparse-sim-1996,galli-quantum-sim-1996}.
+This section describes widely used data structures for representing sparse
+matrices, various algorithms for multiplying two sparse matrices, and their
+trade-offs.
+
+%----------
+% Matrix formats
+%----------
+
+\subsection{Sparse Matrix Formats}
+\input{fig-csr-format}
+
+Since most elements in a sparse matrix are zeros, it is efficient to store only
+non-zero elements to minimize the amount of required storage and also avoid
+ineffectual computation (i.e., multiplying with zero).
+The most common data structures for storing a sparse matrix are coordinate
+format (COO), compressed sparse row (CSR), and compressed sparse column (CSC).
+They are the default data structures in many widely used linear algebra
+libraries such as Intel Math Kernel Library (MKL)~\cite{wang-intel-mkl-2014},
+CUSPARSE~\cite{naumov-cusparse-2010}, and
+Matlab~\cite{gilbert-sparse-matlab-1992}.
+
+COO format stores a list of tuples including row index, column index, and value
+of non-zero elements in a sparse matrix.
+Typically, the list is kept sorted by either row indices, column indices, or a
+combination of both row and column indices for more efficient lookups and
+memory accesses.
+Further improving the storage efficiency, compared to COO, CSR format groups
+per-row non-zero elements so that the row indices for elements in the same row
+can be further compressed.
+Figure~\ref{fig-spz-csr-format} shows an example of CSR format.
+Non-zero elements in each row are represented by a stream of keys (i.e., column
+indices) and values (i.e., element data).
+Typically, elements in a stream are sorted by their keys, and streams of
+adjacent rows are placed consecutively in memory to form the column index and
+value arrays.
+The row pointer array consists of pointers indicating where each row starts in
+the column index and value arrays.
+CSC format is similar to CSR format except that non-zero elements are
+compressed by columns.
+
+In addition to those general sparse matrix formats, there are numerous
+other sparse matrix formats specialized for certain structures of non-zero
+elements and/or
+target architectures~\cite{borvstnik-dbcsr-2014,hu-graphlily-iccad2021,gomez-spmv-vector-2021,srivastava-matraptor-micro2020,chen-spgemm-taihulight-2018}.
+However, such specialized matrix formats often incur format converting
+overheads, and their performance is not portable across different matrices and
+architectures.
+In this chapter, we assume CSR/CSC which are storage-efficient and widely used
+sparse matrix formats.
+
+%----------
+% Dataflows
+%----------
+
+\input{fig-spgemm-dataflows}
+\subsection{SpGEMM Dataflows}
+
+Figure~\ref{fig-spz-spgemm-dataflows} shows common dataflows for SpGEMM:
+inner-product, outer-product, and row-wise-product (also known as Gustavson's
+algorithm).
+
+\BF{Inner-product dataflow --}
+This dataflow computes each element in the output matrix one at a time by doing
+a dot product between two vectors (i.e., a row in matrix A and a corresponding
+column in matrix B), as shown in Figure~\ref{fig-spz-spgemm-dataflows}.
+Since there is no data dependency among output elements, the inner-product
+dataflow is highly parallelizable by computing multiple dot products for
+different output elements in parallel.
+In addition, this dataflow also has good data locality for the output matrix
+but low data reuse for the input matrices.
+One major downside of this approach is the inefficiency of doing a dot product
+between two sparse vectors.
+Since input matrices are sparse, the output matrix is likely to have few
+non-zero elements.
+Therefore, most of the dot products result in zeros.
+Furthermore, the dot product of two sparse vectors requires intersecting two
+lists of indices, and this index matching is highly inefficient due to the high
+sparsity of a row and a column in the input matrices.
+
+\BF{Outer-product dataflow --}
+Unlike the inner-product dataflow, the outer-product dataflow computes partial
+results for the entire output matrix at each step by doing an outer product
+between a column in matrix A and a corresponding row in matrix B, as shown in
+Figure~\ref{fig-spz-spgemm-dataflows}.
+Partial results are combined into a single final output matrix C.
+All non-zero elements in a column in matrix A and a row in matrix B are used to
+generate non-zero elements in matrix C, so the outer-product dataflow avoids
+the problem of ineffectual index matching operations in the inner-product
+dataflow.
+Multiple outer-product operations on different pairs of matrix A's columns and
+matrix B's rows can happen in parallel.
+However, combining partial outer-product results typically requires complex
+synchronizations, and this step is often a performance bottleneck in this
+approach.
+Despite having good input data reuse, the outer-product dataflow has low output
+data reuse, and the aggregate memory space of all partial output matrices is
+often much larger than the final output matrix's size.
+
+\BF{Row-wise-product dataflow --}
+The row-wise-product dataflow computes each row of the output matrix at a time
+by multiplying a row in matrix A (sparse vector) with the entire matrix
+B, as shown in Figure~\ref{fig-spz-spgemm-dataflows}.
+Similar to the outer-product dataflow, this row-wise-product dataflow is
+work-efficient since it processes only non-zero input elements that contribute
+to generating non-zero output elements.
+In each step, a multiplication between a sparse vector and a sparse matrix may
+require merging some partial output vectors into a final row in the output
+matrix.
+However, compared to the two-dimensional matrix merging step in the
+outer-product dataflow, merging partial one-dimensional sparse vectors is much
+less complex and requiring much less temporary memory space, which may fit in
+on-chip caches.
+The row-wise-product dataflow has relatively poor data reuse of matrix B since
+column indices of non-zero elements in each row in matrix A are used to access
+corresponding rows in matrix B.
+Finally, unlike both the inner-product and outer-product approaches, the
+row-wise-product dataflow does not require input matrices to be stored in two
+different formats: CSR and CSC.
+All input and output matrices can be consistently stored in CSR, so there is no
+need for converting between sparse matrix formats.
+
+\input{tab-spgemm-dataflows}
+
+Table~\ref{tab-spz-spgemm-dataflows} summarizes trade-offs among the three
+SpGEMM dataflows.
+In this work, we consider only the row-wise-product dataflow since it is
+relatively work-efficient by avoiding the extremes in both inner-product and
+outer-product dataflows.
+
+%----------
+% Row-wise algorithms
+%----------
+
+\subsection{Row-Wise Product Algorithms}
+
+There are three common algorithms to implement the row-wise-product dataflow
+for SpGEMM: array-based, hash-based, and expand-sort-compress algorithms.
+
+\input{fig-spa-algorithm}
+\BF{Array-based row-wise SpGEMM --}
+This is also known as sparse accumulator algorithm
+(SPA)~\cite{gilbert-sparse-matlab-1992}.
+Figure~\ref{fig-spz-spa-algorithm} shows an example of how this algorithm
+works.
+The algorithm uses a set of three dense arrays that have the same size as the
+number of columns in the output matrix.
+The first two arrays store accumulated values and valid flags.
+When a key-value tuple is inserted, it accesses the two arrays by the key.
+If the flag for the key is false (i.e., no valid value has been added for this
+key yet), it overwrites the corresponding entry in the accumulated value array
+and sets the flag to true.
+Otherwise, the new value is added to the existing value.
+The third array stores inserted keys in the order they are first added to the
+list.
+Those keys are also indices to the value and flag arrays.
+After all key-value tuples are inserted, we can iterate through the key array
+to construct an unsorted list of key-value output list.
+The list is then sorted by keys to produce one row of the output matrix.
+The flag array needs to be reset before processing the next matrix row.
+
+\BF{Hash-based row-wise SpGEMM --}
+Another common approach to accumulate sparse values in row-wise SpGEMM is using
+a hash table~\cite{anh-hash-spgemm-2016,deveci-multithreaded-spgemm-2018}.
+Key-value tuples are inserted into a hash table based on their hashed keys.
+Similar to the array-based row-wise SpGEMM, key-value tuples in the hash table
+are not sorted, so a final sorting step is needed to generate an output matrix
+with per-row non-zero elements sorted by their column indices.
+
+\input{fig-esc-algorithm}
+\BF{Expand-Sort-Compress (ESC) algorithm --}
+ESC algorithm was initially proposed for performing SpGEMM on
+GPUs~\cite{dalton-spgemm-gpu-2015,winter-adaptive-spgemm-gpu-ppopp2019} and
+later adopted to vector
+architectures~\cite{fevre-spgemm-rvv-2023,li-spgemm-vector-arch-mchpc2019}.
+Figure~\ref{fig-spz-esc-algorithm} shows an example of how this ESC algorithm
+works.
+Unlike the array-based and hash-based SpGEMM algorithms, more than one row of
+the input matrix A and output matrix C can be processed together to increase
+the amount of work that can be parallelized or vectorized.
+Intermediate results of multiplications are expanded in triples of row index,
+column index, and value.
+The list of triples are then sorted by their row and then column indices.
+Triples with duplicate key (i.e., same row and column indices) are compressed
+into one entry with the values being accumulated in the final output.

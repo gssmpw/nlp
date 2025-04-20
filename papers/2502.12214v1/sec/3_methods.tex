@@ -1,0 +1,154 @@
+\begin{figure*}[h]
+    \centering
+    \includegraphics[width=0.9\textwidth]{figure/motivation_final.pdf}
+    \vspace{-0.5cm}
+\caption{
+Comparison of model performance under equal computational complexity.
+\textbf{(a)} The effect of varying computational complexity, where 1L denotes the original model with a single layer, and increased complexity corresponds to repeated model calls.
+``Early exit'' refers to adding a classification head after each cycle to train intermediate results.
+\textbf{(b)} On the left y-axis, the intermediate results of different models under the ``early exit'' condition when the total computational complexity is fixed at 15 (cycles $\times$ layers).
+On the right y-axis, the average attention values of other tokens to the Zero Token and the gate value at the output of the Zero Token Transformer.
+}
+\label{fig:1}
+\vspace{-0.5cm}
+\end{figure*}
+
+
+\section{Zero Token Transformer}
+In this section, we introduce our \emph{Zero-Token Transformer (ZTT)}, a novel approach that combines \emph{Head-Tail Decoupled Cyclic Architecture} and a \emph{Zero-Token Mechanism} with a gating strategy.
+We begin by examining preliminary observations from a \emph{Basic Cyclic Transformer (BCT)} and highlight the challenges that arise when scaling up.
+We then describe how our \emph{head-tail decoupling} addresses these issues, and how the \emph{Zero Token} and \emph{gating mechanism} further enhance performance and enable dynamic early exiting.
+
+\subsection{Basic Cyclic Transformer (BCT) and Motivation}
+\label{sec:bct}
+
+We first consider a simple form of cyclic Transformer, following~\cite{bae2024relaxed,takase2021lessons}, where a single Transformer layer (or a small stack of layers) is repeatedly applied for $N$ cycles.
+Formally, let $H_F^{l,n}$ be the output of layer $l$ at cycle $n$:
+
+\vspace{-0.5cm}
+\begin{equation}
+\label{eq:1}
+\begin{aligned}  
+    H_F^{l,n} &=  H_A^{l,n} + \text{FFN}\bigl(\text{LN}(H_A^{l,n}), \theta^l\bigr),\\
+    H_A^{l,n} &= H_F^{l-1,n} + \text{MultiHead}\bigl(H_F^{l-1,n}, \Phi\bigr),\\
+    l &\in \{1, 2, \dots, L\}, \quad n \in \{1, 2, \dots, N\},
+\end{aligned}
+\end{equation}
+\vspace{-0.5cm}
+
+where $\Phi$ and $\theta^l$ are trainable parameters, and the same parameters are reused at each cycle. For simplicity, $H_F^{0,1}$ is the embedding of the input tokens. When $N=1$, this reduces to a standard (vanilla) $L$-layer Transformer.
+
+Figure~\ref{fig:1}(a) shows perplexities on WikiText-2 under the same total computational cost (\emph{number of layers} $\times$ \emph{number of cycles}). 
+For instance, a 1-layer BCT run for 12 cycles achieves a lower perplexity than a 1-layer vanilla Transformer (i.e., $N=1$), but it is still worse than a standard 12-layer Transformer with the same total computational budget.
+Similarly, adding classification heads after each cycle for early exiting (``Early exit'' in Figure~\ref{fig:1}(a)) further degrades performance, indicating that requiring intermediate outputs imposes extra burdens on the cyclic layers.
+
+\paragraph{Empirical Comparison.}
+These findings highlight a fundamental issue with basic cyclic Transformers:
+each \emph{cyclic block} assumes significantly greater responsibilities than a vanilla Transformer layer. 
+First, cyclic layers must fulfill the roles of multiple layers by providing enhanced intermediate representations for subsequent computations, while also producing high-quality outputs for the classification head.
+Moreover, there is no explicit guidance on the specific role a given layer should perform at each iteration. 
+This lack of role distinction may lead to confusion and computational conflicts, ultimately affecting overall performance. 
+Consequently, even when the current representation is well-optimized, it is recalculated in subsequent cycles, potentially overwriting previously learned representations.
+
+\paragraph{Increasing Cycles Alone Is Insufficient.}
+Reusing the same layer(s) for multiple cycles indeed improves performance compared to a single-layer Transformer.
+However, as we increase the total layer count or require early-exit outputs at each cycle, the \emph{performance gap} between Basic Cyclic Transformers and an equivalently sized \emph{vanilla} Transformer \emph{widens}.
+We hypothesize that this occurs because each cyclic block in BCT must simultaneously compute refined internal representations \emph{and} produce final outputs for classification at each cycle, without any guidance on how to specialize. 
+As cycles accumulate, these conflicting objectives can lead to overwriting or “conflicting” representations.
+
+Based on the observations above, we identify three key \emph{issues} that motivate our design:
+\begin{enumerate}[label=\textbf{Issue \arabic*:}, leftmargin=1.2cm, itemsep=2pt, topsep=2pt]
+    \item \textbf{No separation of specialized layers.} 
+    The first and last layers in a Transformer typically have distinct roles (e.g., mapping raw inputs or producing logits). Forcing them to share parameters can degrade performance (\S\ref{sec:hdt}).
+
+    \item \textbf{Lack of role distinction among cycles.} 
+    In BCT, the same layer repeatedly processes the representation, even if the current representation is sufficiently refined. There is no mechanism to skip certain cycles or to mark a cycle as “for further refinement” (\S\ref{sec:ztm}).
+
+    \item \textbf{When to stop further computation?}
+    Simply running $N$ cycles can waste computation once the network is “confident.” Likewise, forcing a classification output at \emph{every} cycle can degrade performance. A more \emph{dynamic} approach is needed (\S\ref{sec:gating}).
+\end{enumerate}
+
+To address these issues, we propose the \emph{Zero-Token Transformer}, which comprises:
+
+- \textbf{Head-Tail Decoupled Cyclic Architecture} (\S\ref{sec:hdt}): We do not cycle the first and last layers, preserving their specialized roles while only reusing \emph{intermediate} layers.
+- \textbf{Zero-Token Mechanism} (\S\ref{sec:ztm}): We insert a learnable “Zero Token” into each attention layer to guide or skip computations dynamically, enabling distinct cycle-specific roles.
+- \textbf{A Dynamic Mechanism for Determining the Number of Cyclic Iterations} (\S\ref{sec:gating}): We add a lightweight gating network in the feed-forward layer to help decide when to terminate further computation based on the Zero Token's attention.
+
+In the following subsections, we detail each component and explain how they address the issues above.
+
+\subsection{Head-Tail Decoupled Cyclic Architecture}
+\label{sec:hdt}
+
+Recent analyses~\cite{sun2024transformer} suggest that \emph{intermediate} Transformer layers often exhibit functionally similar representations, whereas the \emph{head} (first) and \emph{tail} (last) layers specialize in tasks such as raw feature encoding and output mapping. 
+Pruning or drastically altering these boundary layers tends to have an outsized impact on overall performance.
+
+Hence, we preserve the original first and last layers as \emph{fixed} (non-cyclic) and let only the middle layers reuse parameters across $N$ cycles, as shown in Figure~\ref{fig:your_image}(right).
+Concretely, if the Transformer has $L$ layers, we exclude layers $1$ and $L$ from parameter cycling:
+\vspace{-0.1cm}
+\begin{equation}
+l \in \{2,3,\dots,L-1\}, \quad n \in \{1,\dots,N\}.
+\end{equation}
+By doing so, the distinct responsibilities of the head and tail layers remain intact, mitigating conflicts. Figure~\ref{fig:1}(a) shows that under the same total computational budget, our Head-Tail Decoupled Cyclic Transformer (HDT) achieves better perplexity than a straightforward “all-layer cycling” design, confirming that preserving specialized boundary layers helps alleviate the performance gap (Issue 1).
+
+\subsection{Zero-Token Mechanism}
+\label{sec:ztm}
+
+Even with head-tail decoupling, intermediate layers in a cyclic setup can still \emph{redundantly} process representations. 
+If the current representation is already high-quality, repeatedly refining it may overwrite earlier features or create conflicts. 
+We address this by introducing a small, trainable “Zero Token” into each attention layer—acting like a prompt that “signals” whether the model should refine or skip a cycle.
+
+For the $l$-th layer in cycle $n$, we insert a Zero Token (ZToken) at the start of the sequence. It has:
+\begin{itemize}[leftmargin=1.1em]
+    \item A \textbf{key} vector $K_{z,i}^{l,n}$ (split by head $i$) that is \emph{trainable},
+    \item A \textbf{value} vector $V_{0,i}^{l,n}$ that is \emph{all zeros}, and
+    \item \textbf{No query} component.
+\end{itemize}
+Placing the Zero Token at the front ensures all other tokens can attend to it. Formally, the multi-head attention in Eq.~\ref{eq:1} becomes:
+\begin{equation}
+\label{eq:kv}
+\begin{aligned}
+K_{\text{new}, i}^{l,n} &= \bigl[K_{z,i}^{l,n},\, K_i^l\bigr], \\
+V_{\text{new}, i}^{l,n} &= \bigl[V_{0,i}^{l,n},\, V_i^l\bigr], 
+\end{aligned}
+\quad
+\text{MultiHead}\bigl(Q^l, K_{\text{new}}^{l,n}, V_{\text{new}}^{l,n}\bigr).
+\end{equation}
+
+\paragraph{Role of the Zero Token.}
+Each cycle “fetches” its own Zero Token, whose trainable key can induce high or low attention from the queries $Q^l$. 
+If the model “pays a lot of attention” to this zero-valued token, the output effectively becomes the same as the previous representation (since multiplying by zero yields no further update). 
+This lets each layer decide whether to \emph{refine} or \emph{skip}, addressing \emph{Issue 2} (lack of role distinction across cycles).
+
+In Figure~\ref{fig:1}(b) (right y-axis), we plot the average attention score to the Zero Token over different cycles. 
+Higher attention corresponds to the model “opting out” of deeper recalculation.
+
+\subsection{A Dynamic Mechanism for Determining the Number of Cyclic Iterations}
+\label{sec:gating}
+
+While the Zero Token's attention score is the main indicator for deciding whether to halt additional cycles, we introduce a lightweight gating mechanism around the feed-forward network (FFN) to provide finer-grained computational control. 
+Even if the model has not yet triggered an early exit, some cycles may only require partial FFN computation.
+
+We modify the FFN in Eq.~\ref{eq:1} by adding:
+\begin{equation}
+\label{eq:gating}
+\begin{aligned}
+H_F^l &= H_A^l 
++ \Bigl[\text{FFN}\bigl(\text{LN}(H_A^l), \theta^l\bigr)\Bigr] 
+  \cdot \text{gate}\bigl(\text{LN}(H_A^l)\bigr),\\
+\text{gate}(\cdot) &\in [0,1].
+\end{aligned}
+\end{equation}
+When $\text{gate}(\cdot)$ is close to 1, the full FFN transform is applied; when near 0, the FFN is mostly bypassed, saving computation. 
+We observe that the gating value often correlates with the Zero Token’s attention: if the model pays high attention to the Zero Token, it implies less refinement is needed, and the gate decreases accordingly.
+
+\paragraph{Early Exit Criterion.}
+The Zero Token’s attention score (\S\ref{sec:ztm}) remains the primary criterion for early exit. 
+Once it exceeds a threshold (e.g., 0.9), we terminate further cycles and output the final representation. 
+The gating function simply provides a smoother transition for intermediate cycles, reducing unnecessary FFN computation \emph{before} the final exit trigger.
+
+\paragraph{Discussion.}
+We do not gate the \emph{attention module} itself because attention integrates token representations, including the Zero Token. 
+By gating the FFN, we allow partial skipping of the more expensive transformations without interfering with the Zero Token’s signaling. 
+Hence, the Zero Token attention decides \emph{when} to stop entirely, while the gate refines \emph{how much} computation to apply until that point.
+
+Overall, by combining head-tail decoupling (to preserve specialized boundary layers), a Zero Token (to guide cycle-level computation), and a gating-based mechanism (to smooth partial skips and enable early exit), our Zero-Token Transformer effectively addresses the three major issues outlined in \S\ref{sec:bct}.

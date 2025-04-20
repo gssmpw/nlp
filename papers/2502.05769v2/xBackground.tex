@@ -1,0 +1,87 @@
+\section{Background}
+\subsection{3D Gaussian Splatting}
+3D Gaussian Splatting (3DGS) \cite{2023gaussian_splatting} is an explicit view-synthesis method at its core. It allows for the learning of the geometry and lighting of a 3D scene from multi-view 2D images which in return allows for the rasterization of the scene from novel points-of-view. Starting from an initial point cloud, typically created using Structure-from-Motion (SfM), 3DGS initializes a Gaussian primitive at each point, storing learnable mean, covariance, opacity, and local lighting in red, green and blue channels stored as spherical harmonics coefficients. To rasterize an image of the scene, a differentiable tile-based rasterizer is used, projecting Gaussian primitives into 2D onto the image plane. The projected Gaussians are then alpha-blended to generate the image. For the learning of Gaussian Splatting parameters, for a ground truth camera pose, an image is rasterized and compared against the ground truth training image comparing the difference in image pixel values and image quality.
+%via a pixel-wise $L_1$ loss and a difference of Structural Similarity Index Measure (SSIM) loss.
+
+The standard implementation of 3D Gaussian Splatting uses COLMAP \cite{2016COLMAP} for Structure-from-Motion (SfM) preprocessing. This process takes unordered images with unknown camera poses and generates camera positions and a sparse point cloud. Key steps include:
+
+\begin{itemize}
+    \item Feature Extraction: Identifying 2D key points in each image and assigning robust local features using SIFT.
+    \item Matching: Finding overlapping image pairs by matching key point features.
+Geometric Verification: Verifying overlaps between image pairs using homography estimation (e.g., RANSAC).
+    \item Image Registration: Triangulating key points and estimating camera poses to add new images.
+    \item Triangulation: Converting key points into 3D coordinates.
+Error-Correction: Performing bundle adjustment to optimize camera poses and 3D points by minimizing reprojection errors.
+\end{itemize}
+COLMAP introduces several innovations to improve geometric verification, initialization, triangulation, and bundle adjustment efficiency, making it a robust tool for SfM.
+
+After the structure from motion initialization which generates camera poses for each training image, and a sparse point cloud reconstruction of the 3D scene geometry, the 3DGS training process can proceed. A multivariate Gaussian given by
+\begin{equation} \label{eq:lossGaussian}
+    G(x) = e^{-\frac{1}{2} (x-\mu)^T \Sigma^{-1} (x-\mu)}
+\end{equation}
+is initialized at each point in the sparse cloud. Each gaussian is characterized by its position $\mu$, covariance matrix $\Sigma$ given as three scaling factors and an 3D vector to represent its orientation. In addition, attached to each Gaussian is its local opacity $\alpha$ and spherical harmonics coefficients up to degree three for each color channel. These are the learnable parameters characterizing each Gaussian primitive or "splat". The learnable parameters are trained by optimizing a training objective comparing rasterized images against ground truth images. 
+
+3DGS rasterizes the 3D Gaussians into a two dimensional image using a differentiable tile-based rasterizer built for 3DGS. The rasterizer divides the image into 16x16 tiles, projects the 3D Gaussians into 2D, and assigns them to tiles based on their overlap with the view frustum. The 2D projection is computed using the covariance matrix transformed by the view and projective transformations. Gaussians are then sorted by depth for alpha blending, with pixel colors calculated by accumulating in-scene, direction-dependent colors using the learned spherical harmonic coefficients.
+
+The generated image is compared to ground truth images using a combination of L1 photometric loss and structural similarity (D-SSIM) \cite{2004ssim} loss. The model parameters are optimized using the Adam optimizer, with the photometric loss guiding the backpropagation. This is given by
+\begin{equation}
+    L = (1 - \lambda)L_1 + \lambda_{D-SSIM}.
+\end{equation}
+
+To improve the reconstruction, 3DGS also densifies regions with missing geometric features by adding Gaussians where the view-space positional gradient exceeds a threshold. Low variance Gaussians are duplicated, and high variance Gaussians are split for finer detail. Unimportant Gaussians, such as those with opacity below a user-defined threshold, are pruned. Every few iterations, the opacity of all Gaussians is reset and re-optimized to control floater artifacts and manage the total number of Gaussians. This process helps achieve dense, high-quality point cloud reconstructions.
+
+\subsection{2D Gaussian Splatting}
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.5\textwidth]{Figures/2DGS.png}
+\caption{2D Gaussian Splatting uses surfaced aligned 2D Gaussian primitives embedded in 3D to represent the 3D scene. 2D Gaussian is represented by it's 3D position $\mathbf{p_k}$, it's scale $s_u, s_v$, and it's orientation $\mathbf{t_u, t_v}$. Figure 3 in \cite{20242dgs}}\label{img:2dgs}
+\end{figure}
+2D Gaussian Splatting (2DGS) \cite{20242dgs} improves on the standard 3D Gaussian Splatting and better reproduces 3D surface geometry. Although GS2Mesh slightly outperforms 2D Gaussian Splatting on the DTU benchmark, they are fundamentally different. GS2Mesh is mainly a mesh extraction pipeline which makes use of vanilla 3DGS during the 3D reconstruction phase. 2DGS on the other hand is a fundamental improvement 3DGS itself by changing the nature of the Gaussian splats. As such, it is possible to use 2DGS to substitute 3DGS in many pipelines, as we have done.
+
+2D Gaussian splatting makes a fundamental change by representing the scene as 2D oriented planar Gaussians as opposed to 3D Gaussians. Like in standard 3DGS, the 2D Gaussian primitives of 2DGS store the spherical harmonic coefficients of each color channel, local transparency $\alpha$, and 3D location $\mathbf{p}_k$. However, unlike 3D Gaussian primitives, the 2D Gaussian primitives have two scalars to represent variance $s_u, s_v$ and have two tangent vectors $\mathbf{t}_u, \mathbf{t}_v$ whose cross product results in the normal vector which represents orientation (see figure \ref{img:2dgs}). 
+
+The tile-based rasterizer is modified into a ray-based one. From each pixel in the to-be-rasterized image, a ray is projected into the scene, and ray-splat intersections are computed. Intersecting splats/2D Gaussian primitives are then alpha blended. An additional normal consistency term is added to the standard training objective (eq. \ref{eq:lossGaussian}). This term compares the normal vector of the each 2D Gaussian primitive with the estimated normal from the depth map. This is given by 
+\begin{equation}
+L_n = \sum_i \omega_i (1-\mathbf{n_i}^T \mathbf{N}),
+\end{equation}
+where $n_i$ is the normal vector of the $i^th$ splat intersected along the ray, and $\mathbf{N}$ is the normal computed using the gradient of the depth map. This term is added onto the standard 3DGS loss \ref{eq:lossGaussian} with its own hyper parameter weight.
+
+The 2DGS authors also provide a based mesh extraction algorithm. Depth maps are rendered using the projected depth value. These are then voxelized and meshed using a truncated signed distance fusion and the marching cube algorithm using the Open3D implementation \cite{2018open3d}. In other words, by using 2DGS as the fundamental 3DGS representation model, stereo-based depth extractions are no longer required. 2DGS can already generate accurate depth maps due by leveraging the nature of its surface aligned 2D Gaussian primitive representation.
+
+\subsection{Segment Anything Model (version 2) and Grounding DINO}
+Segment Anything Model (SAM) \cite{SAM} is out-of-the-box image segmentation model that is pre-trained on a large billion-image dataset. The is capable of segmenting most objects given point-based, bounding box priors without further training from the user. Users can therefore provide point/click prompts or bounding box prompts to identify the object(s) of interest(s). Segment Anything will then return segmentation masks and scores for the object of interest. One key issue is that for a scene viewed from multiple images, individual SAM masks are not necessarily consistent with each other, which limits its capabilities in segmenting video data which requires temporal consistency, and multi-view data which requires 3D consistency. 
+
+SAM2 \cite{SAM2}, released in August 2024, further introduces consistent video-segmentation that preserves 3D and temporal consistency by using memory attention. Since we wish to extract the mesh of an individual building and not the entire neighborhood, segmentation masks are required. %Both SAM and SAM2 are built from the Vision Transformer \cite{2021vit} backbone. 
+
+GroundingDINO \cite{groundingdino} is pretrained open-set object detector which is capable of extracting bounding boxes of objects in images from natural language prompts without further training from the user. GroundingDINO can be combined with SAM/SAM2 to allow for text-based object segmentation by first first generating a bounding box from text description, then using the bounding box to prompt SAM/SAM2. The GroundingDINO-SAM pipeline is called Grounded-SAM  \cite{groundedsam}, and is available as an open source library.
+
+\subsection{GS2Mesh}
+GS2Mesh \cite{2024gs2mesh} is a Gaussian Splatting-based 3D reconstruction pipeline, outperforming concurrent and competing methods such as SuGAR \cite{2024sugar}, 2DGS \cite{20242dgs}, and GOF \cite{2024GOF} on the DTU dataset \cite{2016dtu} benchmark in terms of reconstruction geometry and training time. 
+\begin{itemize}
+    \item GS2Mesh learns and stores the scene in a standard 3DGS model.
+    \item The trained 3DGS model is then used to generate a stereo pair for each input image. Each stereo pair is used to generate a depth image.
+    \item Grounded-SAM is used to generate multi-view masks to mask out the background for mesh extraction.
+    \item A pre-trained depth from stereo model DLNR is used to generate depth maps for each stereo pair. 
+    \item  The entire ensemble of depth images are integrated into a mesh using the Truncated signed distance function fusion (TSDF) algorithm \cite{1996tsdf} with the Marching-Cubes algorithm \cite{1998marchingcubes}. GS2Mesh uses the Open3D implementation. \cite{2018open3d}.
+\end{itemize}
+
+More specifically, a standard 3DGS model is trained from the input images. The 3DGS model is then used to generate a stereo pairs for each training image's camera pose. For each pair, the left-image is generated with the same camera pose as the training image, and the right-image is generated with a small shift $[b,0,0]$ to the right. Since Gaussian Splatting models performs best near training poses, this method ensures visual high quality in the generated stereo image pair.
+
+For these stereo image pair, Segment Anything Model is used to generate a segmentation mask for the object. In the GS2Mesh paper, which was published before SAM2, the authors addressed the 3D consistency issue by projecting the initial mask to other frames, sampling new points within the projected mask as SAM prompts, and creating a new SAM mask from these prompts for each frame. The GS2Mask code-base has since been updated to use SAM2 instead for 3D consistent mask generation. 
+
+From these stereo pairs, DLNR \cite{2023DLNR} pretrained on the Middlebury dataset\cite{2002middlefury} is used as depth-from-stereo method. To improve the quality of the reconstructions, multiple masks are applied to the stereo model's output. The first one is the object mask generated from SAM2, which removes the separates the background from the object of interest. One of these is the occlusion mask, which is generated by applying a threshold to the disparity difference between left-to-right and right-to-left image pairs. The first mask filters out regions visible to only one camera, where the stereo model's output is less reliable. The rationale for using this mask is that the occluded regions can be filled in with information from neighboring stereo views. The last mask leverages depth information to improve accuracy by filtering out depth estimates outside the valid range, reducing errors for both near and distant objects. This enhances the reliability of the depth estimation process and leads to more accurate geometric reconstructions.
+
+Following depth extraction, the TSDF algorithm initializes and populates a voxel with the scene geometry. The scene's voxel representation is populated with the signed distance to the nearest scene surface integrated from the depth images. The marching cubes algorithms assigns to each cube's vertices in the voxel whether they lie inside or outside the nearest surface based on the TSDF values previously calculated. Based on the 8 vertices configuration, a local surface is meshed for that cube which is then repeated across the entire voxel. This process generates a mesh from the voxel.
+
+
+
+
+
+
+\subsection{Evaluation Metrics}
+For 2D view synthesis visual quality assessment, we use the commonly accepted Peak Signal-to-Noise Ratio (PSNR) \cite{psnr}, 2D Structural Similarity Index Measure (SSIM) \cite{2004ssim}, and Learned Perceptual Image Patch Similarity (LPIPS) \cite{lpips}. These are full-reference metrics which compare an assessed image with a ground truth image. PSNR and SSIM are high when the assessed image and the ground truth are similar. SSIM achieves a maximum of 1 when the two images are identical. LPIPS on the other hand is low when the two images are similar, with minimum at zero when the two images are identical.
+
+For 3D mesh quality assessment, we use 3D Structural Similarity Index Measure (3D-SSIM) \cite{3dssim} comparing a 360$\degree$ rendering video of the mesh with a 360$\degree$ ground truth video created by segmenting the building from its background in the Google Earth training images. We note that there exist other full-reference 3D geometry and visual quality metrics that compare instead 3D models to 3D models. However, we lack ground truth 3D models for the buildings we meshed, and only have access to ground truth 2D images. This is the main reason behind using the video-based 3D-SSIM for mesh quality comparison. We provide both the average 3D-SSIM across the entire video, and the minimum 3D-SSIm across video frames. 
+
+\subsection{Google Earth Studio}
+Google Earth Studio \cite{google_earth_studio} \cite{gao_3dgs} is a web-based animation tool. With access to Google's vast collection of 2D and 3D Earth data, ranging from large geological formations to individual buildings, Google Earth Studio provides a simple and efficient way to collect off-nadir images for the training of 3DGS models. Google Earth Studio allows for the specification of a target of interest in terms of longitude, latitude coordinates, address, postal, or location name. After selecting the target of interest, Google Earth allows for the specification of a camera path for which images of the target location are rendered. By selecting a circular camera path orbiting above and pointing towards a target of interest, Google Earth Studio allows for the extraction of a multi-view dataset of said building with 360 degrees coverage well suited for 3D reconstruction. 

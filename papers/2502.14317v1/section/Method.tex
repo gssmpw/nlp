@@ -1,0 +1,238 @@
+\vspace{-2mm}
+\section{Method}
+\label{Method}
+In this section, we introduce ParallelComp, our proposed approach for achieving efficient long-context inference. Then we introduce its unique bias phenomenon. Figure~\ref{fig:overview} offers a high-level overview of  ParallelComp. 
+% \vspace{-1mm}
+\subsection{ParallelComp}
+\label{ParallelComp}
+% Next, we describe ParallelComp. We will first introduce some of our key observations, followed by the details of the ParallelComp algorithm inspired by our insights. Figure~\ref{fig:overview} provides a high-level overview of inference using ParallelComp, which includes the compression and ranking components.
+
+
+
+% \vspace{-2mm}
+\paragraph{Parallel Attention.}
+Inspired by previous studies~\citep{chen2023longlora,an2024training}, we split the text into chunks according to the model's maximum context size and concatenate them with the input query for parallel encoding. This step is typically performed using local attention. For a given input sequence \( X \in \mathbb{R}^{N \times d} \), the sequence is divided into \( C = \lceil N / w \rceil\) chunks, each containing at most \( w \) tokens (the maximum context length of each chunk). Let \( f_Q(\cdot) \), \( f_K(\cdot) \), and \( f_V(\cdot) \) represent the linear transformation functions for query, key, and value projections, respectively. Then, the attention computation is performed parallelly within each chunk\footnote{We use multi-head attention in implementation but omit the head information for simplicity in our description.}:
+\begin{equation}
+A^{c}_\mathfrak{l} = \text{Softmax}\left(\frac{f_Q({X^{c}}) \cdot f_K(X^{c})^T}{\sqrt{d}}\right),
+\end{equation}
+where \( X^{c} \in \mathbb{R}^{w \times d} \) represents the \( c \)-th chunk of the input sequence and \( A^{c}_\mathfrak{l} \in \mathbb{R}^{w \times w} \) is the corresponding attention matrix. The feature update is performed for each chunk:
+\begin{equation}
+F^{c} = A^{c}_\mathfrak{l} \cdot f_V(X^{c}),
+\end{equation}
+where \( F^{c} \in \mathbb{R}^{w \times d} \) is the updated feature for the \( c \)-th chunk. 
+
+
+
+Below, we discuss how to design chunk eviction strategies and parallel KV cache eviction strategies to maintain high throughput while minimizing redundant computations.
+
+\vspace{-3mm}
+\paragraph{Chunk Eviction.}
+
+To ensure that the computation of parallel attention can be performed on a single 80GB A100 GPU, we design a chunk eviction strategy to control memory overhead as shown in Figure~\ref{fig:overview} step 3. Inspired by \citet{ye2023compositional}, we introduce a chunk eviction mechanism that leverages the self-information of the query tokens \( X^q \) to further enhance parallel processing efficiency. This mechanism utilizes an online priority queue to manage memory, retaining only the most relevant chunks, thereby enhancing language modeling. For a given chunk \( c \), the self-information score for the query tokens \( X^q \) is calculated as follows: 
+\begin{equation}
+I_c = -\log P({X^q} \mid X^c),
+\end{equation}
+where \( X^c \) represents the context of chunk \( c \) and \( X^q \) corresponds to the chunk of the query. Chunks with lower self-information scores are considered more relevant and are retained. The set of indices \(c\) corresponding to the selected chunks is denoted by: 
+\begin{equation}
+S = \{ c \mid I_c \leq \tau \},  
+\end{equation}  
+where \( \tau \) is a threshold that determines whether a chunk will be selected or not. The selected set of chunks is stored in a fixed-size priority queue to ensure that the prefilling stage remains within the memory limit.
+
+
+\paragraph{Parallel KV Cache Eviction.}
+
+
+% where \( S_c \in \mathbb{R}^{w}\) represents the cumulative attention score for each chunk token, \( A_l \) is the local attention score between the \( i \)-th token of the query \( X^q \) and the \( j \)-th token of the chunk \( X^c \), and \( w_q \) denotes the length of the query sequence, and \( w \) is the length of the chunk sequence. The cumulative attention score sums the attention distributions of each token in the query to each token in the chunk. Tokens with low cumulative attention scores within the chunk are evicted, and the retained tokens are used to form the compressed KV cache.
+
+
+To further increase the throughput of chunks, we design a KV cache eviction strategy as shown in Figure~\ref{fig:overview} step 2. We utilize Flash Attention to perform fast attention computation. Since it is hard to obtain the complete attention distribution from Flash Attention~\citep{dao2023flashattention}, we use the \textbf{local attention} of \( X^q \) to quickly estimate tokens with relatively low attention scores and evict them in advance before sending them into Flash Attention:
+\begin{equation}
+\label{cum}
+S_{c,j} = \sum_{i=1}^{w_q} A^c_\mathfrak{l}(X^q_i, X^c_j), \quad j = 1, 2,...,w,
+\end{equation}
+where \( S_c \in \mathbb{R}^{w} \) represents the cumulative attention score for each token in the chunk and \( A^c_\mathfrak{l} \) is the local attention score between the \( i \)-th token of the query \( X^q \) and the \( j \)-th token of the chunk \( X^c \), \( w_q \) denotes the length of the query sequence. The cumulative attention score aggregates the attention distributions from each token in the query to each token in the chunk, thereby measuring the relevance of each token in the chunk to the query $X^q$. Tokens with low cumulative attention scores within the chunk are evicted, and the retained tokens are used to form the compressed KV cache.
+\begin{equation}
+K_r = K_x[R_l], \quad V_r = V_x[R_l],
+\end{equation}
+where \( K_x \) and \( V_x \) represent the KV cache of the input chunk, and \( R_l \) denotes the set of indices corresponding to the evicted tokens with low attention scores. The notation \( [\cdot] \) indicates indexing into \( K_x \) and \( V_x \) to evict only the tokens corresponding to the indices in \( R_l \). $K_r$ and $V_r$ denote the retained KV cache. The compression strategy of the KV cache typically helps reduce memory overhead while increasing chunk throughput, but it often exacerbates attention bias. Next, we introduce a simple and effective strategy to calibrate attention distribution.
+
+\paragraph{Attention Calibration.} To alleviate the attention bias exacerbated by Parallel KV Cache Eviction, we design another token eviction strategy using Eq.~\ref{cum}. Specifically, we evict tokens with excessively high attention scores. Let \( R_h \) correspond to those with extremely high attention scores exceeding \( \lambda \) (a manually-set threshold), then we have:
+\begin{equation}  
+K'_r = K_r[R_h], \quad V'_r = V_r[R_h].  
+\end{equation}  
+ Evicting tokens with exceptionally high scores guarantees that the segmented computation of softmax in Flash Attention can produce calibrated attention distributions. We will thoroughly investigate the impact of this calibration method on the attention distribution in Section~\ref{Empirical Study of Parallel Attention Bias}.
+
+
+
+
+\paragraph{Global Attention.}  
+
+After obtaining the attention outputs for each chunk, we concatenate the key-value (KV) caches from all chunks into a unified representation. Specifically, the concatenated KV cache is given by: 
+\begin{equation}
+\small
+\begin{aligned}
+K =& \big[K^{X^1}, K^{X^2}, \dots, K^{X^C}, K^{X^q}\big], \\
+V =& \big[V^{X^1}, V^{X^2}, \dots, V^{X^C}, V^{X^q}\big],
+\end{aligned}
+\end{equation}
+where \( K^{X^c} \) and \( V^{X^c} \) are the key and value projections of the \( c \)-th chunk.
+
+
+Next, we perform a global attention operation. This global attention enables the model to aggregate information across all chunks, ensuring that global dependencies are captured. The global attention computation for \( X^q \) is given by:
+\begin{equation}
+A_{\mathfrak{g}} = \text{Softmax}\left(\frac{f_Q(X^q) \cdot K^T}{\sqrt{d}}\right),
+\end{equation}
+where \( A_{\mathfrak{g}} \in \mathbb{R}^{w_q \times (C \cdot w + w_q)} \) is the global attention score matrix for the query chunk. The corresponding output of the global attention is computed as:
+\begin{equation}
+F_{\mathfrak{g}} = A_{\mathfrak{g}} \cdot V,
+\end{equation}
+where \( F_{\mathfrak{g}} \in \mathbb{R}^{w_q \times d} \) represents the globally updated features for the query chunk. Finally, the updated global representation is passed through the feedforward and autoregressive decoding stages, enabling the model to generate outputs while leveraging information from all chunks efficiently.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+% \input{table/algo}
+\vspace{-1mm}
+\subsection{Parallel Attention Bias}
+\label{Parallel Attention Bias}
+
+
+
+\paragraph{Theoretical Insights into Parallel Attention Bias.}\label{sec:parallel_attn_collapse}
+
+In this section, we provide a theoretical framework for understanding \textit{Parallel Attention Bias}, extending the concept of attention collapse~\citep{dong2021attention} to parallel attention mechanisms described in Section~\ref{ParallelComp}. Specifically, we analyze the sparsity behavior of the local attention matrices computed over parallel chunks and its implications for efficiency and accuracy.
+
+\begin{theorem}\label{thm:parallel_attn_collapse_main}
+    Consider the following setup:
+      \vspace{-2mm}
+    \begin{itemize}
+        \item {\bf Part 1:} For any \(\epsilon > 0\), the sparsity threshold of effective entries in \(A^{c}_\mathfrak{l}\) increases with \(w\). \( \epsilon \) is a user-defined threshold that controls sparsity in the attention matrix. With more chunks (\( C \)), \( \epsilon \) affects the balance between retaining information within each chunk and computational efficiency.
+        \item {\bf Part 2:} The number of effective entries \(k\) in each row of \(A^{c}_\mathfrak{l}\) is upper-bounded as: 
+        \[
+        k \leq w - \exp\left(O\left(\frac{\log^2(\epsilon \cdot w)}{R^2}\right)\right) \cdot \frac{\delta}{wd},
+        \] where \(R\) represents the rank of the sparse attention matrix, which determines the effective dimensionality of retained attention entries, and \(\delta\) is a probability bound controlling the confidence level of the sparsity constraint. 
+        
+        % A larger \(R\) implies more retained attention entries, whereas a higher \(\delta\) indicates a looser constraint on sparsity.
+        \item {\bf Part 3:} With high probability (\(1 - \delta\)), the number of ineffective entries in each row satisfies:
+        \[
+        \lim_{w \to \infty} | \mathcal{S}_\epsilon^{(c)}(A^{c}_\mathfrak{l}[i,:]) | = w - k.
+        \]
+    \end{itemize}
+\end{theorem}
+
+\begin{proof}[Proof Sketch of Theorem~\ref{thm:parallel_attn_collapse_main}]
+{\bf Proof sketch of Part 1:} From the softmax scaling property, the sparsity threshold for effective entries in \( A^{c}_\mathfrak{l} \) can be bounded as:
+\[
+\epsilon \geq \exp\left(O(R) \cdot \sqrt{\log(w \cdot (w-k)/\delta)}\right).
+\]
+This inequality shows that as \( w \) increases, the threshold for retaining effective entries becomes stricter, limiting the number of such entries. {\bf Proof sketch of Part 2:} Rearranging the above inequality, we derive an upper bound on \( k \), the number of effective entries:
+\[
+k \leq w - \exp\left(O\left(\frac{\log^2(\epsilon \cdot w)}{R^2}\right)\right) \cdot \frac{\delta}{wd}.
+\]
+This implies that the number of effective entries in each row of the attention matrix is given by \( w - k \). {\bf Proof sketch of Part 3:} Substituting the bound of \( k \) into the definition of \( |\mathcal{S}_\epsilon^{(c)}| \), the number of ineffective entries, we find:
+\[
+\lim_{w \to \infty} | \mathcal{S}_\epsilon^{c}(A_\mathfrak{l}^{c}[i,:]) | \geq w - k.
+\]
+Finally, observing that \( R = O(\sqrt{\log(w)}) \) ensures that the sparsity growth is bounded as \( w \to \infty \). Appendix~\ref{sec:parallel_attn_collapse_aa} provides a more detailed proof.
+\end{proof} 
+
+
+\vspace{-6mm}
+\paragraph{Discussion.}
+
+Theorem~\ref{thm:parallel_attn_collapse_main} highlights the inevitability of attention collapse in parallel attention mechanisms. Despite dividing the input sequence into \( C \) smaller chunks, the effective number of attention entries within each chunk diminishes as the chunk size \( w \) increases. Key observations include: \textit{i)} Each local attention matrix \( A^{c}_\mathfrak{l} \) exhibits sparsity behavior similar to the global attention matrix, with most entries becoming negligible for large \( w \). \textit{ii)} When a super-long matrix is input into attention in parallel, {\it attention bias} inevitably occurs. The attention mechanism repeatedly focuses on a small number of tokens due to its inherent limitations, even with more information provided. Selecting an appropriate sparsity parameter \( \epsilon \) can mitigate this issue. \textit{iii)} Dividing the input into chunks reduces computational overhead while maintaining sparsity within each chunk.
+
+
+\section{Empirical Study of Parallel Attention Bias}
+\label{Empirical Study of Parallel Attention Bias}
+In this section, we investigate the attention sink phenomenon in parallel attention mechanisms and compare its similarities and differences with the regular attention sink phenomenon. Specifically, we explore the following question:  
+
+\vspace{-4mm}
+
+\paragraph{Q1: What types of attention patterns can be summarized?}
+ 
+In summary, three main types of attention patterns emerge, as illustrated in Figure~\ref{fig:attention_bias_pattern}: U-shape, Mountain-shape, and Uniform-shape. 
+% \vspace{-10mm}
+\begin{figure}[H]
+% \vskip 0.2in
+% \vspace{-3mm}
+\begin{center}
+\centerline{\includegraphics[width=0.5\textwidth]{figure/Attention_pattern.pdf}}
+\caption{Several types of attention distribution. The Token ID represents the token position in the input text.}
+\label{fig:attention_bias_pattern}
+\vspace{-8mm}
+\end{center}
+% \vskip -0.2in
+\end{figure}
+
+\paragraph{Observations.} These attention distributions give rise to three corresponding biases: \textit{i)} Attention sink, where focus is concentrated on the initial few tokens. \textit{ii)} Recency bias, where attention is more strongly concentrated at the tail. \textit{iii)} Middle bias, where attention is disproportionately focused on a few tokens in the middle of a sequence. \textit{iv)} These biases manifest in a wavelike pattern, with \( R_h \) containing three token types (\( R_s, R_m, R_r \)) corresponding to these biases.
+
+% In summary, there are three main types of attention patterns, as illustrated in Figure~\ref{fig:attention_bias_pattern}, namely U-shape, Mountain-shape, and Uniform-shape. The shapes of the first two attention distributions lead to three types of bias, which can be briefly described as follows: \textit{i)} Attention sink where the focus is concentrated on the initial few tokens. \textit{ii)} The model's attention sink phenomenon is more severe at the tail, indicating a stronger recency bias. \textit{iii)} The model exhibits severe attention concentration in the middle part, where attention focuses on only a few tokens among thousands. This bias is referred to as an middle bias.
+
+
+
+% \paragraph{Answer.}
+% Three types of attention bias—sink, recency, and middle—emerge in a wavelike pattern, with \( R_h \) containing three token types (\( R_s, R_m, R_r \)) that correspond to these biases, where \( R_s \) is the anomalous token.
+
+\paragraph{Q2: Is there any difference between the attention bias in parallel attention and the attention bias in classical attention?}
+In this part, we provide a detailed analysis of some bias phenomena in parallel attention mechanisms. We observe in Figure~\ref{fig:parrallel_attention} that there are relatively more peaks within the contexts. 
+
+\begin{figure}[H]
+% \vskip -0.2in
+\begin{center}
+\centerline{\includegraphics[width=0.5\textwidth]{figure/layer_1_head_1_horizontal.pdf}}
+\caption{Comparison of local and parallel attention patterns. The blue lines show the local attention distribution within a chunk, while the yellow lines represent the parallel attention patterns in global attention.}
+\label{fig:parrallel_attention}
+\end{center}
+% \vskip -0.2in
+\vspace{-8mm}
+\end{figure}
+
+\vspace{-2mm}
+\begin{figure*}[ht]
+\begin{center}
+% \centering
+\includegraphics[width=0.99\textwidth]{figure/eviction.pdf}
+\caption{Several types of attention bias and patterns. In the figure, \textbf{Parallel KV Cache Eviction} performs independent KV cache eviction within each chunk, while \textbf{KV Cache Eviction} unifies this process during global attention. \textbf{Parallel KV Cache Eviction} significantly reduces the computational load of global attention.}
+\label{fig:attention_pattern_comparison}
+\end{center}
+% \vskip -0.2in
+\end{figure*}
+\FloatBarrier
+
+
+% \vspace{-3mm}
+\begin{figure}[H]
+% \vskip -0.2in
+\begin{center}
+\centerline{\includegraphics[width=0.5\textwidth]{figure/Comparison_of_bias_before_and_after.pdf}}
+\caption{The distribution of tokens with abnormally high attention scores. Blue represents outliers.}
+\label{fig:parrallel_attention_count}
+\end{center}
+\vspace{-2mm}
+\end{figure}
+
+
+\paragraph{Observations.} \textit{i)} Similar to the blue local attention, the yellow curve shows the U-shaped attention sink phenomenon repeatedly appearing. \textit{ii)} Parallel attention and local attention both exhibit severe recency bias, but the effect is significantly mitigated in parallel attention compared to local attention. \textit{iii)} When computing global attention \( A{\mathfrak{g}} \), the model suffers from the most severe recency bias, though it is still less pronounced than within \( A^c_{\mathfrak{l}} \) (blue line). \textit{iv)} Compared to the classical attention distribution, i.e., the local attention, the peaks of \( A{\mathfrak{g}} \) within the chunk are significantly weakened, indicating that global attention can significantly mitigate recency bias. \textbf{In other words, the parallel attention mechanism itself can mitigate attention bias.}
+
+\paragraph{Q3: Can the calibration strategy alleviate attention bias?}
+\label{Q3}
+
+By evicting different types of \(R_h\) at different layers, we have the following observations:
+\vspace{-2mm}
+\paragraph{Observations.} \textit{i):} From Figure~\ref{fig:attention_pattern_comparison}, we can see that KV cache eviction exacerbates the bias phenomenon. However, parallel KV cache eviction can achieve a more stable distribution. \textit{ii):} Evicting sink bias tokens in the early layers may exacerbate attention bias, but evicting them in the deeper layers can mitigate this attention bias. \textit{iii):} Evicting recency bias tokens in the intermediate layers can mitigate attention bias, while evicting recency bias tokens in the deeper layers redistributes the attention scores obtained by the recency bias tokens to the intermediate tokens. \textit{iv):}  Simultaneously evicting sink bias and recency bias tokens can alleviate attention bias in the intermediate layers (Layer 16). \textit{v):} From Figure~\ref{fig:parrallel_attention_count}, by evicting tokens with abnormally high attention scores, the model can mitigate attention bias, which means it can also alleviate the performance loss. We will further validate this in our experiments.
+
+
+
+
+

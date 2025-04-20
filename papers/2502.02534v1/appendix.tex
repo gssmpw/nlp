@@ -1,0 +1,847 @@
+\appendix
+\onecolumn
+\section{Appendix}
+\subsection{STeP introduction}
+\label{sec:step-appdix}
+\begin{figure}[htb]
+% \begin{minipage}{0.48\textwidth}
+% \begin{algorithm}[H]
+% \caption{PyTorch}
+% \label{alg:step-example-pytorch}
+% \begin{algorithmic}[1]
+% \INPUT $E_0$: [m,n,k]; $E_1$: [m,n,e]; $E_2$: [m,n,e]
+% \PARAM $W_0$: [k,d], $W_1$: [k,d]
+% \OUTPUT $O$: [m,n,k]
+% \STATE $W$ = [$W_0$, $W_1$] \hfill $\triangleright$ [e,k,d]
+% \STATE $Y_0$ = einsum('mnk,ekd$\rightarrow$emnd', $E_0$, $W$)
+% \STATE $Y_1$ = gelu($Y_0$) \hfill $\triangleright$ [e,m,n,d]
+% \STATE $T$ = $Y_1$ * $E_2$.reshape(e,m,n,1) 
+% \STATE $O$ = ($E_1$.reshape(e,m,n,1) * $T$).sum(dim=0)
+
+% \end{algorithmic}
+% \end{algorithm}
+% \end{minipage}
+% \hfill
+\centering
+\begin{equation}
+    \sum_{i=0}^1 G_i \cdot \text{gelu}(W_i X) \text{ with } N_i = \mathbf{I}[G_i > 0]
+\label{eq:moe-module}
+\end{equation}
+\setcounter{ALC@line}{0}
+\begin{minipage}{0.5\textwidth}
+\begin{algorithm}[H]
+\caption{STeP for a simplified MoE module}
+\label{alg:step-example-step}
+\begin{algorithmic}[1]
+\INPUT $X$: [m,n] of Buffer(k), $N$: [m,n] of Multihot(e), $G$: [m,n] of Buffer(e)
+\OUTPUT [m,n] of Buffer(k)
+\PARAM $W_0$: [k,d], $W_1$: [k,d]
+\FUNC{weightedsum   \hfill $\triangleright$ external function} 
+% \ITYPE {$\langle$Buffer(k), Scalar$\rangle$}
+% \OTYPE {Buffer(k)}
+\FTYPE{Buffer(k) $\rightarrow$ $\langle$Buffer(k), Scalar$\rangle \rightarrow$ Buffer(k)}
+\FN{(s,v) = s + $v_0*v_1$}
+\INIT s = 0
+\FUNC{expert$_0$}
+% \ITYPE {$\langle$Buffer(k), Buffer(e)$\rangle$}
+% \OTYPE {$\langle$Buffer(k), Scalar$\rangle$}
+\FTYPE{$\langle$Buffer(k), Buffer(e)$\rangle \rightarrow \langle$Buffer(k), Scalar$\rangle$}
+\FN{(v) = gelu($W_0v_0$), $v_1$[0])}
+\FUNC{expert$_1$}
+% \ITYPE {$\langle$Buffer(k), Buffer(e)$\rangle$}
+% \OTYPE {$\langle$Buffer(k), Scalar$\rangle$}
+\FTYPE{$\langle$Buffer(k), Buffer(e)$\rangle \rightarrow \langle$Buffer(k), Scalar$\rangle$}
+\FN{(v) = gelu($W_1v_0$), $v_1$[1])}
+\STATE $S_0$ = \primitive{Zip}($X$, $G$)
+\STATE $S_1^0$, $S_1^1$ = \primitive{Copy}($N$)
+\STATE $S_2$ = \primitive{Partition}(2, $S_0$, $S_1^0$)
+\STATE $S_3$ = [\primitive{Map}(expert$_0$, $S_2$[0]), \primitive{Map}(expert$_1$, $S_2$[1])]
+\STATE $S_4$ = \primitive{Merge}(weightedsum, $S_3$, $S_1^1$)
+\end{algorithmic}
+\end{algorithm}
+\end{minipage}
+\caption{\Cref{alg:step-example-step} is a STeP program example for~\cref{eq:moe-module}. The type signature follows the Haskell style where $\rightarrow$ connects a sequence of argument types with one return type. Three \textbf{func}s are external functions provided by the hardware.}
+\label{fig:step-intro}
+\end{figure}
+
+As shown in~\cref{fig:step-intro}, Copy duplicates a stream for the affine type constraint.  Zip combines two streams of values into a stream of tuples. Map applies the function (\textbf{fn}) on each input value. Partition routes tokens of the data stream to experts assigned by the index stream ($S_1^0$). Merge accumulates tokens from experts. The accumulation of Merge is parameterized by \textbf{fn} and \textbf{init} where \textbf{init} initializes the state and \textbf{fn} updates the state with the input value. Partition and Merge are used in pairs, sharing the same index stream. $\langle\rangle$ represents the Tuple type of value tokens. Buffer, Multihot, and Scalar are also types of value tokens, parametrized by the generic data type like float and half, which is omitted for simplicity in the algorithm. Buffer and Multihot types are further parametrized by the shape in the paratheses. Shape manipulation primitives include \texttt{Promote}, \texttt{Repeat} and \texttt{RepeatRef}.~\Cref{fig:rda}(a) also shows two streams. \texttt{S1} is a control token signaling the end of rank-1. \texttt{01} is a value token of multihot vector type served in index streams. \texttt{(v0,v1)} is a value token of type Tuple(Scalar, Reference) because the weight and input streams are composed of scalar and reference values, respectively.
+
+\newpage
+\subsection{Benchmark details}
+\label{sec:bench-info}
+As shown in~\cref{fig:bench}, Group 4 tasks have the same operator: $softmax(S)\cdot V$ where $S$ equals $QK^T$. They differ in external functions as shown in~\cref{fig:attn-tasks}. Group 4 can use RDA's on-chip fusion to compose scale-dot-product attention with Group 5. Group 7 also differs in external functions. Group 5 contains three dataflow orders: inner-product("$mnk,mdk\rightarrow mnd$"), row-wise("$mnk,mkd \rightarrow mnd$"), and outer-product("$mkn,mkd \rightarrow mnd$"). Group 6 contains GptJ and NeoX styles which differ in pairing even and odd or the first and second half positions~\cite{vllm2023rotary}. Group 8 contains LayerNorm and RMSNorm. 
+
+The last three in~\cref{tab:task}: index, expert, and etoe all come from MoE. MoE contains token~\cite{shazeer2017outrageously} \cref{eq:token-choice} and expert choice routing~\cite{zhou2022mixture} \cref{eq:expert-choice}.
+\begin{equation}
+\begin{aligned}
+    &S = softmax(X\cdot W_g), S\in \mathbb{R}^{n\times e} \\
+    &G, I = TopK(S) && \text{Along expert dimension}
+\end{aligned}
+\label{eq:token-choice}
+\end{equation}
+\begin{equation}
+\begin{aligned}
+    &S = softmax(X\cdot W_g), S\in \mathbb{R}^{n\times e} \\
+    &G, I = TopK(S^T) && \text{Along token dimension}
+\end{aligned}
+\label{eq:expert-choice}
+\end{equation}
+The expert choice routing can have another MLP auxiliary predictor for causal inference when it is a binary choice ~\cite{raposo2024mixture} \cref{eq:expert-choice-inference}.
+\begin{equation}
+\begin{aligned}
+    &S = \sigma((gelu(X\cdot W_{g_0}))\cdot W_{g_1}), S\in \mathbb{R}^{n\times 1} && \text{expert=2}\\
+    &G, I = S > 0.5
+\end{aligned}
+\label{eq:expert-choice-inference}
+\end{equation}
+
+\begin{table}[htb]
+    \centering
+    \begin{tabular}{c|l|c}
+    \toprule
+        Group & Description & Count \\
+        \midrule
+         attn & Softmax(S)@V part & 3 \\
+         gemm & Matrix multiplication with expanded reduction dimension & 3 \\
+         bmm & Batch matrix-matrix product& 3 \\
+         norm & RMSNorm and LayerNorm (without bias and gain) & 3 \\
+         rope & GptJ and NeoX style of RoPE & 3 \\
+         index & Index generation of MoE router & 4 \\
+         expert & Expert execution of MoE & 3 \\
+         etoe & End-to-end of MoE module & 4 \\
+        \bottomrule
+         
+    \end{tabular}
+    \caption{Description of each type of tasks. Matmul is short for matrix multiplication.}
+    \label{tab:task}
+\end{table}
+
+\newpage
+
+\subsection{Experiment settings}
+\label{sec:exp-setting}
+In~\cref{sec:exp-learn} we sample 64 times for each temperature of 0.4, 0.7, and 1.0, recording the best result. In~\cref{sec:exp-agent}, we sample 64 times at temperature 0.7 on Claude 3.5 Sonnet to control variables. Four models are: claude-3-5-sonnet-20241022 of Anthropic API (Claude 3.5 Sonnet), gpt-4o-2024-11-20 of OpenAI API (GPT-4o), deepseek-chat of DeepSeek API (DeepSeek-V3), and Meta-Llama-3-1-405B-Instruct-Turbo of TogetherAI API (Llama 3.1-405B). Maximum output tokens are set as 1024 and the seed for GPT-4o is 42.
+
+\subsection{Extra results}
+\begin{figure}[htb]
+    \centering
+    \includegraphics[width=0.5\linewidth]{figs/sonnet_token_plot_passn_diff.pdf}
+    \caption{Self-improvement learning curve with m=3. Claude 3.5 Sonnet consumes much fewer tokens than other models because the input tokens are counted by the least necessary number of tokens averaged across tasks. A task can take increasing input tokens but still fail. Sonnet only has 3 unsolved tasks left. Therefore, although it has the most example tokens, the average number of input tokens across tasks is still less than others.}
+    \label{fig:sonnet-learning-curve}
+\end{figure}
+
+ 
+\begin{figure}[htb]
+\begin{center}
+\centerline{\includegraphics[width=\columnwidth]{figs/all-models-with-avg.pdf}}
+\caption{Result of five models at temperature 0.7.}
+\label{fig:all-models}
+\end{center}
+\end{figure}
+
+\begin{figure}[htb]
+\begin{center}
+\centerline{\includegraphics[width=\columnwidth]{figs/all-methods-with-avg-bar.pdf}}
+\caption{Result of three methods on Claude 3.5 Sonnet at temperature 0.7.}
+\label{fig:all-methods-sonnet}
+\end{center}
+\end{figure}
+% \begin{figure}[ht]
+% \begin{center}
+% \centerline{\includegraphics[width=\columnwidth]{figs/pass@k-models.pdf}}
+% \caption{Pass@k against the number of samples ($k$) for five models.}
+% \label{fig:all-models-pass@k}
+% \end{center}
+% \end{figure}
+
+% \begin{table*}[htb]
+% \centering
+% \begin{tabular}{l l c c c c c}
+% \toprule
+% Type & Metric ($\uparrow$) & Qwen2.5-Coder-32B & Llama3-405B & DeepSeek-V3 & GPT-4o & Claude-3-5-sonnet \\
+% \midrule
+% \multirow{2}{*}{attn} & Pass@1 & 0.0104 & 0 & 0.4062 & 0 & \textbf{0.5885} \\
+% & Pass@n & 0.3333 & 0 & 0.6667 & 0 & \textbf{1} \\
+% \midrule
+% \multirow{2}{*}{gemm} & Pass@1 & 0 & 0 & 0 & 0 & \textbf{0.1406} \\
+% & Pass@n & 0 & 0 & 0 & 0 & \textbf{1} \\
+% \midrule
+% \multirow{2}{*}{bmm} & Pass@1 & 0.0104 & 0 & 0 & \textbf{0.1406} & 0.1302 \\
+% & Pass@n & \textbf{0.3333} & 0 & 0 & \textbf{0.3333} & \textbf{0.3333} \\
+% \midrule
+% \multirow{2}{*}{norm} & Pass@1 & 0 & 0.0573 & 0 & 0.0573 & \textbf{0.1979} \\
+% & Pass@n & 0 & \textbf{1} & 0 & 0.3333 & 0.6667 \\
+% \midrule
+% \multirow{2}{*}{rope} & Pass@1 & 0 & 0 & 0 & 0 & \textbf{0.3854} \\
+% & Pass@n & 0 & 0 & 0 & 0 & \textbf{1} \\
+% \midrule
+% \multirow{2}{*}{index} & Pass@1 & 0 & 0 & 0.0586 & 0.2500 & \textbf{0.6836} \\
+% & Pass@n & 0 & 0 & 0.5000 & 0.2500 & \textbf{0.7500} \\
+% \midrule
+% \multirow{2}{*}{expert} & Pass@1 & 0 & 0 & 0 & 0 & \textbf{0.6042} \\
+% & Pass@n & 0 & 0 & 0 & 0 & \textbf{1} \\
+% \midrule
+% \multirow{2}{*}{etoe} & Pass@1 & 0 & 0 & 0 & 0 & \textbf{0.2539} \\
+% & Pass@n & 0 & 0 & 0 & 0 & \textbf{1} \\
+% \midrule
+% \multirow{2}{*}{Avg} & Pass@1 & 0.0024 & 0.0066 & 0.0565 & 0.0613 & \textbf{0.3714} \\
+% & Pass@n & 0.0769 & 0.1154 & 0.1538 & 0.1154 & \textbf{0.8462} \\
+% \bottomrule
+% \end{tabular}
+% \caption{Agentic method across different models.
+% \weixin{
+% The results are compelling! Perhaps 2-3 decimal places would better reflect our confidence level?}
+% }
+% \label{tab:all-models}
+% \end{table*}
+
+% \begin{table*}[htb]
+% \centering
+% \begin{tabular}{l l c c c c c}
+% \toprule
+% Type & Metric ($\uparrow$) & Qwen2.5-Coder-32B & Llama3-405B & DeepSeek-V3 & GPT-4o & Claude-3-5-sonnet \\
+% \midrule
+% \multirow{2}{*}{attn} & Pass@1 & 0.01 & 0 & 0.41 & 0 & \textbf{0.59} \\
+% & Pass@n & 0.33 & 0 & 0.67 & 0 & \textbf{1.00} \\
+% \midrule
+% \multirow{2}{*}{gemm} & Pass@1 & 0 & 0 & 0 & 0 & \textbf{0.14} \\
+% & Pass@n & 0 & 0 & 0 & 0 & \textbf{1.00} \\
+% \midrule
+% \multirow{2}{*}{bmm} & Pass@1 & 0.01 & 0 & 0 & \textbf{0.14} & 0.13 \\
+% & Pass@n & \textbf{0.33} & 0 & 0 & \textbf{0.33} & \textbf{0.33} \\
+% \midrule
+% \multirow{2}{*}{norm} & Pass@1 & 0 & 0.06 & 0 & 0.06 & \textbf{0.20} \\
+% & Pass@n & 0 & \textbf{1.00} & 0 & 0.33 & 0.67 \\
+% \midrule
+% \multirow{2}{*}{rope} & Pass@1 & 0 & 0 & 0 & 0 & \textbf{0.39} \\
+% & Pass@n & 0 & 0 & 0 & 0 & \textbf{1.00} \\
+% \midrule
+% \multirow{2}{*}{index} & Pass@1 & 0 & 0 & 0.06 & 0.25 & \textbf{0.68} \\
+% & Pass@n & 0 & 0 & 0.50 & 0.25 & \textbf{0.75} \\
+% \midrule
+% \multirow{2}{*}{expert} & Pass@1 & 0 & 0 & 0 & 0 & \textbf{0.60} \\
+% & Pass@n & 0 & 0 & 0 & 0 & \textbf{1.00} \\
+% \midrule
+% \multirow{2}{*}{etoe} & Pass@1 & 0 & 0 & 0 & 0 & \textbf{0.25} \\
+% & Pass@n & 0 & 0 & 0 & 0 & \textbf{1.00} \\
+% \midrule
+% \multirow{2}{*}{Avg} & Pass@1 & 0 & 0.01 & 0.06 & 0.06 & \textbf{0.37} \\
+% & Pass@n & 0.08 & 0.12 & 0.15 & 0.12 & \textbf{0.85} \\
+% \bottomrule
+% \end{tabular}
+% \caption{Agentic method across different models.}
+% \label{tab:all-models}
+% \end{table*}
+
+As shown in~\cref{tab:all-models}, OpenAI-o1 achieves similar performance at the cost of more tokens than a single Claude-3-5-Sonnet. This observation aligns with previous findings that scaling pretraining is preferable over inference for challenging tasks~\cite{snell2024scaling}. Meanwhile, a single Claude-3-5-Sonnet proposer can finish more tasks than the OpenAI-o1 using fewer tokens.~\Cref{tab:task} contains all abbreviations.
+
+\begin{table*}[htb]
+\centering
+\begin{tabular}{l c c c c c c c c c c}
+\toprule
+Model & Metric ($\uparrow$) & attn & gemm & bmm & norm & rope & index & expert & etoe & avg\\
+\midrule
+\multirow{2}{*}{Qwen2.5-Coder-32B} & Pass@1 & 0.010 & 0 & 0.052 & 0 & 0 & 0.004 & 0 & 0 & 0.008 \\
+& Pass@n & 0.33 & 0 & \textbf{0.33} & 0 & 0 & 0.25 & 0 & 0 & 0.115\\
+\midrule
+\multirow{2}{*}{Llama3-405B} & Pass@1 & 0.010 & 0 & 0 & 0.057 & 0.089 & 0.016 & 0 & 0 & 0.020\\
+& Pass@n & 0.33 & 0 & 0 & \textbf{1.00} & 0.67 & 0.25 & 0 & 0 & 0.269\\
+\midrule
+\multirow{2}{*}{DeepSeek-V3} & Pass@1 & 0.438 & 0 & 0 & 0 & 0 & 0.113 & 0 & 0 &0.068\\
+& Pass@n & \textbf{1.00} & 0 & 0 & 0 & 0 & \textbf{0.75} & 0 & 0 & 0.231\\
+\midrule
+\multirow{2}{*}{GPT-4o} & Pass@1 & 0.021 & 0.016 & \textbf{0.214} & 0.094 & 0 & 0.258 & 0.005 & 0 & 0.080\\
+& Pass@n & 0.33 & 0.67 & \textbf{0.33} & 0.67 & 0 & 0.5 & 0.33 & 0 & 0.346\\
+\midrule
+\multirow{2}{*}{Claude-3-5-sonnet} & Pass@1 & \textbf{0.620} & \textbf{0.229} & 0.146 & \textbf{0.208} & \textbf{0.526} & \textbf{0.676} & \textbf{0.688} & \textbf{0.324} & \textbf{0.433}\\
+& Pass@n & \textbf{1.00} & \textbf{1.00} & \textbf{0.33} & \textbf{1.00} & \textbf{1.00} & \textbf{0.75} & \textbf{1.00} & \textbf{1.00} & \textbf{0.885}\\
+\midrule
+\multirow{2}{*}{OpenAI-o1 (n=8)} & Pass@1 & 0.208 & 0.042 & 0 & 0 & 0.083 & 0.343 & 0.583 & 0 & 0.159\\
+  & Pass@n & 0.67 & 0.33 & 0 & 0 & 0.67 & 0.5 & \textbf{1.00} & 0 & 0.385\\
+\bottomrule
+\end{tabular}
+\caption{The performance of the self-improvement agentic system across models.}
+\label{tab:all-models}
+\end{table*}
+
+\newpage
+\subsection{Additional explanation}
+\begin{table}[htb]
+    \centering
+    \begin{tabular}{c|l}
+    \toprule
+        Abbv. & Description \\
+        \midrule
+         DSA & Domain Specific Architectures \\
+         DSL & Domain Specific Language \\
+         ASPL & Architecture Specific Programming Language \\
+         RDA & Reconfigurable Dataflow Architecture, a DSA for AI \\
+         STeP & Streaming Tensor Program, an ASPL for next-generation RDA \\
+        \bottomrule
+    \end{tabular}
+    \caption{Explanation of the abbreviations.}
+    \label{tab:abbv}
+\end{table}
+
+% \begin{algorithm}
+% \caption{Repeated sample}
+% \label{alg:sweep-temprature-alg}
+% \begin{algorithmic}[1]
+% \REQUIRE{$\mathcal{M}$ (agentic system)}
+% \INPUT $\pi$ (prompt)
+%     \STATE $\Omega \gets \emptyset$ \COMMENT{Collection of results}
+%     \FOR{$\alpha \in [0.4, 0.7, 1.0]$}
+%     \STATE $\omega_{\alpha} \gets$ EXECUTE($\mathcal{M}, \pi, \alpha$)
+%     \STATE $\Omega \gets \Omega \cup \{\omega_{\alpha}\}$
+% \ENDFOR
+% \STATE \textbf{return} MERGE\_BEST($\Omega_t$)
+% \end{algorithmic}
+% \end{algorithm}
+
+
+\newpage
+\subsection{Code and prompt examples}
+\lstset{
+    breaklines=true,
+    breakatwhitespace=true  % Optional: breaks only at whitespace
+}
+\begin{figure}[htbp]
+\centering
+\begin{lstlisting}[language=step, mathescape=true, basicstyle=\scriptsize\ttfamily]
+- name: Accum
+  desc: |
+  Accum is a primitive operation that applies a function to a stream in a recursive manner.
+  The function is applied to the first element of the stream and the initial state to produce the first output element.
+  The function is then applied to the second element of the stream and the output of the previous application to produce the second output element, and so on.
+  The state is initialized at rank `b` of the input stream. The output stream's shape is the input stream's shape excluding the first `b` dimensions. 
+
+  examples:
+  - inputs:
+    - name: E0
+      dtype: fp32
+      dims: [M, N]
+      data_gen: torch.rand
+    fns:
+    - name: Sum
+      apply: |
+        return [state[0] + input[0]]
+      init: [0]
+      input_dtype: fp32
+      output_dtype: fp32
+      func_name: fn_sum
+    outputs:
+    - name: S0
+      dtype: fp32
+      dims: [N]
+      data_transform:
+        - |
+          torch.sum(input_data['E0'], 1, keepdim=False)
+    impl: |
+      E1 = step.Accum(fn=fn_sum, b=1).apply(E0)
+      return E1
+\end{lstlisting}
+\caption{The reference of \texttt{Accum} that contains the definition and an example. Each example in the examples field is composed of task description and implementation.}
+\label{fig:reference-accum}
+\end{figure}
+
+\begin{figure}[htbp]
+\centering
+\begin{lstlisting}[language=step, mathescape=true, basicstyle=\scriptsize\ttfamily]
+inputs:
+  - name: E0
+    dtype: fp32
+    dims: [M, N]
+    data_gen: torch.rand
+  - name: E1
+    dtype: Buffer(fp32, [D])
+    dims: [M, N]
+    data_gen: torch.rand
+  
+fns:
+  - name: MaxSum
+    apply: |
+      m_t, l_t, o_t = state # scalar, scalar, [D]
+      s_t, v_t = input # scalar, [D]
+      m_next = torch.max(m_t, s_t) # scalar
+      l_prim_t = torch.exp(m_t - m_next) * l_t
+      p_t = torch.exp(s_t - m_next)
+      l_next = p_t + l_prim_t
+      o_next = l_prim_t * o_t / l_next + p_t * v_t / l_next
+      return [m_next, l_next, o_next]
+    init: [-inf, 0, 0]
+    input_dtype: [fp32, "Buffer(fp32, [D])"]
+    output_dtype: [fp32, fp32, "Buffer(fp32, [D])"]
+    func_name: fn_maxsum
+
+  - name: GetThird
+    apply: |
+      return [input[2]]
+    input_dtype: [fp32, fp32, "Buffer(fp32, [D])"]
+    output_dtype: Buffer(fp32, [D])
+    func_name: fn_getthird
+
+outputs:
+  - name: S0
+    dtype: fp32
+    dims: [D, N]
+    data_transform:
+      - |
+        torch.bmm(torch.softmax(input_data['E0'], 1).unsqueeze(1), input_data['E1']).squeeze(1)
+
+impl: |
+\end{lstlisting}
+\caption{Task description of attn task 0 in our structural IR, where the LLM needs to complete \texttt{impl}.}
+\label{fig:attn-task0-desc}
+\end{figure}
+
+\begin{figure}[htbp]
+\centering
+\begin{tabular}{c c c}
+\vtop{\begin{lstlisting}[language=step, mathescape=true, basicstyle=\scriptsize\ttfamily, linewidth=0.3\textwidth]
+# Task 0
+# MaxSum
+def apply(state, input):
+    $m_t,l_t,\pmb{o_t}$ = state
+    $s_t,\pmb{v_t}$ = input
+    $m_{t+1} = max(m_t,s_t)$
+    $l'_t = l_t * e^{(m_t - m_{t+1})}$
+    $p_t = e^{(s_t - m_{t+1})}$
+    $l_{t+1} = p_t + l'_t$
+    $\pmb{o_{t+1}} = \frac{1}{l_{t+1}}(l'_t * \pmb{o_t} + p_t * \pmb{v_t})$
+    return $(m_{t+1}, l_{t+1}, \pmb{o_{t+1}})$
+    
+def init():
+    return $(-\infty, 0, \pmb{0})$
+
+# GetThrid
+def apply(input):
+    return input[2]
+    
+\end{lstlisting}} &
+\vtop{\begin{lstlisting}[language=step, mathescape=true, basicstyle=\scriptsize\ttfamily, linewidth=0.3\textwidth]
+# Task 1
+# ExpMaxDiff
+def apply(state, input):
+    $m_t,e_t,d_t$ = state
+    $s_t,$ = input
+    $m_{t+1} = max(m_t, s_t)$
+    $\Delta m = m_t - m_{t+1}$
+    $e_{t+1} = e^{(s_t - m_{t+1})}$
+    $d_{t+1} = e^{\Delta m}$
+    return $(m_{t+1}, e_{t+1}, d_{t+1})$
+
+def init():
+    return $(-\infty, 0, 0)$
+
+# DivSum
+def apply(state, input):
+    $\pmb{v_t}, e_t, d_t$ = input
+    $l_t,\pmb{o_t}$ = state
+    $l'_t = d_t * l_t$
+    $l_{t+1} = e_t + l'_t$
+    $o_{t+1} = \frac{1}{l_{t+1}}(l'_t * \pmb{o_t} + e_t * \pmb{v_t})$
+    return $(l_{t+1}, o_{t+1})$
+
+def init():
+    return $(0,\pmb{0})$
+
+# GetSecondThrid
+def apply(input):
+    return input[1],input[2]
+
+# GetSecond
+def apply(input):
+    return input[1]
+    
+\end{lstlisting}} &
+\vtop{\begin{lstlisting}[language=step, mathescape=true, basicstyle=\scriptsize\ttfamily, linewidth=0.3\textwidth]
+# Task 2
+# ExpMaxDiff
+def apply(state, input):
+    $m_t,e_t,d_t$ = state
+    $s_t,$ = input
+    $m_{t+1} = max(m_t, s_t)$
+    $\Delta m = m_t - m_{t+1}$
+    $e_{t+1} = e^{(s_t - m_{t+1})}$
+    $d_{t+1} = e^{\Delta m}$
+    return $(m_{t+1}, e_{t+1}, d_{t+1})$
+
+def init():
+    return $(-\infty, 0, 0)$
+
+# GetSecondThrid
+def apply(input):
+    return input[1],input[2]
+
+# WeightedSumSingle
+def apply(state, input):
+    $e_t,d_t$ = input
+    $r_t$ = state
+    return $(r_t * d_t + e_t)$
+
+def init():
+    return $0$
+
+# WeightedSumDouble
+def apply(state, input):
+    $\pmb{v_t}, e_t, d_t$ = input
+    return $(state * d_t + e_t * \pmb{v_t})$
+
+def init():
+    return $\pmb{0}$
+
+# Div
+def apply(input):
+    $r_t, \pmb{l_t} = input$
+    return $\frac{\pmb{l_t}}{r_t}$
+
+\end{lstlisting}}
+
+\end{tabular}
+
+\caption{Inner functions for 3 tasks of attn. Task 0 encapsulates the whole innermost loop body of FlashAttention~\cite{dao2022flashattention} in the \texttt{MaxSum} function. Task 1 splits the \texttt{MaxSum} into \texttt{ExpMaxDiff} and \texttt{DivSum}. Task 2 postpones the division of summation as in FlashAttention2~\cite{dao2023flashattention}. The bold symbols are streams with type 1D Buffer, and the symbols are streams with type Scalar.}
+\label{fig:attn-tasks}
+\end{figure}
+
+\begin{figure}[htbp]
+\centering
+\begin{lstlisting}[language=step, mathescape=true, basicstyle=\scriptsize\ttfamily]
+name: Stashing dimension
+desc: |
+  When the pritmives require a non-one dimension to be inserted as a non-innermost dimension, a Bufferize&Streamify pair can wrap the primitives to adjust the dimension.
+  This pattern is useful for Repeat and RepeatRef primitives.
+examples:
+  - inputs:
+    - name: E0
+      dtype: fp32
+      dims: [M, N, K]
+      data_gen: torch.rand
+    outputs:
+    - name: S0
+      dtype: fp32
+      dims: [M, N, D, K]
+      data_transform:
+        - |
+          input_data['E0'].unsqueeze(1).repeat(1, D_value, 1, 1)
+    impl: |
+      E1 = step.Bufferize(a=2).apply(E0) # E1: {dtype: Buffer(fp32, [M, N]), dims: [K]}
+      E2 = step.Repeat(n=D).apply(E1) # E2: {dtype: Buffer(fp32, [M, N]), dims: [D, K]}
+      E3 = step.Streamify().apply(E2) # E3: {dtype: fp32, dims: [M, N, D, K]}
+      return E3
+
+\end{lstlisting}
+\caption{An example of usage pattern that contains 3 shape manipulation primitives: Bufferize, Repeat, and Streamify.}
+\label{fig:example-pattern}
+\end{figure}
+
+\begin{figure}[htbp]
+\centering
+\begin{lstlisting}[language=step, mathescape=true, basicstyle=\scriptsize\ttfamily]
+inputs:
+  - name: E0
+    dtype: fp32
+    dims: [M, N]
+    data_gen: torch.rand
+  - name: E1
+    dtype: Buffer(fp32, [D])
+    dims: [M, N]
+    data_gen: torch.rand
+  
+fns:
+  - name: MaxSum
+    apply: |
+      m_t, l_t, o_t = state # scalar, scalar, [D]
+      s_t, v_t = input # scalar, [D]
+      m_next = torch.max(m_t, s_t) # scalar
+      l_prim_t = torch.exp(m_t - m_next) * l_t
+      p_t = torch.exp(s_t - m_next)
+      l_next = p_t + l_prim_t
+      o_next = l_prim_t * o_t / l_next + p_t * v_t / l_next
+      return [m_next, l_next, o_next]
+    init: [-inf, 0, 0]
+    input_dtype: [fp32, "Buffer(fp32, [D])"]
+    output_dtype: [fp32, fp32, "Buffer(fp32, [D])"]
+    func_name: fn_maxsum
+
+  - name: GetThird
+    apply: |
+      return [input[2]]
+    input_dtype: [fp32, fp32, "Buffer(fp32, [D])"]
+    output_dtype: Buffer(fp32, [D])
+    func_name: fn_getthird
+
+outputs:
+  - name: S0
+    dtype: fp32
+    dims: [D, N]
+    data_transform:
+      - |
+        torch.bmm(torch.softmax(input_data['E0'], 1).unsqueeze(1), input_data['E1']).squeeze(1)
+
+impl: |
+  E3 = step.Zip().apply((E0, E1))
+  E4 = step.Accum(fn=fn_maxsum, b=1).apply(E3)
+  E5 = step.Map(fn=fn_getthird).apply(E4)
+  E2 = step.Streamify().apply(E5)
+  return E2
+
+\end{lstlisting}
+\caption{The complete implementation of attn task 0 written in structural IR.}
+\label{fig:impl-attn0-yaml}
+\end{figure}
+
+\begin{figure}[htbp]
+\centering
+\begin{lstlisting}[language=step, mathescape=true, basicstyle=\scriptsize\ttfamily]
+
+import step
+from sympy import Symbol
+import torch
+
+M = Symbol("M")
+N = Symbol("N")
+K = Symbol("K")
+D = Symbol("D")
+M_value = 5
+N_value = 7
+K_value = 9
+D_value = 11
+ctx = {M: M_value, N: N_value, K: K_value, D: D_value}
+input_dtype = {'E0': step.Scalar("float"), 'E1': step.Buffer(step.Scalar("float"), [D])}
+input_data = {'E0': torch.rand(N_value, M_value), 'E1': torch.rand(N_value, M_value, D_value)}
+
+class MaxSum(step.Fn):
+    def __init__(self, input, output):
+        super().__init__("MaxSum", input, output)
+    def getInit(self):
+        return [torch.tensor(float('-inf')), torch.tensor(0), torch.zeros(D_value)]
+    def apply(self, state, input):
+        m_t, l_t, o_t = state # scalar, scalar, [D]
+        s_t, v_t = input # scalar, [D]
+        m_next = torch.max(m_t, s_t) # scalar
+        l_prim_t = torch.exp(m_t - m_next) * l_t
+        p_t = torch.exp(s_t - m_next)
+        l_next = p_t + l_prim_t
+        o_next = l_prim_t * o_t / l_next + p_t * v_t / l_next
+        return [m_next, l_next, o_next]     
+fn_maxsum = MaxSum(step.STuple((step.Scalar("float"), step.Buffer(step.Scalar("float"), [D]))), step.STuple((step.Scalar("float"), step.Scalar("float"), step.Buffer(step.Scalar("float"), [D]))))
+    
+class GetThird(step.Fn):
+    def __init__(self, input, output):
+        super().__init__("GetThird", input, output)    
+    def apply(self, input):
+        return [input[2]]
+fn_getthird = GetThird(step.STuple((step.Scalar("float"), step.Scalar("float"), step.Buffer(step.Scalar("float"), [D]))), step.Buffer(step.Scalar("float"), [D]))
+    
+def prepare():
+    E0 = step.Stream("E0", step.Scalar("float"), 1, [M, N])
+    E0.ctx = ctx
+    E0.data = [input_data['E0']]
+    E1 = step.Stream("E1", step.Buffer(step.Scalar("float"), [D]), 1, [M, N])
+    E1.ctx = ctx
+    E1.data = [input_data['E1']]
+    return E0, E1
+    
+def check_shape(S0):
+    assert S0.shape == [D, N]
+    assert S0.dtype == step.Scalar("float")
+    
+def check_data(S0):
+    S0_data_0 = torch.bmm(torch.softmax(input_data['E0'], 1).unsqueeze(1), input_data['E1']).squeeze(1)
+    torch.testing.assert_close(S0.data[0], S0_data_0)
+    
+def test():
+    E0, E1 = prepare()
+    S0 = body(E0, E1)
+    check_shape(S0)
+    check_data(S0)
+    
+def body(E0, E1):
+    E3 = step.Zip().apply((E0, E1))
+    E4 = step.Accum(fn=fn_maxsum, b=1).apply(E3)
+    E5 = step.Map(fn=fn_getthird).apply(E4)
+    E2 = step.Streamify().apply(E5)
+    return E2
+
+\end{lstlisting}
+\caption{The unit test of the implementation of attn task 0 in Python produced by the code generator from structural IR shown in~\cref{fig:impl-attn0-yaml}.}
+\label{fig:impl-attn0-python}
+\end{figure}
+
+
+
+\begin{figure}[htbp]
+\centering
+\begin{lstlisting}[language=step, mathescape=true, basicstyle=\scriptsize\ttfamily]
+desc: |
+  Streaming Tensor Programs (STeP) provides a higher-level abstraction for dataflow systems.
+  The streams can be only consumed once. Your task is to use Copy primitives to create a new stream that is a copy of the input stream when necessary.
+
+examples:
+  - input_impl: |
+      E2 = step.Partition(N=E_value).apply((E0, E1))
+      E3 = [step.Map(fn=fn).apply(s) for fn, s in zip(matmul_fns, E2)]
+      E4 = step.Merge(fn=fn_sum).apply((E3, E1))
+      return E4
+    
+    output_impl: |
+      E1_0, E1_1 = step.Copy().apply(E1)
+      E2 = step.Partition(N=E_value).apply((E0, E1_0))
+      E3 = [step.Map(fn=fn).apply(s) for fn, s in zip(matmul_fns, E2)]
+      E4 = step.Merge(fn=fn_sum).apply((E3, E1_1))
+      return E4
+    
+    explanation: |
+      Stream E1 is consumed twice in the input implementation. To ensure that the stream is consumed only once, we create a copy of the stream E1 and use the copy in the second step.
+
+  - input_impl: |
+      E1 = step.Map(fn=fn_predict).apply(E0)
+      E2 = step.Map(fn=fn_router).apply(E1)
+      E3 = step.Map(fn=fn_affinity).apply(E0)
+      E4 = step.Zip().apply((E0, E3))
+      return E4
+
+    output_impl: |
+      E0_0, E0_1 = step.Copy().apply(E0)
+      E0_2, E0_3 = step.Copy().apply(E0_0)
+      E1 = step.Map(fn=fn_predict).apply(E0_1)
+      E2 = step.Map(fn=fn_router).apply(E1)
+      E3 = step.Map(fn=fn_affinity).apply(E0_2)
+      E4 = step.Zip().apply((E0_3, E3))
+      return E4
+    
+    explanation: |
+      Stream E0 is consumed 3 times in the input implementation. To ensure that all streams are consumed only once, we create a copy of the stream E0 and use the copy in the subsequent steps.
+  
+  - input_impl: |
+      E1 = step.Bufferize(a=1).apply(E0)
+      E2 = step.Map(fn=fn_gate).apply(E1)
+      E3 = step.Map(fn=fn_top2).apply(E2)
+      return E3, E2
+  
+    output_impl: |
+      E1 = step.Bufferize(a=1).apply(E0)
+      E2 = step.Map(fn=fn_gate).apply(E1)
+      E3 = step.Map(fn=fn_top2).apply(E2)
+      return E3, E2
+
+    explanation: |
+      All streams are consumed only once in the input implementation. No need to create a copy of any stream.
+\end{lstlisting}
+\caption{Base prompt for the guardian agent.}
+\label{fig:prompt-agent-2}
+\end{figure}
+
+\begin{figure}[htbp]
+\centering
+\begin{lstlisting}[language=step, mathescape=true, basicstyle=\scriptsize\ttfamily]
+### <a name="Accum"></a>Accum
+Accumulate the lower `b` dimensions in `Stream<A,a>` into a single value of type `B`. **Accum** will continue to dequeue and accumulate to a value of type `B` by calling the given accumulation function (`Fn(A,B)->B`) until it sees a `.Sb` in the input stream. Then, it will emit the accumulated value of type `B` into the output stream and initialize the accumulator with the given initialize function.
+```
+Accum<A,B,a,b>: Fn(A,B) -> B, Fn() -> B, Stream<A,a> -> Stream<B,a-b>
+                (accumulate)  (initialize)
+Precondition: 0 < b <= a
+```
+We can think of `b` as the minimum stop token level **Accum** has to see before emitting the accumulated values. More details on how to set `b` according to the type of reduction we do can be found in the below examples.
+
+<details>
+
+<summary>
+Examples
+</summary>
+
+**Example1: Rowmax**  <br/>
+
+```
+Goal: [B,N,E] -> [B,N] (Reduce over the inner-most dim)
+Accum<A=f32, B=f32, a=3, b=1>: 
+  Fn(f32,f32)->f32, Fn()->f32, Stream<f32,3>->Stream<f32,2>
+
+Precondition: 0 < b <= a
+                (=1)  (=3)
+
+```
+We will call the given function (max) on every dequeue and emit the accumulated value when we see a `.Sx(x>=b)`. b is 1 in this example because we have to see the whole vector to obtain the reduced value.
+<br/>
+\end{lstlisting}
+\caption{The specification of \texttt{Accum} primitive in the STeP document.}
+\label{fig:accum-english}
+\end{figure}
+
+
+\begin{figure}[htbp]
+\centering
+\begin{lstlisting}[language=step, mathescape=true, basicstyle=\scriptsize\ttfamily]
+class Accum(OpBase):
+    def __init__(self, **kwargs):
+        super().__init__("Accum", **kwargs)
+
+    def apply(self, input: base.Stream, name=""):
+        b = self.config["b"]
+        fn: base.Fn = self.config["fn"]
+        assert isinstance(fn, base.Fn), f"Accum should take one of provided fns as input, but get {type(fn)}"
+        assert fn.input == input.dtype, f"Accum should take {fn.input} as input, but get {input.dtype}"
+        assert b > 0 and b <= input.rank, f"Accum should take a positive integer b less than or equal to the rank of the input, but get b: {b} and input rank: {input.rank}"
+
+        result = base.Stream(
+            self.getName(name), fn.output, input.rank - b, input.shape[b:]
+        )
+        if input.data is not None:
+            result.ctx = input.ctx
+            # TODO: Construct a general application function here
+            output_indices = get_full_indices(base.subsOuterShape(result.shape, result.ctx))
+            input_indices = get_full_indices(base.subsOuterShape(input.shape[:b], input.ctx))
+            if isinstance(result.dtype, base.Element) or isinstance(result.dtype, base.Buffer):
+                output_shapes = [base.subsFullShape(result.dtype, result.shape, result.ctx)[::-1]]
+            elif isinstance(result.dtype, base.STuple):
+                output_shapes = [base.subsFullShape(r, result.shape, result.ctx)[::-1] for r in result.dtype]
+            else:
+                raise ValueError("Invalid dtype")
+            result.data = [torch.zeros(shape) for shape in output_shapes]
+            for idx in output_indices:
+                state = fn.getInit()
+                for i in input_indices:
+                    full_idx = idx + i
+                    partial_data = [d[full_idx + (...,)] for d in input.data]
+                    state = fn.apply(state, partial_data)
+                for n, s in enumerate(state):
+                    result.data[n][idx] = s
+        return result
+\end{lstlisting}
+\caption{The definition of \texttt{Accum} primitive in the Python frontend.}
+\label{fig:accum-python}
+\end{figure}
+
+% \caption{Comparison between the structural IR and the Python unit test code produced by the code generator.}
+
+\newpage
+
+% \begin{table*}[htb]
+% \centering
+% \begin{tabular}{l c c c c c c c c c}
+% \toprule
+% Model & Metric ($\uparrow$) & attn & gemm & bmm & norm & rope & index & expert & etoe \\
+% \midrule
+% \multirow{2}{*}{Qwen2.5-Coder-32B} & Pass@1 & 0.0104 & 0 & 0.0104 & 0 & 0 & 0 & 0 & 0 \\
+% & Pass@n & 0.3333 & 0 & \textbf{0.3333} & 0 & 0 & 0 & 0 & 0 \\
+% \midrule
+% \multirow{2}{*}{Llama3-405B} & Pass@1 & 0 & 0 & 0 & 0.0573 & 0 & 0 & 0 & 0 \\
+% & Pass@n & 0 & 0 & 0 & \textbf{1} & 0 & 0 & 0 & 0 \\
+% \midrule
+% \multirow{2}{*}{DeepSeek-V3} & Pass@1 & 0.4062 & 0 & 0 & 0 & 0 & 0.0586 & 0 & 0 \\
+% & Pass@n & 0.6667 & 0 & 0 & 0 & 0 & 0.5000 & 0 & 0 \\
+% \midrule
+% \multirow{2}{*}{GPT-4o} & Pass@1 & 0 & 0 & \textbf{0.1406} & 0.0573 & 0 & 0.2500 & 0 & 0 \\
+% & Pass@n & 0 & 0 & \textbf{0.3333} & 0.3333 & 0 & 0.2500 & 0 & 0 \\
+% \midrule
+% \multirow{2}{*}{Claude-3-5-sonnet} & Pass@1 & \textbf{0.5885} & \textbf{0.1406} & 0.1302 & \textbf{0.1979} & \textbf{0.3854} & \textbf{0.6836} & \textbf{0.6042} & \textbf{0.2539} \\
+% & Pass@n & \textbf{1} & \textbf{1} & \textbf{0.3333} & 0.6667 & \textbf{1} & \textbf{0.7500} & \textbf{1} & \textbf{1} \\
+% \bottomrule
+% \end{tabular}
+% \caption{Agentic method across different models.}
+% \label{tab:all-models}
+% \end{table*}
+
+\newpage
+
+

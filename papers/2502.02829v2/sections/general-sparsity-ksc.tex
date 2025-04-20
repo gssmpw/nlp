@@ -1,0 +1,278 @@
+%!TEX root = ../main.tex
+
+\section{Correlative and Term Sparsity}
+\label{sec:general-sparsity-ksc}
+
+In this section, we review a systematic mechanism to relax a  general (nonconvex) polynomial optimization problem (POP) as a (convex) semidefinite program (SDP) while exploiting two levels of sparsity: (a) variable level---correlative sparsity (CS); and (b) term level---term sparsity (TS). 
+Formally, we consider the following POP
+\begin{align}
+    \label{eq:gs:general-pop}
+    \rho^\star = \min_{\mvx\in \R^n}\left\{
+        f(\mvx)\mymid  \substack{ \displaystyle g_1(\mvx)\ge 0, \dots, g_{m_{\ineq}}(\mvx)\ge 0,\\
+        \displaystyle h_1(\mvx) = 0, \dots, h_{m_{\eq}}(\mvx) = 0}
+    \right\} 
+\end{align}
+where the objective function $f$ and the constraints $g_i, h_i$ are all real polynomials. To ground our discussion in a concrete robotics example, let us consider the following simple contact-rich motion planning problem.
+
+\begin{example}[Double Integrator with Soft Wall]
+	\label{exa:gs:di-soft-wall}
+    As shown in Fig.~\ref{fig:sp:double-integrator}, consider a point mass $m$ driven by a control force $u$ that can bounce between two soft walls with spring coefficients $k_1$ and $k_2$. Denote the system state as $(x, v)$ ($x$: position, $v$: velocity), the control input as $u$, and the two wall's forces as $(\lam{1}, \lam{2})$, we consider the following trajectory optimization (optimal control) problem
+    \begin{subequations}
+        \begin{align}
+            \min \quad & \sum_{k = 0} ^ {N - 1} u_k^2 + \x[k+1]^2 + v_{k+1}^2 \label{eq:di:obj}\\
+            \text{s.t.} \quad & \x[k+1] - \x[k] = \dt \cdot v_k \label{eq:di:dynamics:1}\\
+            & v_{k+1} - v_k = \frac{\dt}{m} \cdot (u_k + \lam{1}[k] - \lam{2}[k]) \label{eq:di:dynamics:2} \\
+            & u_{\max}^2 - u_k^2 \ge 0 \label{eq:di:control}\\
+            & 0 \le \lam{1}[k] \perp \frac{\lam{1}[k] }{k_1} + d_1 + \x[k] \ge 0 \label{eq:di:force:1}\\
+            & 0 \le \lam{2}[k] \perp \frac{\lam{2}[k] }{k_2} + d_2 - \x[k] \ge 0 \label{eq:di:force:2} \\
+            & x_0 = x_{\init} \quad \text{and} \quad v_0 = v_{\init} \label{eq:di:init}
+        \end{align} 
+    \end{subequations}
+where $\dt$ represents the time discretization, \eqref{eq:di:obj} formulates a quadratic regulation loss function around $x=0,v=0$, \eqref{eq:di:dynamics:1}-\eqref{eq:di:dynamics:2} represent system dynamics, \eqref{eq:di:control} enforces control saturation, \eqref{eq:di:force:1}-\eqref{eq:di:force:2} specify the soft complementarity constraints between position and contact forces, and \eqref{eq:di:init} provides the initial condition. $\lam{1}[k]$ denotes the contact force at step $k$.
+\end{example}
+
+\textbf{Outline.} We begin by introducing the fundamentals of chordal graphs, a key mathematical tool for analyzing sparsity patterns (\S\ref{sec:gs:chordal-graph}). Next, we review correlative sparsity (CS) (\S\ref{sec:gs:cs}) and term sparsity (TS) (\S\ref{sec:gs:ts}) separately. Finally, we introduce our high-performance C++ sparse polynomial optimization toolbox, \spot (\S\ref{sec:gs:spot}). 
+
+% To complement these mathematical concepts, we present a toy example — the double integrator with soft walls — to illustrate the two-level sparsity patterns inherent in contact-rich planning problems.
+
+\input{figures/sparsity/double-integrator.tex}
+
+
+
+\subsection{Chordal Graph}
+\label{sec:gs:chordal-graph}
+
+\begin{definition}[Chordal graph]
+    A graph $G = (V, E)$ is \emph{chordal} if every cycle of four or more vertices has a chord---an edge connecting two non-adjacent vertices in the cycle. 
+    
+    % Formally, for any induced cycle $C \subseteq V$ with $|C| \geq 4$, there exists an edge $(v_i, v_j) \in E$ such that $v_i, v_j \in C$ and $(v_i, v_j)$ is not part of the cycle $C$.
+\end{definition}
+
+For a quick example, the graph in Fig.~\ref{fig:gs:chordal-extension-ksc}(a) is not chordal but the graph in Fig.~\ref{fig:gs:chordal-extension-ksc}(b) is. Apparently, one can change a non-chordal graph to chordal by adding edges. This is the notion of a chordal extension.
+
+\textbf{Chordal extension.} A graph $G'(V', E')$ is called a \emph{chordal extension} of graph $G(V, E)$ if (a) $G'$ is chordal, and (b) $V' = V$ and $E\subseteq E'$. The ideal objective of chordal extension is to add the \emph{minimum} number of edges to $G$ to make $G'$ chordal. However, it is known that finding such a minimal chordal extension is NP-complete~\cite{Yannakakis1981siam-minimum-fill-in}.
+% \footnote{A minimal chordal extension refers to adding the minimum number of edges to the graph $G$ such that the resulting graph $G'$ is chordal. This problem is also known as the Minimum Fill-In problem.} 
+A common heuristic for approximating the minimal chordal extension is the \emph{minimal degree} (MD) chordal extension~\cite{Rose1976siam-vertex-elimination}. An alternative heuristic is to select vertices based on the number of additional edges (MF) required to maintain chordality~\cite{Yannakakis1981siam-minimum-fill-in}. We summarize the MD chordal extension method in Algorithm~\ref{alg:gs:md} and MF chordal extension in Algorithm~\ref{alg:gs:mf} in Appendix~\ref{app:sec:mdmf}. 
+ In our \spot package, we implement both algorithms.
+
+\textbf{Maximal cliques.} Once the chordal extension is constructed, the next step is to identify the \emph{maximal cliques}. 
+
+\begin{definition}[Clique]
+    A \emph{clique} in a graph $G(V, E)$ is a subset of vertices $C \subseteq V$ where every pair of vertices is connected by an edge. 
+    A clique is \emph{maximal} if it is not properly contained within any other clique in $G$.
+\end{definition}
+
+The nice consequence of the chordal extension is that the maximal cliques of a chordal graph can be enumerated efficiently in linear time in terms of the number of nodes and edges~\cite{Delbert1965pjm-matrix-and-graph, Hans2010iac-treewidth-computations, golumbic2004algorithmic}. 
+Identifying all maximal cliques in a chordal graph plays a fundamental role in exploiting sparsity patterns.
+
+\input{figures/sparsity/chordal-extension-ksc.tex}
+
+\begin{example}[Chordal Extension and Maximal Cliques]
+    Consider the graph in Fig.~\ref{fig:gs:chordal-extension-ksc}(a) that is non-chordal. The MD chordal extension Algorithm~\ref{alg:gs:md} adds two edges $(B,D)$, $(B,F)$, leading to the chordal graph in Fig.~\ref{fig:gs:chordal-extension-ksc}(b). 
+    The maximal cliques of the resulting chordal graph are $\cbrace{A,B,D}$, $\cbrace{B,D,E}$, $\cbrace{B,E,F}$, and $\cbrace{B,C,F}$, as shown in Fig.~\ref{fig:gs:chordal-extension-ksc}(c).
+\end{example}
+
+With the notion of a chordal graph and maximal cliques, it is natural to use such a graph-theoretic tool to exploit sparsity.
+
+
+\subsection{Correlative Sparsity}
+\label{sec:gs:cs}
+
+As mentioned before, correlative sparsity (CS) seeks to exploit sparsity in the ``variable'' level. Roughly speaking, the intuition is that we can construct a graph that represents the connectivity in the POP~\eqref{eq:gs:general-pop}, perform a chordal extension to that graph, and find its maximal cliques to group the (potentially very large number of) POP variables into many groups where each group only contains a few variables~\cite{Waki2006siam-sos-semidefinite-relaxation}.
+
+% Correlative sparsity (CS) pertains to the variables in a POP and is leveraged by partitioning and regrouping these variables into cliques based on their interconnections. There are two steps: (a) CS graph construction; and (b) chordal extension and regrouping. 
+
+\textbf{CS graph construction.}  The graph $G^{\csp}(V, E)$ is the correlative sparsity pattern (CSP) graph of a POP with variables $\mvx \in \R^n$ if $V = [n]$ and $(i, j) \in E$ if at least one of the following three conditions holds:
+\begin{enumerate}
+    \item $\exists \mva \in \text{supp}(f)$, s.t. $\alpha_i, \alpha_j > 0$,
+    \item $\exists k \in [m_{\ineq}]$, s.t. $x_i, x_j \in \text{var}(g_k)$,
+    \item $\exists k \in [m_{\eq}]$, s.t. $x_i, x_j \in \text{var}(h_k)$.
+\end{enumerate}
+
+In words, the nodes of the CSP graph represent variables of the POP, and a pair of nodes are connected if and only if they simultaneously appear in the objective or the constraints.
+
+\textbf{Chordal extension and grouping.} With the MD chordal extension Algorithm~\ref{alg:gs:md} (or the MF chordal extension Algorithm~\ref{alg:gs:mf}), we compute the chordal extension of $G^{\csp}$--- denoted $(G^{\csp})'$---and its maximal cliques $\cbrace{I_l}_{l=1}^{p}$, where each clique $I_l$ contains a set of nodes (variables). We then partition the constraint polynomials $g_1, \dots, g_{m_{\ineq}}$ and $h_1, \dots, h_{m_{\eq}}$ into groups $\left\{ g_j\mymid j\in \calG_l \right\}$ and $\left\{ h_j\mymid j\in \calH_l \right\}$, where $\mathcal{G}_l$ and $\mathcal{H}_l$, $l \in \enum{p}$ index the inequality and equality constraints involving the variables in $I_l$, respectively. Formally, this is 
+\begin{enumerate}
+    \item $\forall j \in \calG_l, \text{var}(g_j)\subseteq I_l$, 
+    \item $\forall j \in \calH_l, \text{var}(h_j)\subseteq I_l$.
+\end{enumerate}
+
+\input{figures/sparsity/csp-graph.tex}
+
+We make this concrete by recalling our robotics Example~\ref{exa:gs:di-soft-wall}.
+
+\begin{example}[CSP Graph of Example~\ref{exa:gs:di-soft-wall}]
+	Fig.~\ref{fig:sp:csp-graph} shows the CSP graph of Example~\ref{exa:gs:di-soft-wall}. It is already a chordal graph without chordal extension. Two maximal cliques are highlighted: $\cbrace{x_0, v_0, \lambda_{1,0}, \lambda_{2,0}}$ and $\cbrace{x_0, x_1, v_0}$. There is an edge between $x_0$ and $v_0$ since $x_1 - x_0 = \dt \cdot v_0$ shows up in~\eqref{eq:di:dynamics:1}.
+\end{example}
+
+After grouping the variables into cliques $\{I_l\}_{l=1}^p$ and the polynomial constraints into subsets $\calH_l,\calG_l$, we can design a hierarchy of ``sparse'' moment and sums-of-squares (SOS) relaxations to globally optimize the POP~\eqref{eq:gs:general-pop}. 
+
+Before we present the sparse Moment-SOS hierarchy, it is useful to understand the ``dense'' Moment-SOS hierarchy.
+
+\textbf{Dense Moment-SOS relaxations.} Recall the POP~\eqref{eq:gs:general-pop}. Let $\mvy = (y_\mva)_{\mva}$ be a sequence of real numbers indexed by the standard monomial basis of $\R[\mvx]$. Define the Riesz linear functional $L_{\mvy} \colon \R[\mvx]\to \R$ as:
+\begin{align}
+    f = \sum_{\mva}f_{\mva}\mvx^\mva \mapsto \sum_{\mva}f_{\mva}y_{\mva}, \quad \forall f(\mvx) \in \R[\mvx]
+\end{align}
+In words, the Riesz linear functional $L_\mvy$ transforms a real polynomial $f$ to a real number that is the inner product between $\mvy$ and the vector of coefficients of $f$. The notation of $L_{\mvy}$ can be naturally extended to polynomial vectors and matrices, as illustrated in the following example.
+\begin{example}[Riesz Linear Functional]
+    Let $n = 3$, $I = \left\{ 1,3 \right\}$. Then $\sqbk{\mvx}_1 = \left[1;x_1;x_2;x_3\right]$ and $\sqbk{\mvx(I)}_2 = \left[ 1;x_1;x_3;x_1^2;x_1x_3;x_3^2 \right]$. Applying $L_{\mvy}$, we have
+    \begin{align}
+        & L_{\mvy}((x_1 + x_3)\cdot \sqbk{\mvx(I)}_2) = 
+	 \sqbk{
+		\begin{array}{c}
+			y_{1,0,0} + y_{0,0,1}\\
+			y_{2,0,0} + y_{1,0,1}\\
+			y_{1,0,1} + y_{0,0,2}\\
+			y_{3,0,0} + y_{2,0,1}\\
+			y_{2,0,1} + y_{1,0,2}\\
+			y_{1,0,2} + y_{0,0,3}
+		\end{array}
+     },
+    \end{align}
+    \begin{align}
+	 & L_{\mvy}(\sqbk{\mvx}_1\sqbk{\mvx}_1^T) = 
+		\sqbk{
+			\begin{array}{cccc}
+				y_{0,0,0} & y_{1,0,0} & y_{0,1,0} & y_{0,0,1}\\
+				y_{1,0,0} & y_{2,0,0} & y_{1,1,0} & y_{1,0,1}\\
+				y_{0,1,0} & y_{1,1,0} & y_{0,2,0} & y_{0,1,1}\\
+				y_{0,0,1} & y_{1,0,1} & y_{0,1,1} & y_{0,0,2}
+			\end{array}
+		},
+    \end{align}
+    where the number $y_{1,0,0}$ is applying $L_\mvy$ to the monomial $x_1^1 \cdot x_2^0 \cdot x_3^0 = x_1$.
+\end{example} 
+
+With the Riesz linear functional, we can state the dense Moment-SOS hierarchy. Essentially, through the Riesz linear functional $L_\mvy$, the Moment-SOS hierarchy relaxes the original POP~\eqref{eq:gs:general-pop} as a convex optimization problem whose variable becomes the sequence $\mvy$. The reason why this is called a ``hierarchy'' is because one can make the sequence arbitrarily long, depending on how many monomials are included. 
+
+\begin{proposition}[Dense Moment-SOS Hierarchy]\label{prop:dense}
+    Consider the POP~\eqref{eq:gs:general-pop}. Let $d_j^g = \ceil{\text{deg}(g_j)/2}$, $\forall j \in \enum{m_{\ineq}}$ and $d_j^h = \text{deg}(h_j)$, $\forall j \in \enum{m_{\eq}}$. Define
+    \bea\label{eq:min-relaxation-order} 
+    \hspace{-2mm}d_{\min}\!\!=\!\!\max\cbrace{ \ceil{\text{deg}(f)/2}, \cbrace{d_j^g}_{j\in \enum{m_{\ineq}}}, \cbrace{\ceil{d_j^h / 2}}_{j \in \enum{m_\eq}} }.\!\!\!\!
+    \eea
+    Given a positive integer $d \geq d_\min$, 
+    the $d$-th order dense Moment-SOS hierarchy reads:
+    \begin{subequations}\label{eq:gs:ds-moment}
+        \begin{eqnarray}
+            \min_\mvy & L_\mvy(f) \\
+            \text{s.t.} & L_\mvy\left( \enum{\mvx}_d \enum{\mvx}_d\tran \right) \succeq 0\\
+            & L_\mvy\left( g_j \cdot\enum{\mvx}_{d-d_j^g} \enum{\mvx}_{d-d_j^g}\tran \right) \succeq 0, \forall j\in \calG_l, l\in [p]\\
+            & L_\mvy\left( h_j \cdot \enum{\mvx}_{2d-d_j^h} \right) = 0, \forall j\in \calH_l, l\in [p]\\
+            & \mvy_{\mathbf{0}} = 1 
+        \end{eqnarray}
+    \end{subequations}
+    The optimal value of the convex optimization~\eqref{eq:gs:ds-moment} converges to the optimal value of the nonconvex POP~\eqref{eq:gs:general-pop} $\rho^\star$ as $d \rightarrow \infty$.
+    % \hy{@Shucheng, the $d_\min$ definition seems wrong, and please write the dense version similar as the sparse version below.}
+\end{proposition}
+In~\eqref{eq:gs:ds-moment}, the matrix $L_\mvy([\mvx]_d [\mvx]_d\tran)$ is usually called a \emph{moment matrix} and it is enforced by a positive semidefinite (PSD) constraint.
+One can see that the dense Moment-SOS hierarchy can become expensive very quickly as the relaxation order $d$ increases. This is because the ``dense'' moment matrix at order $d$ has size $(\substack{n+d\\d})$ which quickly makes the PSD constraint too large to be handled by off-the-shelf SDP solvers (recall that the length of the monomial basis indexing the moment matrix---$[\mvx]_d$---is $(\substack{n+d\\d})$).
+
+\textbf{Moment-SOS relaxations with CS.} On the other hand, with correlative sparsity and when the variables are divided into cliques $\{I_l\}_{l=1}^p$ where the size of clique $I_l$ is $n_l$, then instead of generating a single moment matrix with size $\nchoosek{n+d}{d}$, the sparse Moment-SOS hierarchy will generate $p$ moment matrices where the size of each moment matrix is $\nchoosek{n_l+d}{d}$. A different way to view this is that, correlative sparsity breaks a large PSD constraint into multiple smaller PSD constraints. 
+
+Let us formalize this.
+
+\begin{proposition}[Sparse Moment-SOS Hierarchy]\label{prop:sparse} Consider the POP~\eqref{eq:gs:general-pop} and assume its variables are grouped into cliques $\{ I_l\}_{l=1}^p$ and its constraints are grouped into $\calG_l,\calH_l$ where $\calG_l$ and $\calH_l$ include constraints only involving variables $\mvx[I_l]$. For any fixed integer $d \geq d_\min$ ($d_\min$ defined as in~\eqref{eq:min-relaxation-order}), define the following polynomial matrices and vectors associated with each clique $I_l$ as:
+    \begin{subequations}\label{eq:sparse-matrices}
+        \begin{align}
+            M_d(I_l) & = {\sqbk{\mvx(I_l)}_d} \sqbk{\mvx(I_l)}_d\tran, l\in \sqbk{p}\\
+            M_d(g_j, I_l) & = g_j\cdot {\sqbk{\mvx(I_l)}_{d-d_j^g}} \sqbk{\mvx(I_l)}_{d-d_j^g}\tran, j\in \calG_l, l\in \sqbk{p}\\
+            H_d(h_j, I_l) & = h_j\cdot \sqbk{\mvx(I_l)}_{2d-d_j^h}, j\in \calH_l, l\in \sqbk{p} \label{eq:gs:H}
+        \end{align}
+    \end{subequations}
+    Let  $g_0 := 1$, then $M_d(g_0, I_l) = M_d(I_l)$. The $d$-th order Moment-SOS hierarchy with correlative sparsity reads:
+    \begin{subequations}\label{eq:gs:cs-moment}
+        \begin{eqnarray}
+            \hspace{-5mm}\rho_d := \min_\mvy & L_\mvy(f) \\
+            \text{s.t.} & L_\mvy\left( M_d(g_j, I_l) \right) \succeq 0, \forall j\in \cbrace{0} \cup \calG_l, l\in [p]\\
+            & L_\mvy\left( H_d(h_j, I_l) \right) = 0, \forall j\in \calH_l, l\in [p]\\
+            & \mvy_{\mathbf{0}} = 1 
+        \end{eqnarray}
+    \end{subequations}
+    Moreover, under appropriate compactness assumptions~\cite{Lasserre2006siam-convergent-sdp-relaxation}, the sequence ${\rho_d} \rightarrow \rho^\star$ as $d \rightarrow \infty$.
+\end{proposition}
+
+\input{figures/sparsity/dense-sparse-moment.tex}
+
+As an illustrative example, suppose the POP has two variables $\mvx=(x_1,x_2)$. Then the moment matrix corresponding to the dense Moment-SOS hierarchy at $d=2$ is shown in Fig.~\ref{fig:sp:compare-dense-sparse} left, where its rows and columns are indexed by the standard monomial basis $[\mvx]_2$. However, suppose from the chordal extension of the CSP graph one can find two cliques $\{x_1\}$ and $\{x_2\}$ (i.e., they are not connected), then the sparse Moment-SOS hierarchy at $d=2$ would generate two moment matrices shown in Fig.~\ref{fig:sp:compare-dense-sparse} right. From the color coding in Fig.~\ref{fig:sp:compare-dense-sparse}, we can see that the two smaller moment matrices are principal submatrices of the big moment matrix. Hence, a $6 \times 6$ PSD constraint is broken into two $3 \times 3$ PSD constraints.
+
+It is worth mentioning that (a) while both the dense and the sparse Moment-SOS hierarchy converge to $\rho^\star$, they may, and in general, converge at different speeds; (b) associated with both~\eqref{eq:gs:ds-moment} and~\eqref{eq:gs:cs-moment} are their dual sums-of-squares (SOS) convex relaxations (hence the name Moment-SOS hierarchy). Though we do not explicitly state the SOS relaxations (see~\cite{Yang2024book-sdp} and references therein), our \spot package implements them.
+
+
+%%%%%%%%%%%%%%%%%%%%%%% Term sparsity %%%%%%%%%%%%%%%%%%%%%%%
+
+\subsection{Term Sparsity}
+\label{sec:gs:ts}
+
+While correlative sparsity (CS) focuses on relationships between variables, term sparsity (TS) addresses relationships between monomials. Specifically, TS is designed to partition monomial bases into blocks according to the monomial connections in the POP~\cite{wang2021siam-tssos}. Rather than analyzing general TS in isolation, we focus on the integration of CS and TS~\cite{wang2022tms-cs-tssos}.
+
+Similar to CS, exploiting TS is also related to constructing a graph called the term sparsity pattern (TSP) graph. This construction involves three steps: (a) initialization; (b) support extension; and (c) chordal extension.
+
+We remark that the notion of TS and the construction of the TSP graph can be less intuitive than the CSP graph mentioned before, and the mathematical notations can get quite involved. However, it is safe for the reader to quickly glance the TSP construction just to understand its high-level idea, and revisit the math a couple more times later.
+
+\textbf{Initialization.} Let ${I_l}, \ l\in [p]$ be the maximal cliques of ($G^{\csp})'$, with $n_l \coloneqq |I_l|$ the size of each clique. Let $\mathcal{G}_l$ and $\mathcal{H}_l$, $l\in [p]$ be defined in the CS grouping procedure and contain polynomial constraints related to clique $I_l$. The variables $\mvx$ are grouped into subsets $\mvx(I_1), \dots, \mvx(I_l)$. Denote $\calA$ as the set of all monomials appearing in the POP~\eqref{eq:gs:general-pop}, union with all even-degree monomials:
+\begin{align}
+	\label{eq:gs:ts-A}
+	\calA \coloneqq \text{supp}(f)\cup\bigcup_{j = 1}^{m_{\ineq}}\text{supp}(g_j)\cup\bigcup_{j = 1}^{m_{\eq}}\text{supp}(h_j)\cup (2\bbN)^n
+\end{align}
+where $(2\bbN)^n$ is defined as $\cbrace{2\mva \mymid \mva\in \bbN^n}$.
+
+\textbf{Support extension.} For each $l \in [p]$ and $j \in \{0\} \cup \mathcal{G}_l$, construct constraint $g_j$'s TSP graph $G_{d,l,j}^g$ with:
+\begin{enumerate}
+    \item Nodes: $V_{d,l,j} := |[\mathbf{x}(I_l)]_{d-d_j^g}|$ (these relate to monomials)
+    \item Edges: $E_{d,l,j} = \cbrace{(\beta, \gamma)\mymid \text{supp}( M_d(g_j, I_l)_{\beta,\gamma})\cap \calA \ne 0}$, where 
+    \begin{align}
+        \label{eq:gs:supp-beta-gamma}
+       \hspace{-4mm} M_d(g_j, I_l)_{\beta,\gamma} = g_j \cdot [\mathbf{x}(I_l)]_{d-d_j^g}(\beta) \cdot [\mathbf{x}(I_l)]_{d-d_j^g}(\gamma).
+    \end{align}
+\end{enumerate}
+For each each $l \in [p]$ and $j \in \mathcal{H}_l$, define the binary mask vector $B_{d,l,j}^h$ as:
+\begin{align}
+	\label{eq:gs:ts-equality-support-extension}
+	B_{d,l,j}^h(\beta) = \begin{cases}
+		1, & \text{supp}(H_d(h_j, I_l)_{\beta}) \cap \calA \ne \emptyset\\
+		0, & \text{otherwise}
+	\end{cases}
+\end{align}
+where 
+\begin{align}
+    H_d(h_j, I_l)_{\beta} = h_j \cdot [\mvx(I_l)](\beta).
+\end{align}
+
+\textbf{Chordal extension.} For each $l \in [p]$ and $j \in \{0\} \cup \mathcal{G}_l$, let $G'_{d,l,j}$ be the chordal extension of $G_{d,l,j}^g$. Define $B_{d,l,j}^g$ as its adjacency matrix, which is naturally a binary mask matrix.
+
+\input{figures/sparsity/support-extension.tex}
+
+We shall illustrate this using our robotics example.
+
+\begin{example}[TSP Graph of Example~\ref{exa:gs:di-soft-wall}]
+	Consider the toy example's two cliques: $I_1 := \cbrace{x_0, v_0, \lambda_{1,0}, \lambda_{2,0}}$ and $I_2 := \cbrace{x_0, x_1, v_0}$ (illustrated in Fig.~\ref{fig:sp:csp-graph}). Define $g_1 := \lambda_{1,0} + 1 + x_0$ and $g_0 := 1$. Then, $G_{2,1,1}^g$ is illustrated in Fig.~\ref{fig:sp:support-extension}(a). 
+    
+    There exists an edge between $x_0$ and $\lam{1,0}$ since $x_0$ and $\lam{1,0}$ appear at the second and fifth positions of $\mvx(I_1)_{d - d_g} := [1, x_0, v_0, \lambda_{1,0}, \lambda_{2,0}]\tran$, respectively. According to~\eqref{eq:gs:supp-beta-gamma}, 
+    \begin{align}
+        \lambda_{2,0} x_0 \in M_2(g_1, I_1)_{2,5} = (\lambda_{1,0} + 1 + x_0) \cdot x_0 \cdot \lambda_{2,0} 
+    \end{align}
+    and $\lambda_{2,0} x_0 \in \calA$ since $\lam{2}[0] \cdot (\frac{\lam{2}[0] }{k_2} + d_2 - \x[0]) = 0$. 
+    
+    Similarly, $G_{2,2,0}^g$ is illustrated in Fig.~\ref{fig:sp:support-extension}(b). There exists an edge between $x_0^2$ and $x_1^2$ since $x_0^2 \cdot x_1^2$ is of even degree. Both $G_{2,1,1}^g$ and $G_{2,2,0}^g$ are already chordal. 
+\end{example}
+
+Note that the crucial difference between CSP and TSP is that the nodes of a CSP graph are the variables while the nodes of a TSP graph are monomials. Therefore, while the goal of CSP is to break the entire variable $\mvx$ into smaller cliques of variables, the goal of TSP is to break the dense monomial basis $[\mvx(I_l)]_d$ into smaller cliques of monomials.
+
+Combining CS and TS, we can further decompose the PSD constraints in the sparse Moment-SOS hierarchy~\eqref{eq:gs:cs-moment} into smaller ones. Due to space constraints, we defer a formal presentation to Appendix~\ref{app:sec:cs-ts-relax}. The high-level intuition, however, is that the binary masks obtained from the TSP allow us to only focus on the entries of the matrix variables in~\eqref{eq:gs:cs-moment} corresponding to nonzero entries in the masks.
+
+
+
+\subsection{Sparse Polynomial Optimization Toolbox (SPOT)}
+\label{sec:gs:spot}
+
+To automate the aforementioned sparsity exploitation, we develop a new C++ package \spot. Compared with the Julia package \tssos, \spot is faster and also provides more options. (i) \spot provides both moment relaxation and SOS relaxation, which complements \tssos (only provides SOS relaxation). 
+(ii) For both CS and TS, \spot provides four options: (a) maximal chordal extension (MAX); (b) minimal degree chordal extension (MD); (c) minimum fill chordal extension (MF); (d) user-defined. 
+(iii) \spot provides a special option ``\emph{partial term sparsity}'', which enables TS only for the moment matrices and the localizing matrices (\ie inequality constraints), while applying CS to equality constraints. This heuristic approach is motivated by the observation that in SOS relaxation, tightening equality constraints merely introduces more free variables and does not significantly impact the solution time of an SDP solver. In many cases, partial TS yields tighter lower bounds while keeping the computation time nearly unchanged.
+(iv) Through our Matlab and Python interface, \spot provides a way for the user to visualize the CSP and TSP graphs, as shown in Fig.~\ref{fig:demos}.
+
+
+
+
+
+
+

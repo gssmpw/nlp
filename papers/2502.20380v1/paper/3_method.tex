@@ -1,0 +1,102 @@
+\section{\method: Multi-turn Code Generation}
+
+\input{algorithms/training}
+
+We propose \method, a simple and scalable algorithm for multi-turn code generation using execution feedback. \method follows an \emph{expert iteration}~\citep{anthony2017thinkingfastslowdeep} framework with a \emph{local search expert}. 
+\method iteratively trains two components -- a \emph{learned verifier} $R_{\phi}$ to score code snippets (Section~\ref{sec:training_learned_verifiers}), and a \emph{generator} $\pi_\theta$ to imitate local search with the verifier (Section~\ref{sec:training_generator}). This iterative process allows the generator and expert to bootstrap off each other, leading to continuous improvement. At inference time, both the generator and verifier are used as BoN search to select and execute code (Section~\ref{sec:inference_time}). Finally, we analyze the performance of \method in Section~\ref{sec:analysis}.
+
+\subsection{The \method Algorithm}
+\label{sec:mucode}
+Algorithm~\ref{algo:pseudo_training_mucode} presents the iterative training procedure. At an iteration $i$, the current generator $\pi_{\theta}$ is rolled out in the multi-turn code environment $\mathcal{E}$ to generate interaction data $\mathcal{D}_i\leftarrow\{(x,s_t,y_t, r_t)\}$. Every turn $t$ in $\mathcal{D}_i$ includes the prompt $x$, interaction history $s_t$, code generated $y_t$ and the correctness score from the oracle verifier $r_t=R(x, y_t)$. 
+This data is then aggregated $\mathcal{D} \gets \mathcal{D} \cup \mathcal{D}_i$. 
+The learned verifier $R_{\phi}^i$ is trained on the aggregated data $\mathcal{D}$.
+An expert is created using $R_\phi^i$ to perform local search to find the optimal action $\pi_\star^i(x) = \arg\max_{y \in \mathcal{D}(x)} R_\phi^i(x,y)$, where $\mathcal{D}(x)$ are all the code completions for a given prompt $x$. The expert $\pi_\star^i(x)$ relabels the data $\mathcal{D}$ with the optimal action. The generator $\pi_\theta^i$ is then trained via fine-tuning (FT) on $\mathcal{D}$. This process iterates $M$ times, and the best generator and verifier pair on the validation dataset are returned.
+
+\subsection{Training Verifier}
+\label{sec:training_learned_verifiers}
+The learned verifier provides dense scores to code solutions for a given problem. At train time, this is used by the expert to perform local search to obtain optimal code. At inference time, the verifier is used for multi-turn BoN~(\ref{sec:inference_time}) for efficient search. 
+The learned verifier has two distinct advantages over process reward functions typically used in multi-turn RL:
+(1) It is conditioned only on the initial prompt and the current solution, and is not dependent on previous states (2) It is trained via supervised learning on oracle reward labels. We explore two different losses: % for the learned verifier:
+
+\textbf{Binary Cross-Entropy loss}~(BCE): 
+The nominal way to train the verifier is to directly predict the oracle reward ~\citep{cobbe2021training}:
+\begin{equation}
+\begin{aligned}
+    \mathcal{L}_{\rm BCE}(\phi) = -\mathbb{E}_{(x, y, r) \sim \mathcal{D}}[r \log R_{\phi}(x,y) \\ - (1 - r) \log R_{\phi}(x, y)]
+\end{aligned}
+\end{equation}
+
+\textbf{Bradley Terry Model}~(BT):
+Since the goal of the verifier is to relatively rank code solutions rather than predict absolute reward, we create a preference dataset and then train with a  Bradley Terry loss~\citep{ouyang2022traininglanguagemodelsfollow}.
+For every prompt $x$, we create pairs of correct $y^{+}$ (where $r=1$) and incorrect $y^{-}$ (where $r=0$) code and define the following loss:
+\begin{equation}
+    \small
+    \mathcal{L}_{BT}(\phi) = -\mathbb{E}_{(x, y^+, y^-) \sim \mathcal{D}} [\log \sigma(R_{\phi}(x,y^+) - R_{\phi}(x,y^-))].
+\end{equation}
+where $\sigma(.)$ is the sigmoid function. 
+We hypothesize that BT is strictly easier to optimize as the verifier has to only focus on relative performance. This is also consistent with observations made for training process reward models, where the advantage function is easier to optimize than the absolute Q function~\citep{setlur2024rewarding}. 
+
+
+
+\subsection{Training Generator}
+\label{sec:training_generator}
+
+\method comprises a generator~$\pi_\theta$ trained to produce code solutions conditioned on the initial problem and execution observations from previous turns.
+Given a dataset $\mathcal{D}$, \method iteratively trains the generator to find the optimal code solution labeled using the local expert over the learned verifier.
+% \method constructs an expert using local search and the learned verifier.
+For this step, \method extracts all code solutions from $\mathcal{D}$ for every problem $x$.
+An expert is then created by picking the best solution, $y^\star$, which achieves the highest score using with the learned verifier~$R_{\phi}(x, y)$ and is given by
+\begin{equation}
+    y^\star = \pi_\star(x) = \arg\max_{y \in \mathcal{D}(x)} R_\phi(x,y).
+\end{equation}
+Using this expert dataset, we relabel the dataset $\mathcal{D}$ with the optimal solutions for each prompt: 
+\begin{equation}
+    \mathcal{D}_\star = \{(x, s_t, y^\star)~|~(x, s_t) \sim \mathcal{D}\},
+\end{equation}
+where $\mathcal{D}_\star$ represents the expert dataset. 
+%As a result of this relabeling, every trajectory for a problem \(x\) ends with the same optimal solution. 
+The generator $\pi_{\theta}$ is then trained via fine-tuning~(FT) on this expert dataset $\mathcal{D}_\star$.
+
+\input{algorithms/inference}
+
+
+
+\subsection{Inference: Multi-turn Best-of-N}
+\label{sec:inference_time}
+At inference time, the goal is to generate a code solution with a fixed inference budget -- denoting the number of times generators can provide one complete solution.
+In this work, we propose to leverage the learned verifier to improve search and code generations over successive turns with \textit{multi-turn Best-of-N}~(BoN).
+To achieve this, \method uses a natural extension of BoN to the multi-turn setting.
+At each turn, the generator produces $N$ one-step rollouts $\{y^n_t\}_{n=1}^N \sim\pi_\theta(.|s_{t})$ and the learned verifier picks the most promising code solution among these candidates using
+\begin{equation}
+    y_t^*=\arg \max_{n} R_{\phi}(x,y^{n}_t). 
+\end{equation}
+The selected code~$y_t^*$ is executed in the environment over public tests to obtain the execution feedback $o_t$.
+This solution and the feedback is provided as context to the generator at the next turn to repeat this procedure.
+The search ends once~$y_t^*$ passes all public tests or when the turn limit is reached. Consequently, even if $R_\phi(\cdot)$ grants a high score to a code solution, inference continues until the solution has successfully cleared all public tests, thus mitigating potential errors by $R_\phi(\cdot)$.
+The final response $y^*_t$ is then passed through the oracle verifier to check its correctness.
+Algorithm~\ref{algo:pseudo_inference_mucode} describes a description of multi-turn BoN.
+We found it beneficial to use the reward model trained with samples of the latest generator $\pi_\theta$ (see Table~\ref{tab:bon_results}).
+
+\subsection{Analysis}
+\label{sec:analysis}
+\method effectively treats multi-turn code generation as an interactive imitation learning problem by collecting rollouts from a learned policy and re-labeling them with an expert. It circumvents the exploration burden of generic reinforcement learning which has exponentially higher sample complexity~\cite{sun2017deeply}. We briefly analyze why this problem is amenable to imitation learning and prove performance bounds for \method.
+
+\begin{definition}[One-Step Recoverable MDP]
+\label{def:one_step_recoverability}
+A MDP $\mathcal{M} = (\mathcal{S}, \mathcal{A}, P, R, \gamma)$ with horizon $T$ is \emph{one-step recoverable} if the advantage function of the optimal policy $\pi^*$, defined as $A^*(s, a) = Q^*(s, a) - V^*(s)$, is uniformly bounded for all $(s, a)$, i.e. $A^*(s, a) \leq 1$.
+\end{definition}
+
+\paragraph{Code generation is one-step recoverable MDP.}
+Multi-turn code generation satisfies one-step recoverability because the optimal policy $\pi^*(y_t | s_t)$ depends only on the problem prompt $x$ and not the interaction history $s_t = (x, y_1, o_1, \dots, y_{t-1}, o_{t-1})$. Since the correctness of a code snippet $y_t$ is fully determined by $x$, the optimal Q-function satisfies $Q^*(s_t, y_t) = R(x, y_t)$, where $R(x, y_t) \in \{0,1\}$. The optimal value function is $V^*(s_t) = \max_{y_t} R(x, y_t)$, so the advantage function simplifies to $A^*(s_t, y_t) = R(x, y_t) - \max_{y_t'} R(x, y_t') \leq 1$. 
+
+\paragraph{Code generation enables efficient imitation learning.} There are two challenges to applying interactive imitation learning ~\cite{ross2011reduction, ross2014reinforcement} -- (1) Existence of expert policies or value functions, and (2) Recoverability of expert from arbitrary states. First, for code generation, the expert is simply the one-step reward maximizer $\arg\max_y R(x, y)$. We can efficiently estimate $R_\phi(x, y)$ to compute the expert, without needing to compute value function backups. Second, even if the learner fails to imitate the expert at any given state, the expert can perfectly recover from the next state. 
+This results in the best possible performance bounds for imitation learning, which we formalize below. 
+\begin{theorem}[Performance bound for \method]
+\label{thm:one_step_bound} 
+For a one-step recoverable MDP $\mathcal{M}$ with horizon $T$, running $N$ iterations of \method yields at least one policy $\pi$ such that
+\begin{equation}
+    J(\pi^*) - J(\pi) \leq O(T (\epsilon + \gamma(N))).
+\end{equation}
+where $\pi^*$ is the expert policy, $\epsilon$ is the realizability error, and $\gamma(N)$ is the average regret.
+\end{theorem}
+Proof is in Appendix~\ref{appendix:proof}. The bound $O(\epsilon T)$ is much better than the worst-case scenario of $O(\epsilon T^2)$ for unrecoverable MDPs~\cite{swamy2021moments}. Thus, \method exploits the structure of multi-turn code generation to enable imitation learning, bypassing the need for hierarchical credit assignment. More generally, this analysis suggests that for any task where the optimal action is history-independent and recoverable in one step, reinforcement learning can be reduced to efficient imitation learning without loss of performance.

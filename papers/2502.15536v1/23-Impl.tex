@@ -1,0 +1,236 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%% IMPLEMENTATION %%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{Rust NPB Implementation}
+\label{sec:npb-rust-implementation}
+
+%Section \ref{sec:sub:npb-rust-seq} outlines the challenges encountered when porting NPB to Rust, detailing the strategies to reach efficient performance in Rust. Section \ref{sec:sub:npb-rust-par} presents the methods used to achieve parallelism in each benchmark, highlighting the optimizations made to leverage Rust's parallel features. We overview the unsafe code usage on the NPB-Rust, and measure how programmability is affected when using each framework.
+Section \ref{sec:sub:npb-rust-seq} outlines the challenges encountered when porting NPB to Rust, detailing the strategies to reach efficient performance in Rust. Section \ref{sec:sub:npb-rust-par} presents the methods used to achieve parallelism in each kernel and pseudo-application, highlighting the optimizations made to leverage Rust's parallel features, and overview the unsafe code usage on the NPB-Rust.
+
+    \subsection{NPB-Rust Sequential Porting}
+    \label{sec:sub:npb-rust-seq}
+    
+    \textbf{Design principles.} The sequential porting of the NPB to Rust was based on NPB-CPP \cite{NPB-CPP-2021}. We have two main design principles: (1) retaining algorithmic structure, preserving naming conventions and following the original sequence of operations; (2) idiomatic Rust, ensuring that the port not only mirrors the original in functionality but also embodies the best practices and safety of the Rust language.
+    % In light of the inherent differences between the programming languages, the primary objective was to minimize discrepancies during this process. The approach focused on retaining the original algorithmic structure, preserving function computational procedures, and following the original sequence of operations. Simultaneously, the goal was to develop an idiomatic Rust version of the NPB, ensuring that the port not only mirrors the original in functionality but also embodies the best practices and safety of the Rust language.
+
+    \textbf{Project.} The NPB-Rust project was developed with Cargo, the Rust package manager. Each benchmark was treated as a distinct application that generates a separate binary. Common auxiliary programs, such as the \texttt{timers}, \texttt{randdp}, and \texttt{print\_results}, were also ported. Since Rust does not have a built-in variable type for complex numbers (used in the FT kernel), a custom implementation was added to the common files, similar to the C++ version. Regarding the class parameters, each benchmark now includes the full definition of the different problem sizes within its own structure. Class selection still occurs at compile time through a mandatory \texttt{RUSTFLAGS} specification and with the usage of Rust's conditional configuration feature. 
+
+    \textbf{Porting process.} Converting the NPB to Rust is challenging and demands significant effort. The main obstacles involve dealing with global mutable variables, keeping coherence in memory allocation, function calls and operations that violate the borrowing rules, and converting \texttt{for} loops to iterator-based constructs. Rust does not provide a safe and mutable global variable approach without using locks. Consequently, every time a global variable is declared in C++, in Rust, the equivalent variable is declared inside the main function and passed as a mutable reference parameter whenever needed. Similarly, all the \texttt{\#define} preprocessor directives and the \texttt{static const} variables from the pseudo-applications were replaced by Rust's \texttt{pub const} notation. 
+
+    In general, static memory allocation offers better performance than dynamic allocation. However, when dealing with very large arrays, static allocation may lead to stack overflow errors. Following the recommendations from the official NPB reports and to ensure a fair comparison across the different NPB implementations, arrays that were originally allocated using \texttt{malloc} in C++ were replaced with \texttt{Vec} in Rust, which is heap-allocated. For other cases, static memory allocation using arrays was employed to maintain efficiency.
+
+    In rare instances within the C++ code, a specific function is invoked with the same mutable variable passed as two different parameters, while in other cases, distinct mutable variables are needed. Since this violates Rust's borrowing rules, we created a duplicate of the function with modified receiving parameters to accommodate both situations. This solution effectively manages cases where either the same variable is used twice or two distinct variables are passed.
+ 
+    To guarantee a well-executed porting process, it is crucial to adapt the loop structures appropriately. The NPB-CPP source code predominantly uses \texttt{for} statements to manipulate indices and pointers. In Rust, the idiomatic strategy involves leveraging iterator-based patterns. However, it is important to note that not all \texttt{for} statements can be seamlessly converted to iterators. Complex loops with intricate logic or indirect index calculation may not be feasible to transform organically into iterator-based constructs. %The traditional \texttt{for} statement was retained for such cases and simpler loops. 
+
+    The main obstacle during the porting phase was the MG kernel. In the original C++ code, arrays are defined as single-dimensional entities with their maximum length fixed at compile time. Still, during execution, these arrays are dynamically reshaped into three-dimensional structures within function calls, utilizing void pointers. The dimensions of these arrays are redefined at runtime, with their lengths varying as execution progresses. In Rust, those procedures lead to unsafe operations. To avoid this problem, we preserved the arrays as one-dimensional and applied arithmetic to compute the appropriate indices, simulating a three-dimensional array.
+
+   The NPB and NPB-CPP applications are designed to fully utilize the available resources to maximize performance. The pursuit of greater speedup has led us to explore unsafe Rust regions. We developed a serial version of the FT, IS, and MG kernels that incorporates unsafe code, while all other benchmarks are entirely safe Rust. The unsafe operations were introduced to bypass bound checks in a few performance hot spots. Lastly,  by using the \texttt{--cfg safe="true"} option in \texttt{RUSTFLAGS}, it is possible to compile a safe sequential version of these kernels.
+
+    \subsection{NPB-Rust with Rayon}
+    \label{sec:sub:npb-rust-par}
+        \textbf{EP kernel.}
+        The EP kernel is one of the simpler NPB programs in terms of parallelism, it features a single highly intensive computational region that calculates the independent total sum of Gaussian deviations. The partial count values of each iteration are also accumulated in a vector. Following a similar strategy to the C++ parallel implementation, we applied a \texttt{MapReduce} pattern to this region to efficiently sum and accumulate the values. The main difference compared to the OpenMP version is that, instead of using a mutual exclusion section to manage the accumulation in the vector, we update it directly within Rayon's reduction lambda function.
+        
+        \textbf{CG kernel.}
+        The central component of this kernel revolves around the \texttt{conj\_grad} function, which performs the computationally expensive sparse matrix-vector multiplications. This function contains a sequence of parallel regions where we incorporated the \texttt{Map} and \texttt{MapReduce} patterns. Additionally, the kernel includes two concurrent sections related to post-conjugate gradient normalization, where the same patterns were applied. Finally, the \texttt{Map} was utilized to optimize the untimed initialization phases. The major contrast with C++ in this kernel is that, in the OpenMP version, \texttt{nowait} directives were used to optimize the \texttt{parallel for} intrinsic barriers inside the \texttt{conj\_grad} function.
+
+        \textbf{FT kernel.}
+        The core computational routines of this kernel perform independent symmetric Fast Fourier Transforms across three dimensions. These functions were parallelized using the \texttt{Map} pattern. However, extra care was required to ensure performance and safety for the \texttt{cffts3} and \texttt{cffts3\_2} functions. The main loops in these routines iterate over the second dimension in the outermost \texttt{for} loop, while the first dimension is processed in an inner loop. Since it is not possible to create an iterator that processes the second dimension before the first, and the intricate logic restricts loop reordering, we relied on unsafe code. Listing \ref{lst:FT_par_exe} shows how an unsafe mutable pointer was used to access a mutable reference to an external variable inside the parallel iterator. This approach is safe because the variable used as an index is always unique and thread-private. Other parallel regions in the FT kernel occur in the initialization steps and within the \texttt{evolve} function, where the \texttt{Map} pattern was also applied. Finally, for the checksum calculation over complex numbers, the \texttt{MapReduce} pattern was employed.
+
+\begin{figure}[t]
+\lstset{aboveskip=0pt, belowskip=-17pt}
+\begin{lstlisting}[language=Rust, style=boxed,caption={Simplified representation of the unsafe array access on \texttt{cffts3} and \texttt{cffts3\_2} functions in the FT kernel.}, label={lst:FT_par_exe}]
+pub struct UnsPtr(pub *mut [[f64; NX]; NY]);
+unsafe impl Sync for UnsPtr {}
+
+let my_array = /* some three-dimensional data */;
+let ptr = UnsPtr(my_array.as_mut_ptr());
+
+(0..NY).into_par_iter().for_each(|j| {
+  let my_array = unsafe {
+    &mut from_raw_parts_mut((&ptr).0, NZ)[..]
+  };
+  
+  /* computation indexing my_array with 
+     thread-private and unique j variable */
+     
+});
+\end{lstlisting}
+\end{figure}
+
+% \begin{figure}[t]
+% \captionsetup[figure]{skip=0pt}
+% \lstset{aboveskip=0pt, belowskip=-12pt}
+% \begin{lstlisting}[language=Rust, style=boxed,caption={Simplified representation of the unsafe array access on \texttt{cffts3} and \texttt{cffts3\_2} functions in the FT kernel.}, label={lst:FT_par_exe}]
+% fn foo(array: &mut [[[f64; D3]; D2]; D1]) {
+% let ptr = UnsPtr(array.as_mut_ptr());
+%   (0..D2).into_par_iter().for_each(|j| {
+%   /*each j is unique and thread-private*/
+%     let array = unsafe {
+%       &mut from_raw_parts_mut(&ptr, N)
+%     };
+%     ... /*other computations*/
+%     for i in 0..D1 { /*first dimension*/
+%       let mut x = 0.0;
+%       ... /*other computations*/
+%       array[i][j] = x;
+%     }
+%   });
+% }
+% \end{lstlisting}
+% \end{figure}
+
+        \textbf{IS kernel.}
+        The IS kernel is centered around a primary function that implements a bucket sort algorithm, supported by auxiliary functions for key sequence generation and result validation. In the OpenMP version, thread identifiers serve as indices for statically partitioning the workload across threads within parallel regions. The Rust implementation with Rayon mirrors this structure, but in some cases, this indirect index manipulation led to the use of unsafe code. Similarly to Listing \ref{lst:FT_par_exe}, it makes the primary data array a mutable reference. The safety of this implementation is assured, as the indexing relies on manually calculated values that depend on the thread identifier. The \texttt{MapReduce} pattern was applied in the verification function to count incorrectly sorted values, while the \texttt{Map} pattern was applied in the other regions.
+
+        
+        %isting \ref{lst:IS_par_exe} presents a simplified function of the IS kernel that highlights the use of thread identifiers for index calculation. The safety of this implementation is ensured, as the indexing relies on values tied to the thread identifier.
+
+% \begin{figure}[t]
+% \captionsetup[figure]{skip=0pt}
+% \lstset{aboveskip=0pt, belowskip=-12pt}
+% \begin{lstlisting}[language=Rust, style=boxed,caption={Simplified representation of index calculation based on thread id on unsafe array accesses in the IS kernel.}, label={lst:IS_par_exe}]
+% fn foo(array: &mut [i32]) {
+%   let range_size = TOTAL_WORK/N_PROCS;
+%   let ptr = UnsPtr(array.as_mut_ptr());
+%   (0..N_PROCS).into_par_iter().for_each(|id| {
+%   /*each id is unique and thread-private*/
+%     let array = unsafe {
+%       &mut from_raw_parts_mut(&ptr, N)
+%     };
+%     ... /*other computations*/
+%     let min_range = range_size*id;
+%     let max_range = min_range + range_size;
+%     for j in min_range..max_range {
+%       /*each j is unique and thread-private*/
+%       let mut x = 0.0;
+%       ... /*other computations*/
+%       array[j] = x;
+%     }
+%   });
+% }
+% \end{lstlisting}
+% \end{figure}
+
+        \textbf{MG kernel.}
+        This kernel integrates multiple functions featuring parallel regions. The principal computationally intensive routines that operate over the V-cycle are the restriction, prolongation, residual, and smoother functions. Each of these methods is structured around a main loop, where the \texttt{Map} were employed to achieve parallelism. Other small computations were also parallelized with this same pattern. The \texttt{MapReduce} was only used for the uniform norm calculus. Due to the sequential porting strategy, the parallel MG kernel necessitates the use of unsafe blocks. In Rust, one-dimensional arrays were chosen over three-dimensional arrays due to the need for frequent reshaping during execution, making it essential to apply arithmetic operations to compute the correct indices. This approach restricts the ability to fully utilize parallel iterator-based constructs without resorting to unsafe code, similar to Listing \ref{lst:FT_par_exe}. However, despite the need for unsafe blocks, thread safety is maintained. Each thread retains private control over index values, preventing memory races and preserving the kernel's integrity.
+
+
+% \begin{figure}[t]
+% \captionsetup[figure]{skip=0pt}
+% \lstset{aboveskip=0pt, belowskip=-12pt}
+% \begin{lstlisting}[language=Rust, style=boxed,caption={Simplified representation of index calculation on unsafe array accesses in the MG kernel.}, label={lst:MG_par_exe}]
+% fn foo(array: &mut [f64]){
+%   let ptr = UnsPtr(array.as_mut_ptr());
+%   (0..D1).into_par_iter().for_each(|i| {
+%   /*each i is unique and thread-private*/
+%     let array = unsafe { 
+%       &mut from_raw_parts_mut(&ptr, N)
+%     };
+%     ... /*other computations*/
+%     for j in 0..D2 { 
+%       let idx = i*D2 + j;
+%       /*each idx is unique and thread-private*/
+%       let mut x = 0.0;
+%       ... /*other computations*/
+%       array[idx] = x;
+%     }
+%   });
+% }
+% \end{lstlisting}
+% \end{figure}
+
+        \begin{figure}[t]
+        
+        \centering
+        \includegraphics[width=0.25\textwidth]{Images/cuboLU.pdf}
+        \caption{LU data dependencies illustration.}
+        %\vspace{-0.1cm}
+        \label{fig:ludaata}
+        %\vspace{-0.1cm}
+        \vspace{-0.5cm}
+        \end{figure}
+
+        \textbf{BT pseudo-application.}
+        The BT pseudo-application employs iterative techniques to solve CFD equations and was designed to achieve parallelism. The most computationally demanding operations include residual calculations, and solvers applied across all three spatial dimensions. With data primarily structured along the \textit{z}-dimension, parallelism was achieved in the \textit{x} and \textit{y} dimensions by applying the \texttt{Map} pattern in the outermost loop for residual and solver computations. However, due to data dependencies along the \textit{z}-dimension, the \texttt{Map} pattern was applied within the inner loops to compute residuals. Efficient parallelization of the \textit{z}-solver required the use of unsafe code. As in the FT kernel, this routine iterates over the vector's second dimension in the outer \texttt{for} loop, where a significant volume of inner computation prevents efficient loop reordering. Thus, the same approach was applied in FT. Safety is ensured because a unique, thread-private value is used as an index to write on the vector.
+
+        \textbf{SP pseudo-application.}
+        This pseudo-application is also an iterative method derived from CFD. While the specific procedures differ, the code follows a similar pattern to BT, involving residual and solver calculations for each spatial dimension. As a result, the same challenges are encountered. Parallelization across the three dimensions was achieved using the \texttt{Map} pattern. Particular care was required for the \textit{z}-dimension, where the same approach as in BT was applied. For SP, we also increased the thread pool stack size. This was necessary to keep coherence with the C++ version, which uses the stack to allocate large data inside solver functions.
+
+
+
+        \textbf{LU pseudo-application.}
+        The LU benchmark is the most complex program in the NPB suite in terms of parallelism. Efficient parallelization is challenging due to data dependencies across all spatial dimensions in \texttt{blts} and \texttt{buts} functions. To introduce parallelism, the pipeline technique was employed, utilizing a synchronization mechanism to progressively grant ordered access to data \cite{nasomp}. We implemented locks and conditional variables, following a similar approach used in the parallel version of NPB-CPP \cite{NPB-CPP-2021} with FastFlow and OneTBB frameworks. As illustrated in Figure \ref{fig:ludaata}, the computation is oriented along the \textit{k}-dimension. Once a thread completes its task, the subsequent thread is allowed to proceed. The green spheres represent the computed data, the gray spheres indicate data yet to be processed, and the blue plane represents the division of data among the threads.
+
+    \newcolumntype{C}[1]{>{\centering\arraybackslash}p{#1}}
+    \newcolumntype{M}[1]{>{\centering\arraybackslash}m{#1}}
+    \begin{table}[t]
+    \scriptsize
+    \centering
+    \vspace{0.2cm}
+    \caption{Unsafe blocks usage in NPB-Rust.}
+    \begin{tabular}{C{1.2cm}|C{0.4cm}C{0.4cm}C{0.4cm}C{0.4cm}C{0.4cm}C{0.4cm}C{0.4cm}C{0.4cm}} 
+        \toprule
+    Purpose & \multicolumn{8}{c}{Benchmarks} \\
+    & EP & CG & FT & IS & MG & BT & SP & LU \\
+    \midrule
+        1) & 0 & 0 & 9 & 3 & 8 & 0 & 0 & 0  \\
+        2) & 0 & 0 & 2 & 0 & 0 & 1 & 1 & 2  \\
+        3) & 0 & 0 & 0 & 5 & 10 & 0 & 0 & 1 \\
+        \bottomrule
+    \end{tabular}
+    \vspace{0.3cm}
+    \begin{enumerate}
+        \item Avoid bound checks;
+        \item Modify an external array inside a parallel iterator due to the non-sequential iteration order through array dimensions;
+        \item Modify an external array inside a parallel iterator due to the intricate logic to find/calculate the index.
+    \end{enumerate}
+    \label{tab:unsafe}
+    \vspace{-0.2cm}
+    \end{table}
+    %\vspace{-0.2cm}
+    % \subsection{Unsafe Code Usage}\label{ref:UNSCODEUSAGE}
+    
+    \textbf{Unsafe code usage.} The sequential version of NPB-Rust includes instances of unsafe code in the FT, IS, and MG kernels, exclusively to bypass bounds checks. In the parallel implementations using Rayon, unsafe features were applied to manage mutable shared data within parallel iterators, where safety arose due to indirect factors. These cases typically involved iterating over dimensions in a non-sequential order, where data dependencies or computational constraints made loop reordering infeasible. In some cases, unsafe code was required for accessing data through indirect index manipulation, where the index calculation relied on thread-private values. Table \ref{tab:unsafe} indicates the unsafe blocks applied in the NPB-Rust.
+
+% \begin{table}[h]
+%     \scriptsize
+%     \centering
+%     \caption{SLOC for each NPB version.}
+%     \begin{tabular}{C{1cm}|C{0.7cm}C{0.7cm}C{0.7cm}C{0.7cm}C{0.7cm}C{0.7cm}} 
+%         \toprule
+%     Benchmark & Rust serial & Rust Rayon & C++ serial & C++ OpenMP & Fortran serial & Fortran OpenMP \\
+%     \midrule
+%         EP & 230 & 265 & 177 & 195 & 147 & 158 \\
+%         CG & 570 & 596 & 553 & 602 & 535 & 593 \\
+%         FT & 892 & 929 & 718 & 789 & 459 & 470 \\
+%         IS & 541 & 596 & 530 & 543 & 612 & 629 \\
+%         MG & 1855 & 1891 & 902 & 994 & 764 & 797 \\
+%         BT & 2648 & 2716 & 2541 & 2595 & 3088 & 3176 \\
+%         SP & 2397 & 2417 & 1981 & 2079 & 2028 & 2118 \\ 
+%         LU & 2475 & 2733 & 2494 & 2633 & 3457 & 3658 \\
+%         \bottomrule
+%     \end{tabular}
+%     \label{tab:sloc}
+% \end{table}
+%     \vspace{-0.1cm}
+%     % rs 11608
+%     % rr 12143 -> 535 (104.6 %)
+%     % cs 9896
+%     % co 10430 -> 534 (105.39 %)
+%     % fs 11090
+%     % fo 11599 -> 509 (104.58 %)
+
+% Table \ref{tab:sloc} shows the SLOC (significant source lines of code) metric for each benchmark and version. The parallel implementation with Rayon adds 4.6\% more lines of code, while the OpenMP versions in C++ and Fortran add 5.39\% and 4.58\%, respectively.
+
+% \textbf{Programmability.} To assess the impact of each framework on programmability, we use the significant source lines of code (SLOC) metric. Table \ref{tab:sloc} shows the SLOC for each benchmark and version. The parallel implementation with Rayon adds 4.6\% more lines of code, while the OpenMP versions in C++ and Fortran add 5.39\% and 4.58\%, respectively. Despite their differences, both Rayon and OpenMP demand similar programming effort when considering SLOC. OpenMP's low impact on programmability stems from its use of straightforward code annotations to enable parallelism. As Rayon's parallel features rely on iterator-based constructs, similar to the sequential pattern, it also requires minimal code modifications.
+
+    
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+
+%   \textbf{Project.} The NPB-Rust project was developed with Cargo, the Rust package manager, which required restructuring the original directory layout. This adaptation was necessary to align with Cargo's conventions and optimize the building. Each benchmark was treated as a distinct application that generates a separate binary. It is possible to compile all the benchmarks simultaneously or specify an individual program using the \texttt{--bin} flag. Furthermore, other optional debugging flags can be included during the building. Common auxiliary programs, such as the \texttt{timers}, \texttt{randdp}, and \texttt{print\_results}, were also ported. Since Rust does not have a built-in variable type for complex numbers (used in the FT kernel), a custom implementation of it was added to the common files, similar to the C++ version. Regarding the class parameters, each benchmark now includes the full definition of the different problem sizes within its own structure. Class selection still occurs at compile time through a mandatory \texttt{RUSTFLAGS} specification and with the usage of Rust's conditional configuration feature. 

@@ -1,0 +1,1435 @@
+% Ensure arXiv processes the file with pdfLaTeX
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+
+\usepackage[utf8]{inputenc} % allow utf-8 input
+\usepackage[T1]{fontenc}    % use 8-bit T1 fonts
+\usepackage{hyperref}       % hyperlinks
+\usepackage{url}            % simple URL typesetting
+\usepackage{booktabs}       % professional-quality tables
+\usepackage{amsfonts}       % blackboard math symbols
+\usepackage{nicefrac}       % compact symbols for 1/2, etc.
+\usepackage{microtype}      % microtypography
+\usepackage{lipsum}         % Can be removed after putting your text content
+\usepackage{graphicx}
+\usepackage{natbib}
+\usepackage{doi}
+\usepackage{dsfont}
+% Load in macros and other important stuff
+\input{macros}
+
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{5pt}
+
+% Use fancyhdr package
+\RequirePackage{fancyhdr}
+\RequirePackage{xcolor} % changed from color to xcolor (2021/11/24)
+\RequirePackage{algorithm}
+\RequirePackage{algorithmic}
+\RequirePackage{natbib}
+\RequirePackage{eso-pic} % used by \AddToShipoutPicture
+\RequirePackage{forloop}
+\RequirePackage{url}
+
+\title{Upweighting Easy Samples in Fine-Tuning Mitigates Forgetting}
+
+\author{
+  Sunny Sanyal\thanks{Equal contribution} , Hayden Prairie\footnotemark[1] , Rudrajit Das\footnotemark[1] , Ali Kavis\footnotemark[1] , and Sujay Sanghavi \\[0.5em]
+  University of Texas at Austin \\[0.5em]
+  %UT Austin \\[0.5em]
+  \texttt{\{sanyal.sunny, haydenprairie, rdas\}@utexas.edu}, \texttt{kavis@austin.utexas.edu}, \\[0.5em]
+  \texttt{sanghavi@mail.utexas.edu}
+}
+
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+\noindent Fine-tuning a pre-trained model on a downstream task often degrades its original capabilities, a phenomenon known as \enquote{catastrophic forgetting}. This is especially an issue when one does not have access to the data and recipe used to develop the pre-trained model. Under this constraint, most existing methods 
+for mitigating forgetting are inapplicable. To address this challenge, we propose a \textit{sample weighting scheme for the fine-tuning data} solely based on the pre-trained model's losses. Specifically, we upweight the easy samples on which the pre-trained model's loss is low and vice versa to limit the drift from the pre-trained model. Our approach is orthogonal and yet complementary to existing methods; while such methods mostly operate on parameter or gradient space, we concentrate on the sample space. We theoretically analyze the impact of fine-tuning with our method in a linear setting, showing that it stalls learning in a certain subspace which inhibits overfitting to the target task. We empirically demonstrate the efficacy of our method on both language and vision tasks. As an example, when fine-tuning Gemma 2 2B on MetaMathQA, our method results in only a $0.8\%$ drop in accuracy on GSM8K (another math dataset) compared to standard fine-tuning, while preserving $5.4\%$ more accuracy on the pre-training datasets. Our code is publicly available at \url{https://github.com/sanyalsunny111/FLOW_finetuning}.
+\end{abstract}
+
+\section{Introduction}
+\label{sec:introduction}
+
+In the modern era of large-scale machine learning, one of the central goals is to design models capable of performing multiple tasks. 
+Traditionally, this is achieved by training an appropriately large model over datasets of multiple tasks, ensuring that the model jointly learns multiple tasks at once. 
+Unfortunately, it is not viable to repeat this process with every new additional task due to the scale of contemporary models, necessitating effective strategies that can essentially learn without full retraining.
+A resource-efficient convention in machine learning is to take a \emph{pre-trained} model which is trained on some vast and diverse dataset, and 
+\emph{fine-tune} it on a new dataset/task. 
+Such pre-trained models are typically large and expensive to train from scratch but perform well on a variety of tasks while offering a versatile basis for learning a new task. 
+
+Fine-tuning is a delicate process that should ideally serve multiple objectives simultaneously; we would like to use the base model and its capabilities to facilitate learning a strong model on the downstream task, and in the meantime, preserve the existing abilities of the pre-trained model. 
+On this particular front, the major challenge in standard, unregulated fine-tuning is the \emph{catastrophic forgetting} phenomenon.
+In broad terms, it describes the performance decline of the pre-trained model on previously observed data/tasks after fine-tuning on a new one. 
+When the learning process for the downstream task interferes with the previously-learned representations beyond tolerable margins, the pre-trained model loses its prior capabilities and significantly under-performs on previously-learned tasks.
+
+\begin{figure}[t!]
+    \centering
+    \includegraphics[width=0.7\columnwidth]{Figures/average_accuracy_plot_with_overlapping_legend.pdf}
+     \caption{\method versus standard fine-tuning (FT) and relevant baselines for a ResNet-50 model pre-trained on ImageNet-1K (from \Cref{table:main_vision_table}). \methodbold \textbf{achieves the best average accuracy} (between pre-training and target fine-tuning accuracies).}
+    \label{fig:baseline_figure-1}
+\end{figure}
+Mitigating catastrophic forgetting is an active area of research with many fundamental questions awaiting solutions. 
+The key idea is to constrain the fine-tuning process to prevent the degeneration of the learned representations while guiding the learning of the new task to augment existing capabilities. 
+The literature on the topic offers various approaches based on the available knowledge pertaining to the pre-training process. 
+In fact, pre-training-specific data availability and how it is treated predominantly dictates the success of mitigating forgetting. 
+In many real-life scenarios, however, the data and the training recipe used for generating the pre-trained model are not available \citep{radford2021learning, touvron2023llama, Touvron2023Llama2O, grattafiori2024llama3herdmodels, jiang2024mistral}. 
+Naturally, one needs to approach the forgetting phenomenon accordingly to design realistic methods.
+
+Therefore, we focus on the case in which we have \emph{\textbf{no access} to the pre-training-specific information} during the fine-tuning process; we call it the \textbf{\emph{data-oblivious}} setting.
+The only piece of information available during fine-tuning is indeed the pre-trained model. 
+Therefore, one needs to devise a strategy to regulate and guide the fine-tuning process to preserve the pre-trained model capabilities while learning the new task in the absence of prior knowledge.
+Under this challenging setting, we present an answer to the question:
+\begin{center}
+    \textit{Can we design a principled method that mitigates forgetting during fine-tuning \\ in the data-oblivious setting?}
+\end{center}
+In this paper, we propose \textbf{F}ine-tuning with Pre-trained \textbf{L}oss-\textbf{O}riented \textbf{W}eighting (\methodbold) to mitigate catastrophic forgetting in the data-oblivious setting. 
+Our key insight is upweighting the \enquote{easy} samples on which the pre-trained model's loss is low and vice versa.
+We believe that boosting the samples on which the pre-trained model performs well (i.e., has low loss) 
+will introduce supervised bias to the gradient updates in favor of the pre-trained model. Intuitively, this will prevent the parameters from deviating 
+too much from the {initial pre-trained state}, thus mitigating forgetting. 
+
+
+Some prior papers assign more importance to {samples} with \textit{larger losses} to accelerate the training process \citep{Loshchilov2015OnlineBS, shrivastava2016training, katharopoulos2017biased, kawaguchi2020ordered, dasunderstanding}. 
+We follow the reciprocal reasoning; we tweak the fine-tuning process in favor of the pre-trained model by assigning \emph{larger} weights to samples with \emph{smaller} pre-trained loss values. 
+We elaborate on this while stating our \textbf{contributions} next.
+\begin{enumerate}[topsep=0.1cm]%leftmargin=0.5cm
+    \item To mitigate forgetting, we propose \methodbold, which fine-tunes the pre-trained model using a sample-wise weighted loss.
+    Inspired by robust optimization ideas, we derive the $i^\text{th}$ sample's weight to be $\exp( -\ell_{i}/\tau)$, where $\ell_{i}$ is the $i^\text{th}$ sample's pre-trained loss and $\tau$ is a parameter which we set as median$(\ell_{i})$ in practice. 
+    Thus, our method is essentially \textit{parameter-free}.
+
+    \item We demonstrate the superiority of \method  
+    over relevant baselines (model averaging, $\ell_2$ regularization, LoRA, etc.) 
+    in both vision and language model experiments. For instance, ResNet-50 fine-tuned with \method on six image classification datasets achieves {$\sim \mathbf{17}$\% %16.83\% 
+    higher average accuracy} (over pre-training and fine-tuning data) than standard fine-tuning, while also surpassing other relevant baselines (see \cref{table:main_vision_table}). When fine-tuning Gemma 2 2B on math datasets, the corresponding improvement of \method over standard fine-tuning is $\sim \mathbf{4}\%$ %$3.86\%$ 
+    (see \cref{tab:main_lang_table}).
+
+    \item We also empirically show that combining \method with existing methods for mitigating forgetting \textit{improves the performance} of the base methods (see \cref{table:complementary_vision_table,tab:lang-ours-baseline}).
+
+    \item We theoretically analyze the effect of fine-tuning with \method for linear models. 
+    In particular, the covariance matrix of the fine-tuning data weighted by \method has a small eigenvalue and \textit{training is stalled} along the corresponding eigenvector, \textit{impeding overfitting to the fine-tuning task} (see \Cref{rmk-2}).
+\end{enumerate}
+We end this section with a preview of the comparison of our method \method with some relevant baselines (in the data-oblivious setting) in \Cref{fig:baseline_figure-1}.
+
+\section{Related Work}
+\label{sec:related-work}
+\subsection{Mitigating Catastrophic Forgetting}
+We begin by summarizing the vast literature on catastrophic forgetting with a focus on prior works most relevant to our proposed setting.
+For a streamlined presentation, we survey prior work in two settings -- data-aware and data-oblivious. 
+We refer the reader to \cref{app:related-work} for a more detailed and explanatory literature review. 
+
+\subsubsection{Data-aware approaches}
+The majority of the approaches for mitigating  
+forgetting assume task-specific knowledge access to different extents; either (a subset of) the pre-training dataset itself or some information/statistic computed from pre-training data. Below, we describe the data-aware approaches based on how they make use of task-specific knowledge.
+\\
+\\
+\textbf{Regularization-based methods.} This line of work aims to preserve existing capabilities by keeping the parameters close to the pre-trained model. The key idea is to introduce task-specific regularization to penalize modifications along the ``important'' directions for the old tasks 
+\citep{ahn2019uncertainty}. 
+\citet{kirkpatrick2016overcoming} introduces the elastic weight consolidation (EWC) algorithm, which estimates the important directions by approximating the Fisher information matrix. 
+Several variants of EWC have been proposed \citep{schwarz2018progress, ritter2018online, Lee2020ContinualLW, liu2018rotate}. \citet{zenke2017continual, aljundi2018memory} infer the importance of each parameter by their variational effect on the outputs. In a similar spirit, \citet{lee2017overcoming} aims to match the posteriors of the pre-trained and fine-tuned models. 
+\\
+\\
+\textbf{Optimization-driven methods.} Another perspective to mitigating forgetting is guiding the optimization process by constraining the algorithms directly as opposed to manipulating the loss function. 
+The core idea is to keep track of \enquote{important directions} for the old tasks, and train on the new task \enquote{orthogonally.} 
+This could be done by storing prior data samples or gradients in a buffer \citep{lopezpaz2017gradient, farajtabar2020orthogonal, chaudhry2018efficient} or by incrementally expanding the subspace of important directions without storing task-specific information \citep{zeng2019continual, wang2021training, wang2023orthogonal}.
+\\
+\\
+\textbf{Replay-based methods.} A more direct approach is to store old task samples in buffers and introduce them into the training process for the new task to refresh task-specific representations periodically.
+There are several components to such methods. Some prior work focus on \emph{data selection} based on the nature of old data access \citep{rebuffi2017icarl, aljundi2019gradient, Bang2021RainbowMC, chaudhry2019continual, isle2018selective, delange2021continual, borsos2020coresets, tiwari2021gcr} (e.g., streaming versus on-demand). Another important perspective is the \emph{re-introduction strategy} of the stored information into the fine-tuning process \citep{silver2002task, li2016learning, Triki2017EncoderBL, Lee2019OvercomingCF, dhar2019learning, rebuffi2017icarl, riemer2019learning, chaudhry2019continual, delange2021continual, tiwari2021gcr}.
+\\
+\\
+\textbf{Architecture-driven methods.} Another technique to limit interference between tasks is to allocate a separate trainable set of parameters per task. 
+This could be done by initializing a sub-networks per new task \citep{Rusu2016ProgressiveNN, aljundi2017expertgate, patrick2020routing, rajasegaran2019random, Ramesh2021ModelZA, wang2023incorporating, wang2022coscl}, gradually expanding the parameters of a base network \citep{yoon2018lifelong, Ostapenko2019LearningTR, hung2019compacting}, or segregating a fixed model into task-specific subsets \citep{mallya2018piggyback, kang2022forgetfree, serra2018overcoming, worstman2020supermasks, Mallya2017PackNetAM, gurbuz2022nispa, jung2020continual}. 
+The main downside with this line of work is that task identities must be known for inference to (de)activate relevant sub-networks \citep{aljundi2017expertgate}. 
+
+\subsubsection{Data-oblivious approaches}
+In the less-explored data-oblivious setting, it is particularly challenging to devise a principled approach, as there is no access to any data-specific information, except for the pre-trained model. 
+One line of work explores the simple idea of ``model averaging'' (MA) which essentially does a convex combination of the parameters of the pre-trained model and that of the fully fine-tuned model for the new task. 
+MA and more sophisticated model merging variants have been studied in relevant context to forgetting \citep{lubana2021quadratic, wortsman2021robust, ilharco2023editing, lin2023mitigating, kleiman2025soupgomitigatingforgetting}. 
+Some recent works \citep{chen2024mofo,panda2406lottery} introduce different strategies to selectively update a subset of parameters in a pre-training data-agnostic manner.
+Finally, \citet{biderman2024lora} has shown that LoRA \cite{hu2022lora} could be effective for mitigating catastrophic forgetting in transformers. 
+Unlike the methods discussed above which focus on the parameter or gradient space, ours focuses on the sample space.
+
+\subsection{Sample Selection and Weighting}
+Sample-wise importance selection/weighting has been studied in optimization papers \citep{needell2014stochastic, zhao2015stochastic, Alain2015VarianceRI, stich2017safe} and ML papers \citep{Loshchilov2015OnlineBS, shrivastava2016training, katharopoulos2017biased, katharopoulos2018not, kawaguchi2020ordered, dasunderstanding} to speed up the optimization/training process by reducing the variance of the gradient updates. 
+Such papers advocate focusing on \enquote{hard} samples with high-gradient norms or losses. In contrast, we focus on \enquote{easy} samples to mitigate forgetting. Another line of work focuses on robust learning under uncertain data distributions. Distributionally robust optimization (DRO) proposes to minimize the worst-case weighted loss, where the sample weights are constrained or regularized \citep{ben2013robust,levy2020large,duchi2021learning,qi2021online}. 
+Some recent works \citep{xie2024doremi,chen2024take,anonymous2025dynamic} propose dynamic sample-weighting strategies for LLM training based on the previously discussed ideas. 
+
+\section{Notation and Definitions}
+$\mathds{1}(.)$ denotes the indicator variable. For any $n \in \mathbb{N}$, the set $\{1,\ldots,n\}$ is denoted by $[n]$. 
+Vectors and matrices are in lowercase and uppercase bold font, respectively. 
+The $\ell_p$ norm of a vector $\mathbf{v}$ is denoted by $\|\mathbf{v}\|_p$. The inner product between two vectors $\mathbf{v}$ and $\mathbf{v}'$ is denoted as $\langle \mathbf{v}, \mathbf{v}' \rangle$. A set of $n$ linearly independent $n$-dimensional vectors $\{\mathbf{u}_1,\ldots,\mathbf{u}_n\}$ is said to be 
+an orthonormal basis for $\mathbb{R}^n$ if $\langle \mathbf{u}_i, \mathbf{u}_j \rangle = \mathds{1}(i=j)$. A vector $\mathbf{v} = [\text{v}_1,\ldots,\text{v}_n]^\top$ is said to belong to the $n$-dimensional probability simplex $\bm{\Delta}_n$ if $\sum_{i=1}^n \text{v}_i = 1$ and $\text{v}_i \geq 0$ $\forall$ $i \in [n]$. For any $n \in \mathbb{N}$, $\mathbf{I}_n$ denotes the identity matrix of dimension $n$. 
+
+\section{Proposed Algorithm}
+\label{sec:method}
+Our proposed algorithm consists of two main steps: 
+\begin{enumerate*}
+[(\itshape i\hspace*{1pt})]
+    \item computing weights for the samples based on their respective pre-trained loss values; and
+    \item fine-tuning with a weighted loss wherein the per-sample losses are scaled by their respective weights.
+\end{enumerate*}
+The sample-wise weights are computed once and used throughout the entire fine-tuning process. 
+We formally state our proposed fine-tuning protocol in \cref{alg:method} and delve into its design details in the sequel.
+\begin{algorithm}[ht] %!htb
+   \caption{\textbf{F}ine-tuning with Pre-trained \textbf{L}oss-\textbf{O}riented \textbf{W}eighting ({\methodbold})}
+   \label{alg:method}
+\begin{algorithmic}
+    \STATE {\bfseries Input:}  
+    Pre-trained model $\bm{\theta}^{*}$, dataset $\{(\mathbf{x}_i, \text{y}_i)\}_{i=1}^n$ for the 
+    new task, temperature parameter $\tau$. 
+    \vspace{0.15 cm}
+    \STATE $f_i(\bm{\theta}) \rightarrow$ $i^\text{th}$ sample's loss at $\bm{\theta}$, with a non-negative loss function (e.g., cross-entropy loss). 
+    \vspace{0.15 cm}
+    \STATE 1. Compute sample weights: $w_i = \exp \left(- \frac{f_i(\bm{\theta}^{*})}{\tau} \right)$.%, $\forall i \in [n]$.
+    \vspace{0.15 cm}
+    \STATE 2. Weighted loss: $\mathcal L(\bm{\theta}) = \sum_{i=1}^n w_i f_i(\bm{\theta}).$
+    \vspace{0.15 cm}
+    \STATE 3. Fine-tune with weighted loss: $\widehat{\bm{\theta}}^{*} := \argmin\limits_{\bm{\theta}} \mathcal L(\bm{\theta}).$
+    % \vspace{0.15 cm}
+    \STATE \textbf{Output:} 
+    Fine-tuned model $\widehat{\bm{\theta}}^{*}$.
+    \end{algorithmic}
+\end{algorithm}
+
+\begin{remark}
+    Depending on the setting, our model might have task-specific components, such as per-task prediction heads (e.g., in vision). 
+    \cref{alg:method} can be slightly modified in the presence of task-specific components to enhance performance. {Refer to \Cref{alg:multi-head} for these modifications.} 
+\end{remark}
+
+\begin{remark}
+\label{rmk-tau}
+As a heuristic prescription, we set $\tau = \textup{median}\left(f_i(\bm{\theta}^{*})\right)$ in all our experiments (unless otherwise stated), which leads to consistently good 
+performance. \textbf{Thus, our algorithm is essentially parameter-free in practice}.
+\end{remark}
+
+\textbf{Algorithm design.} Our main intuition is that we can control forgetting by not drifting away too much from the pre-trained model (i.e., $\bm{\theta}^{*}$) during fine-tuning. In the presence of pre-training data, this is done by introducing data-dependent constraints on the parameter space or gradient space. Since we have \emph{no access} to pre-training data, we 
+redirect our focus towards \textit{strategies on the \textbf{sample space} depending only on the \textbf{pre-trained model}}.
+
+To that end, we propose to infer the easiness 
+of each sample of the fine-tuning dataset with respect to the pre-trained model, based on the per-sample losses $f_i(\bm{\theta}^{*})$'s (see Alg. \ref{alg:method}). We say that the $i^\text{th}$ sample is \enquote{easy} if $f_i(\bm{\theta}^{*})$ is \enquote{small}.\footnote{This is not a formal definition and so \enquote{small} is not quantified.} Intuitively, prioritizing the \enquote{easy} samples during fine-tuning would limit the drift from $\bm{\theta}^*$. On the other hand, over-focusing on the \enquote{easy} samples would probably lead to poor performance on the fine-tuning task. Thus, it is important to strike a balance. 
+
+Let us formalize these ideas mathematically. For fine-tuning on the new task, let us consider the objective function $\mathcal{L}_{\bm{\pi}}(\bm{\theta}) = \sum_{i=1}^n \pi_i f_i(\bm{\theta})$, where $\bm{\pi} = [\pi_1,\ldots,\pi_n]^\top$ is a \textbf{static} design-choice 
+$\in \bm{\Delta}_n$ (i.e., $\sum_{i=1}^n \pi_i = 1$ and $\pi_i \geq 0$ $\forall$ $i \in [n]$) which we allow to only depend on the pre-trained model's losses $\{f_i(\bm{\theta}^{*})\}_{i=1}^n$ (and \textit{not} the current model's losses $\{f_i(\bm{\theta})\}_{i=1}^n$). We would like to design $\bm{\pi}$ so that: 
+\begin{enumerate} [topsep=0.1cm]
+    \item for all $i \neq j$ such that $f_i(\bm{\theta}^{*}) \leq f_j(\bm{\theta}^{*})$, $\pi_i \geq \pi_j$,
+    \item $\bm{\pi}$ does not concentrate around one or a few samples but rather spreads uniformly over the samples.
+\end{enumerate}
+These two requirements can be enforced by minimizing the following function (w.r.t. $\bm{\pi}$) involving negative \emph{entropic regularization}:
+\begin{equation}
+    g(\bm{\pi}) = \sum_{i=1}^n \pi_i f_i(\bm{\theta}^{*}) 
+    + \tau \sum_{i=1}^n \pi_i \log \pi_i.
+\end{equation}
+Here $\tau > 0$ is a parameter controlling the extent of the second requirement which is facilitated by the entropy term. 
+We now state the minimizer of $g(\bm{\pi})$ (proof is in \Cref{pf-prop-pi}). 
+\begin{proposition}
+\label{prop-pi}
+Let $\bm{\pi}^{*} = [\pi_1^{*}, \ldots, \pi_n^{*}]^\top = \argmin\limits_{\bm{\pi} \in \bm{\Delta}_n} g(\bm{\pi})$. Then we have 
+\begin{equation*}
+    {\pi}_i^{*} = \frac{1}{Z} \exp \left( - \frac{f_i(\bm{\theta}^{*})}{\tau} \right), %\text{ where }
+\end{equation*}
+where $Z = \sum_{j=1}^n \exp \left( - \frac{f_j(\bm{\theta}^{*})}{\tau} \right)$ is the normalizing factor. 
+\end{proposition}
+Modulo the normalizing factor $Z$ (it does not matter when optimizing w.r.t. $\bm{\theta}$), note that $w_i$ and $\mathcal L(\bm{\theta})$ in  \Cref{alg:method} are equivalent to ${\pi}_i^{*}$ and $\mathcal{L}_{\bm{\pi}^{*}}(\bm{\theta})$, respectively. 
+
+\textbf{Distributionally robust optimization (DRO) perspective.}
+Our formulation above is motivated by prior work on DRO \citep{qi2021online}, but it is  \textbf{exactly the opposite} of DRO in spirit. Specifically, in our setting, \citet{qi2021online} consider the following min-max problem: %(translated to our setting):
+\begin{equation}
+    \label{eq:DRO}
+    \min_{\bm{\theta}} \max_{\bm{\pi} \in \bm{\Delta}_n} \sum_{i=1}^n \pi_i f_i(\bm{\theta}) - \tau \sum_{i=1}^n \pi_i \log \pi_i.
+\end{equation}
+The first term in Eq. (\ref{eq:DRO}) is the \textit{worst-case} weighted loss at $\bm{\theta}$, while the second term (i.e., entropic regularization) promotes uniform weights. The optimal solution to the inner max function w.r.t. $\bm{\pi}$ turns out to be $\pi_i^{*} \propto \exp \left(\frac{f_i({\mathbf{\bm{\theta}}})}{\tau} \right)$. Note that this is essentially the \textit{inverse of our weighting function} (modulo the normalizing factor) because it assigns a higher weight to samples with larger losses (i.e., the \enquote{hard} samples). The weighting function of DRO would be very conducive to forgetting because it focuses more on the \enquote{hard} samples. Further, our weighting function is static (or one-shot) as it depends only on the losses at ${\mathbf{{\bm{\theta}}}}^{*}$. On the other hand, the weighting function of DRO is dynamic (i.e., it depends on the current point ${\mathbf{{\bm{\theta}}}}$). In fact, after plugging in the optimal value of $\pi$ into Eq. (\ref{eq:DRO}) and simplifying, the DRO objective reduces to $\min_{\bm{\theta}} \sum_{i=1}^n \exp\left(\frac{f_i(\bm{\theta})}{\tau}\right)$; this is noticeably different from our objective $\mathcal L(\bm{\theta})$ in \Cref{alg:method}. 
+
+\section{Experimental Setup}
+\label{sec: experiments}
+We empirically evaluate the performance of \method (\Cref{alg:method}) on vision and language tasks, showcasing its effectiveness across different model architectures and modalities. 
+Here, we explain the details of our experiments: baselines, model architectures, datasets, and evaluation metrics.
+
+\textbf{Baselines.} In our language and vision experiments, we compare \method against relevant baselines in the \textit{data-oblivious setting}, namely, standard fine-tuning (fine-tuning with vanilla unweighted loss), $\ell_2$-regularization [following  \citet{kirkpatrick2016overcoming}], and WiSE-FT \citep{wortsman2021robust} (model averaging of pre-trained and standard fine-tuned models). Additionally, we compare against linear probing (fine-tuning only the classification head, keeping the body frozen) in vision experiments and low-rank adaptation (LoRA) \citep{hu2022lora} in language experiments. More details on baselines can be found in \cref{app:add-baseline-detials}.
+
+\subsection{Vision Experiments} 
+We study the performance of \method and associated baselines in a transfer learning setup. 
+
+\paragraph{Models.} We consider 
+ResNet-18 and ResNet-50 models pre-trained on Imagenet-1K \citep{russakovsky2015imagenet} taken from \citet{wightman2021resnet}. 
+
+\paragraph{Datasets.} We select six widely-used image classification datasets: CIFAR-10 \citep{Krizhevsky09learningmultiple}, CIFAR-100 \citep{Krizhevsky09learningmultiple}, Flowers102 \citep{nilsback2008automated}, Caltech101
+\citep{Li2022}, Cars \citep{krause20133d}, and Dogs \citep{parkhi2012dog}. 
+
+\paragraph{Evaluation metrics.} 
+Vision models are trained with task-specific parts, such as classification head (head) and batch-norm (BN); see \Cref{alg:multi-head} for how \method works with with task-specific parts. 
+Forgetting is measured by how much the model's top-1 validation accuracy on ImageNet-1K (subsequently referred to as IN-1K accuracy) reduces after fine-tuning. 
+We report the fine-tuning performance in terms of \emph{average fine-tuning accuracy} over all the six datasets following \cite{goyal2022finetune, ilharco2023editing}. For IN-1K evaluation \emph{after} fine-tuning, we replace the task-specific components of the {fine-tuned} model with their pre-trained counterparts. An extended discussion on experimental details, evaluation, and hyper-parameters are in \cref{app:vision-hyperparameters}.
+We also report the \textbf{average} of IN-1K accuracy and averaged fine-tuning accuracy for each method; this is a reasonable \textit{unified metric} to evaluate the performance of a method jointly on the pre-training and fine-tuning data.
+
+\begin{table}[t!]
+\centering
+ \caption{
+ \textbf{Performance of \methodbold with vision models.}
+ \textbf{Bolded} and \underline{underlined} values indicate the \textbf{best} and \underline{second-best} 
+ accuracies within each column (and for each model). 
+ Deltas (in color) for IN-1K and target performance are computed w.r.t. the pre-trained and standard fine-tuned models. \textbf{\methodbold attains the best average accuracy} and is better than the second-best method (linear probing) by 2.94\% and 3.44\% for ResNet-18 and ResNet-50, respectively.}
+ \vspace{0.1 cm}
+\small
+\begin{tabular}{ll|l|l|c}
+\toprule
+ & \multicolumn{1}{c|}{{\textbf{Method}}} & \multicolumn{1}{c|}{{\textbf{IN-1K Acc.}}} & \multicolumn{1}{c|}{{\textbf{Target Acc.}}} & \textbf{Average} \\
+\midrule
+\multirow{6}{*}{\rotatebox{90}{\textbf{ResNet-18}}} 
+ % & Ideal         & 69.76  & 89.07  & -- \\
+ & Pre-trained   & \textbf{69.76} \hfill {\tiny \textcolor{blue}{(+0.00)}} & --  & -- \\
+ & Standard FT   & 19.58 \hfill {\tiny \textcolor{red}{(-50.18)}} & \textbf{89.07} \hfill {\tiny \textcolor{blue}{(+0.00)}} & 54.60 \\
+ & Linear Probe       & \textbf{69.76} \hfill {\tiny \textcolor{blue}{(+0.00)}} & 73.57 \hfill {\tiny \textcolor{red}{(-15.50)}} & \underline{71.63} \\
+ & $\ell_2$-Reg.         & 34.78 \hfill {\tiny \textcolor{red}{(-34.98)}} & \underline{88.12} \hfill {\tiny \textcolor{red}{(-0.95)}} & 61.45 \\
+ & WiSE-FT       & 54.15 \hfill {\tiny \textcolor{red}{(-15.61)}} & 80.23 \hfill {\tiny \textcolor{red}{(-8.84)}} & 67.19 \\
+ & \methodbold (Ours) & \underline{65.21} \hfill {\tiny \textcolor{red}{(-4.55)}} & 83.93 \hfill {\tiny \textcolor{red}{(-5.14)}} & \textbf{74.57} \\
+\midrule
+\multirow{6}{*}{\rotatebox{90}{\textbf{ResNet-50}}} 
+ % & Ideal         & 79.02  & 91.78  & -- \\
+ & Pre-trained   & \textbf{79.02} \hfill {\tiny \textcolor{blue}{(+0.00)}} & --  & -- \\
+ & Standard FT   & 36.91 \hfill {\tiny \textcolor{red}{(-42.11)}} & \textbf{91.78} \hfill {\tiny \textcolor{blue}{(+0.00)}} & 64.34 \\
+ & Linear Probe        & \textbf{79.02} \hfill {\tiny \textcolor{blue}{(+0.00)}} & 76.45 \hfill {\tiny \textcolor{red}{(-15.33)}} & \underline{77.73} \\
+ & $\ell_2$-Reg.         & 44.78 \hfill {\tiny \textcolor{red}{(-34.24)}} & \underline{91.58} \hfill {\tiny \textcolor{red}{(-0.20)}} & 68.18 \\
+ & WiSE-FT       & 61.65 \hfill {\tiny \textcolor{red}{(-17.37)}} & 81.38 \hfill {\tiny \textcolor{red}{(-10.40)}} & 71.52 \\
+ & \methodbold (Ours) & \underline{76.09} \hfill {\tiny \textcolor{red}{(-2.93)}} & 86.25 \hfill {\tiny \textcolor{red}{(-5.53)}} & \textbf{81.17} \\
+\bottomrule
+\end{tabular}
+\label{table:main_vision_table}
+\end{table}
+\subsection{Language Model Experiments}
+\label{sec:llm-experiments-setup}
+
+We follow a similar setup to \citet{biderman2024lora, chen2024mofo}, where a language model's general capabilities are evaluated before and after fine-tuning on a mathematical reasoning dataset. All training for language experiments is done with HuggingFace \texttt{peft} \citep{peft}, \texttt{transformers} \citep{wolf-etal-2020-transformers}, \texttt{datasets} \citep{lhoest-etal-2021-datasets}, and \texttt{accelerate} \citep{accelerate}.
+
+\paragraph{Models.} We use Gemma 2 2B \citep{gemmateam2024gemma2improvingopen} and Llama 3.2 3B \citep{grattafiori2024llama3herdmodels} as our base language models. Further details on training hyper-parameters can be found in \cref{app:language-hyperparameters}.
+
+\paragraph{Datasets.} Following previous works \citep{biderman2024lora, chen2024mofo}, we fine-tune on MetaMathQA \citep{yu2023metamath}, a mathematical reasoning dataset that is bootstrapped from the training set of GSM8K \citep{cobbe2021training} and MATH \citep{hendrycksmath2021} using a LLM. We train with all 395K samples in MetaMathQA.
+
+\paragraph{Evaluation metrics.} To evaluate the validity of \method, we break down our metrics into \emph{general capability} and \emph{target fine-tuning} evaluations. To evaluate general capabilities, we again follow a similar setup as \citet{chen2024mofo}, where we use commonsense reasoning, 5-shot MMLU \citep{hendryckstest2021}, and 3-shot MBPP \citep{austin2021program} metrics. To evaluate the target domain, we use 5-shot GSM8K \citep{cobbe2021training}. 
+All evaluations are performed with \texttt{lm-evaluation-harness} \citep{eval-harness}. More details on evaluation and the commonsense metric can be found in \cref{app:further-language-evaluation-details}. Similar to vision, we also report the \textbf{average} of general capabilities and the target fine-tuning accuracies as a \textit{unified metric}.
+
+
+\section{Experimental Results}
+\label{sec:results}
+
+\begin{table*}[t!]
+    \centering
+    \caption{\textbf{Performance of \methodbold with LLMs.} After fine-tuning Gemma 2 2B and Llama 3.2 3B on MetaMathQA, we compare the target fine-tuning performance (GSM8K) with general capability performance. \textbf{Bolded} and \underline{underlined} values indicate the \textbf{best} and \underline{second-best} results within each column (and for each model). 
+    Deltas (in color) for general capability metrics and fine-tuning metrics are computed w.r.t. the pre-trained and standard fine-tuned model's accuracy, respectively.  
+    We see that \textbf{\methodbold, on average, has the best performance} on general capabilities and target domain, achieving within $\sim0.8\%$ (Gemma 2 2B) and $\sim1.4\%$ (Llama 3.2 3B) of standard fine-tuning's target performance, while significantly mitigating the degradation of general pre-training capabilities in comparison to other baselines. 
+    }
+    \vspace{0.1 cm}
+    \small
+    \begin{tabular}{ll|ccc|c|c}
+         \toprule
+        & \textbf{} &  \multicolumn{3}{c}{\textbf{General Capability Acc.}} & \textbf{Target Acc.} & \\ 
+        \cmidrule(lr){3-5}
+        \cmidrule(lr){6-6}
+         &\multicolumn{1}{c|}{{\textbf{Method}}} &  \textbf{Commonsense} & \textbf{MMLU} & \textbf{MBPP} & \textbf{GSM8K} & \textbf{Average}\\
+        \midrule
+        \multirow{6}{*}{\rotatebox{90}{\textbf{Gemma 2 2B}}} 
+         & Pre-trained & \underline{57.23} \relax {\tiny\textcolor{blue}{(+0.00)}} & \underline{49.59} \relax {\tiny\textcolor{blue}{(+0.00)}} & \textbf{28.40} \relax {\tiny\textcolor{blue}{(+0.00)}} & 24.49 \relax {\tiny\textcolor{red}{(-38.89)}}& 40.79 \\
+         & Standard Fine-tuning & 55.07 {\tiny\relax\textcolor{red}{(-2.16})} & 45.59 \relax{\tiny\textcolor{red}{(-4.00)}}& 16.80 \relax{\tiny\textcolor{red}{(-11.60)}}& \textbf{63.38} \relax{\tiny\textcolor{blue}{(+0.00)}}& 46.31 \\
+         & WiSE-FT ($\alpha=0.5$) & 57.28 \relax{\tiny\textcolor{blue}{(+0.05)}} & \textbf{50.13} \relax{\tiny\textcolor{blue}{(+0.54)}} & 25.60 \relax{\tiny\textcolor{red}{(-2.80)}} & 53.30 \relax{\tiny\textcolor{red}{(-10.08)}}&  47.60\\
+         & LoRA ($r=64$) &  55.67 \relax{\tiny\textcolor{red}{(-1.56)}} & 44.28 \relax{\tiny\textcolor{red}{(-5.31)}}& 25.80 \relax{\tiny\textcolor{red}{(-2.60)}}& 60.43 \relax{\tiny\textcolor{red}{(-2.95)}}& 47.05\\
+         & $\ell_2$-Regularization & 57.01 \relax{\tiny\textcolor{red}{(-0.22)}} & 48.43 \relax{\tiny\textcolor{red}{(-1.16)}}& 24.80 \relax{\tiny\textcolor{red}{(-3.60)}}& \underline{62.85} \relax{\tiny\textcolor{red}{(-0.53)}} &  \underline{49.19} \\
+         & \methodbold (Ours) & \textbf{57.59} \relax{\tiny\textcolor{blue}{(+0.36)}} & 49.31 \relax{\tiny\textcolor{red}{(-0.28)}}& \underline{26.80} \relax{\tiny\textcolor{red}{(-1.60)}}& 62.55 \relax{\tiny\textcolor{red}{(-0.83)}}& \textbf{49.98} \\
+        \midrule
+        \multirow{6}{*}{\rotatebox{90}{\textbf{Llama 3.2 3B}}} 
+         & Pre-trained & \underline{54.48} \relax{\tiny\textcolor{blue}{(+0.00)}} & \textbf{54.34} \relax{\tiny\textcolor{blue}{(+0.00)}}& \textbf{38.00} \relax{\tiny\textcolor{blue}{(+0.00)}}& 26.01 \relax{\tiny\textcolor{red}{(-40.94)}} & 44.28 \\
+         & Standard Fine-tuning & 50.68 \relax{\tiny\textcolor{red}{(-3.80)}}& 45.29 \relax{\tiny\textcolor{red}{(-9.05)}}& 17.80 \relax{\tiny\textcolor{red}{(-20.20)}} & \textbf{66.95} \relax{\tiny\textcolor{blue}{(+0.00)}}& 46.10 \\
+         & WiSE-FT ($\alpha=0.5$) & \textbf{54.54} \relax{\tiny\textcolor{blue}{(+0.04)}}& 53.33 \relax{\tiny\textcolor{red}{(-1.01)}}& 34.60 \relax{\tiny\textcolor{red}{(-3.40)}}& 57.01 \relax{\tiny\textcolor{red}{(-9.94)}}&  50.75\\
+         & LoRA ($r=64$) & 53.10 \relax{\tiny\textcolor{red}{(-1.38)}}& 50.95 \relax{\tiny\textcolor{red}{(-3.39)}}& 34.00 \relax{\tiny\textcolor{red}{(-4.00)}}& 63.84 \relax{\tiny\textcolor{red}{(-3.15)}}&  51.66 \\
+         & $\ell_2$-Regularization & 53.60 \relax{\tiny\textcolor{red}{(-0.88)}}& 51.28 \relax{\tiny\textcolor{red}{(-3.06)}}& 33.60 \relax{\tiny\textcolor{red}{(-4.40)}}& \underline{66.87} \relax{\tiny\textcolor{red}{(-0.08)}}& \underline{52.30}\\
+         & \methodbold (Ours) & 54.30 \relax{\tiny\textcolor{red}{(-0.18)}}& 51.86 \relax{\tiny\textcolor{red}{(-2.48)}}& \underline{36.00} \relax{\tiny\textcolor{red}{(-2.00)}}& 65.58 \relax{\tiny\textcolor{red}{(-1.37)}}& \textbf{52.87} \\
+         \bottomrule
+    \end{tabular}
+    \label{tab:main_lang_table}
+\end{table*}
+
+\subsection{Comparing \texorpdfstring{\method}{TEXT} and Related Baselines}
+For \textbf{vision} experiments, Table \ref{table:main_vision_table} lists the accuracies 
+of all the baselines and \method. Our findings are consistent among the two vision models, so we focus on the larger ResNet-50 model. 
+The pre-trained ResNet-50 model achieves a top-1 accuracy of 79.02\% on ImageNet-1K's validation set. Standard fine-tuning experiences a significant 42.11\% drop in IN-1K accuracy, while achieving an average fine-tuning accuracy of 91.78\% across the target datasets. In contrast, \method suffers only a 2.93\% drop in IN-1K accuracy and exhibits a reasonable 86.25\% average accuracy on target fine-tuning datasets, demonstrating a significant improvement over standard fine-tuning. Overall, \method's \textbf{average} on IN-1K and target domain accuracy 
+is \textbf{16.83\% higher} than standard fine-tuning.
+
+\begin{table}[t!]
+\centering
+\tiny
+ \caption{\textbf{WiSE-FT with \methodbold vs. (standalone) WiSE-FT in vision.}
+ \enquote{WiSE-FT+} denotes WiSE-FT with \method in the table. Comparison here is in the same setting as \Cref{table:main_vision_table}. Note that \textbf{{WiSE-FT+} is significantly better than WiSE-FT}. 
+ }
+ \vspace{0.1 cm}
+\small
+\begin{tabular}{ll|c|c|c}
+\toprule
+ & \textbf{Method} & \textbf{IN-1K Acc.} & \textbf{Target Acc.} & \textbf{Average} \\
+\midrule
+\multirow{2}{*}{\textbf{ResNet-18}} 
+& WiSE-FT & 54.15 & 80.23 & 67.19 \\
+& WiSE-FT+ & 68.71 & 74.03 & \textbf{71.37} \\
+\midrule
+\multirow{2}{*}{\textbf{ResNet-50}} 
+
+& WiSE-FT      & 61.65  & 81.38 & 71.52 \\
+& WiSE-FT+ & 78.29 & 73.80 & \textbf{76.04} \\
+\bottomrule
+\end{tabular}
+\label{table:complementary_vision_table}
+\end{table}
+
+Going beyond standard fine-tuning, our results in Table \ref{table:main_vision_table} show that \method comprehensively outperforms other baselines. Interestingly, despite its simplicity, linear probing is the second-best method. 
+Overall, \method outperforms other baselines, when \textbf{averaging} IN-1K and target fine-tuning accuracies, by \textbf{a 3.44\% advantage} over the closest competitor, linear probing.
+Although linear probing completely prevents forgetting, it learns significantly less during fine-tuning compared to \method. 
+{The accuracies on individual fine-tuning datasets and corresponding accuracies for IN-1K} 
+{can be found in \cref{add-vis-results}. 
+
+\begin{table}[t!]
+    \centering
+    \caption{\textbf{$\mathbf{\ell_2}$-Reg./LoRA with \methodbold vs. (standalone) $\mathbf{\ell_2}$-Reg./LoRA in language.} \enquote{$\ell_2$+} and \enquote{LoRA+} denote $\ell_2$-Reg. with \method and LoRA with \method, respectively. 
+    The results below are for Gemma 2 2B in the same setup as \Cref{tab:main_lang_table}.  
+    We let A1, A2, A3, and B1 represent {Commonsense}, {MMLU}, {MBPP}, and {GSM8K}, respectively. 
+    We see that \textbf{{$\mathbf{\ell_2}$+} and {LoRA+} are better than {$\mathbf{\ell_2}$} and {LoRA}}. 
+    }
+    \vspace{0.1 cm}
+    \small
+    \begin{tabular}{c|ccc|c|c}
+        \toprule
+        \textbf{Method} & \textbf{A1} & \textbf{A2} & \textbf{A3} & \textbf{B1} & \textbf{Avg.}\\
+        \midrule
+        $\ell_2$ &  57.01 & 48.43 & 24.80 & \textbf{62.85} & 49.19 \\
+        $\ell_2$+ & \textbf{57.53} & \textbf{49.38} & \textbf{26.60} & 62.02 & \textbf{49.79} \\
+        \midrule
+        LoRA & 55.67 & 44.28 & 25.80 & 60.43 & 47.05 \\
+        $\text{LoRA}$+ & \textbf{56.74} & \textbf{47.68} & \textbf{28.80} & \textbf{61.49} &  \textbf{49.31} \\ 
+        \bottomrule
+    \end{tabular}
+   \label{tab:lang-ours-baseline}
+\end{table}
+
+Our \textbf{language model} results are in \Cref{tab:main_lang_table}. Results for Gemma 2 2B %in \cref{tab:main_lang_table} 
+show that \method helps preserve (and even somewhat enhance) the general capabilities of the pre-trained model. {Specifically, compared to standard fine-tuning,   \method improves general capability accuracy by 2.52\% in commonsense reasoning, 3.73\% in MMLU, and 10.00\% in MBPP, with a minor degradation of 0.83\% in GSM8K. We see a similar trend in our Llama 3.2 3B experiments.} Furthermore, while alternative baselines show specific strengths (such as WiSE-FT's general capability performance and $\ell_2$-regularization's target fine-tuning performance), \textbf{\methodbold outperforms all baselines, on average,} for both models, striking the best balance between preserving general capabilities and achieving good target fine-tuning performance. Additional details on commonsense reasoning results are in \cref{app:extended-commonsense-results} and an ablation for our choice of sample weighting in LLMs is in \cref{app:token-wise-ablation}.
+
+In summary, \textit{\methoditalic strikes a good balance between learning a new task and retaining knowledge from pre-training.}
+
+\subsection{Combining \texorpdfstring{\method}{TEXT} with Related Baselines}
+To complement our results in \cref{table:main_vision_table,tab:main_lang_table}, we investigate the performance of baselines when \textbf{combined with \methodbold}. 
+In the vision setting, we consider uniform model averaging with WiSE-FT (with $\alpha=0.5$) and report its performance with and without \method in \cref{table:complementary_vision_table}. 
+Interestingly, averaging the pre-trained IN-1K model and the fine-tuned model obtained with \method \textbf{improves} over standard WiSE-FT (i.e., averaging the pre-trained IN-1K model and the standard fine-tuned model) by \textbf{4.18}\% and \textbf{4.52}\% for ResNet-18 and ResNet-50, respectively, in average performance. 
+
+Further, as seen in \cref{tab:lang-ours-baseline}, \method 
+\textbf{boosts the performance} of other baselines in language modeling. When combined with $\ell_2$-regularization, we observe improvements in general capability between $0.5\%$ and $1.80\%$, with only a $0.83\%$ reduction in GSM8K performance. Furthermore, the integration of \method with LoRA yields even stronger results, enhancing general capability performance by $1.07\%$ to $3.40\%$, while simultaneously improving GSM8K performance by $1.06\%$. Further details and discussion combining \method with $\ell_2$-regularization and LoRA are in \cref{app:extended-commonsense-results}.
+
+
+\section{Theoretical Analysis}
+\label{sec: theory}
+Here we consider linear pre-training and fine-tuning  tasks\footnote{Our insights carry over to neural networks following the dynamics of linear models under gradient descent \citep{lee2019wide}.} and theoretically analyze the effect of fine-tuning with our proposed method \method (\Cref{alg:method}). 
+Specifically, we compare the non-asymptotic trajectories of \method and vanilla fine-tuning. A key insight of our analysis is that \method stalls training in a certain direction, 
+impeding overfitting to the fine-tuning task (see \Cref{rmk-2}). We also demonstrate that \method goes beyond the simple idea of model averaging (see \Cref{rmk-3}). 
+
+We begin by describing the {problem setting.} 
+
+\textbf{Pre-training task:} The label $\text{y} \in \mathbb{R}$ for a $d$-dimensional data point $\mathbf{x} \sim \mathcal{P}$ is given by $\text{y} = \langle \bm{\theta}_{*}, \mathbf{x} \rangle$, where $\bm{\theta}_{*} \in \mathbb{R}^{d}$ is the ground-truth model. 
+Let $\mathcal{D}$ denote the joint distribution of $(\mathbf{x}, \text{y})$, where $\mathbf{x} \sim \mathcal{P}$. Let $\bm{\Sigma} = \mathbb{E}_{\mathbf{x} \sim \mathcal{P}}\big[\mathbf{x} \mathbf{x}^\top\big]$ be the data covariance matrix. 
+Without loss of generality, let $\bm{\Sigma} \succeq \mathbf{I}_d$. 
+
+\textbf{Fine-tuning task:} The label $\widetilde{\text{y}} \in \mathbb{R}$ for a $d$-dimensional data point $\widetilde{\mathbf{x}} \sim \widetilde{\mathcal{P}}$ is given by $\widetilde{\text{y}} = \big\langle \widetilde{\bm{\theta}}_{*}, \widetilde{\mathbf{x}} \big\rangle$, where $\widetilde{\bm{\theta}}_{*} \in \mathbb{R}^{d}$ is the ground-truth model. Let $\widetilde{\mathcal{D}}$ denote the joint distribution of $(\widetilde{\mathbf{x}}, \widetilde{\text{y}})$, where $\widetilde{\mathbf{x}} \sim \widetilde{\mathcal{P}}$. Also, let $$\mathbf{e} := \bm{\theta}_{\ast} - \widetilde{\bm{\theta}}_{*}, \text{ } \overline{\mathbf{e}} := \frac{\mathbf{e}}{\|\mathbf{e}\|_2},$$
+and $\overline{\mathbf{{e}}}_{\perp}$ be a unit vector orthogonal to $\overline{\mathbf{e}}$. We consider the case of $\widetilde{\mathcal{P}} = \mathcal{N}(\vec{\bm{0}}_d, \widetilde{\bm{\Sigma}})$, where 
+\begin{flalign}
+    \label{eq:1-jan15}
+    \widetilde{\bm{\Sigma}} = \mathbf{{I}}_d + \rho  \big(\overline{\mathbf{{e}}} \overline{\mathbf{{e}}}_{\perp}^\top + \overline{\mathbf{{e}}}_{\perp} \overline{\mathbf{{e}}}^\top\big),
+\end{flalign}
+where $\rho \in [0,1)$ is a constant. Note that $\widetilde{\bm{\Sigma}}$ is the data covariance matrix here.
+
+\begin{remark}[\textbf{Regarding $\widetilde{\bm{\Sigma}}$}]
+    \label{rmk-just-jan30}
+    We study the case of $\widetilde{\bm{\Sigma}}$ as given in Eq. (\ref{eq:1-jan15}) because it is the minimal analytically tractable case where we can show that \method goes beyond model averaging (MA) (see \Cref{rmk-3}). Specifically, if $\rho = 0$ and $\widetilde{\bm{\Sigma}} = \mathbf{{I}}_d$, then \method reduces to MA. Moreover, for an arbitrary $\widetilde{\bm{\Sigma}}$, characterizing the eigen-spectrum of the matrix dictating the trajectory of \method becomes intractable. For the analysis to be tractable, we need some relationship between $\widetilde{\bm{\Sigma}}$ and $\mathbf{e}$ (i.e., the difference between the optima of the pre-training and fine-tuning tasks).\footnote{See \Cref{sec:gen_sigma} for more details.}
+\end{remark}
+
+For a model parameterized by $\bm{\theta} \in \mathbb{R}^d$, let 
+\begin{equation*}
+    \text{err}_1(\bm{\theta}) := \mathbb{E}_{\mathcal{D}} \Big[\big(\text{y} - \langle \bm{\theta}, \mathbf{x}\rangle \big)^2\Big] = \big(\bm{\theta} - \bm{\theta}_{\ast}\big)^\top \bm{\Sigma} \big(\bm{\theta} - \bm{\theta}_{\ast}\big), 
+\end{equation*}
+\begin{equation}
+    \label{eq:4-jan17}
+    \text{err}_2(\bm{\theta}) := \mathbb{E}_{\widetilde{\mathcal{D}}} \Big[\big(\widetilde{\text{y}} - \langle \bm{\theta}, \widetilde{\mathbf{x}} \rangle\big)^2\Big] = \big(\bm{\theta} - \widetilde{\bm{\theta}}_{*}\big)^\top \widetilde{\bm{\Sigma}} \big(\bm{\theta} - \widetilde{\bm{\theta}}_{*}\big)
+\end{equation}
+be the population errors on the pre-training and fine-tuning tasks, respectively. Also, the total error with $\bm{\theta}$ on the two tasks is denoted by $\text{err}_\text{tot}(\bm{\theta}) = \text{err}_1(\bm{\theta}) + \text{err}_2(\bm{\theta})$. 
+
+We assume that initially, we learn $\bm{\theta}_{*}$ with the pre-training data; so $\bm{\theta}_{*}$ is our pre-trained model. Note that 
+\begin{equation}
+    \label{eq:4-jan18}
+    \text{err}_\text{tot}(\bm{\theta}_{\ast}) = \text{err}_2(\bm{\theta}_{\ast}) = \mathbf{e}^\top \widetilde{\bm{\Sigma}} \mathbf{e} = \|\mathbf{e}\|_2^2,
+\end{equation}
+where the last step follows by using %the value of 
+$\widetilde{\bm{\Sigma}}$ from \Cref{eq:1-jan15}.
+
+We start fine-tuning starting from $\bm{\theta}_{*}$. 
+Specifically, we assume access to the population $(\widetilde{\mathbf{x}}, \widetilde{\text{y}}) \sim \widetilde{\mathcal{D}}$ of the fine-tuning task, but we lose access to the pre-training data. 
+
+\textbf{Vanilla fine-tuning (FT):} We minimize $\text{err}_2(\bm{\theta})$ (Eq. (\ref{eq:4-jan17})) with gradient descent (GD) starting from $\bm{\theta}_{\ast}$ using a constant learning rate $\overline{\eta}$. Our iterate $\overline{\bm{\theta}}_K$ at the $K^\text{th}$ iteration is given by (using the value of  $\widetilde{\bm{\Sigma}}$ from Eq. (\ref{eq:1-jan15}) and $\bm{\theta}_{\ast} - \widetilde{\bm{\theta}}_{*} = \mathbf{e}$):
+\begin{equation}
+    \label{eq:6-jan17}
+    \overline{\bm{\theta}}_K = \widetilde{\bm{\theta}}_{*} + \Big(\mathbf{I}_d - 2 \overline{\eta} \Big(\mathbf{{I}}_d + \rho  \big(\overline{\mathbf{{e}}} \overline{\mathbf{{e}}}_{\perp}^\top + \overline{\mathbf{{e}}}_{\perp} \overline{\mathbf{{e}}}^\top\big)\Big)^K \mathbf{e}.
+\end{equation}
+
+\textbf{\methodbold:} For some temperature $\tau$, the weight of $(\widetilde{\mathbf{x}}, \widetilde{\text{y}}) \sim \widetilde{\mathcal{D}}$ is $w(\widetilde{\mathbf{x}}, \widetilde{\text{y}}) = \exp\Big(-\frac{(\widetilde{\text{y}} -  \langle \bm{\theta}_{\ast}, \widetilde{\mathbf{x}}\rangle)^2}{\tau}\Big)$. We minimize
+    \begin{equation}
+        \label{eq:3}
+        \widehat{\text{err}}_2(\widehat{\bm{\theta}}) := \mathbb{E}_{\widetilde{\mathcal{D}}} \Big[w(\widetilde{\mathbf{x}}, \widetilde{\text{y}}) \big(\widetilde{\text{y}} - \langle \widehat{\bm{\theta}}, \widetilde{\mathbf{x}} \rangle\big)^2\Big], 
+    \end{equation}
+    with GD starting from $\bm{\theta}_{\ast}$ using a constant learning rate $\widehat{\eta}$. Suppose our iterate at the $K^\text{th}$ iteration is $\widehat{\bm{\theta}}_{K}$.
+
+\begin{theorem}[\textbf{\methodbold}]
+    \label{thm-ploss}
+    Let $\mu = \Big(\frac{\tau}{\tau + 2\|\mathbf{{e}}\|_2^2}\Big)^{1/2}$. Then:
+    \begin{flalign}
+    \label{eq:8-jan17}
+    \widehat{\bm{\theta}}_K =  \widetilde{\bm{\theta}}_{*} + \Big(\mathbf{{I}}_d - 2 \widehat{\eta} \widetilde{\bm{\Sigma}}'\Big)^K \mathbf{{e}}, %, \text{ where } 
+    \end{flalign}
+    where $\widetilde{\bm{\Sigma}}' := \mu \big(\mathbf{I}_d - \mathbf{Q}\big)$ with   
+    \begin{equation}
+        \label{eq:11-jan19}
+        \mathbf{Q} = 
+        (1 - \mu^2)\overline{\mathbf{{e}}} \overline{\mathbf{{e}}}^\top + \rho^2 (1 - \mu^2) \overline{\mathbf{{e}}}_{\perp} \overline{\mathbf{{e}}}_{\perp}^\top 
+        - \rho \mu^2 \big(\overline{\mathbf{{e}}} \overline{\mathbf{{e}}}_{\perp}^\top + \overline{\mathbf{{e}}}_{\perp} \overline{\mathbf{{e}}}^\top\big).
+    \end{equation}
+\end{theorem}
+We prove \Cref{thm-ploss} in \Cref{pf-thm-ploss}. The \textbf{main technical 
+challenge} %in the proof 
+is the evaluation of $\widetilde{\bm{\Sigma}}'$, viz., the covariance matrix of the \textbf{weighted} fine-tuning data; see \Cref{lem1} for this.
+
+Now, we are going to compare vanilla FT (\ref{eq:6-jan17}) with $\overline{\eta} = \frac{1}{2}$ and \method \space (\ref{eq:8-jan17}) with $\widehat{\eta} = \frac{1}{2 \mu}$. We believe these are comparable learning rates for vanilla FT and \method because 
+the resultant matrices (Eqs. (\ref{eq:10-jan17}) and (\ref{eq:11-jan17})) dictating the convergence of both methods have exactly two non-zero eigenvalues and the corresponding eigenvectors lie in the span of $\overline{\mathbf{{e}}}$ and $\overline{\mathbf{{e}}}_{\perp}$. 
+Plugging in $\overline{\eta} = \frac{1}{2}$ into Eq. (\ref{eq:6-jan17}), we get:
+\begin{flalign}
+    \label{eq:10-jan17}
+    \overline{\bm{\theta}}_K = \widetilde{\bm{\theta}}_{*} + \mathbf{P}^K \mathbf{e}, \text{ with } \mathbf{P} = - \rho  \big(\overline{\mathbf{{e}}} \overline{\mathbf{{e}}}_{\perp}^\top + \overline{\mathbf{{e}}}_{\perp} \overline{\mathbf{{e}}}^\top\big)
+\end{flalign}
+for vanilla FT. Plugging in $\widehat{\eta} = \frac{1}{2 \mu}$ into Eq. (\ref{eq:8-jan17}), we get:
+\begin{equation}
+    \label{eq:11-jan17}
+    \widehat{\bm{\theta}}_K = \widetilde{\bm{\theta}}_{*} + \mathbf{Q}^K \mathbf{e}, \text{ with } \mathbf{Q} \text{ given by Eq. (\ref{eq:11-jan19})}
+\end{equation}
+for \method. The non-zero eigenvalues of $\mathbf{P}$ are $\mp \rho$ and the corresponding eigenvectors are $\frac{1}{\sqrt{2}}\big(\overline{\mathbf{{e}}} \pm \overline{\mathbf{{e}}}_{\perp}\big)$. Using this in (\ref{eq:10-jan17}) and simplifying, we get for vanilla FT:
+\begin{equation}
+    \overline{\bm{\theta}}_K = \widetilde{\bm{\theta}}_{*} + {\rho^K} \Big(\mathds{1}\big(K \text{ is even}\big) \mathbf{e} - \mathds{1}\big(K \text{ is odd}\big) \|\mathbf{e}\|_2 \overline{\mathbf{{e}}}_{\perp}\Big).
+\end{equation}
+\begin{remark}[\textbf{Vanilla FT}]
+    \label{rmk-1}
+    Since $\rho < 1$, $\overline{\bm{\theta}}_K$  converges to $\widetilde{\bm{\theta}}_{*}$ rapidly, %which we cannot slow down. 
+    and we cannot impede this convergence. %to $\widetilde{\bm{\theta}}_{*}$.
+\end{remark}
+Note that (we use $\bm{\Sigma} \succeq \mathbf{I}_d$ below):
+\begin{equation}
+    \label{eq:13-jan18}
+    \text{err}_\text{tot}(\widetilde{\bm{\theta}}_{*}) = \text{err}_1(\widetilde{\bm{\theta}}_{*}) = \mathbf{e}^\top {\bm{\Sigma}} \mathbf{e} \geq  \|\mathbf{e}\|_2^2.
+\end{equation}
+On the other hand, the non-zero eigenvalues and corresponding eigenvectors of $\mathbf{Q}$ are not as straightforward to compute. 
+We do this computation in \Cref{lem3} with the re-parameterization of $\mu = \sqrt{\frac{\beta (1-\rho^2)}{(1+\beta)(1-\beta \rho^2)}}$ for some $\beta \in (0,1]$.\footnote{The corresponding temperature is $\tau = \frac{2 \beta (1-\rho^2) \|\mathbf{e}\|_2^2}{(1 - \beta^2 \rho^2)}$.} 
+Using this in Eq. (\ref{eq:11-jan17}) and simplifying, we get for \method:
+\begin{equation}
+\label{eq:14-jan17}
+\widehat{\bm{\theta}}_K = \widetilde{\bm{\theta}}_{*} + \Bigg(\frac{\widehat{\lambda}_1^K + \widehat{\lambda}_2^K \beta^2 \rho^2}{1 + \beta^2 \rho^2} \Bigg) \mathbf{{e}} -\beta \rho \Bigg(\frac{\widehat{\lambda}_1^K -  \widehat{\lambda}_2^K}{1 + \beta^2 \rho^2} \Bigg) \|\mathbf{{e}}\|_2 \overline{\mathbf{{e}}}_{\perp},
+\end{equation}
+where $\widehat{\lambda}_1 = \frac{1 + \beta \rho^2}{1 + \beta}$ { and } $\widehat{\lambda}_2 = \rho^2\Big(\frac{1 - \beta}{1 - \beta \rho^2}\Big)$.
+
+\begin{remark}[\methodbold's \textbf{trajectory}]
+\label{rmk-2}
+{Note that we can control $\widehat{\lambda}_1$ by varying $\beta$. Specifically, we can make $\widehat{\lambda}_1$ arbitrarily close to $1$ by choosing a small enough  $\beta$}. On the other hand, $\frac{1 - \beta}{1 - \beta \rho^2} < \frac{1 + \beta \rho^2}{1 + \beta} = \widehat{\lambda}_1$ and so, $\widehat{\lambda}_2 < \rho^2 \widehat{\lambda}_1$. 
+Hence, beyond a certain number of iterations $K$, Eq. (\ref{eq:14-jan17}) effectively becomes:
+\begin{equation}
+    \label{eq:15-jan18}
+    \widehat{\bm{\theta}}_K \approx {\bm{\theta}}_K := \widetilde{\bm{\theta}}_{*} + \gamma(K, \beta) \Big(\mathbf{{e}} - \beta \rho \|\mathbf{{e}}\|_2 \overline{\mathbf{{e}}}_{\perp}\Big),
+\end{equation}
+with $\gamma(K, \beta) := \Big(\frac{\widehat{\lambda}_1^K}{1 + \beta^2 \rho^2}\Big)$. Because we can control $\widehat{\lambda}_1$ by varying $\beta$, we can control $\gamma(K, \beta)$. Thus, \textbf{we can stall convergence along $\big(\mathbf{{e}} - \beta \rho \|\mathbf{{e}}\|_2 \overline{\mathbf{{e}}}_{\perp}\big)$, impeding the convergence of $\widehat{\bm{\theta}}_K$ to $\widetilde{\bm{\theta}}_{*}$}. 
+\end{remark} 
+{The direction $\big(\mathbf{{e}} - \beta \rho \|\mathbf{{e}}\|_2 \overline{\mathbf{{e}}}_{\perp}\big)$ is the eigenvector of $\mathbf{Q}$ with the largest eigenvalue (see \Cref{lem3}). Since $\widetilde{\bm{\Sigma}}' = \mu \big(\mathbf{I}_d - \mathbf{Q}\big)$ (recall $\widetilde{\bm{\Sigma}}'$ is the covariance matrix of the weighted fine-tuning data as defined in  \Cref{thm-ploss}), this direction is also the eigenvector of $\widetilde{\bm{\Sigma}}'$ with the smallest eigenvalue.}
+
+\begin{remark}[\textbf{\methodbold \space goes beyond model averaging}]
+    \label{rmk-3}
+    If we perform model averaging between 
+    $\bm{\theta}_{*}$ and $\widetilde{\bm{\theta}}_{*}$ with parameter $\omega \in [0,1]$, then our averaged model is:
+    \begin{equation}
+        \label{eq:16-jan18}
+        \bm{\theta}_\textup{avg}(\omega) = \omega \bm{\theta}_{*} + (1-\omega) \widetilde{\bm{\theta}}_{*} = \widetilde{\bm{\theta}}_{*} + \omega \mathbf{{e}}. 
+    \end{equation}
+    Comparing the above with Eq. (\ref{eq:15-jan18}), we see that \method \space goes beyond model averaging because of the component along $\overline{\mathbf{{e}}}_{\perp}$. But we can make ${\bm{\theta}}_K$ (Eq. (\ref{eq:15-jan18})) $\to$ $\bm{\theta}_\textup{avg}(\omega)$ by choosing $\beta \to 0$ and $K$ such that $\gamma(K, \beta) \to \omega$. So, we expect \methodbold \space \textbf{to be at least as powerful as model averaging}.
+\end{remark}
+As per \Cref{lem-4}, the minimum total error on both tasks with optimally tuned model averaging is given by:
+\begin{equation}
+    \label{eq:17-jan18}
+    \min_{\omega \in [0,1]} \textup{err}_\textup{tot}\big(\bm{\theta}_\textup{avg}(\omega)\big) =  \Bigg(\frac{\overline{\mathbf{{e}}}^\top \bm{\Sigma} \overline{\mathbf{{e}}}}{\overline{\mathbf{{e}}}^\top \bm{\Sigma} \overline{\mathbf{{e}}} + 1}\Bigg) \|{\mathbf{{e}}}\|_2^2 < \|{\mathbf{{e}}}\|_2^2,
+\end{equation}
+where recall that $\bm{\Sigma}$ is the covariance matrix of the pre-training  data. On the other hand, using Eqs. (\ref{eq:4-jan18}) and (\ref{eq:13-jan18})
+\begin{equation}
+    \label{eq:18-jan18}
+    \textup{min}\Big(\textup{err}_\textup{tot}(\bm{\theta}_{\ast}),  \textup{err}_\textup{tot}(\widetilde{\bm{\theta}}_{*})\Big) = \|{\mathbf{{e}}}\|_2^2.
+\end{equation}
+\begin{remark}[\textbf{Error comparison}]
+    \label{rmk-4}
+    By comparing Eqs. (\ref{eq:17-jan18}) and (\ref{eq:18-jan18}), we see that optimally tuned model averaging attains a smaller total error than both $\bm{\theta}_{\ast}$ (i.e., the pre-trained model) and $\widetilde{\bm{\theta}}_{*}$ to which vanilla FT converges rapidly (\Cref{rmk-1}). More importantly, following our discussion in \Cref{rmk-3}, we conclude that \textbf{optimally tuned \methodbold's total error is 
+    %\space can attain a total error 
+    at least as good as the one in Eq. (\ref{eq:17-jan18}}).
+\end{remark}
+
+\section{Conclusion}
+
+In this paper, we studied the problem of catastrophic forgetting in pre-trained models during fine-tuning when we do not have access to the pre-training data. 
+To mitigate this issue, we proposed \method, a method which upweights easy samples based on the pre-trained loss values. Empirically, we showed that \method, on average, outperforms relevant baselines and is also complementary to these baselines in both vision and language settings. 
+We also theoretically analyzed \method for linear models.
+
+\section*{Acknowledgments}
+Ali Kavis is funded in part by the Swiss National Science Foundation (SNSF) under grant number P500PT\_217942.
+
+\newpage
+\bibliographystyle{unsrtnat}
+\bibliography{refs}  %%% Uncomment this line and comment out the ``thebibliography'' section below to use the external .bib file (using bibtex) .
+
+\newpage
+\appendix
+\onecolumn
+
+\begin{center}
+    {\LARGE \bf Appendix}
+\end{center}
+
+\section*{Table of Contents}
+\vspace{1mm}
+\begin{itemize}
+    \item \Cref{app:related-work}: Extended Related Work on Data-Aware Approaches
+    \item \Cref{alg:multi-head}: Our Algorithm in the Presence of Task-Specific Model Components
+    \item \Cref{pf-prop-pi}: Proof of Proposition~\ref{prop-pi}
+    \vspace{0.1 cm}
+    \item \Cref{pf-thm-ploss}: Proof of Theorem~\ref{thm-ploss}
+    \vspace{0.1 cm}
+    \item \Cref{sec:gen_sigma}: Difficulty in the Analysis with a General Covariance Matrix $\widetilde{\bm{\Sigma}}$
+    \vspace{0.1 cm}
+    \item \Cref{lemma-sec}: Lemmas Used and Their Proofs
+    \vspace{0.1 cm}
+    \item \Cref{app:experimental-details}: Experimental Details
+    \begin{itemize}
+        \vspace{0.1 cm}
+        \item \Cref{app:add-baseline-detials}: Additional Experimental Baseline Details
+        \vspace{0.1 cm}
+        \item \Cref{app:language-hyperparameters}: Language Model Hyper-Parameters
+        \vspace{0.1 cm}
+        \item \Cref{app:further-language-evaluation-details}: Language Model Evaluation Details
+        \vspace{0.1 cm}
+        \item \Cref{app:vision-hyperparameters}: Vision Implementation Details
+        % \vspace{0.1 cm}
+        % \item \Cref{app:further-vision-evaluation-details}: Vision Evaluation Details
+    \end{itemize}
+    \vspace{0.1 cm}
+    \item \Cref{add-vis-results}: Detailed Vision Results and Ablations
+    \vspace{0.1 cm}
+    \item \Cref{add-lang-results}: Additional Language Model Results and Ablations
+    \begin{itemize}
+        \vspace{0.1 cm}
+        \item \Cref{app:extended-commonsense-results}: Extended Commonsense Reasoning Results
+        \vspace{0.1 cm}
+        \item  \Cref{app:token-wise-ablation}: Token-wise Sample Weighting Ablations
+        \vspace{0.1 cm}
+        % \item \Cref{lora-ablation}: LoRA Fine-tuning Ablations
+        % \vspace{0.1 cm}
+        \item \Cref{app:extended-wa-results}: Extended Weight Averaging Results
+        \vspace{0.1 cm}
+    \end{itemize}
+\end{itemize}
+
+\clearpage
+
+\section{Extended Related Work on Data-Aware Approaches}
+\label{app:related-work}
+The majority of the approaches for mitigating %catastrophic 
+forgetting assume task-specific knowledge access to different extents; either (a subset of) the pre-training dataset itself or some information/statistic computed from pre-training data. Below, we describe the data-aware approaches based on how they make use of task-specific knowledge.
+\\
+\\
+\textbf{Regularization-based methods.} This line of work aims to preserve performance on previously learned tasks by keeping the (fine-tuned) model parameters close to the pre-trained model. The key idea is to introduce task-specific regularization in the fine-tuning phase which will penalize updates along the ``important'' directions for the old tasks %, i.e., pre-trained model 
+\citep{ahn2019uncertainty}. 
+\citet{kirkpatrick2016overcoming} introduces the elastic weight consolidation (EWC) algorithm, which estimates the important direction per-task by calculating a diagonal approximation to the Fisher information matrix (FIM), which 
+acts as the weight matrix for the regularization term. 
+Several variants of EWC have been subsequently proposed \citep{schwarz2018progress, ritter2018online, Lee2020ContinualLW, liu2018rotate}. \citet{zenke2017continual, aljundi2018memory} adopt online strategies to infer the importance of each parameter by their variational effect on the model outputs. In a spirit similar to EWC, \citet{lee2017overcoming} incrementally matches the posterior of the pre-trained model and the new task by assuming Gaussian posteriors. 
+\\
+\\
+\textbf{Optimization-driven methods.} Another perspective to mitigating forgetting is guiding the optimization process by constraining the algorithms directly as opposed to manipulating the loss function. 
+The core idea is to keep track of \enquote{important directions} for the old tasks, and train on the new task \enquote{orthogonally.} 
+This could be done by storing prior data samples or gradients in a buffer \citep{lopezpaz2017gradient, farajtabar2020orthogonal, chaudhry2018efficient} or by incrementally expanding the subspace of important directions without storing task-specific information \citep{zeng2019continual, wang2021training, wang2023orthogonal}.
+\\
+\\
+\textbf{Replay-based methods.} Drawing inspiration from the complementary learning systems theory \citep{mcclelland1995why}, a more direct approach is to introduce samples from old tasks into the training process for the new task. Samples are selected in a streaming fashion or by manually crafting a subset on demand, stored in dedicated buffers 
+and replayed during the fine-tuning. 
+The intuition is that the task-specific representations are refreshed periodically through historical data.
+
+Replay-based methods consist of two fundamental components: data selection and data reiteration mechanisms. 
+When the data is received in a streaming fashion, information has to be buffered online \citep{riemer2019learning, chaudhry2019continual, isle2018selective, delange2021continual}. 
+In the case when datasets are available on demand, \citet{rebuffi2017icarl} selects samples which are \enquote{representative} of their respective class, while others focus on inducing diversity \citep{aljundi2019gradient, Bang2021RainbowMC} and balance \citep{borsos2020coresets, tiwari2021gcr} across buffered data. 
+For the scenarios in which storage is limited, \citet{caccia2020online, wang2022memory} develop compression methods for buffered data. 
+
+As a complimentary component to the data selection process, how the buffered data is replayed plays a significant role in the success of such methods. A fundamental idea, which has several interpretations across the board, is knowledge distillation \citep{hinton2015distilling}. Prior work argues that augmenting fine-tuning with knowledge distillation shows great performance on the forgetting front \citep{lopezpaz2017gradient, chaudhry2018efficient, rebuffi2017icarl, Jung2017LessforgetfulLF, Triki2017EncoderBL, li2016learning, Lee2019OvercomingCF, dhar2019learning}. 
+
+An orthogonal research direction focuses on maintaining a generative model that could reliably output pseudo-samples that are representative of the dataset of the old tasks \citep{kemker2018fearnet, wu2018incremental}. 
+Note that generative approaches are prone to scalability issues and distribution shifts. 
+\\
+\\
+\textbf{Architecture-driven methods.} Another technique to limit the interference between tasks is allocating a separate trainable set of parameters per task. 
+This could be done by initializing a sub-networks per new task \citep{Rusu2016ProgressiveNN, aljundi2017expertgate, patrick2020routing, rajasegaran2019random, Ramesh2021ModelZA, wang2023incorporating, wang2022coscl}, gradually expanding the parameters of a base network \citep{yoon2018lifelong, Ostapenko2019LearningTR, hung2019compacting}, or segregating a fixed model into task-specific subset of parameters \citep{mallya2018piggyback, kang2022forgetfree, serra2018overcoming, worstman2020supermasks, Mallya2017PackNetAM, gurbuz2022nispa, jung2020continual}. While some parameters are task-specific, 
+parts of the overall model could be shared to enable knowledge transfer. 
+The main downside is that task identity must be available during inference to (de)activate relevant sub-networks, which hinders versatility. 
+\citet{aljundi2017expertgate} develop dedicated strategies to overcome the need for task identification by automatizing task-specific parameter activation.
+
+\section{Our Algorithm in the Presence of Task-Specific Model Components}
+\label{alg:multi-head}
+Suppose our model is parameterized by $\bm{\theta} = {\mathbf{U}} \cup {\mathbf{V}}$, where $\mathbf{U}$ is the common/shared part of the model for all tasks (i.e., this part remains the same for all tasks), and $\mathbf{V}$ is the task-specific part of the model. In particular, in our vision experiments, the models have task-specific prediction heads (i.e., softmax layers) and batch-norm (BN). The modified version of \Cref{alg:method} in the presence of task-specific components is stated in \Cref{alg:example-ii}. The main differences from \Cref{alg:method} are steps (i) and (iv) -- these steps optimize the task-specific part for the new task with uniform weighting. %over the samples of the new task.
+It is worth mentioning that if our model consists of task-specific prediction heads -- which is the case in our vision experiments -- then steps (i) and (iv) are just vanilla linear probing with the pre-trained body and the body learned after fine-tuning, respectively. 
+
+ \begin{algorithm}[!htb] %!htb
+    \caption{\textbf{F}ine-tuning with Pre-trained \textbf{L}oss-\textbf{O}riented \textbf{W}eighting (\methodbold)}
+    \label{alg:example-ii}
+ \begin{algorithmic}
+    \STATE {\bfseries Input:} Pre-trained model $\bm{\theta}_{*}^{(1)} = {\mathbf{U}}_{*}^{(1)} \cup {\mathbf{V}}_{*}^{(1)}$, dataset $\{(\mathbf{x}_i, \text{y}_i)\}_{i=1}^n$ for the new task, and temperature parameter $\tau$.
+    \vspace{0.25 cm}
+    \STATE $f_i({\mathbf{U}}, {\mathbf{V}}) \rightarrow$ $i^\text{th}$ sample’s loss at $\bm{\theta} = {\mathbf{U}} \cup {\mathbf{V}}$, with a non-negative loss function (e.g., cross-entropy loss).
+    \vspace{0.25 cm}
+    \STATE \textbf{Step (i)} {Fine-tune task-specific part for new task with vanilla unweighted loss:} ${\mathbf{V}}_{*}^{(2)} := \text{argmin }_{\mathbf{V}} \sum_{i=1}^n f_i({\mathbf{U}}_{*}^{(1)}, {\mathbf{V}}).$
+    \vspace{0.25 cm}
+    \STATE \textbf{Step (ii)} Compute sample weights: $w_i = \exp\left(- {f_i({\mathbf{U}}_{*}^{(1)}, {\mathbf{V}}_{*}^{(2)})}\big/{\tau}\right)$. 
+    \vspace{0.25 cm}
+    \STATE \textbf{Step (iii)} Fine-tune full model \textbf{with weighted loss}: $\overline{\mathbf{U}}_{*}^{(2)}, \overline{\mathbf{V}}_{*}^{(2)} := \text{argmin }_{\mathbf{U}, \mathbf{V}} \sum_{i=1}^n w_i f_i({\mathbf{U}}, {\mathbf{V}})$.
+    \vspace{0.25 cm}
+    {\STATE \textbf{Step (iv)} {Fine-tune task-specific part for new task  \textit{using the learned common part} with vanilla unweighted loss:} $\widehat{\mathbf{V}}_{*}^{(2)} := \text{argmin }_{\mathbf{V}} \sum_{i=1}^n f_i(\overline{\mathbf{U}}_{*}^{(2)}, {\mathbf{V}}).$}
+    \vspace{0.25 cm}
+    \STATE \textbf{Output:} New model for 
+    \begin{itemize}
+        \item Original/pre-training task is $\widehat{\bm{\theta}}_{*}^{(1)} = \overline{\mathbf{U}}_{*}^{(2)} \cup {\mathbf{V}}_{*}^{(1)}$.
+        \item New/fine-tuning task is $\widehat{\bm{\theta}}_{*}^{(2)} = \overline{\mathbf{U}}_{*}^{(2)} \cup \widehat{\mathbf{V}}_{*}^{(2)}$.
+    \end{itemize}
+ \end{algorithmic}
+ \label{alg:vision_algo}
+ \end{algorithm}
+
+\begin{remark}
+    In all our vision experiments (with task-specific parts), we set $\tau = \textup{median}(f_i({\mathbf{U}}_{*}^{(1)}, {\mathbf{V}}_{*}^{(2)}))$ (similar to \Cref{rmk-tau}).
+\end{remark}
+
+\section{Proof of Proposition~\ref{prop-pi}}
+\label{pf-prop-pi}
+\begin{proof}
+    We wish to minimize $g(\bm{\pi}) = \sum_{i=1}^n \pi_i f_i(\bm{\theta}^{*}) + \tau \sum_{i=1}^n \pi_i \log \pi_i$ subject to $\sum_{i=1}^n \pi_i = 1$ and $\pi_i \geq 0$ for all $i \in [n]$. The proof is a straightforward application of Lagrangian multipliers. It is enough to enforce $\sum_{i=1}^n \pi_i = 1$ only ($\pi_i \geq 0$ for all $i \in [n]$ will also follow). For that, the Lagrangian function is:
+    \begin{equation}
+        J(\bm{\pi}, \lambda) = \sum_{i=1}^n \pi_i f_i(\bm{\theta}^{*}) + \tau \sum_{i=1}^n \pi_i \log \pi_i + \lambda \Big(\sum_{i=1}^n \pi_i - 1\Big),
+    \end{equation}
+    where $\lambda$ is the Lagrangian multiplier. Now, at the optimal point $\bm{\pi}^{*} = [\pi_1^{*}, \ldots, \pi_n^{*}]^\top$, we must have:
+    \begin{equation}
+        \frac{\partial J}{\partial \pi_i}\Bigg|_{\pi_i^{*}} = f_i(\bm{\theta}^{*}) + \tau \left(1 + \log \pi_i^{*}\right) + \lambda = 0,
+    \end{equation}
+    for all $i \in [n]$. Simplifying, we get:
+    \begin{equation}
+        \pi_i^{*} = \frac{1}{Z} \exp\left(-\frac{f_i(\bm{\theta}^{*})}{\tau}\right),
+    \end{equation}
+    where $Z = \exp\left(\left(1 + \frac{\lambda}{\tau}\right)\right)$ is the normalizing constant. To have $\sum_{i=1}^n \pi_i = 1$, we get $Z = \sum_{j=1}^n \exp \left( - \frac{f_j({\mathbf{{W}}}^{*})}{\tau} \right)$. Also, note that we are good with the non-negativity constraints.
+\end{proof}
+
+\section{Proof of Theorem~\ref{thm-ploss}}
+\label{pf-thm-ploss}
+\begin{proof}
+Note that:
+\begin{equation}
+    \widehat{\text{err}}_2(\widehat{\bm{\theta}}) = \big(\widehat{\bm{\theta}} - \widetilde{\bm{\theta}}_{*}\big)^\top \mathbb{E}_{\widetilde{\mathcal{D}}}\Big[w(\widetilde{\mathbf{x}}, \widetilde{\text{y}}) \widetilde{\mathbf{x}} \widetilde{\mathbf{x}}^\top\Big] \big(\widehat{\bm{\theta}} - \widetilde{\bm{\theta}}_{*}\big).
+\end{equation}
+Also, after plugging in $\widetilde{\text{y}} = \big\langle \widetilde{\bm{\theta}}_{*}, \widetilde{\mathbf{x}} \big\rangle$, we get:
+$$w(\widetilde{\mathbf{x}}, \widetilde{\text{y}}) = \exp\Bigg(-\frac{\big(\langle \bm{\theta}_{\ast} - \widetilde{\bm{\theta}}_{*}, \widetilde{\mathbf{x}} \rangle\big)^2}{\tau}\Bigg).$$
+Recall $\mathbf{e} := \bm{\theta}_{\ast} - \widetilde{\bm{\theta}}_{*}$ and  $\overline{\mathbf{e}} := \frac{\mathbf{e}}{\|\mathbf{e}\|_2}$. Suppose $\tau = \alpha \|\mathbf{e}\|_2^2$, for some $\alpha > 0$. Then $w(\widetilde{\mathbf{x}}, \widetilde{\text{y}}) = \exp\Big(-\frac{(\langle \overline{\mathbf{e}}, \widetilde{\mathbf{x}} \rangle)^2}{\alpha}\Big)$, and we can focus on
+\begin{equation}
+    \label{eq:23-jan30}
+    \widetilde{\bm{\Sigma}}' := \mathbb{E}_{\widetilde{\mathbf{x}} \sim \widetilde{\mathcal{P}}}\Bigg[\exp\Bigg(-\frac{\big(\langle \overline{\mathbf{e}}, \widetilde{\mathbf{x}} \rangle\big)^2}{\alpha}\Bigg) \widetilde{\mathbf{x}} \widetilde{\mathbf{x}}^\top \Bigg].
+\end{equation}
+Let $\mu = \big(\frac{\alpha}{\alpha+2}\big)^{1/2} = \Big(\frac{\tau}{\tau + 2\|\mathbf{e}\|_2^2}\Big)^{1/2}$. As per \Cref{lem1}, we have:
+\begin{equation}
+    \label{eq:8-jan14}
+    \widetilde{\bm{\Sigma}}' = \mu \big(\mathbf{I}_d - \mathbf{Q}\big),
+\end{equation}
+where 
+\begin{equation}
+    \mathbf{Q} = (1 - \mu^2)\overline{\mathbf{{e}}} \overline{\mathbf{{e}}}^\top + \rho^2 (1 - \mu^2) \overline{\mathbf{{e}}}_{\perp} \overline{\mathbf{{e}}}_{\perp}^\top - \rho \mu^2 \big(\overline{\mathbf{{e}}} \overline{\mathbf{{e}}}_{\perp}^\top + \overline{\mathbf{{e}}}_{\perp} \overline{\mathbf{{e}}}^\top\big).
+\end{equation}
+So if we minimize $\widehat{\text{err}}_2(\widehat{\bm{\theta}})$ with GD starting from {$\widehat{\bm{\theta}}_0 = \bm{\theta}_{\ast}$} and using a constant learning rate $\widehat{\eta}$, our iterate $\widehat{\bm{\theta}}_K$ at the $K^\text{th}$ iteration satisfies:
+\begin{flalign}
+    \widehat{\bm{\theta}}_K - \widetilde{\bm{\theta}}_{*} & = \Big(\mathbf{I}_d - 2 \widehat{\eta} \widetilde{\bm{\Sigma}}'\Big)^K \big(\bm{\theta}_{\ast} - \widetilde{\bm{\theta}}_{*}\big) = \Big(\mathbf{I}_d - 2 \widehat{\eta} \widetilde{\bm{\Sigma}}'\Big)^K \mathbf{e},
+\end{flalign}
+where the last step follows by recalling that $\bm{\theta}_{\ast} - \widetilde{\bm{\theta}}_{*} = \mathbf{e}$, and $\widetilde{\bm{\Sigma}}'$ is given by \cref{eq:8-jan14}.
+\end{proof}
+
+\section{Difficulty in the Analysis with a General Covariance Matrix \texorpdfstring{$\widetilde{\Sigma}$}{TEXT}}
+\label{sec:gen_sigma}
+We will first derive the \textit{weighted} (fine-tuning) data covariance matrix $\widetilde{\bm{\Sigma}}'$ in the context of \Cref{thm-ploss} for a general (fine-tuning) data covariance matrix $\widetilde{\bm{\Sigma}}$. Specifically, following the proof of \Cref{thm-ploss}, we have:
+\begin{equation}
+    \widetilde{\bm{\Sigma}}' := \mathbb{E}_{\widetilde{\mathbf{x}} \sim \mathcal{N}(\vec{\bm{0}}_d, \widetilde{\bm{\Sigma}})}\Bigg[\exp\Bigg(-\frac{\big(\langle {\mathbf{e}}, \widetilde{\mathbf{x}} \rangle\big)^2}{\tau}\Bigg) \widetilde{\mathbf{x}} \widetilde{\mathbf{x}}^\top \Bigg].
+\end{equation}
+Note that $\widetilde{\mathbf{x}} = \widetilde{\bm{\Sigma}}^{1/2} \mathbf{z}$, where ${\mathbf{z}} \sim \mathcal{N}(\vec{0}_d, \mathbf{I}_d)$. Using this above, we get:
+\begin{equation}
+    \widetilde{\bm{\Sigma}}' = \widetilde{\bm{\Sigma}}^{1/2} \mathbb{E}\Bigg[\exp\Bigg(-\frac{\big(\langle {\mathbf{e}}, \widetilde{\bm{\Sigma}}^{1/2} \mathbf{z} \rangle\big)^2}{\tau}\Bigg) \mathbf{z} \mathbf{z}^\top \Bigg] \widetilde{\bm{\Sigma}}^{1/2} = \widetilde{\bm{\Sigma}}^{1/2} \mathbb{E}\Bigg[\exp\Bigg(-\frac{\big(\langle {\widetilde{\bm{\Sigma}}^{1/2} \mathbf{e}}, \mathbf{z} \rangle\big)^2}{\tau}\Bigg) \mathbf{z} \mathbf{z}^\top \Bigg] \widetilde{\bm{\Sigma}}^{1/2},
+\end{equation}
+where the last step follows by using the symmetry of $\widetilde{\bm{\Sigma}}$. Let $\tau = \alpha \big\|\widetilde{\bm{\Sigma}}^{1/2} \mathbf{e}\big\|_2^2$ for some $\alpha > 0$. Also, let $\mathbf{r} := {(\widetilde{\bm{\Sigma}}^{1/2} \mathbf{e})}/{\|\widetilde{\bm{\Sigma}}^{1/2} \mathbf{e}\|_2}$. In that case, we have:
+\begin{equation}
+    \label{eq:9-jan11}
+    \widetilde{\bm{\Sigma}}' = \widetilde{\bm{\Sigma}}^{1/2} \mathbf{M} \widetilde{\bm{\Sigma}}^{1/2}, \text{ where } \mathbf{M} := \mathbb{E}\Bigg[\exp\Bigg(-\frac{\big(\langle \mathbf{r}, \mathbf{z} \rangle\big)^2}{\alpha}\Bigg) \mathbf{z} \mathbf{z}^\top \Bigg].
+\end{equation}
+
+Suppose $\{{\mathbf{{r}}}_{\perp, j}\}_{j=1}^{d-1}$ is an orthonormal basis for the subspace of $\mathbb{R}^d$ orthogonal to $\mathbf{r}$; so $\langle {\mathbf{{r}}}_{\perp, j}, \mathbf{r} \rangle = 0$ $\forall$ $j \in [d-1]$ and $\langle {\mathbf{{r}}}_{\perp, j}, {\mathbf{{r}}}_{\perp, k} \rangle = \mathds{1}(j=k)$ $\forall$ $j, k \in [d-1]$. {Note that $\{\mathbf{r}, \mathbf{r}_{\perp, 1}, \ldots, \mathbf{r}_{\perp, d-1}\}$ forms an orthonormal basis for $\mathbb{R}^d$.}  
+Then, as per \Cref{lem1-jan30}, we have that $\mathbf{r}$ is an eigenvector of $\mathbf{M}$ with eigenvalue $\big(\frac{\alpha}{\alpha+2}\big)^{3/2}$, and each $\mathbf{r}_{\perp, j}$ is an eigenvector of $\mathbf{M}$ with eigenvalue $\big(\frac{\alpha}{\alpha+2}\big)^{1/2}$. For brevity, let $\mu = \big(\frac{\alpha}{\alpha+2}\big)^{1/2}$. Then, we can write:
+\begin{equation}
+    \label{eq:10-jan12}
+    \mathbf{M} = \mu^3 \mathbf{r} \mathbf{r}^\top + \mu \sum_{j=1}^{d-1} \mathbf{r}_{\perp, j} \mathbf{r}_{\perp, j}^\top = \mu^3 \mathbf{r} \mathbf{r}^\top + \mu \Big(\mathbf{I}_d - \mathbf{r} \mathbf{r}^\top\Big),
+\end{equation}
+where the last step follows because $\{\mathbf{r}, \mathbf{r}_{\perp, 1}, \ldots, \mathbf{r}_{\perp, d-1}\}$ forms an orthonormal basis for $\mathbb{R}^d$, due to which $\mathbf{r} \mathbf{r}^\top + \sum_{j=1}^{d-1} \mathbf{r}_{\perp, j} \mathbf{r}_{\perp, j}^\top = \mathbf{I}_d$. Simplifying \cref{eq:10-jan12} a bit, we get:
+\begin{equation}
+    \mathbf{M} = \mu \Big(\mathbf{I}_d - (1 - \mu^2)\mathbf{r} \mathbf{r}^\top\Big).
+\end{equation}
+Plugging this into \cref{eq:9-jan11} and recalling that $\mathbf{r} := {(\widetilde{\bm{\Sigma}}^{1/2} \mathbf{e})}/{\|\widetilde{\bm{\Sigma}}^{1/2} \mathbf{e}\|_2}$, we get:
+\begin{equation}
+    \label{eq:11-jan11}
+    \widetilde{\bm{\Sigma}}' = \mu \mathbf{B}, \text{ where } \mathbf{B} := \Bigg(\widetilde{\bm{\Sigma}} - (1 - \mu^2)\frac{{\widetilde{\bm{\Sigma}} \mathbf{e} \mathbf{e}^\top \widetilde{\bm{\Sigma}}}}{\mathbf{e}^\top \widetilde{\bm{\Sigma}} \mathbf{e}}\Bigg).
+\end{equation}
+\Cref{eq:11-jan11} is the weighted covariance matrix for a general $\widetilde{\bm{\Sigma}}$. 
+
+\begin{remark}[\textbf{Difficulty with general $\widetilde{\bm{\Sigma}}$}]
+It is hard to proceed with the analysis after this point because it %appears 
+is difficult to characterize the eigen-spectrum of $\mathbf{B}$ in general, without assuming any relation between $\widetilde{\bm{\Sigma}}$ and $\mathbf{e}$. This is what we meant in \Cref{rmk-just-jan30}.
+\end{remark}
+
+
+\section{Lemmas Used and their Proofs}
+\label{lemma-sec}
+\begin{lemma}
+    \label{lem1}
+    In the proof of \Cref{thm-ploss}, recall that $\tau = \alpha \|\mathbf{{e}}\|_2^2$. Then, we have:
+    \begin{flalign*}
+        \widetilde{\bm{\Sigma}}' & := \mathbb{E}_{\widetilde{\mathbf{{x}}} \sim \widetilde{\mathcal{P}}}\Bigg[\exp\Bigg(-\frac{\big(\langle \overline{\mathbf{{e}}}, \widetilde{\mathbf{{x}}} \rangle\big)^2}{\alpha}\Bigg) \widetilde{\mathbf{{x}}} \widetilde{\mathbf{{x}}}^\top \Bigg] 
+        = \mu \Big(\mathbf{{I}}_d - (1 - \mu^2)\overline{\mathbf{{e}}} \overline{\mathbf{{e}}}^\top - \rho^2 (1 - \mu^2) \overline{\mathbf{{e}}}_{\perp} \overline{\mathbf{{e}}}_{\perp}^\top + \rho \mu^2 \big(\overline{\mathbf{{e}}} \overline{\mathbf{{e}}}_{\perp}^\top + \overline{\mathbf{{e}}}_{\perp} \overline{\mathbf{{e}}}^\top\big)\Big),
+    \end{flalign*}
+    where $\mu = \big(\frac{\alpha}{\alpha+2}\big)^{1/2} = \Big(\frac{\tau}{\tau + 2\|\mathbf{{e}}\|_2^2}\Big)^{1/2}$.
+\end{lemma}
+\begin{proof}
+    Recall that $\overline{\mathbf{{e}}}$ and $\overline{\mathbf{{e}}}_{\perp}$ are orthogonal to each other and both are unit-norm. Suppose $\{\overline{\mathbf{{e}}}_{\perp, 3}, \overline{\mathbf{{e}}}_{\perp, 4}, \ldots, \overline{\mathbf{{e}}}_{\perp, d}\}$ is an orthonormal basis for the $(d-2)$-dimensional subspace of $\mathbb{R}^d$ orthogonal to $\overline{\mathbf{{e}}}$ and $\overline{\mathbf{{e}}}_{\perp}$. Thus, $\{\overline{\mathbf{{e}}}, \overline{\mathbf{{e}}}_{\perp}, \overline{\mathbf{{e}}}_{\perp, 3}, \overline{\mathbf{{e}}}_{\perp, 4},  \ldots, \overline{\mathbf{{e}}}_{\perp, d}\}$ is an orthonormal basis for $\mathbb{R}^d$. Then using \Cref{lem0}, we can write:
+    \begin{equation}
+        \widetilde{\mathbf{x}} = \text{z}_1 \overline{\mathbf{{e}}} + \Big(\rho \text{z}_1 + \sqrt{1-\rho^2} \text{z}_2\Big) \overline{\mathbf{{e}}}_{\perp} + \sum_{j=3}^d \text{z}_j \overline{\mathbf{{e}}}_{\perp, j},
+    \end{equation}
+    where $\{\text{z}_j\}_{j=1}^d \underset{\text{iid}}{\sim} \mathcal{N}(0,1)$.
+    
+    Using independence and zero-mean nature of $\{\text{z}_j\}_{j=1}^d$, we get:
+    \begin{multline}
+        \label{eq:33-jan14}
+        \widetilde{\bm{\Sigma}}' = \underbrace{\mathbb{E}\Big[\exp\Big(-\frac{\text{z}_1^2}{\alpha}\Big)\text{z}_1^2\Big]}_{:=\textup{T}_1} \overline{\mathbf{{e}}} \overline{\mathbf{{e}}}^\top + \underbrace{\mathbb{E}\Big[\exp\Big(-\frac{\text{z}_1^2}{\alpha}\Big)\text{z}_1 \Big(\rho \text{z}_1 + \sqrt{1-\rho^2} \text{z}_2\Big) \Big]}_{:=\textup{T}_2} \big(\overline{\mathbf{{e}}} \overline{\mathbf{{e}}}_{\perp}^\top + \overline{\mathbf{{e}}}_{\perp} \overline{\mathbf{{e}}}^\top\big) \\ 
+        + \underbrace{\mathbb{E}\Big[\exp\Big(-\frac{\text{z}_1^2}{\alpha}\Big)\Big(\rho \text{z}_1 + \sqrt{1-\rho^2} \text{z}_2\Big)^2 \Big]}_{:=\textup{T}_3}\overline{\mathbf{{e}}}_{\perp} \overline{\mathbf{{e}}}_{\perp}^\top + \sum_{j=3}^d \underbrace{\mathbb{E}\Big[\exp\Big(-\frac{\text{z}_1^2}{\alpha}\Big) \Big]}_{:=\textup{T}_4} \underbrace{\mathbb{E}\big[\text{z}_j^2\big]}_{=1}   \overline{\mathbf{{e}}}_{\perp, j} \overline{\mathbf{{e}}}_{\perp, j}^\top.
+    \end{multline} 
+    Note that (we use the independence of $\text{z}_1$ and $\text{z}_2$):
+    \begin{equation}
+        \label{eq:34-jan14}
+        \textup{T}_2 = \rho \textup{T}_1 + \sqrt{1-\rho^2} \mathbb{E}\Big[\exp\Big(-\frac{\text{z}_1^2}{\alpha}\Big)\text{z}_1\Big] \underbrace{\mathbb{E}\big[\text{z}_2\big]}_{=0} = \rho \textup{T}_1,
+    \end{equation}
+    and 
+    \begin{equation}
+        \label{eq:35-jan14}
+        \textup{T}_3 = \rho^2 \textup{T}_1 + 2 \rho \sqrt{1-\rho^2} \Big[\exp\Big(-\frac{\text{z}_1^2}{\alpha}\Big)\text{z}_1\Big] \underbrace{\mathbb{E}\big[\text{z}_2\big]}_{=0} + (1-\rho^2) \textup{T}_4  \underbrace{\mathbb{E}\big[\text{z}_2^2\big]}_{=1} = \rho^2 \textup{T}_1 + (1-\rho^2) \textup{T}_4.
+    \end{equation}
+    In the above two equations, we have again used the independence of $\text{z}_1$ and $\text{z}_2$. Now we will compute $\textup{T}_1$ and $\textup{T}_4$. We have:
+    \begin{equation}
+        \label{eq:36-jan14}
+        \textup{T}_1 = \Bigg(\frac{1}{\sqrt{2 \pi}} \int_{-\infty}^{\infty} \text{z}_1^2 \exp\Big(-\text{z}_1^2 \Big(\frac{1}{\alpha} + \frac{1}{2}\Big)\Big) \text{d} \text{z}_1\Bigg) = \Big(\frac{\alpha}{\alpha+2}\Big)^{3/2},
+    \end{equation}
+    and
+    \begin{equation}
+        \label{eq:37-jan14}
+        \textup{T}_4 = \Bigg(\frac{1}{\sqrt{2 \pi}} \int_{-\infty}^{\infty} \exp\Big(-\text{z}_1^2 \Big(\frac{1}{\alpha} + \frac{1}{2}\Big)\Big) \text{d} \text{z}_1\Bigg) = \Big(\frac{\alpha}{\alpha+2}\Big)^{1/2}.
+    \end{equation}
+    Recall that $\mu = \big(\frac{\alpha}{\alpha+2}\big)^{1/2}$. Plugging this into Equations (\ref{eq:34-jan14}) to (\ref{eq:37-jan14}) gives us:
+    \begin{equation}
+        \textup{T}_1 = \mu^3, \textup{T}_2 = \rho \mu^3, \textup{T}_3 = \rho^2 \mu^3 + (1 - \rho^2) \mu, \text{ and } \textup{T}_4 = \mu.
+    \end{equation}
+    Plugging this into \cref{eq:33-jan14} gives us:
+    \begin{equation}
+        \widetilde{\bm{\Sigma}}' = \mu^3 \overline{\mathbf{{e}}} \overline{\mathbf{{e}}}^\top + \rho \mu^3 \big(\overline{\mathbf{{e}}} \overline{\mathbf{{e}}}_{\perp}^\top + \overline{\mathbf{{e}}}_{\perp} \overline{\mathbf{{e}}}^\top\big) + \Big(\rho^2 \mu^3 + (1 - \rho^2) \mu \Big) \overline{\mathbf{{e}}}_{\perp} \overline{\mathbf{{e}}}_{\perp}^\top + \mu \sum_{j=3}^d \overline{\mathbf{{e}}}_{\perp, j} \overline{\mathbf{{e}}}_{\perp, j}^\top.
+    \end{equation}
+    Recall that $\{\overline{\mathbf{{e}}}, \overline{\mathbf{{e}}}_{\perp}, \overline{\mathbf{{e}}}_{\perp, 3}, \overline{\mathbf{{e}}}_{\perp, 4}, \ldots, \overline{\mathbf{{e}}}_{\perp, d}\}$ is an orthonormal basis for $\mathbb{R}^d$. Thus, $\sum_{j=3}^d \overline{\mathbf{{e}}}_{\perp, j} \overline{\mathbf{{e}}}_{\perp, j}^\top = \mathbf{I}_d - \overline{\mathbf{{e}}} \overline{\mathbf{{e}}}^\top - \overline{\mathbf{{e}}}_{\perp} \overline{\mathbf{{e}}}_{\perp}^\top$. Using this above, we get:
+    \begin{equation}
+        \widetilde{\bm{\Sigma}}' = \mu \Big(\mathbf{I}_d - (1 - \mu^2)\overline{\mathbf{{e}}} \overline{\mathbf{{e}}}^\top - \rho^2 (1 - \mu^2) \overline{\mathbf{{e}}}_{\perp} \overline{\mathbf{{e}}}_{\perp}^\top + \rho \mu^2 \big(\overline{\mathbf{{e}}} \overline{\mathbf{{e}}}_{\perp}^\top + \overline{\mathbf{{e}}}_{\perp} \overline{\mathbf{{e}}}^\top\big)\Big).
+    \end{equation}
+    This finishes the proof.
+\end{proof}
+
+\begin{lemma}
+    \label{lem0}
+    Suppose $\{\overline{\mathbf{{e}}}, \overline{\mathbf{{e}}}_{\perp}, \overline{\mathbf{{e}}}_{\perp, 3}, \overline{\mathbf{{e}}}_{\perp, 4}, \ldots, \overline{\mathbf{{e}}}_{\perp, d}\}$ is an orthonormal basis for $\mathbb{R}^d$. If $\widetilde{\mathbf{x}} \sim \mathcal{N}(\vec{\bm{0}}_d, \widetilde{\bm{\Sigma}})$, then we can write:
+    \begin{equation}
+        \label{eq:37-jan29}
+        \widetilde{\mathbf{x}} = \textup{z}_1 \overline{\mathbf{{e}}} + \Big(\rho \textup{z}_1 + \sqrt{1-\rho^2} \textup{z}_2\Big) \overline{\mathbf{{e}}}_{\perp} + \sum_{j=3}^d \textup{z}_j \overline{\mathbf{{e}}}_{\perp, j},
+    \end{equation}
+    where $\{\textup{z}_j\}_{j=1}^d \underset{\textup{iid}}{\sim} \mathcal{N}(0,1)$.
+\end{lemma}
+\begin{proof}
+    If $\widetilde{\mathbf{x}}$ is as per \cref{eq:37-jan29}, then clearly $\widetilde{\mathbf{x}}$ is a zero-mean Gaussian. All that remains to show is that $$\mathbb{E}\Big[\widetilde{\mathbf{x}} \widetilde{\mathbf{x}}^\top\Big] = \widetilde{\bm{\Sigma}} = \mathbf{{I}}_d + \rho  \big(\overline{\mathbf{{e}}} \overline{\mathbf{{e}}}_{\perp}^\top + \overline{\mathbf{{e}}}_{\perp} \overline{\mathbf{{e}}}^\top\big).$$
+    
+    Using independence and zero-mean nature of $\{\text{z}_j\}_{j=1}^d$, we get:
+    \begin{multline}
+        \label{eq:34-jan15}
+        \mathbb{E}\Big[\widetilde{\mathbf{x}} \widetilde{\mathbf{x}}^\top\Big] = \underbrace{\mathbb{E}\big[\text{z}_1^2\big]}_{=1} \overline{\mathbf{{e}}} \overline{\mathbf{{e}}}^\top + \underbrace{\mathbb{E}\Big[\text{z}_1 \Big(\rho \text{z}_1 + \sqrt{1-\rho^2} \text{z}_2\Big) \Big]}_{:=\textup{(A)}} \big(\overline{\mathbf{{e}}} \overline{\mathbf{{e}}}_{\perp}^\top + \overline{\mathbf{{e}}}_{\perp} \overline{\mathbf{{e}}}^\top\big)  
+        + \underbrace{\mathbb{E}\Big[\Big(\rho \text{z}_1 + \sqrt{1-\rho^2} \text{z}_2\Big)^2 \Big]}_{:=\textup{(B)}}\overline{\mathbf{{e}}}_{\perp} \overline{\mathbf{{e}}}_{\perp}^\top \\ 
+        + \sum_{j=3}^d \underbrace{\mathbb{E}\big[\text{z}_j^2\big]}_{=1}   \overline{\mathbf{{e}}}_{\perp, j} \overline{\mathbf{{e}}}_{\perp, j}^\top.
+    \end{multline} 
+    Note that (we use the independence of $\text{z}_1$ and $\text{z}_2$):
+    \begin{equation}
+        \textup{(A)} = \rho \underbrace{\mathbb{E}[\text{z}_1^2]}_{=1} + \sqrt{1-\rho^2} \underbrace{\mathbb{E}[\text{z}_1]}_{=0} \underbrace{\mathbb{E}\big[\text{z}_2\big]}_{=0} = \rho,
+    \end{equation}
+    and 
+    \begin{equation}
+        \textup{(B)} = 
+        \rho^2 \underbrace{\mathbb{E}\big[\text{z}_1^2\big]}_{=1} + 2 \rho \sqrt{1-\rho^2} \underbrace{\mathbb{E}\big[\text{z}_1\big]}_{=0} \underbrace{\mathbb{E}\big[\text{z}_2\big]}_{=0} + (1-\rho^2)  \underbrace{\mathbb{E}\big[\text{z}_2^2\big]}_{=1} = 1.
+    \end{equation}
+    Plugging this into \cref{eq:34-jan15}, we get:
+    \begin{equation}
+        \mathbb{E}\Big[\widetilde{\mathbf{x}} \widetilde{\mathbf{x}}^\top\Big] = \overline{\mathbf{{e}}} \overline{\mathbf{{e}}}^\top + \rho  \big(\overline{\mathbf{{e}}} \overline{\mathbf{{e}}}_{\perp}^\top + \overline{\mathbf{{e}}}_{\perp} \overline{\mathbf{{e}}}^\top\big)  
+        + \overline{\mathbf{{e}}}_{\perp} \overline{\mathbf{{e}}}_{\perp}^\top + \sum_{j=3}^d   \overline{\mathbf{{e}}}_{\perp, j} \overline{\mathbf{{e}}}_{\perp, j}^\top.
+    \end{equation}
+    Recall that $\{\overline{\mathbf{{e}}}, \overline{\mathbf{{e}}}_{\perp}, \overline{\mathbf{{e}}}_{\perp, 3}, \overline{\mathbf{{e}}}_{\perp, 4},  \ldots, \overline{\mathbf{{e}}}_{\perp, d}\}$ is an orthonormal basis for $\mathbb{R}^d$. Thus, $\sum_{j=3}^d \overline{\mathbf{{e}}}_{\perp, j} \overline{\mathbf{{e}}}_{\perp, j}^\top = \mathbf{I}_d - \overline{\mathbf{{e}}} \overline{\mathbf{{e}}}^\top - \overline{\mathbf{{e}}}_{\perp} \overline{\mathbf{{e}}}_{\perp}^\top$. Using this above, we get:
+    \begin{equation}
+        \mathbb{E}\Big[\widetilde{\mathbf{x}} \widetilde{\mathbf{x}}^\top\Big] = \mathbf{I}_d + \rho  \big(\overline{\mathbf{{e}}} \overline{\mathbf{{e}}}_{\perp}^\top + \overline{\mathbf{{e}}}_{\perp} \overline{\mathbf{{e}}}^\top\big) = \widetilde{\bm{\Sigma}}.
+    \end{equation}
+    This finishes the proof.
+\end{proof}
+
+\begin{lemma}
+    \label{lem3}
+    Recall that 
+    \begin{equation*}
+        \mathbf{{Q}} = (1 - \mu^2)\overline{\mathbf{{e}}} \overline{\mathbf{{e}}}^\top  + \rho^2 (1 - \mu^2) \overline{\mathbf{{e}}}_{\perp} \overline{\mathbf{{e}}}_{\perp}^\top - \rho \mu^2 \big(\overline{\mathbf{{e}}} \overline{\mathbf{{e}}}_{\perp}^\top + \overline{\mathbf{{e}}}_{\perp} \overline{\mathbf{{e}}}^\top\big).
+    \end{equation*}
+    Let $$\mu = \sqrt{\frac{\beta (1-\rho^2)}{(1+\beta)(1-\beta \rho^2)}}$$
+    for some $\beta \in (0,1]$. In that case, the eigenvalues of $\mathbf{{Q}}$ are:
+    \begin{equation*}
+    \widehat{\lambda}_1 = \frac{1 + \beta \rho^2}{1 + \beta} \text{ and } \widehat{\lambda}_2 = \rho^2\Bigg(\frac{1 - \beta}{1 - \beta \rho^2}\Bigg),
+    \end{equation*}
+    and the corresponding eigenvectors are:
+    $$\widehat{\mathbf{{v}}}_1 = \frac{1}{\sqrt{1+\beta^2 \rho^2}} \overline{\mathbf{{e}}} - \frac{\beta \rho}{\sqrt{1+\beta^2 \rho^2}} \overline{\mathbf{{e}}}_{\perp} \text{ and } \widehat{\mathbf{{v}}}_2 = -\frac{\beta \rho}{\sqrt{1+\beta^2 \rho^2}} \overline{\mathbf{{e}}} - \frac{1}{\sqrt{1+\beta^2 \rho^2}} \overline{\mathbf{{e}}}_{\perp}.$$
+\end{lemma}
+\begin{proof}
+$\mathbf{Q}$ is a rank-2 matrix and its two eigenvectors will be in the span of $\overline{\mathbf{{e}}}$ and $\overline{\mathbf{{e}}}_{\perp}$. In particular, an eigenvector of $\mathbf{Q}$ is of the form $[\overline{\mathbf{{e}}}, \overline{\mathbf{{e}}}_{\perp}] \mathbf{b}$, where $\mathbf{b} \in \mathbb{R}^{2 \times 1}$ is an eigenvector of the $2 \times 2$ matrix:
+\begin{equation}
+    \mathbf{A} := \begin{bmatrix}
+                    (1 - \mu^2) & - \rho \mu^2 \\
+                    - \rho \mu^2 & \rho^2 (1 - \mu^2)
+                \end{bmatrix}.
+\end{equation}
+Also, the corresponding eigenvalues of $\mathbf{Q}$ are the corresponding eigenvalues of $\mathbf{A}$. It can be verified that the eigenvalues of $\mathbf{A}$ are:
+\begin{equation}
+    \widehat{\lambda}_1 = \frac{(1+\rho^2)(1-\mu^2)}{2} + \sqrt{\frac{(1-\rho^2)^2(1-\mu^2)^2}{4} + \rho^2 \mu^4}.
+\end{equation}
+and
+\begin{equation}
+    \widehat{\lambda}_2 = \frac{(1+\rho^2)(1-\mu^2)}{2} - \sqrt{\frac{(1-\rho^2)^2(1-\mu^2)^2}{4} + \rho^2 \mu^4}.
+\end{equation}
+The corresponding eigenvectors of $\mathbf{A}$ are:
+\begin{equation}
+    \widehat{\mathbf{b}}_1 = \frac{1}{\sqrt{b_{1,1}^2 + b_{1,2}^2}}
+                    \begin{bmatrix}
+                    %\frac{(1-\rho^2)(1-\mu^2)}{2} + \sqrt{\frac{(1-\rho^2)^2(1-\mu^2)^2}{4} + \rho^2 \mu^4} \\
+                    %-\rho \mu^2,
+                    b_{1,1}
+                    \\
+                    b_{1,2}
+                \end{bmatrix}
+\end{equation}
+where %$b_1 = {\frac{(1-\rho^2)^2(1-\mu^2)^2}{2} + 2 \rho^2 \mu^4 + (1-\rho^2) (1-\mu^2) \sqrt{\frac{(1-\rho^2)^2(1-\mu^2)^2}{4} + \rho^2 \mu^4}}$, and
+$b_{1,1} = \frac{(1-\rho^2)(1-\mu^2)}{2} + \sqrt{\frac{(1-\rho^2)^2(1-\mu^2)^2}{4} + \rho^2 \mu^4}$ and $b_{1,2} = -\rho \mu^2$, and 
+\begin{equation}
+    \widehat{\mathbf{b}}_2 = \frac{1}{\sqrt{b_{2,1}^2 + b_{2,2}^2}}
+                    \begin{bmatrix}
+                    %\frac{(1-\rho^2)(1-\mu^2)}{2} - \sqrt{\frac{(1-\rho^2)^2(1-\mu^2)^2}{4} + \rho^2 \mu^4} \\
+                    %-\rho \mu^2
+                    b_{2,1} \\
+                    b_{2,2}
+                \end{bmatrix},
+\end{equation}
+where %$b_2 = {\frac{(1-\rho^2)^2(1-\mu^2)^2}{2} + 2 \rho^2 \mu^4 - (1-\rho^2) (1-\mu^2) \sqrt{\frac{(1-\rho^2)^2(1-\mu^2)^2}{4} + \rho^2 \mu^4}}$
+$b_{2,1} = \frac{(1-\rho^2)(1-\mu^2)}{2} - \sqrt{\frac{(1-\rho^2)^2(1-\mu^2)^2}{4} + \rho^2 \mu^4}$ and $b_{2,2} = -\rho \mu^2$. Thus, the eigenvalues of $\mathbf{Q}$ are $\widehat{\lambda}_1$ and $\widehat{\lambda}_2$; the corresponding eigenvectors are  $\widehat{\mathbf{v}}_1 = [\overline{\mathbf{{e}}}, \overline{\mathbf{{e}}}_{\perp}] \widehat{\mathbf{b}}_1$ and $\widehat{\mathbf{v}}_2 = [\overline{\mathbf{{e}}}, \overline{\mathbf{{e}}}_{\perp}] \widehat{\mathbf{b}}_2$. Note that:
+$$\frac{(1-\rho^2)(1-\mu^2)}{2} \leq \sqrt{\frac{(1-\rho^2)^2(1-\mu^2)^2}{4} + \rho^2 \mu^4} \leq \frac{(1-\rho^2)(1-\mu^2)}{2} + \rho \mu^2.$$
+Let us set $\sqrt{\frac{(1-\rho^2)^2(1-\mu^2)^2}{4} + \rho^2 \mu^4} = \frac{(1-\rho^2)(1-\mu^2)}{2} + \beta \rho^2 \mu^2$, for some $\beta \in (0,1]$. That gives us:
+\begin{equation}
+    %\mu^2 = \frac{1}{1 + \frac{1 - (\beta \rho)^2}{\beta(1-\rho^2)}}.
+    \mu = \sqrt{\frac{\beta (1-\rho^2)}{(1+\beta)(1-\beta \rho^2)}}.
+\end{equation}
+In that case, we have:
+\begin{equation}
+    \label{eq:18-jan15}
+    \widehat{\lambda}_1 = \frac{1 + \beta \rho^2}{1 + \beta} \text{ and } \widehat{\lambda}_2 = \rho^2\Bigg(\frac{1 - \beta}{1 - \beta \rho^2}\Bigg).
+\end{equation}
+Also,
+\begin{equation}
+    b_{1,1} = \frac{1-\rho^2}{(1+\beta)(1-\beta \rho^2)}, b_{1,2} = b_{2,2} = -\frac{\beta \rho (1-\rho^2)}{(1+\beta)(1-\beta \rho^2)}, \text{ and } b_{2,1} = -\frac{\beta^2 \rho^2 (1-\rho^2)}{(1+\beta)(1-\beta \rho^2)}.
+\end{equation}
+Therefore,
+\begin{equation}
+    \label{eq:20-jan15}
+    \widehat{\mathbf{b}}_1 = \frac{1}{\sqrt{1+\beta^2 \rho^2}} \begin{bmatrix}
+                    1
+                    \\
+                    -\beta \rho
+                \end{bmatrix}
+    \text{ and }
+    \widehat{\mathbf{b}}_2 = \frac{1}{\sqrt{1+\beta^2 \rho^2}} \begin{bmatrix}
+                    -\beta \rho
+                    \\
+                    -1
+                \end{bmatrix}.
+\end{equation}
+Recall that the eigenvalues of $\mathbf{Q}$ are $\widehat{\lambda}_1$ and $\widehat{\lambda}_2$, and the corresponding eigenvectors are  $$\widehat{\mathbf{v}}_1 = [\overline{\mathbf{{e}}}, \overline{\mathbf{{e}}}_{\perp}] \widehat{\mathbf{b}}_1 = \frac{1}{\sqrt{1+\beta^2 \rho^2}} \overline{\mathbf{{e}}} - 
+\frac{\beta \rho}{\sqrt{1+\beta^2 \rho^2}} \overline{\mathbf{{e}}}_{\perp} \text{ and } \widehat{\mathbf{v}}_2 = [\overline{\mathbf{{e}}}, \overline{\mathbf{{e}}}_{\perp}] \widehat{\mathbf{b}}_2 = -\frac{\beta \rho}{\sqrt{1+\beta^2 \rho^2}} \overline{\mathbf{{e}}} - 
+\frac{1}{\sqrt{1+\beta^2 \rho^2}} \overline{\mathbf{{e}}}_{\perp}.$$
+Finally, recall that $\mu = \sqrt{\frac{\beta (1-\rho^2)}{(1+\beta)(1-\beta \rho^2)}}$.
+\end{proof}
+
+\begin{lemma}
+    \label{lem-4}
+    Recall that the averaged model with parameter $\omega$ as defined in \cref{eq:16-jan18} was $$\bm{\theta}_\textup{avg}(\omega) = \omega \bm{\theta}_{*} + (1-\omega) \widetilde{\bm{\theta}}_{*} = \widetilde{\bm{\theta}}_{*} + \omega \mathbf{{e}}.$$
+    We have:
+    \begin{equation}
+        \min_{\omega \in [0,1]} \textup{err}_\textup{tot}\big(\bm{\theta}_\textup{avg}(\omega)\big) =  \Bigg(\frac{\overline{\mathbf{{e}}}^\top \bm{\Sigma} \overline{\mathbf{{e}}}}{\overline{\mathbf{{e}}}^\top \bm{\Sigma} \overline{\mathbf{{e}}} + 1}\Bigg) \|{\mathbf{{e}}}\|_2^2,
+    \end{equation}
+    where recall that $\bm{\Sigma}$ is the covariance matrix of the pre-training data. 
+\end{lemma}
+\begin{proof}
+    We have:
+    \begin{flalign}
+    \nonumber
+    \textup{err}_\textup{tot}\big(\bm{\theta}_\textup{avg}(\omega)\big) & = \textup{err}_1\big(\bm{\theta}_\textup{avg}(\omega)\big) + \textup{err}_2\big(\bm{\theta}_\textup{avg}(\omega)\big) 
+    \\
+    & = \big(\bm{\theta}_\textup{avg}(\omega) - \bm{\theta}_{\ast}\big)^\top \bm{\Sigma} \big(\bm{\theta}_\textup{avg}(\omega) - \bm{\theta}_{\ast}\big) + \big(\bm{\theta}_\textup{avg}(\omega) - \widetilde{\bm{\theta}}_{*}\big)^\top \widetilde{\bm{\Sigma}} \big(\bm{\theta}_\textup{avg}(\omega) - \widetilde{\bm{\theta}}_{*}\big).
+    \end{flalign}
+    Plugging in the value of $\bm{\theta}_\textup{avg}(\omega)$ and using the value of $\widetilde{\bm{\Sigma}}$ from \cref{eq:1-jan15}, we get:
+    \begin{flalign}
+    \label{eq:14-dec28}
+    \text{err}_\text{tot}(\bm{\theta}_\textup{avg}(\omega)) &= (1-\omega)^2 {\mathbf{e}}^\top \bm{\Sigma} {\mathbf{e}} + \omega^2 \|{\mathbf{e}}\|_2^2.
+    \end{flalign}
+    It can be verified (with elementary calculus) that the optimal value of $\omega$ that minimizes the RHS in \cref{eq:14-dec28} is $\omega^{\ast} = \frac{{\mathbf{e}}^\top \bm{\Sigma} {\mathbf{e}}}{{\mathbf{e}}^\top \bm{\Sigma} {\mathbf{e}} + \|{\mathbf{e}}\|_2^2}$. Plugging this into \cref{eq:14-dec28} and simplifying a bit yields the desired result.
+\end{proof}
+
+\begin{lemma}
+    \label{lem1-jan30}
+    Suppose $\alpha > 0$ and ${\mathbf{r}} \in \mathbb{R}^d$ is a unit-norm vector, i.e., $\|{\mathbf{r}}\|_2 = 1$.
+    Let $${\mathbf{M}} := \mathbb{E}\Bigg[\exp\Bigg(-\frac{\big(\langle {\mathbf{r}}, {\mathbf{z}} \rangle\big)^2}{\alpha}\Bigg) {\mathbf{z}} {\mathbf{z}}^\top \Bigg],$$
+    where ${\mathbf{z}} \sim \mathcal{N}(\vec{0}_d, {\mathbf{I}}_d)$.
+    ${\mathbf{r}}$ is an eigenvector of ${\mathbf{M}}$ with eigenvalue $\big(\frac{\alpha}{\alpha+2}\big)^{3/2}$. 
+    Further, the eigenvectors of ${\mathbf{M}}$ in the subspace of $\mathbb{R}^d$ orthogonal to ${\mathbf{r}}$ all have eigenvalues $\big(\frac{\alpha}{\alpha+2}\big)^{1/2}$.
+\end{lemma}
+\begin{proof}
+    We have:
+    \begin{flalign}
+        \label{eq:10}
+        \mathbb{E}\Big[{\mathbf{M}} {\mathbf{r}}\Big] &= \mathbb{E}\Bigg[\exp\Bigg(-\frac{\big(\langle {\mathbf{r}}, {\mathbf{z}} \rangle\big)^2}{\alpha}\Bigg) \langle {\mathbf{r}}, {\mathbf{z}} \rangle {\mathbf{z}} \Bigg].
+    \end{flalign}
+    Suppose $\{{\mathbf{{r}}}_{\perp, j}\}_{j=1}^{d-1}$ is an orthonormal basis for the subspace orthogonal to $\mathbf{r}$; so $\langle {\mathbf{{r}}}_{\perp, j}, \mathbf{r} \rangle = 0$ $\forall$ $j \in [d-1]$ and $\langle {\mathbf{{r}}}_{\perp, j}, {\mathbf{{r}}}_{\perp, k} \rangle = \mathds{1}(j=k)$ $\forall$ $j, k \in [d-1]$. Then, note that:
+    \begin{equation}
+        {\mathbf{z}} = \langle \mathbf{{r}}, {\mathbf{z}} \rangle {\mathbf{r}} + \sum_{j = 1}^{d-1} \langle \mathbf{{r}}_{\perp, j}, {\mathbf{z}} \rangle \mathbf{{r}}_{\perp, j}.
+    \end{equation}
+    Since ${\mathbf{z}} \sim \mathcal{N}(\vec{0}_d, \mathbf{I}_d)$, $\langle \mathbf{{r}}, {\mathbf{z}} \rangle$ and $\{\langle \mathbf{{r}}_{\perp, j}, {\mathbf{z}} \rangle\}_{j=1}^{d-1}$ are i.i.d. $\mathcal{N}(0, 1)$. Using all of this in \cref{eq:10}, we get:
+    \begin{flalign}
+        \mathbb{E}\Big[{\mathbf{M}} {\mathbf{r}}\Big] &= \mathbb{E}\Bigg[\exp\Bigg(-\frac{\big(\langle \mathbf{{r}}, {\mathbf{z}} \rangle\big)^2}{\alpha}\Bigg) \big(\langle \mathbf{{r}}, {\mathbf{z}} \rangle\big)^2 \Bigg] \mathbf{{r}} + \sum_{j=1}^{d-1}\underbrace{\mathbb{E}\Bigg[\exp\Bigg(-\frac{\big(\langle \mathbf{{r}}, {\mathbf{z}} \rangle\big)^2}{\alpha}\Bigg) \langle \mathbf{{r}}, {\mathbf{z}} \rangle \langle \mathbf{{r}}_{\perp, j}, {\mathbf{z}} \rangle \Bigg]}_{=0 \text{ ($\langle \mathbf{{r}}, {\mathbf{z}} \rangle$ and $\langle \mathbf{{r}}_{\perp, j}, {\mathbf{z}} \rangle$ are independent)}} \mathbf{{r}}_{\perp, j}
+        \\
+        & = \mathbb{E}_{Z \sim \mathcal{N}(0,1)}\Bigg[\exp\Big(-\frac{Z^2}{\alpha}\Big) Z^2\Bigg] \mathbf{{r}} \quad \quad \quad  \quad \quad \quad \quad \quad \quad \text{(because $\langle \mathbf{{r}}, {\mathbf{z}} \rangle \sim \mathcal{N}(0,1)$)}
+        \\
+        & = \Bigg(\frac{1}{\sqrt{2 \pi}} \int_{-\infty}^{\infty} {z}^2 \exp\Big(-{z}^2 \Big(\frac{1}{\alpha} + \frac{1}{2}\Big)\Big) {dz}\Bigg) \mathbf{{r}}
+        \\
+        & = \Big(\frac{\alpha}{\alpha+2}\Big)^{3/2} \mathbf{{r}}.
+    \end{flalign}
+    So $\mathbf{{r}}$ is an eigenvector of $\mathbf{M}$ with eigenvalue $\big(\frac{\alpha}{\alpha+2}\big)^{3/2}$.
+    \\
+    \\
+    Next, note that:
+    \begin{multline}
+        \mathbb{E}\Big[\mathbf{M} {\mathbf{r}}_{\perp, 1}\Big] = \underbrace{\mathbb{E}\Bigg[\exp\Bigg(-\frac{\big(\langle \mathbf{{r}}, {\mathbf{z}} \rangle\big)^2}{\alpha}\Bigg) \langle {\mathbf{r}}_{\perp, 1}, {\mathbf{z}} \rangle \langle {\mathbf{r}}, {\mathbf{z}} \rangle \Bigg]}_{=0} {\mathbf{r}} 
+        + \mathbb{E}\Bigg[\exp\Bigg(-\frac{\big(\langle \mathbf{{r}}, {\mathbf{z}} \rangle\big)^2}{\alpha}\Bigg) \big(\langle {\mathbf{r}}_{\perp, 1}, {\mathbf{z}} \rangle\big)^2 \Bigg] {\mathbf{r}}_{\perp, 1}
+        \\
+        \sum_{j=2}^{d-1}\underbrace{\mathbb{E}\Bigg[\exp\Bigg(-\frac{\big(\langle \mathbf{{r}}, {\mathbf{z}} \rangle\big)^2}{\alpha}\Bigg) \langle {\mathbf{r}}_{\perp, 1}, {\mathbf{z}} \rangle \langle {\mathbf{r}}_{\perp, j}, {\mathbf{z}} \rangle \Bigg]}_{=0} {\mathbf{r}}_{\perp, j}.
+    \end{multline}
+    In the above equation, the first and last terms are $0$ because $\langle \mathbf{{r}}, {\mathbf{z}} \rangle$ and $\{\langle \mathbf{{r}}_{\perp, j}, {\mathbf{z}} \rangle\}_{j=1}^{d-1}$ are i.i.d. $\mathcal{N}(0, 1)$; using this fact again, we get:
+    \begin{flalign}
+        \mathbb{E}\Big[\mathbf{M} {\mathbf{r}}_{\perp, 1}\Big] & = \mathbb{E}_{Z \sim \mathcal{N}(0,1)}\Bigg[\exp\Big(-\frac{Z^2}{\alpha}\Big) \Bigg] \underbrace{\mathbb{E}_{\bar{Z} \sim \mathcal{N}(0,1)}\big[\bar{Z}^2\big]}_{=1}{\mathbf{r}}_{\perp, 1} 
+        \\
+        & = \Bigg(\frac{1}{\sqrt{2 \pi}} \int_{-\infty}^{\infty} \exp\Big(-{z}^2 \Big(\frac{1}{\alpha} + \frac{1}{2}\Big)\Big) {dz}\Bigg)  {\mathbf{r}}_{\perp, 1} 
+        \\
+        & = \Big(\frac{\alpha}{\alpha+2}\Big)^{1/2} {\mathbf{r}}_{\perp, 1}.
+    \end{flalign}
+    Similarly, we can show that for $j = \{2,\ldots,d-1\}$, we have:
+    \begin{equation}
+        \mathbb{E}\Big[\mathbf{M} {\mathbf{r}}_{\perp, j}\Big] = \Big(\frac{\alpha}{\alpha+2}\Big)^{1/2} {\mathbf{r}}_{\perp, j}.
+    \end{equation}
+    So for all $j \in [d-1]$, ${\mathbf{r}}_{\perp, j}$ is an eigenvector of $\mathbf{M}$ with eigenvalue $\big(\frac{\alpha}{\alpha+2}\big)^{1/2}$. Thus, the eigenvectors of $\mathbf{M}$ in the subspace orthogonal to $\mathbf{r}$ all have eigenvalues $\big(\frac{\alpha}{\alpha+2}\big)^{1/2}$.
+\end{proof}
+
+\newpage
+
+\section{Experimental Details}
+\label{app:experimental-details}
+
+In this section, we further discuss the experimental setup of \method's usage in both language and vision settings, specifically covering the following:
+
+\begin{itemize}
+    \item \Cref{app:add-baseline-detials}: Baseline implementation details for both language and vision experiments
+    \item \Cref{app:language-hyperparameters}: Fine-tuning specifications for language models (baselines versus \method)
+    \item \Cref{app:further-language-evaluation-details}: Evaluation metrics breakdown for language tasks
+    \item \Cref{app:vision-hyperparameters}: Training parameters for vision models (baselines versus \method)
+\end{itemize}
+
+\subsection{Additional Experimental Baseline Details}
+\label{app:add-baseline-detials}
+
+In this section, we further discuss the baselines mentioned in \cref{sec: experiments}. %, providing a b explanation of each method.
+
+\paragraph{Linear probing:} In our vision experiments, we define linear probing as freezing the body of the pre-trained model, initializing a new (task-specific) head and batch normalization layers, and training only the new head and batch normalization layers. 
+
+\paragraph{${\ell_2}$ regularization:} 
+Based on \citet{kirkpatrick2016overcoming}, we perform $\ell_2$ regularization as a baseline in the data-oblivious setting. Specifically, the $\ell_2$-regularized loss is:
+\begin{equation}
+    \mathcal L(\bm{\theta}) = \sum_{i=1}^n f_i(\bm{\theta}) + \lambda \|\bm{\theta} - \bm{\theta}^*\|_2^2
+\end{equation}
+where $f_i$ is the $i^\text{th}$ sample's loss, $\bm{\theta}^*$ is the pre-trained model, and $\lambda$ is the regularization parameter. Intuitively, as $\lambda$ increases, our model stays closer to the pre-trained model, mitigating forgetting at the expense of target domain %fine-tuning 
+performance.
+
+\paragraph{LoRA \citep{hu2022lora}:} Recently, \citet{biderman2024lora} showed  that fine-tuning language models with LoRA \citep{hu2022lora} effectively mitigates forgetting. 
+Following a similar setup as us, \citet{biderman2024lora} fine-tuned language models on MetaMathQA \citep{yu2023metamath} and then evaluated the fine-tuned model on several general capability tasks, viz., HellaSwag \citep{zellers2019hellaswag}, ARC-c \citep{Clark2018ThinkYH}, and WinoGrande \citep{sakaguchi2019winogrande}, and one target domain task, viz., GSM8K \citep{cobbe2021training}. 
+Further details about experimental hyper-parameters can be found in \cref{app:language-hyperparameters}.
+
+\paragraph{WiSE-FT \citep{wortsman2021robust}:} We also consider model averaging as a baseline, specifically focusing on WiSE-FT \citep{wortsman2021robust}. WiSE-FT is simply the convex combination of the model parameters shared between the two tasks, while the task-specific parts are not averaged. Specifically, we perform model averaging between the pre-trained model and the fine-tuned model. The convex combination parameter $\alpha$ of WiSE-FT is set to $0.5$ in our experiments, as we cannot optimize $\alpha$ in the data-oblivious setting. 
+
+\subsection{Language Model Hyper-Parameters}
+\label{app:language-hyperparameters}
+
+For both Gemma 2 2B \citep{gemmateam2024gemma2improvingopen} and Llama 3.2 3B \citep{grattafiori2024llama3herdmodels}, we run hyper-parameter sweeps on learning rates for each baseline. For standard fine-tuning, $\ell_2$ regularization, and \method, we do a learning rate sweep in [1e-4, 2e-5, 1e-5, 5e-6], and for LoRA ($r=64$) we do a sweep in [2e-4, 2e-1], following the learning rates used in \cite{biderman2024lora}. We then select the learning rate that results in the best GSM8K \citep{cobbe2021training} accuracy, oblivious to general capability metrics. We report the hyper-parameters used for our Gemma 2 2B experiments in \cref{tab:gemma-hyperparams} and for Llama 3.2 3B in \cref{tab:llama-hyperparams}.
+
+\begin{table}[h!]
+    \centering
+    \small
+    \caption{The hyper-parameters used to train Gemma 2 2B in our experiments. Note that the learning rate selected is based on the best results on GSM8K after fine-tuning the method on MetaMathQA.}
+    \vspace{0.2cm}
+    \begin{tabular}{lcccc}
+        \toprule
+        \textbf{Hyper-parameter} & \textbf{Standard Fine-tuning} & \textbf{LoRA ($r=64$)} & \textbf{\(\ell_2\)-Reg.} & \textbf{\methodbold (Ours)} \\
+        \midrule
+        Learning Rate & 1e-5 & 2e-4 & 5e-6 & 5e-6 \\
+        \midrule
+        \multirow{1}{*}{Learning Rate Scheduler} & \multicolumn{4}{c}{Cosine} \\
+        \multirow{1}{*}{Batch Size} & \multicolumn{4}{c}{128} \\
+        \multirow{1}{*}{Optimizer} & \multicolumn{4}{c}{AdamW} \\
+        \multirow{1}{*}{Weight Decay} & \multicolumn{4}{c}{0.00} \\
+        \multirow{1}{*}{Warmup Ratio} & \multicolumn{4}{c}{0.03} \\
+        \multirow{1}{*}{Epochs} & \multicolumn{4}{c}{2} \\
+        \multirow{1}{*}{Max Sequence Length} & \multicolumn{4}{c}{1024} \\
+        \multirow{1}{*}{Seed} & \multicolumn{4}{c}{42} \\
+        \bottomrule
+    \end{tabular}
+    \label{tab:gemma-hyperparams}
+\end{table}
+
+\begin{table}[h!]
+    \centering
+    \small
+    \caption{The hyper-parameters used to train Llama 3.2 3B in our experiments. Note that the learning rate selected is based on the best results on GSM8K after fine-tuning the method on MetaMathQA.}
+    \vspace{0.2cm}
+    \begin{tabular}{lccccc}
+        \toprule
+        \textbf{Hyper-parameter} & \textbf{Standard Fine-tuning} & \textbf{LoRA ($r=64$)} & \textbf{\(\ell_2\)-Reg.} & \textbf{\methodbold (Ours)} \\
+        \midrule
+        Learning Rate & 2e-5 & 2e-4 & 1e-5 & 1e-5 \\
+        \midrule
+        \multirow{1}{*}{Learning Rate Scheduler} & \multicolumn{4}{c}{Cosine} \\
+        \multirow{1}{*}{Batch Size} & \multicolumn{4}{c}{128} \\
+        \multirow{1}{*}{Optimizer} & \multicolumn{4}{c}{AdamW} \\
+        \multirow{1}{*}{Weight Decay} & \multicolumn{4}{c}{0.00} \\
+        \multirow{1}{*}{Warmup Ratio} & \multicolumn{4}{c}{0.03} \\
+        \multirow{1}{*}{Epochs} & \multicolumn{4}{c}{2} \\
+        \multirow{1}{*}{Max Sequence Length} & \multicolumn{4}{c}{1024} \\
+        \multirow{1}{*}{Seed} & \multicolumn{4}{c}{42} \\
+        \bottomrule
+    \end{tabular}
+    \label{tab:llama-hyperparams}
+\end{table}
+
+For our WiSE-FT model averaging experiments, we use $\alpha = 0.5$. For our LoRA experiments, we use $\alpha = r = 64$. For $\ell_2$ regularization we use $\lambda = 1e-3$ which is taken from \cite{chen2024mofo}. Most training hyper-parameters for our language experiments are taken from \citet{chen2024mofo}, with the introduction of learning rate sweeps.
+
+\subsection{Language Model Evaluation Details}
+\label{app:further-language-evaluation-details}
+
+As described in \cref{sec:llm-experiments-setup}, we create a commonsense reasoning metric composed of the following six metrics: ARC-e \citep{Clark2018ThinkYH}, ARC-c \citep{Clark2018ThinkYH}, HellaSwag \citep{zellers2019hellaswag}, PIQA \citep{Bisk2020}, SIQA \citep{sap2019social}, and OBQA \citep{OpenBookQA2018}. On top of the commonsense metric, we evaluate MMLU \citep{hendryckstest2021} and MBPP \citep{austin2021program} to estimate the general capabilities of a language model and to measure the effects of catastrophic forgetting when fine-tuning a model on MetaMathQA \citep{yu2023metamath}. We additionally use GSM8K \citep{cobbe2021training} to evaluate the target fine-tuning performance of a given fine-tuning method. We provide a brief describe each of these evaluation metrics:
+
+\begin{enumerate}
+    \item \textbf{HellaSwag} \citep{zellers2019hellaswag}: A benchmark designed to test commonsense reasoning. HellaSwag presents a context followed by several plausible endings, and the model must choose the most appropriate continuation.
+    \item \textbf{ARC Easy} \citep{Clark2018ThinkYH}: A benchmark part of the AI2 reasoning challenge designed to test basic scientific reasoning and knowledge. ARC Easy presents 5,197 multiple-choice science questions drawn from grade 3-9 standardized tests, where each question typically includes a brief scientific scenario or statement followed by four possible answer choices. 
+    \item \textbf{ARC Challenge} \citep{Clark2018ThinkYH}: A benchmark part of the AI2 reasoning challenge designed to test advanced scientific reasoning and knowledge application. ARC Challenge presents 2,590 multiple-choice science questions drawn from grade 3-9 standardized tests, where each question typically includes a scientific scenario or phenomenon followed by four possible answer choices. The questions in ARC Challenge are significantly more challenging than ARC Easy.
+    \item \textbf{PIQA} \citep{Bisk2020}: A benchmark designed to evaluate physical commonsense understanding in natural language. PIQA presents a goal and two possible solutions, requiring models to choose the most appropriate solution that demonstrates an understanding of everyday physical interactions.
+    \item \textbf{SIQA} \citep{sap2019social}: A benchmark designed to evaluate social commonsense intelligence and emotional reasoning. SIQA presents a social situation context followed by a question and three possible answers, requiring models to demonstrate an understanding of social interactions, emotional responses, and behavioral implications.
+    \item \textbf{Open Book QA} \citep{OpenBookQA2018}: A benchmark designed to assess understanding of elementary science concepts in an open-book exam format. OBQA presents 5,957 multiple-choice questions paired with a small "book" of 1,326 core science facts, requiring models to combine these facts with common knowledge to arrive at correct answers.
+    \item \textbf{MMLU} \citep{hendryckstest2021}: A benchmark designed to evaluate massive multitask language understanding. MMLU presents approximately 16,000 multiple-choice questions spanning 57 subjects including mathematics, philosophy, law, and medicine, requiring models to demonstrate broad knowledge and reasoning capabilities.
+    \item \textbf{MBPP} \citep{austin2021program}: A benchmark designed to evaluate basic Python programming capabilities. The entire MBPP dataset presents 974 Python programming problems, where each problem includes a natural language task description and three test cases written as assert statements, requiring models to generate functionally correct Python code solutions. 
+    \item \textbf{GSM8K} \citep{cobbe2021training}: A benchmark designed to evaluate multi-step mathematical reasoning capabilities. The GSM8K test set contains 1,000 grade school math word problems, where each problem requires 2-8 steps to solve using basic arithmetic operations (addition, subtraction, multiplication, division).
+\end{enumerate}
+
+We follow the standard evaluation process for each of these datasets and specifically use lm-evaluation-harness \citep{eval-harness} to evaluate our experiments.
+
+\subsection{Vision Implementation Details}
+\label{app:vision-hyperparameters}
+
+We performed an extensive hyper-parameter search over six learning rates $\{0.05, 0.01, 0.005, 0.001,$
+$ 0.0005, 0.0001\}$, two models, and six datasets (i.e., 72 total runs per method) for standard fine-tuning, linear probing, and \method. We chose the best learning rates associated with the highest average score over all the target (fine-tuning) datasets. Since our method is data oblivious, we do not use the validation set of ImageNet-1K other than evaluation. All vision model fine-tuning was performed on a single {A6000} GPU. For fine-tuning, we used the SGD optimizer with a cosine scheduler, a weight decay of $5e-4$ (except for the $\ell_2$-regularization baseline, where weight decay was set to 0), and a fixed random seed of 42. For fine-tuning models with $\ell_2$-regularization, we adapted the same learning rates and other related hyper-parameters used for standard fine-tuning. We searched for $\lambda$ using one dataset and ResNet50 model (\(\text{$\lambda$} = [0.002, 0.00001, 0.00002]\)) and chose $\lambda=0.002$ based on average accuracy over target data. We chose (\(\text{$\alpha$} = 0.05\)) for WiSE-FT following \citet{wortsman2021robust}. We present additional training details for vision models in \Cref{table:app_vis_hyparams}.
+
+\begin{table}[!ht]
+    \centering
+    \caption{Hyperparameter configurations for finetuning ResNet-18 and ResNet-50 on the image classification datasets.}
+    \vspace{0.1 cm}
+    \label{tab:hyperparams}
+    \renewcommand{\arraystretch}{1.2}
+    \begin{tabular}{l l | c c c c c c}
+        \toprule
+          & Epochs & 20 & 25 & 25 & 30 & 30 & 30 \\
+        \midrule
+        \multirow{3}{*}{\rotatebox[origin=c]{90}{ResNet18}} 
+        & LR-Standard fine-tuning & 5E-3 & 1E-2 & 5E-2 & 5E-3 & 1E-3 & 5E-2 \\
+        & LR-Linear probing & 5E-3 & 5E-3 & 5E-2 & 1E-2 & 5E-3 & 5E-2 \\
+        & LR-\method & 1E-3 & 5E-3 & 5E-2 & 1E-2 & 5E-3 & 1E-2 \\
+        
+        \midrule
+        \multirow{3}{*}{\rotatebox[origin=c]{90}{ResNet50}} 
+        & LR-Standard fine-tuning & 5E-3 & 1E-3 & 1E-2 & 5E-3 & 5E-4 & 5E-2 \\
+        & LR-Linear probing & 5E-2 & 5E-2 & 5E-2 & 5E-2 & 1E-2 & 5E-2 \\
+        & LR-\method & 5E-4 & 1E-3 & 1E-2 & 1E-2 & 5E-3 & 1E-2 \\
+        \bottomrule
+    \end{tabular}
+    \label{table:app_vis_hyparams}
+\end{table}
+
+\paragraph{Datasets}
+
+\begin{enumerate}
+    \item \textbf{ImageNet-1K} \citep{russakovsky2015imagenet} serves as the pre-training dataset for all our vision base models. It is a widely used large-scale image classification dataset, consisting of over a million images spanning 1000 classes.
+    
+    \item \textbf{CIFAR-10} \citep{Krizhevsky09learningmultiple} is a widely used dataset for image classification tasks. It consists of 60,000 32x32 color images divided into ten classes, with 6,000 images per class.
+    
+    \item \textbf{CIFAR-100} \citep{Krizhevsky09learningmultiple} extends CIFAR-10 by providing 100 classes containing 600 images each. This dataset is used for fine-grained image classification tasks.
+    
+   \item \textbf{Caltech101} \citep{Li2022} comprises images of a diverse range of objects across 101 categories with a diverse set of image classes.
+
+    \item \textbf{Flowers102} \citep{nilsback2008automated} comprises 102 categories of flowers, with each category containing between 40 to 258 images. This dataset is commonly used for fine-grained image classification and flower recognition tasks.
+    
+    \item \textbf{Cars} \citep{krause20133d} refers to the Stanford Cars dataset, which includes 16,185 images of 196 classes of cars. It provides a rich resource for fine-grained car classification task.
+    
+    \item \textbf{Dogs} \citep{parkhi2012dog} pertains to the Stanford Dogs dataset, containing 20,580 images of 120 breeds of dogs. This dataset is widely used for fine-grained dog breed classification and recognition tasks.
+\end{enumerate}
+
+\newpage
+\section{Detailed Vision Results and Ablations}
+\label{add-vis-results}
+
+\begin{table}[ht!]
+\centering
+ \caption{\textbf{Target accuracies on each of the six datasets for the results in \Cref{table:main_vision_table}.}}
+ \vspace{0.7em}
+\scriptsize
+\begin{tabular}{llccccccc}
+\toprule
+ & \textbf{Method} & \textbf{CIFAR-10} & \textbf{CIFAR-100} & \textbf{Flowers-102} & \textbf{Caltech-101} & \textbf{Dogs} & \textbf{Cars} & \textbf{Average} \\
+\midrule
+\multirow{5}{*}{\rotatebox{90}{\textbf{ResNet18}}} 
+ & LP                  & 81.32 & 60.06 & 87.20 & 91.15 & 78.50 & 43.23 & 73.57 \\
+ & Standard FT             & 96.15 & 83.42 & 92.45 & 94.02 & 80.47 & 87.91 & 89.07 \\
+ & $\ell_2$-Regularization & 95.53 & 81.82 & 92.11 & 94.23 & 80.27 & 84.78 & 88.12 \\
+ & WiSE-FT & 91.47 & 65.90 & 87.28 & 91.40 & 82.48 & 62.88 & 80.23 \\
+ & \methodbold (Ours) & 88.25 & 78.95 & 90.01 & 93.05 & 86.20 & 67.17 & 83.93 \\
+ \midrule
+\multirow{5}{*}{\rotatebox{90}{\textbf{ResNet50}}} 
+& Linear probing & 86.62 & 67.80 & 83.64 & 93.45 & 85.76 & 41.97 & 76.45 \\
+& Standard FT & 97.61 & 86.11 & 91.74 & 96.02 & 89.26 & 89.94 & 91.78 \\
+& $\ell_2$-Regularization & 97.50 & 85.77 & 91.67 & 95.85 & 89.29 & 89.42 & 91.58 \\
+& WiSE-FT & 94.65 & 72.55 & 71.95 & 93.73 & 92.52 & 62.89 & 81.38 \\
+& \methodbold (Ours) & 91.11 & 79.42 & 86.78 & 94.45 & 91.16 & 74.59 & 86.25 \\
+\bottomrule
+\end{tabular}
+\label{table:app_vision_results1}
+\end{table}
+
+\begin{table}[ht!]
+\centering
+\caption{\textbf{Top-1 ImageNet-1K accuracy of vision models after fine-tuning on target datasets for the results in \Cref{table:main_vision_table}. }}
+\vspace{0.7em}
+\scriptsize
+\begin{tabular}{llccccccc}
+\toprule
+& \textbf{Method} & \textbf{CIFAR-10} & \textbf{CIFAR-100} & \textbf{Flowers-102} & \textbf{Caltech-101} & \textbf{Dogs} & \textbf{Cars} & \textbf{Average} \\
+\midrule
+\multirow{5}{*}{\rotatebox{90}{\textbf{ResNet18}}} 
+ & LP & 69.76 & 69.76 & 69.76 & 69.76 & 69.76 & 69.76 & 69.76 \\
+ & Standard FT & 19.93 & 0.39 & 6.48 & 34.17 & 56.38 & 0.17 & 19.58 \\
+ & $\ell_2$-Regularization & 37.86 & 29.86 & 19.34 & 46.67 & 58.34 & 16.64 & 34.78 \\
+ & WiSE-FT & 62.24 & 47.65 & 49.98 & 64.70 & 67.34 & 33.03 & 54.15 \\
+ & \methodbold (Ours) & 69.02 & 52.64 & 67.80 & 68.32 & 67.78 & 65.74 & 65.21 \\
+% & LP & \textbf{69.76} & \textbf{69.76} & \textbf{69.76} & \underline{69.76} & \underline{69.76} & \textbf{69.76} & \textbf{69.76} \\
+%  & Standard FT & 19.93 & 0.39 & 6.48 & 34.17 & 56.38 & 0.17 & 19.58 \\
+%  & $\ell_2$-Reg. & 37.86 & 29.86 & 19.34 & 46.67 & 58.34 & 16.64 & 34.78 \\
+%  & WiSE-FT & 62.24 & 47.65 & 49.98 & 64.70 & \textbf{67.34} & 33.03 & 54.15 \\
+%  & \methodbold (Ours) & \underline{69.02} & \underline{52.64} & \underline{67.80} & \textbf{68.32} & 67.78 & \underline{65.74} & \underline{65.21} \\
+\midrule
+\multirow{5}{*}{\rotatebox{90}{\textbf{ResNet50}}} 
+& Linear probing & 79.02 & 79.02 & 79.02 & 79.02 & 79.02 & 79.02 & 79.02 \\
+& Standard FT & 16.89 & 35.95 & 61.01 & 40.51 & 66.93 & 0.21 & 36.91 \\
+& $\ell_2$-Regularization & 33.98 & 47.16 & 62.85 & 43.42 & 67.03 & 14.27 & 44.78 \\
+& WiseFT ($\alpha=0.5$) & 61.40 & 73.04 & 76.33 & 73.25 & 77.36 & 8.55 & 61.65 \\
+& \methodbold (Ours) & 78.26 & 75.13 & 78.60 & 73.38 & 78.55 & 72.64 & 76.09 \\
+\bottomrule
+\end{tabular}
+\label{table:app_vision_results3}
+\end{table}
+
+
+
+\begin{figure}[!ht]
+    \centering
+    \includegraphics[width=0.75\columnwidth]{Figures/classB_vs_classA_plot.pdf}
+     \caption{\textbf{Comparison of \methodbold with different values of $\tau$ and other baselines also with different hyper-parameter values.} This plot is for ResNet-50 on the Stanford cars dataset. \method's plot (in red) is with $\tau = \{10,20,30,40,50\}$ percentile of the per-sample losses. As the name \enquote{random selection} may imply, we just pick a random subset of the fine-tuning data and train on this subset to limit the drift from the pre-trained model. To have some correspondence with our choice of $\tau$ for \method, we pick random $\{10,20,30,40,50\}$ \% of the data in \enquote{random selection}. As we see, \method significantly outperforms other methods.} 
+    \label{fig:baseline_figure}
+\end{figure}
+
+
+\newpage
+\section{Additional Language Model Results and Ablations}
+\label{add-lang-results}
+
+In this section, we discuss expanded results and further ablations of \method within our language experiments, specifically covering the following:
+
+\begin{itemize}
+    \item \Cref{app:extended-commonsense-results}: An expanded table of results on commonsense reasoning tasks along with other baselines.
+    \item \Cref{app:token-wise-ablation}: An additional ablation on \textit{token}-wise weighting scheme for fine-tuning with language data. 
+    \item \Cref{app:extended-wa-results}: An expanded set of plots and results for the combination of \method with weight averaging techniques such as Wise-FT \citep{wortsman2021robust}.
+\end{itemize}
+
+\subsection{Extended Commonsense Reasoning Results}
+\label{app:extended-commonsense-results}
+
+As discussed in \cref{sec:llm-experiments-setup} and \cref{app:further-language-evaluation-details}, we evaluate \method and the other baselines on various commonsense reasoning tasks within fine-tuning with the procedure described in \cref{sec:llm-experiments-setup}. We include the exact results of these evaluation metrics for various baselines and \method in \cref{tab:commonsense-expanded}. We also include the results of commonsense reasoning metrics for the ablation combining \method with LoRA and $\ell_2$ in \cref{tab:our-and-baseline-commonsense-expanded}.
+
+\begin{table*}[h!]
+    \centering
+    \scriptsize
+    \caption{\textbf{Extended commonsense reasoning metrics for \methodbold and other baselines within language modeling}. The performance on commonsense reasoning evaluations when fine-tuning Gemma 2 2B and Llama 3.2 3B on MetaMathQA. We include the target domain evaluation GSM8K for convenience. The results show that \method can effectively mitigate catastrophic forgetting while still getting strong performance on our target fine-tuning task. }
+    \vspace{0.1cm}
+    \begin{tabular}{lccccccccc}
+         \toprule
+         & \textbf{Method} &  \textbf{ARC-e} & \textbf{ARC-c} & \textbf{HellaSwag} & \textbf{PIQA} & \textbf{SIQA} &  \textbf{OBQA} & \textbf{Average} & \textbf{GSM8K} \\
+        \midrule
+        \multirow{6}{*}{\rotatebox{90}{Gemma 2 2B}}
+         & Pre-trained & 80.18 & 46.84 & 54.95 & 78.67 & 51.33 & 31.40 & 57.23 & 24.49 \\
+         & Standard Fine-tuning & 76.09 & 42.07 & 45.59 & 9.76 & 48.06 & 32.00 & 55.07 & 63.38 \\
+         & WiSE-FT & 79.55 & 46.42 & 56.43 & 78.24 & 51.08 & 32.00 & 57.28 & 53.30 \\
+         & LoRA ($r=64$) & 77.78 & 44.37 & 54.59 & 76.99 & 50.51 & 29.80 & 55.67 & 60.43 \\
+         & $\ell_2$-Regularization  & 79.08 & 45.99 & 56.21 & 77.20 & 50.97 & 32.60 & 57.01 & 62.85 \\
+         & \methodbold (Ours) & 79.76 & 47.18 & 56.23 & 77.69 & 51.48 & 33.20 & 57.59 & 62.55 \\
+        \midrule
+        \multirow{6}{*}{\rotatebox{90}{Llama 3.2 3B}}
+         & Pre-trained & 74.54 & 42.15 & 55.31 & 76.66 & 47.03 & 31.20 & 54.48 & 26.01\\
+         & Standard Fine-tuning & 70.03 & 34.22 & 52.02 & 74.16 & 45.24 & 28.40 & 50.68 & 66.95 \\
+         & WiSE-FT & 75.63 & 40.79 & 55.18 & 76.93 & 47.34 & 31.40 & 54.54 & 57.01 \\
+         & LoRA ($r=64$) & 71.38 & 37.88 & 55.01 & 76.55 & 47.39 & 30.40 & 53.10 & 63.84 \\
+         & $\ell_2$-Regularization & 73.57 & 38.91 & 54.939 & 76.12 & 47.24 & 30.80 & 53.60 & 66.87 \\
+         & \methodbold (Ours) &  74.96 & 39.68 & 55.39 & 76.01  & 47.80 & 32.00 & 54.30 & 65.58 \\
+         \bottomrule
+    \end{tabular}
+    \label{tab:commonsense-expanded}
+\end{table*}
+
+
+\begin{table*}[h!]
+    \centering
+    \caption{\textbf{Extended commonsense reasoning metrics for combining \methodbold with other baselines}. The performance on commonsense reasoning evaluations when fine-tuning Gemma 2 2B baselines in conjunction with \method on MetaMathQA. We include the target domain evaluation GSM8K for convenience. The results show that \method can effectively be used in conjunction with other methods that mitigate catastrophic forgetting.}
+    \scriptsize
+    \vspace{0.1cm}
+    \begin{tabular}{ccccccccc}
+         \toprule
+         \textbf{Method} &  \textbf{ARC-e} & \textbf{ARC-c} & \textbf{HellaSwag} & \textbf{PIQA} & \textbf{SIQA} &  \textbf{OBQA} & \textbf{Average} & \textbf{GSM8K} \\
+        \midrule
+        
+         LoRA ($r=64$) & 77.78 & 44.37 & 54.59 & 76.99 & 50.51 & 29.80 & 55.67 & 60.43 \\
+         LoRA ($r=64$) + \methodbold & 79.50 & 45.39 & 55.27 & 77.31 & 51.18 & 31.80 & 56.74 & 61.49 \\
+         $\ell_2$-Regularization  & 79.08 & 45.99 & 56.21 & 77.20 & 50.97 & 32.60 & 57.01 & 62.85 \\
+         $\ell_2$-Regularization + \methodbold & 79.67 & 47.10 & 56.38 & 77.48 & 51.13 & 33.40 & 57.53 & 62.02 \\
+         \bottomrule
+    \end{tabular}
+    \label{tab:our-and-baseline-commonsense-expanded}
+\end{table*}
+
+\cref{tab:commonsense-expanded} shows a clear trend that \method, can strongly mitigate catastrophic forgetting in comparison to standard fine-tuning. For Gemma 2 2B, we can see that \method only has $\sim$ 0.8\% reduction in the performance of the target fine-tuning while on average maintaining the commonsense reasoning abilities of the pre-trained model, a $\sim 2.52\%$ increase over standard fine-tuning. For Llama 3.2 3B, we can see that \method can again maintain the commonsense reasoning abilities of the base pre-trained model while only having a $\sim$1.4\% drop on target fine-tuning performance. Overall, \method strikes a strong balance between general capabilities and target fine-tuning performance compared to other baselines.
+
+For experiments with Gemma 2 2B, \method can on average maintain the best scores on commonsense reasoning tasks. Performing only $\sim 0.8 \%$ and $\sim 0.3 \%$ worse on GSM8K in comparison to standard fine-tuning and $\ell_2$ regularization, \method can improve on commonsense reasoning metrics by $\sim 2.42 \%$ and $\sim 0.58 \%$ respectively. Interestingly, in our Llama 3.2 3B experiments, we found that WiSE-FT performed the strongest in preventing catastrophic forgetting of commonsense capabilities ($+0.04$ over the pre-trained model); however, this came at the cost of a significant decrease in GSM8K accuracy ($-9.94$ under standard fine-tuning). In comparison, \method effectively mitigated forgetting in commonsense reasoning metrics ($-0.18$ under the pre-trained model), while achieving significantly higher accuracy in GSM8K ($-1.37$ under standard fine-tuning).
+
+\subsection{Token-wise Sample Weighting Ablations}
+\label{app:token-wise-ablation}
+{In the language experiments, \enquote{sample} for \method can be defined as an entire sequence or an individual token. The experiments in the main paper treat a sequence as a sample; in that case, the per-sample loss is the average loss over the tokens in the sequence. We call this \textit{sequence}-wise re-weighting. Instead, one could treat a token as a sample in which case the per-sample loss is just the token's loss. We call this \textit{token}-wise re-weighting. 
+We run a small ablation on both \textit{sequence}-wise and \textit{token}-wise re-weighting by following a similar experimental setup as  \cref{sec:llm-experiments-setup}. We train a Gemma 2 2B on MetaMathQA and evaluate it on several general capability and target domain evaluations. The results of this experiment is in \cref{tab:token-comparison}.}
+
+\begin{table*}[h!]
+    \centering
+    \caption{The performance of Gemma 2B 2B on general capabilities metrics compared to target domain performance (GSM8K) when training on MetaMathQA. \textit{Pre-trained} is the base model performance of Gemma 2 2B, \textit{Standard} is the performance after full end-to-end fine-tuning, \textit{Sequence} is our sequence sample weighting schema with \method, and \textit{Token} is our token sample weighting schema with \method.  \textbf{Bold} and \underline{underlined} values indicate the \textbf{best} and \underline{second-best} results respectively within each evaluation metric.}
+    \scriptsize
+    \vspace{0.2 cm}
+    \begin{tabular}{cccccccccc}
+         \toprule
+         \textbf{Method} &  \textbf{ARC-e} & \textbf{ARC-c} & \textbf{HellaSwag} & \textbf{PIQA} & \textbf{SIQA} &  \textbf{OBQA} & \textbf{MMLU} & \textbf{MBPP} & \textbf{GSM8K} \\
+        \midrule
+         Base & \textbf{80.18} & \underline{46.84} & \underline{54.95} & \textbf{78.67} & \underline{51.33} & 31.40 & \textbf{49.59} & \textbf{28.40} & 24.49 \\
+         Standard & 76.09 & 42.07 & 54.41 & 76.99 & 48.06 & \textbf{32.80} & 45.59 & 16.80 & \textbf{63.38} \\
+         Sequence & \underline{79.76} & \textbf{47.18} & \textbf{56.23} & 77.69 & \textbf{51.48} & \underline{33.20} & \underline{49.31} & \underline{26.80} & \underline{62.55} \\
+         Token & 79.38 & 45.90 & 53.95 & \underline{78.29} & 51.28 & 31.80 & 48.75 & 22.00 & 23.73 \\
+         \bottomrule
+    \end{tabular}
+    \label{tab:token-comparison}
+\end{table*}
+
+\begin{figure}[h!]
+\centering
+\begin{tabular}{cc}
+\includegraphics[width=0.45\textwidth]{Figures/weights.png} &
+\includegraphics[width=0.45\textwidth]{Figures/token_weights.png} \\
+\end{tabular}
+\caption{Histograms comparing the sample-wise distribution of weights in \textit{sequence}-wise re-weighting schema for \method and token-wise distribution of weights \textit{token}-wise re-weighting schema for \method. The \textit{sequence}-wise weight distribution is given on the left, while the \textit{token}-wise weight distribution is given on the right.}
+\label{fig:token-sequence-weight-comparison}
+\end{figure}
+
+While \textit{token}-wise sample re-weighting performs comparably or slightly worse than \textit{sequence}-wise sample re-weighting in terms of the catastrophic forgetting of general capabilities of Gemma 2 2B, it struggles to effectively learn the fine-tuning target domain of GSM8K. To further understand this problem, we compare the weight distributions between \textit{sequence}-wise and \textit{token}-wise re-weighting schema in \cref{fig:token-sequence-weight-comparison}. We can see that the \textit{sequence} weights appear Gaussian, while most of the \textit{token} weights are either 0 or 1. We speculate that \textit{token}-wise re-weighting will force any token not commonly appearing in the pre-training data to have a high loss or perplexity, which combined with our algorithm, will heavily down-weight them to almost zero. We further speculate that these tokens are essential to improving the performance of our target fine-tuning task and that using \method with a \textit{token}-wise scheme over-regularizes, preventing any meaningful learning of the target task. As \textit{sequence}-wise re-weighting significantly outperforms \textit{token}-wise re-weighting, we recommend using \textit{sequence}-wise re-weighting in \method for language models. 
+
+\subsection{Extended Weight Averaging Results}
+\label{app:extended-wa-results}
+
+As discussed in \cref{sec:results}, we further combine \method with WiSE-FT to mitigate the effects of catastrophic forgetting when fine-tuning. In this section, we report the full results of combining \method and WiSE-FT to prevent catastrophic forgetting with Gemma 2 2B.
+
+\begin{figure*}[h!]
+    \centering
+    \begin{tabular}{c@{\hspace{-2mm}}c@{\hspace{-2mm}}c}
+        \includegraphics[width=0.3\textwidth]{Figures/gemma_wiseft/ncommonsense_plot.png} &
+        \includegraphics[width=0.3\textwidth]{Figures/gemma_wiseft/mmlu_plot.png} &
+        \includegraphics[width=0.3\textwidth]{Figures/gemma_wiseft/mbpp_plot.png} \\
+        \noalign{\vspace{-3mm}} % Reduce vertical space
+        \includegraphics[width=0.3\textwidth]{Figures/gemma_wiseft/arc_e_plot.png} &
+        \includegraphics[width=0.3\textwidth]{Figures/gemma_wiseft/arc_c_plot.png} &
+        \includegraphics[width=0.3\textwidth]{Figures/gemma_wiseft/hellaswag_plot.png} \\
+        \noalign{\vspace{-3mm}} % Reduce vertical space
+        \includegraphics[width=0.3\textwidth]{Figures/gemma_wiseft/piqa_plot.png} &
+        \includegraphics[width=0.3\textwidth]{Figures/gemma_wiseft/siqa_plot.png} &
+        \includegraphics[width=0.3\textwidth]{Figures/gemma_wiseft/obqa_plot.png} \\
+        \noalign{\vspace{-3mm}} % Reduce vertical space
+    \end{tabular}
+    \caption{\textbf{\methodbold is complementary with model averaging (WiSE-FT) in language modeling.} We compare WiSE-FT \citep{wortsman2021robust} with a standard model fine-tuning and with \method after fine-tuning Gemma 2 2B on MetaMathQA. We use varying $\alpha \in [0,1]$ for WiSE-FT. The results indicate that combining Wise-FT with \method outperforms vanilla WiSE-FT with standard fine-tuning. }
+    \label{fig:wiseft-and-ours-lang}
+\end{figure*}
+
+\end{document}

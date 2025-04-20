@@ -1,0 +1,207 @@
+% \newpage
+\begin{appendix}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+\section{Bugs Due to Generic Type Conversion} \label{sec:appendixB}
+
+
+We demonstrate these three types of type conversion bugs using an example.
+The bugs are discovered from \texttt{lmdb-rs} package~\cite{lmdb-rs2023}, which is a package providing API bindings to the LMDB (Lightning Memory-Mapped Database) library. 
+In Listing~\ref{listing:motivation_example}, we showcase an implementation of \texttt{from\_mdb\_value} function defined in the \texttt{FromMdbvalue} trait. 
+The primary functionality of this code snippet is to convert a reference of \texttt{MdbValue} into another type \texttt{\$t}.
+The type conversion is performed using \texttt{transmute} at line 4, which is included in \texttt{unsafe}. 
+The function \texttt{new\_from\_size} (line 9) is used to create a new object \texttt{MdbValue} from the reference of generic type \texttt{T}. 
+Therefore, the users of the package can create input for \texttt{from\_mdb\_value} with \texttt{new\_from\_size} function.
+All type conversion bugs occur in \texttt{from\_mdb\_value} function because of the problematic type conversion.
+
+
+
+
+
+
+\begin{lstlisting}[
+language=rust, 
+style=lst,
+caption=The vulnerabilities in \texttt{lmdb-rs} package~\cite{lmdb-rs2023}.,
+label=listing:motivation_example,
+mathescape=false]
+// lmdb-rs/src/traits.rs
+impl FromMdbValue for $t {
+  fn from_mdb_value(value: &MdbValue) -> $t {
+    unsafe { *transmute(value.get_ref()) }
+  }
+}
+// lmdb-rs/src/core.rs
+#[inline]
+pub fn new_from_sized<T>(data: &'a T) -> MdbValue<'a> {
+  unsafe { MdbValue::new(transmute(data), 
+           size_of::<T>())}
+}
+\end{lstlisting}
+
+
+
+
+\begin{lstlisting}[
+language=rust, 
+style=lst,
+caption=Exploit that trigger bug type I.,
+label=listing:exploit_bug1,
+mathescape=false]
+fn main() {
+  let a: i32 = 3;
+  let mdbval = MdbValue::new_from_sized(&a);
+  let res = i64::from_mdb_value(&mdbval);
+  println!("{:?}", res);
+}
+\end{lstlisting}
+
+
+\vspace{0.05in}
+\noindent\textbf{Type I: \Bone bug.} 
+The first type of bug occurs when reinterpreting the type of the source object in memory to another type with a larger alignment.
+In the exploit code of Listing~\ref{listing:exploit_bug1}, we define and initialize an \texttt{i32} variable \texttt{a}, and convert it into \texttt{i64} using \texttt{from\_mdb\_value} defined in Listing~\ref{listing:motivation_example}, which would cause the misalignment issue.
+The data is aligned only if it is stored at an address that is a multiple of the type's alignment bytes. Most primitive types (e.g., u8 and u32 in this case) are aligned to their size. For example, a 32-bit integer (\texttt{i32}) should be stored at the memory address that is a multiple of 4. However, the starting address of \texttt{i32} may not be a multiple of 4, hence accessing a misaligned object can results in undefined behavior. In this case, a misaligned pointer dereference (Line 5 in Listing~\ref{listing:motivation_example}) would cause runtime panic.
+Generally, such undefined behaviors in architectures that do not support unaligned access (e.g., before ARMv5) would cause the program to crash.
+
+
+\vspace{0.05in}
+\noindent\textbf{Type II: Inconsistent layout bug.}
+In Listing~\ref{listing:exploit_bug2}, the second type of bug occurs when reinterpreting the uninitialized area of the source object in memory. We define a struct \texttt{Padding} (line 3) and instantiate an object \texttt{la} (line 5), and then convert it into an \texttt{i32} primitive object \texttt{res}. It looks like the source and target objects share the same size (\texttt{u8}+\texttt{u16}+\texttt{u8}=\texttt{i32}), but there will be padding bits among each member variable in the struct for alignment. In this case, member \texttt{b}'s size is 16 bits (\texttt{u16}); thus, there will be 8-bit padding for both \texttt{a} and \texttt{c}. These paddings are uninitialized areas in memory, which would trigger the undefined behavior when \texttt{transmute()} accesses them. 
+Besides, a further dangerous issue is the unknown padding layout in Rust. Different from the struct padding rule in C (i.e., \texttt{repr(c)}), which usually adds padding bits at the end of the struct, Rust has no guarantees of data layout made by the default representation (\texttt{repr(rust)}). That means the compiler can do whatever it wants to reorder fields based on access patterns. A possible rule in practice is to organize by field size to minimize padding. Therefore, the location of padding is random and may cause data exposure.
+
+
+
+
+\begin{lstlisting}[
+language=rust, 
+style=lst,
+caption=Exploit that trigger bug type II.,
+label=listing:exploit_bug2,
+mathescape=false]
+#[repr(align(2))]
+#[derive(Copy, Clone, Debug)]
+struct Padding { a: u8, b: u16, c: u8 }
+fn main() {
+  let la = Padding { a: 10, b: 11, c: 12 };
+  let mdbval = MdbValue::new_from_sized(&la);
+  let res = i32::from_mdb_value(&mdbval);
+  println!("{:?}", res);
+}
+\end{lstlisting}
+
+
+
+
+\begin{lstlisting}[
+language=rust, 
+style=lst,
+caption=Exploit that trigger bug type III.,
+label=listing:exploit_bug3,
+mathescape=false]
+fn main() {
+  let a: i32 = 3;
+  let mdbval = MdbValue::new_from_sized(&a);
+  let res = bool::from_mdb_value(&mdbval);
+  println!("{:?}", res);  // illegal boolean type
+
+  let arr = [1u8; 2];
+  println!("{:?}", arr[res as usize]); // OOB index
+}
+\end{lstlisting}
+
+
+\vspace{0.05in}
+\noindent\textbf{Type III: Mismatched scope bug.} The third bug type happens when the value of the source object exceeds the bit-pattern range of the target type. The bit pattern refers to the raw binary representation of data in memory. In the case of Listing~\ref{listing:exploit_bug3}, we convert an \texttt{i32} variable into the \texttt{bool} type. However, the \texttt{i32} has $2^{32}$ bit-patterns while the boolean type has only 2 bit-patterns (\texttt{false/true}). The value \texttt{false} has the bit pattern \texttt{0x00} and the value \texttt{true} has the bit pattern \texttt{0x01}. Hence, an undefined behavior would occur if an \texttt{bool} object represents any other bit pattern.
+Moreover, even the conversion between same-sized types may suffer such an issue. For example, the \texttt{string} type in Rust only supports UTF-8 encoding that includes $(2^8-2)$ unit characters. When we convert an \texttt{u8} ($2^8$ bit-patterns) into \texttt{string} type, the undefined behavior can also be triggered if the value of source object is 254 or 255. 
+The third bug can also be exploited to trigger the Out-Of-Bound memory access (OOB). Originally, the compiler always inserts the bound check to protect us from the OOB vulnerability. When the compiler assumes that type has legal value and removes the unnecessary bound check, OOB can be triggered (see line 8).
+
+
+
+\section{Root Cause of Type Confusion Bugs} \label{evaluation:rootcause}
+% \xz{do you know \Bug (macro) bugs are repetitive?}
+Based on \autoref{top1k-zerodays}, we summarize the root cause of \bugs we have found in two phases: First, we discuss how developers make mistakes based on type conversion patterns. 
+Second, we study the error-prone methods of {\bf \BC{1}} Conversion and {\bf \BC{2}} Access, specifically on usages of \texttt{unsafe} functions.
+% \noindent \textbf{Error-Prone Type Conversion.} \label{evaluation:observation} 
+
+
+\vspace{0.05in}
+\noindent{\bf Con $\rightarrow$ Con}.
+{{TypePulse identifies more type confusion bugs in the concrete type conversion from the top 3,000 packages.} In concrete type conversion, we highlight the causes of \bone bugs since its number ({21}) is much more than the others ({10} on \btwo bugs and {6} on \bthree bugs). 
+We consider the root cause to be the lack of alignment awareness. 
+We can also find that developers 
+% \xz{change to developer, globally} 
+suppress the warnings of alignment from Clippy\cite{clippy}.
+While some developers consider the impacts of misalignment are minor since most operating systems nowadays can tolerate the unaligned memory access, we have discovered an issue that can cause to crash (see \autoref{evaluation:sec-impacts})}.
+
+\vspace{0.05in}
+\noindent{\bf Gen $\rightarrow$ Con.}
+{ In the type conversion $Gen \rightarrow Con$, we have discovered more \btwo bugs (15) than the others (2 on \bone bugs and {4} on \bthree bugs). 
+Based on our observation, the developers usually consider the input types that initialize the generic type have a stable memory layout and consequently initialized.
+For example, the function \texttt{as\_byte\_slice} is always used to convert the generic type into the slice of \texttt{u8}, leading to uninitialized memory exposure}.
+
+\vspace{0.05in}
+\noindent{\bf Con $\rightarrow$ Gen.}
+{For bugs related to type conversion $Con \rightarrow Gen$, we find that developers have tried to limit the input types by adding the size check, ensuring the memory layout to be stable. However, the size check is not sufficient to check the alignment and the validity of types.
+Nevertheless, we still consider that the developers of the top 3,000 packages provide more protection in this type conversion, leading to the least number ({14}) of bugs compared to the others ({37} in Con $\rightarrow$ Con and {21} in Gen $\rightarrow$ Con)}. 
+% While we randomly pick several packages which have lower ranks than the top 3k, we find more bugs caused by the type conversion on generic types without any limitations.
+
+\vspace{0.05in}
+\noindent{\bf \BC{1} Conversion.}
+For the methods used for type conversion, we find that developers make more mistakes with \texttt{as} than \texttt{transmute}. 
+We assume that developers tend to use \texttt{as} more commonly since \texttt{transmute} is a \texttt{unsafe} function itself while \texttt{as} is not, 
+but they are not aware that \texttt{as} can also create 
+problematic types,  
+even if it is a \texttt{safe} function.
+% as \texttt{transmute} does.
+Since we find fewer numbers of \bthree bugs than the other two types of bugs, we consider that the maintainers of the top 3,000 packages are more experienced in avoiding this kind of bug. To support our conjecture, we randomly pick 10 more packages that are not ranked in the top 3,000 and find 6 more \bthree bugs. The bug discovered in \texttt{lmdb-rs} package is one of the examples (see~\autoref{sec:appendixB}).
+
+\vspace{0.05in}
+\noindent{\bf \BC{2} Access.}
+We also study the \texttt{unsafe} usages of problematic types which could trigger the bugs, and separate them into three categories. 
+First, type conversion can cause bugs when developers try to build a slice or vector with unsafe functions such as \texttt{from\_raw\_parts}. 
+Second, \textit{dest} is a raw pointer type, and the developers try to dereference the raw pointer. The purpose of raw pointer dereference can be separated into two kinds: a) overwrite the value stored at the memory address and b) dereference the raw pointer to rebuild the reference. 
+Third, developers try to use \texttt{transmute} between references, which is dangerous and might break the safety guarantee of reference.
+
+
+
+\end{appendix}

@@ -1,0 +1,593 @@
+
+\section{Approach}
+\label{sec:approach}
+
+
+% \begin{itemize}
+%     \item Static Analysis/Data flow/Control flow/Taint analysis/Program Dependency Graph -- Program analysis
+%     \item State consistency mechanism / rollback mechanism -- Program Slicing -- Code Generation
+%     \item Invariant specification -- Formal verification.
+% \end{itemize}
+
+\subsection{Overview}
+\Cref{fig:overview} illustrates the workflow of \tool, an LLM-driven fine-grained program partitioning framework for smart contracts. \tool processes smart contracts annotated with \secrete variable information, ultimately producing partitioned contracts. These partitions isolate privileged statements into dedicated subordinate functions, separating them from normal statements.
+At a high-level overview,
+\tool breaks a contract function into two smaller parts--one for normal statements while the other for privileged statements related to operations on \secrete variables.
+\tool encompasses seven steps.
+\textcircled{1} \textbf{Locate} will employ taint analysis to identify critical functions containing privileged statements.
+For each function, 
+\textcircled{2} \textbf{Slice} will yield two program slices according to privileged statements and these slices will be one of prompt parameters for partition generation within \textcircled{3} \textbf{Iterative Loop} for each function.
+In detail, \textcircled{4} \textbf{Generate} harnesses LLM by incorporating the aforementioned program slices and using a few  examples as the seed, thus tailoring the code refactoring process for partition purpose. 
+Syntactically incorrect code alerted by compilers can be revised by LLM with concrete compiler feedback in~\textcircled{5} \textbf{Revise}.
+Next, syntactically correct code will be analyzed to determine whether the program is securely partitioned or not in \textcircled{6} \textbf{Validate} using an effective detection rule.
+If it is insecurely partitioned, the current program partition should be repaired.
+Therefore, we regenerate the program partitions taking the current program partition as bad example.
+For all the compilable and likely secure partitions, we perform \textcircled{7} \textbf{Weighted Selection} to choose the top-K partition candidates.
+We develop a dedicated prover to conduct equivalence checking between the original and the post-partition function code.
+Consequently, the correctness of all the resulting program partitions are formally verified and \tool outputs \emph{compilable}, and \emph{verified} program partitions for smart contracts.     
+% \wei{If using a simple example here, it may be better and more clear.} 
+\begin{figure*}[h]
+    \centering
+    \includegraphics[width=.8\linewidth]{figure/Overview.pdf}
+    % \vspace{-25pt}
+    \caption{The overview of \tool.}
+    \label{fig:overview}
+\end{figure*}
+
+\subsection{Identification of Sensitive Functions}
+\label{sec:identification}
+
+\begin{algorithm}[t]
+    \caption{Identify Sensitive Functions and Statements}\label{algo:identify}
+    \begin{algorithmic}[1]
+        \Require $\mathcal{V}$, a set of sensitive state variables of smart contract. 
+        \Require $PDGs$, a set of program dependence graphs.
+        \Ensure $\mathcal{F}$, a set of sensitive functions; $\Delta$, a set of sensitive program statement nodes.
+        \State $sinkNodes \gets \emptyset$ \Comment{Initialize sink nodes} \label{sink:start}
+        \For{$v \in \mathcal{V}, (f, pdg) \in PDGs$}
+            % \For{$(f, pdg) \in PDGs$}
+                \For{$node \in pdg$}
+                    \If{$\exists\; var\_rw \in \text{node.rwVars}, \textsc{isDependent}(v, var\_rw, pdg)$} \label{check:cond1}
+                        \State $sinkNodes \gets sinkNodes \cup \{node\}$ \label{sink:update}
+                        \State $\mathcal{F} \gets \mathcal{F} \cup \{f\}$ \label{sensitive:update1}                      
+                    \EndIf
+                \EndFor
+            % \EndFor
+        \EndFor \label{sink:end}
+        \State $srcNodes \gets \emptyset$ \Comment{Initialize source nodes} \label{source:start}
+        \For{$sink \in sinkNodes$}
+            \For{$var\_rd \in \text{sink.readVars}, (f, pdg) \in PDGs$}
+                % \For{$(f, pdg) \in PDGs$}
+                    \For{$node \in pdg$}
+                        \If{$\exists\; var\_wrt \in \text{node.writeVars}, \textsc{isDependent}(var\_wrt, var\_rd, pdg)$} \label{check:cond2}
+                            \State $srcNodes \gets srcNodes \cup \{node\}$ \label{source:update}
+                            \State $\mathcal{F} \gets \mathcal{F} \cup \{f\}$ \label{sensitive:update2}                      
+                        \EndIf
+                    \EndFor
+                % \EndFor
+            \EndFor
+        \EndFor \label{source:end}
+        \State $\Delta \gets sinkNodes \cup sourceNodes$ \Comment{All sink and source nodes are privileged}
+        \State \Return $\mathcal{F}$, $\Delta$ 
+\end{algorithmic}
+\end{algorithm}
+
+Identifying critical functions is a key step in \tool's workflow, as it ensures the accurate isolation of sensitive statements.
+%  This process involves three components: annotation source, program dependence graphs (PDGs) construction, and taint analysis.
+% \paragraph{Annotation source}
+% Annotations serve as the foundation for identifying \secrete variables in smart contracts. 
+Developers manually specify privacy annotations, marking \secrete variables that are considered privileged~\cite{zdancewic2002secure}. 
+These annotations guide the taint analysis and subsequent partitioning process, ensuring a focus on protecting critical data.
+% \paragraph{PDG construction}
+Moreover,
+program dependence graphs (PDGs) are constructed to capture the dependencies between statements in smart contracts. 
+The PDGs comprise control dependencies, representing the flow of control, and data dependencies, which highlight interactions between variables. 
+% By structuring the contract's logic in this graph form, \tool enables precise identification of all the privileged operations tied to \secrete variables.
+The construction of PDGs is straightforward and quite standard, and readers could refer to~\cite{liu2017ptrsplit} in which PDG construction is detailed for program partitioning. 
+% \paragraph{Taint analysis}
+% Source code-level taint analysis is applied to traverse the PDG and locate functions that handle \secrete variables. 
+% Starting from annotated variables, the analysis propagates taint across data dependencies. 
+% Functions containing statements influenced by tainted variables are marked as sensitive. 
+% This step ensures a thorough identification of all code regions requiring privilege separation, forming the foundation for subsequent slicing and partitioning.
+\Cref{algo:identify} shows the taint analysis algorithm used to identify sensitive functions and sensitive program statement nodes.
+\Cref{algo:identify} takes the user-provided sensitive state variables and constructed PDGs as input.
+We perform forward analysis to recognize all the sink nodes (\Cref{sink:start} to \Cref{sink:end}) by enumerating each sensitive variable and each node of every PDG for different functions.
+We use \textsc{isDependent} to indicate the data dependencies between any two variables along the PDG, while for each node, \textit{readVars}, \textit{writeVars}, and \textit{rvVars} represent the read variables, the written variables, and their combinations, respectively.
+When the sensitive variable has a data flow to a variable that the node reads or writes (\Cref{check:cond1}), 
+% \wei{it is better to state the functions, rwVars, ISDEPENDENT, writeVar, readVars.}
+we mark it as a sink node (\Cref{sink:update}) and sensitive functions will be updated accordingly (\Cref{sensitive:update1}).
+Additionally, we perform backward analysis to recognize all the source nodes (\Cref{source:start} to \Cref{source:end}) by revisiting all the variables that sink nodes read and the PDGs for different functions.
+When a node has a data flow to a variable that the sink node reads (\Cref{check:cond2}),
+we mark it as a source node (\Cref{source:update}) and sensitive functions will be updated accordingly (\Cref{sensitive:update2}).
+
+Note we also have some limitations for the range of sensitive data variables.
+Solidity smart contracts could have composite data types like structure of which some member variables may be sensitive.
+To eliminate the complexity of data type splitting, we also label the corresponding composite data variables as sensitive, although it may result in a slightly larger set of sensitive operations. 
+
+
+\subsection{Program Slicing and Partitioning}
+
+% \paragraph{Problem Formalization}
+
+% \paragraph{High-quality Program Partitions. Trade-off between optimal program partitions and developer efforts.}
+
+To employ the in-context learning capability of LLMs, \tool necessitates that contract functions are sliced based on privileged, i.e., sensitive statements, in order to generate high-quality program partitions that probably preserve the confidentiality and semantic integrity of original code.
+
+Here, we formulate program slicing process and the constraints of slicing-based partition.
+
+\begin{definition}{\textbf{Program Slicing}.}
+Given a contract function $f = (\mathcal{S},\; \preceq_{control},\; \preceq_{data})$, $\mathcal{S}$ indicates the set of all program statement nodes. $\mathcal{S} = \{entry,\; \cdots,\; exit\}$ includes the input-related entry point and return-related exit point(s) of function. The two relations $\preceq_{control}$ and $\preceq_{data}$ represent the partial order between nodes in terms of control and data flow, respectively. For instance, $\exists\; a, b \in \mathcal{S}, a \preceq_{control} b$ delineates that $a$ is control-dependent on $b$, while $a \preceq_{data} b$ implies that $a$ is data-dependent on $b$.
+Note we assume $\forall a$, $a \preceq_{control/data} a$ always holds.
+Let $\Delta$ be the privileged nodes related to operations on \secrete variables, and $\Delta \subseteq \mathcal{S}$.
+The program slice for privileged nodes can be defined as:
+\begin{align}
+    f\downharpoonright \Delta &= (\mathcal{S}',\; \preceq_{control},\; \preceq_{data}) \quad w.r.t. \nonumber\\
+    &\quad \mathcal{S}'= \{a \;| \forall\,  a \in \mathcal{S}, \exists\, b \in \Delta\;  
+     \; (b \preceq_{control/data} a) \} \nonumber
+\end{align}
+where the program slice for non-privileged nodes $\overline{\Delta} = \mathcal{S}\setminus\Delta$, i.e., $f\downharpoonright \overline{\Delta}$, is defined similarly.
+\end{definition}
+
+
+
+\begin{definition}{\textbf{Slicing-based Program Partitioning}.} \label{def:partition}
+We partition $f$ into two parts denoted as $f'_{public}$ and $f'_{priv}$.
+To orchestrate the execution between the two function units,
+a special statement node, denoted as \texttt{priv\_invoke} is added to $f'_{public}$ that will trigger the execution of $f'_{priv}$. 
+For simplicity, let $\mathcal{S}_{public}$ be the statement nodes of $f'_{public}$ and $\mathcal{S}_{priv}$ for $f'_{priv}$. Note \texttt{special\_invoke} $\in \mathcal{S}_{public}$.
+The program partitioning problem can be abstracted and defined as: 
+\begin{align}
+    &\forall a \in \mathcal{S}_{public}, \; a\in \overline{\Delta} \label{eq:inclusion} \\ 
+    &\forall a,b \in \mathcal{S}_{priv}, \;  (a \preceq b)_{f'_{priv}} \implies (a \preceq b)_{f\downharpoonright {\Delta}} \label{eq:imply_one} \\ 
+    &\forall a,b \in \mathcal{S}_{public}, \;  (a  \preceq b)_{f'_{public}} \implies (a \preceq b)_{f\downharpoonright \overline{\Delta}} \label{eq:imply_two} \\ 
+    &\forall a \in \mathcal{S}_{public}, b \in \mathcal{S}_{priv},\;\nonumber\\ 
+   &(a \preceq b)_{f} \implies (a \preceq \texttt{priv\_invoke})_{f'_{public}} \land ({exit} \preceq b)_{f'_{priv}}   \nonumber \\
+   &\textbf{and}\;\label{eq:imply_three}\\ 
+   &(b \preceq a)_{f} \implies (\texttt{priv\_invoke} \preceq a)_{f'_{public}} \land (b \preceq entry)_{f'_{priv}} \nonumber 
+\end{align}    
+where $\preceq$ represents $\{\preceq_{control}, \preceq_{data}\}$, $(\cdot \preceq \cdot)_x$ refers to the partial order of control or data flow for a given function/slice $x$.     
+\end{definition}
+
+% \ye{TODO: Need to check the Correctness of this formula in the partitioning definition.}
+
+\Cref{eq:inclusion} expresses the security constraints where privileged statement nodes cannot be included in the public part $f'_{public}$.
+\Cref{eq:imply_one} and \Cref{eq:imply_two} assure the local integrity of control and data flow in $f'_{public}$ and $f'_{priv}$, respectively.
+In contrast, \Cref{eq:imply_three} examines the inter-procedure data or control flow integrity between $f'_{public}$ and $f'_{priv}$.
+During program partitioning, we highlight that the data flow from $f'_{public}$ to $f'_{priv}$ permits only the user-provided parameters. 
+
+Wu et al.~\cite{wu2013automatically} have shown that the fine-grained program partitioning is NP-hard because it can be translated into the multi-terminal cut problem, which is a typical NP-hard problem.
+With an impressive capability of in-context learning, LLMs can adapt to diverse coding styles and complex contexts, offering more nuanced and context-aware suggestions~\cite{shirafuji2023refactoring}. 
+In this work, we leverage the capability of in-context learning of LLMs to effectively search for valid program partitions.
+
+\begin{figure*}[t]
+    \begin{tcolorbox}[title=Generation/Repairing Prompt for Program Partitions]
+Suppose you are an expert developer for Solidity smart contracts. There is a code transformation task of smart contract function ([function code to be partitioned]) where two program slices, i.e., the normal and privileged slices ([normal slice] and [priviledged slice]), have been given. \\
+In our slicing, slicing critera are a sequence of program statements that are labelled privileged ([privileged statements]). \\
+Your job is to transform the original contract function to a new variant encompassing these two program slices. The new function variant MUST be functionally equivalent with the original one.
+\tcbline
+\text{[function code to be partitioned]}: \blue{\{func\_code\}}       \\
+\text{[privileged statements]}: \blue{\{privilege\_stmts\}}   \\
+\text{[normal slice]}: \blue{\{slice\_normal\}}                    \\
+\text{[priviledged slice]}: \blue{\{slice\_priv\}}
+\tcbline
+\blue{Bad partition output: // default is null} \\
+\text{[one unsecure partition]}: \blue{\{unsecure\_partition\_result\}}       \\
+\text{[explanation]}: \blue{\{unsecure\_reason\}}       
+\tcbline
+Please STRICTLY follow the below actions step by step: \\
+1. MUST identify all the privilege statements including conditional checks shared between the two program slices.\\
+2. MUST base on the provided privileged and normal slice for creating new sub functions. Privileged slice-based sub function in the form of ``XXX\_priv`` contains all the identified privileged statements. If priviledged functions need to yield return value, there must be a normal callback function in the form of ``XXX\_callback`` to process the return value. If there are normal statements to execute after the priviledged sub function, there must be a normal callback function in the form of ``XXX\_callback`` to process the normal statements.\\
+3. NOTE if modifier statements contain privileged statements, then modifier statements MUST be included in the privileged sub function.\\
+4. TRY to reduce those normal, i.e., non-privileged, statements in privileged sub functions as many as possible.\\
+5. All the resulting code MUST satisfy the grammar of Solidity programming language.
+\tcbline
+You MUST output all the result in plain text format.\\
+Only output the transformed contract code, and avoid unnecessary text description.
+
+\end{tcolorbox}
+    
+\caption{The prompt for generating/repairing program partitions.}
+\label{fig:partitionprompt}
+\end{figure*}
+
+\begin{figure*}[t]
+\begin{tcolorbox}[title=Grammar-Fix Prompt for Program Partitions]
+You are an expert Solidity developer. Your task is to fix grammar errors ([compiler error message]) in the given Solidity smart contract code ([incorrect code]) while ensuring the logic and functionality remain intact. 
+\tcbline
+\text{[incorrect code]}:\blue{\{input\_code\}}       \\
+\text{[compiler error message]}:\blue{\{error\_msg\}}      
+\tcbline
+All the resulting code MUST satisfy the grammar of Solidity programming language.\\
+MUST Output only the Fixed Code: Provide the corrected Solidity code in proper format, and Avoid unnecessary text description.
+\end{tcolorbox}
+    
+\caption{The prompt for fixing grammar errors of program partitions.}
+\label{fig:fixprompt}
+\end{figure*}
+\subsection{LLM-driven Fine-grained Partitioning}
+The process of fine-grained program partitioning in \tool leverages the power of LLMs to transform smart contract functions into securely partitioned variants. Using a carefully designed prompt (\Cref{fig:partitionprompt}), \tool guides the LLM by preprocessing a function into two slices: the normal slice, containing non-sensitive statements, and the privileged slice, encompassing operations related to sensitive data variables. 
+\tool's partitioning ensures that privileged operations are isolated from normal execution, creating a secure and modular structure within the smart contract.
+
+The LLM performs this Solidity-to-Solidity transformation by strictly adhering to the guidelines provided in the prompt. 
+In the partition result, privileged partition encapsulates privileged operations in a dedicated function (e.g., XXX\_priv).
+For non-privileged partition, while refactoring the entry function, necessary callbacks (e.g., XXX\_callback) are also introduced to handle return values or continue execution of normal statements for the purpose of higher modularity. 
+Modifier statements\footnote{In Solidity smart contracts, modifiers are often used to restrict user access of functions.} that include privileged operations will be incorporated into the privileged partition. 
+By doing so, the LLM minimizes the inclusion of non-privileged statements in the privileged partition, ensuring a clear separation of concerns and enhancing security.
+Note the privileged and non-privileged partition by \tool communicates with each other through function calls (e.g. \Cref{lst:partition}).
+Additionally, we also provide some (currently two) human-written program partitions for contract functions as the seed examples to direct the LLM for program partitioning.
+While these examples may be limited, we argue that our preliminary experiment found that without few examples, the resulting program partitions often deviate from the aforementioned structure requirements listed in the prompt.     
+
+In cases where the generated partition does not meet security requirements, the LLM undertakes iterative repairs, which is discussed in the next section. The prompt is updated to include the insecure partition and a detailed explanation of its shortcomings, enabling the LLM to refine its output. This iterative process continues until a compilable and secure partition is produced. Through this LLM-driven approach, \tool achieves precise and reliable partitioning, ensuring that smart contracts are both robust and resistant to data leakage risks.
+% \paragraph{
+% Highlight finding the smallest program partitioning is an NP problem in terms of minimizing communication and the size of privilege code. 
+% In this work, we should devise an approach to approximate the optimal solution.
+% }
+
+Nevertheless, inaccuracy could exist in some partition results. 
+To mitigate this problem, for each subject function, \tool attempts to generate up to 10 partitions, where for each output code, \tool makes less than 10 tries to revise compilation error if available. 
+The resulting partitions will be ranked and selected to represent the \emph{appropriate} program partitions that developers are interested in.
+We will discuss the ranking process in~\Cref{sec:ranking} and illustrate one partition case in~\Cref{lst:partition} of \Cref{sec:illustration}.    
+
+
+
+\subsection{Revising and Repairing Program Partitions}
+% \rain{Should this be placed at the beginning? The preceding security checks need to refer to this.}
+The partition results by \tool may not be compilable because while partition generation seems straightforward for LLMs, it suffers from innate randomness to some extent. 
+Following the practice~\cite{grubisic2024compiler}, we leverage compiler feedback to revise the subject code.   
+
+The grammar-fix prompt shown in~\Cref{fig:fixprompt} is designed to leverage the expertise of LLMs to correct syntax errors in Solidity smart contract code, ensuring the output is grammatically valid while preserving the original logic and functionality. The prompt explicitly provides the incorrect code and corresponding compiler error messages, guiding the LLM to focus on specific issues without altering the program's intended behavior. By emphasizing strict adherence to Solidity grammar and requiring output in plain text without unnecessary explanations, the prompt ensures that the resulting code is concise, accurate, and ready for further validation.
+
+The compilable partition code will be validated to determine if the partition is secure.
+Recall that the correctness of program partitioning can be verified by the four equations (c.f. \Cref{eq:inclusion,eq:imply_one,eq:imply_two,eq:imply_three} of \Cref{def:partition}).
+In practicality, \Cref{eq:imply_one,eq:imply_two,eq:imply_three} are non-trivial to verify since LLMs could slightly modify original statement nodes for better clarity
+where new temporary variables and its related statements could be added, for which we leave such validation for equivalence checking in~\Cref{sec:verification} to derive robust guarantee.
+Fortunately, the security constraints expressed in \Cref{eq:inclusion} can be easily checked by syntactically examining if the public part of partition result contains any privileged statement node that has data flow into or out of the given \secrete variables.
+With this insight, we devise an effective detection rule based on \Cref{eq:inclusion} to discover insecure partitions or obtain \emph{likely} secure partitions.
+To repair the insecure partitions (c.f.~\Cref{fig:partitionprompt}), \tool will regenerate new program partitions until they satisfy the security constraints.   
+% \wei{In Section 3.3, we refer one euqation , using Equation (1) but here we use eq.(1).}
+
+\subsection{Ranking the Top-K Appropriate Program Partitions}
+\label{sec:ranking}
+Since optimal program partitions are usually subjective and hard to define,
+to avoid human bias, we leverage a weighted selection algorithm to select the appropriate program partitions which is usually time-consuming.
+{Specifically, we establish a fitness function to evaluate the candidates by considering the following factors:}
+\begin{itemize}[leftmargin=.5cm]
+\item $X(f, f')$: Edit distance between function $f$ and its partition result $f'$.
+\item $Y_{codebase}(f', f'_{priv})$: The ratio of codebase size of privileged part $f'_{priv}$ compared to the whole partition result $f'$.
+\item $Y_{codebase}(f'_{priv}, \Delta)$: The ratio of codebase size of privileged statements $\Delta$ compared to the whole privileged part $f'_{priv}$.
+\end{itemize}
+Note that we introduce $Y_{codebase}$ to cope with that granularity of partitioning could vary a lot for the same function code.
+We use $X(f, f')$ to reflect the edit distance that could estimate the efforts for developers to refactor the original code.
+
+Given an unknown code $f$, 
+we score  $f'$ using a weighted algorithm as below.
+ \begin{align}
+ 	Score(f, f') =& \alpha \times  X(f, f') + \beta \times  Y_{codebase}(f', f'_{priv}) + \nonumber\\
+    &\gamma \times  Y_{codebase}(f'_{priv}, \Delta) \nonumber
+ \end{align}
+where $\alpha$, $\beta$, $\gamma$ are coefficients and $\alpha + \beta + \gamma = 1$.
+%\wei{I am not sure if we should unify the symbols $f'_{priv}$  $f_{priv}$, $f'_{public}$  $f_{public}$ with Eq 1-4}
+%\ye{addressed}
+
+
+Let $\hat{f}$ be the human-written program partition result of $f$.
+To tune these coefficients,
+we train a linear regression model by approximating actual score $\hat{Score}(f, \hat{f})$ that is computed based on their text embedding similarity.
+We have conducted a primitive experiment on 1,267 program partitions generated by~\tool.
+Note these partitions are distinct from the evaluated partitions appearing in \Cref{tab:gen} of \Cref{sec:evaluation}.
+The results show $\alpha$:
+0.594, $\beta$: 0.192, and $\gamma$: 0.214 are aligned to human-written partitioned data. 
+% \wei{we should be careful here. We should claim that these hyperparameters are not tuned by our evalaution programs. One risk is that the reviewers say our method is overfitting. }\ye{Actually these program partitions are generated from same evaluation cases for tuning the parameter purpose. The partition experiments of RQ1 use the same cases but are different runs of \tool. Should think how to address the potential problems.}\wei{Maybe we can blur this point but in a correct way if it actually will not affect the fairness of the evaluation like ``The coeficients are aligned to huamn partitioned data''.} 
+As a result, all the program partitions will be sorted in descending order, and we believe that the program partitions of higher rank are likely to be the high-quality program partitions.
+\begin{figure*}[t]
+    \begin{multicols}{2} % Start of double-column layout
+        \begin{lstlisting}[basicstyle=\scriptsize,  numberstyle=\scriptsize, language=Solidity, caption={Original function code \textit{bid} of BlindAuction.}, label=lst:bid]
+function bid(uint64 value) external @\tikzmark{onlyBeforeEnd}@onlyBeforeEnd@\tikzmark{onlyBeforeEndend}@@\label{bid:start}@ 
+{
+  uint64 sentBalance;
+  @\tikzmark{block1start}@uint64 existingBid = bids[msg.sender];@\tikzmark{block1end}@
+  if (@\tikzmark{cond1start}@existingBid>0@\tikzmark{cond1end}@) {
+    @\tikzmark{block2start}@uint64 balanceBefore = tokenContract.balanceOf(address(this));
+    bool isHigher = existingBid < value;
+    uint64 toTransfer = value - existingBid;
+    uint64 amount = 0;
+    if (isHigher){
+      amount = toTransfer;
+    }
+    tokenContract.transferFrom(msg.sender, address(this), amount);
+    
+    uint64 balanceAfter = tokenContract.balanceOf(address(this));
+    sentBalance = balanceAfter - balanceBefore;
+    uint64 newBid = existingBid + sentBalance;
+    bids[msg.sender] = newBid;@\tikzmark{block2end}@
+   } else {
+    @\tikzmark{bidCounter}@bidCounter++;@\tikzmark{bidCounterend}@@\label{bidCounter:inc}@
+    @\tikzmark{block3start}@uint64 balanceBefore = tokenContract.balanceOf(address(this));
+    tokenContract.transferFrom(msg.sender, address(this), value);
+    uint64 balanceAfter = tokenContract.balanceOf(address(this));
+    sentBalance = balanceAfter - balanceBefore;
+    bids[msg.sender] = sentBalance;@\tikzmark{block3end}@
+  }
+  @\tikzmark{block4start}@uint64 currentBid = bids[msg.sender];
+  if (highestBid == 0) {
+    highestBid = currentBid;
+  } else {
+    bool isNewWinner = highestBid < currentBid;
+    if (isNewWinner)
+      highestBid = currentBid;
+  }@\tikzmark{block4end}@
+}
+    
+\end{lstlisting}
+\begin{tikzpicture}[remember picture,overlay]
+  \draw[academicred,thick,rounded corners]
+  ([shift={(-3pt,1ex)}]pic cs:block1start) 
+    rectangle 
+  ([shift={(3pt,-0.6ex)}]pic cs:block1end);
+  \node at ([shift={(6pt,-0.6ex)}]pic cs:block1end) {\color{academicred}{\textcircled{2}}};
+  \draw[academicred,thick,rounded corners]
+  ([shift={(-1pt,1ex)}]pic cs:cond1start) 
+    rectangle 
+  ([shift={(1pt,-0.6ex)}]pic cs:cond1end);
+  \node at ([shift={(20pt,0ex)}]pic cs:cond1end) {\color{academicred}{\textcircled{3}}};
+  \draw[academicred,thick,rounded corners]
+  ([shift={(-3pt,1ex)}]pic cs:block2start) 
+    rectangle 
+  ([shift={(115pt,-0.6ex)}]pic cs:block2end);
+  \node at ([shift={(6pt,-0.6ex)}]pic cs:block2end) {\color{academicred}{\textcircled{4}}};
+  \draw[academicred,thick,rounded corners]
+  ([shift={(-3pt,1ex)}]pic cs:block3start) 
+    rectangle 
+  ([shift={(95pt,-0.6ex)}]pic cs:block3end);
+  \node at ([shift={(6pt,-0.6ex)}]pic cs:block3end) {\color{academicred}{\textcircled{6}}};
+  \draw[academicred,thick,rounded corners]
+  ([shift={(-3pt,1ex)}]pic cs:block4start) 
+    rectangle 
+  ([shift={(200pt,-0.6ex)}]pic cs:block4end);
+  \node at ([shift={(6pt,-0.6ex)}]pic cs:block4end) {\color{academicred}{\textcircled{7}}};
+  \draw[academicblue,thick,rounded corners]
+    ([shift={(-3pt,1ex)}]pic cs:onlyBeforeEnd) 
+      rectangle 
+    ([shift={(3pt,-0.6ex)}]pic cs:onlyBeforeEndend);
+  \node at ([shift={(6pt,-0.6ex)}]pic cs:onlyBeforeEndend) {\color{academicblue}{\textcircled{1}}};
+  \draw[academicblue,thick,rounded corners]
+    ([shift={(-3pt,1ex)}]pic cs:bidCounter) 
+      rectangle 
+    ([shift={(3pt,-0.6ex)}]pic cs:bidCounterend);
+    \node at ([shift={(15pt,0.6ex)}]pic cs:bidCounterend) {\color{academicblue}{\textcircled{5}}};
+\end{tikzpicture}
+
+\begin{lstlisting}[basicstyle=\scriptsize, numberstyle=\scriptsize, language=Solidity, caption={Paritioned code by \tool.}, , label=lst:partition]
+/* Paritioned Code by @\tool@ */
+function bid(uint64 value) external onlyBeforeEnd 
+{
+  @\tikzmark{bida}@bool amountChanged=bid_priv(msg.sender, value);@\tikzmark{bidaend}@
+  @\tikzmark{bidb}@bid_callback(amountChanged);@\tikzmark{bidbend}@
+} 
+@\tikzmark{bidcallback}@function bid_callback(bool amountChanged) internal@\label{line:callback:start}@
+{
+  if (amountChanged) {@\label{line:stateChange:check}@  
+    // Increment bidCounter only for a new bid
+    bidCounter++; @\label{line:bidCounter}@
+  }
+} @\label{line:callback:end}@
+function bid_priv(address user, uint64 value) internal returns (bool) {@\tikzmark{bidpriv}@
+  uint64 existingBid = bids[msg.sender];
+  bool amountChanged = false; @\label{amountChanged:initialize}@
+  if (existingBid>0) {
+    uint64 balanceBefore = tokenContract.balanceOf(address(this));
+    ...;
+    bids[msg.sender] = newBid;
+    @\textcolor{academicred}{amountChanged = true;}@ // buggy assignment @\label{amountChanged:false}@
+  } 
+  else {
+    uint64 balanceBefore = tokenContract.balanceOf(address(this));
+    ...;
+    bids[msg.sender] = sentBalance;
+    amountChanged = true; @\label{amountChanged:true}@
+  }
+  uint64 currentBid = bids[msg.sender];
+  if (highestBid == 0) {
+    highestBid = currentBid;
+  } else {
+    bool isNewWinner = highestBid < currentBid;
+    if (isNewWinner)
+        highestBid = currentBid;
+  }
+  return amountChanged; @\label{amountChanged:return}@
+}  
+\end{lstlisting}
+\begin{tikzpicture}[remember picture,overlay]
+  \draw[academicred,dashed,thick,rounded corners]
+    ([shift={(-3pt,1ex)}]pic cs:bida) 
+      rectangle 
+    ([shift={(3pt,-0.6ex)}]pic cs:bidaend);
+  \draw[academicred,->,thick,bend left]
+    ([shift={(-3pt,-1ex)}]pic cs:bidaend) 
+    to
+    ([shift={(40pt,3ex)}]pic cs:bidpriv);
+  \draw[academicblue,dashed,thick,rounded corners]
+    ([shift={(-3pt,1ex)}]pic cs:bidb) 
+      rectangle 
+    ([shift={(3pt,-0.6ex)}]pic cs:bidbend);
+  \draw[academicblue,->,thick,bend right]
+    ([shift={(2pt,-1ex)}]pic cs:bidb) 
+    to
+    ([shift={(15pt,1ex)}]pic cs:bidcallback);
+\end{tikzpicture}
+
+\end{multicols}
+\end{figure*}
+
+
+\subsection{Illustration Example}
+\label{sec:illustration}
+We use a case study to illustrate how \tool generates program partitions.
+\Cref{lst:bid} lists the function code of \textit{bid} from an auction contract named \textit{BlindAuction} which is one of official examples provided in Solidity documentation~\cite{solidity}.
+Briefly speaking, \Cref{lst:bid} shows that user bids will be processed to update the current \texttt{highestBid} and \texttt{bidCounter}.
+When a user have ever put a bid in the auction, \texttt{bidCounter} will not be updated.
+In this auction contract, user bids stored in the data variable \texttt{existingBid} and the current highest bid \texttt{highestBid} are labeled as the \secrete variables.
+To partition this function,
+\tool first performs taint analysis to identify all the sensitive statements.
+As shown in~\Cref{lst:bid}, the \textcolor{academicred}{orange} code blocks \color{academicred}{\textcircled{2}}, \color{academicred}{\textcircled{3}}, \color{academicred}{\textcircled{4}}, \color{academicred}{\textcircled{6}}, \color{black}{and} \color{academicred}{\textcircled{7}} \color{black}{}encompass all the sensitive statements while the other statements, e.g., the invocation to modifier \texttt{onlyBeforeEnd} (\color{academicblue}{\textcircled{1}}\color{black}{} of \Cref{bid:start}) that checks if the auction ends and the increment of \texttt{bidCounter} (\color{academicblue}{\textcircled{5}}\color{black}{} of \Cref{bidCounter:inc}), belong to non-sensitive statements.  
+Next, we perform slicing according to the aforementioned sensitive statements, leading to two program slices.
+The privileged slice can be formalized as \color{academicblue}{\textcircled{1}} \color{academicred}{\textcircled{2}} \color{black}{}\textbf{if} \color{academicred}{\textcircled{3}} \color{black}{}\textbf{then} \color{academicred}{\textcircled{4}} \color{black}{}\textbf{else} \color{academicred}{\textcircled{6}} \color{black}{}\textbf{fi} \color{academicred}{\textcircled{7}},\color{black}{} while the normal slice is \color{academicblue}{\textcircled{1}} \color{academicred}{\textcircled{2}} \color{black}{}\textbf{if} \color{academicred}{\textcircled{3}} \color{black}{}\textbf{then} \{\} \color{black}{}\textbf{else} \color{academicblue}{\textcircled{5}} \color{black}{}\textbf{fi}.
+\color{black}{}The two slices preserve the execution integrity for either sensitive and non-sensitive statements, but are coupled with each other since they share \color{academicblue}{\textcircled{1}} \color{academicred}{\textcircled{2}} \color{black}{}\textbf{if} \color{academicred}{\textcircled{3}}.
+\color{black}{}To decouple these, we leverage LLM's in-context learning by instantiating the generation template (c.f.~\Cref{fig:partitionprompt}) with the original function code, identified sensitive statements, and computed normal and privileged slices.
+Finally, \tool yields one partition result as shown in \Cref{lst:partition}.
+This normal partition comprises two functions--the refactored \texttt{bid} and created \texttt{bid\_callback} functions while the privileged partition includes only one function called \texttt{bid\_priv}.
+Note that the refactored \texttt{bid} remains the entry function for users to trigger smart contract execution.
+As illustrated in \Cref{lst:partition},   
+to orchestrate the execution between the privileged part \texttt{bid\_priv} and the normal part \texttt{bid\_callback},
+\tool introduces new temporary flag variable \texttt{amountChanged} (\Cref{amountChanged:initialize}) and set the value in \Cref{amountChanged:false} and \Cref{amountChanged:true}.
+This flag variable will be returned (\Cref{amountChanged:return}) and when \texttt{amountChanged} is true (\cref{line:stateChange:check}), \texttt{bidCounter} will increase (\cref{line:bidCounter}).
+However, the value assignment in \Cref{amountChanged:false} (colored in \textcolor{academicred}{orange}) is wrong because users have already held a bid position that can be implied by the non-zero existing bid price, thus nonequivalent with the pre-partition function in~\Cref{lst:bid}. 
+This indicates that although LLM commands powerful in-context learning capability, precise semantic understanding may be challenging and external verification tools are essential to generate formal guarantee of correctness. 
+
+
+
+\section{Equivalence Checking}
+\label{sec:verification}
+The correctness of the resulting compilable and likely secure program partitions should be formally \emph{verified} against the original subject code. 
+To the best that we know, only one proprietary formal verification tool\footnote{https://docs.certora.com/en/latest/docs/equiv-check/index.html} provided by Certora~\cite{Certora} is able to perform equivalence checking between smart contract functions.
+However, their tool is closed-source and limited to only the comparison between two ``pure'' functions where a pure function cannot read and alter data variables of smart contracts\footnote{https://solidity-by-example.org/view-and-pure-functions/}.
+
+To address this problem, in this work, we develop a dedicated equivalence checker for smart contracts that verify the correctness of program partitions.
+Our equivalence checker comprise two steps. 
+First, we perform symbolic execution of any two different smart contract functions to gather all the possible execution paths.
+{Second, we apply two essential correctness criteria, focusing on the consistency of state changes and the accuracy of returned values, to evaluate the equivalence between the execution results of the two functions.}
+
+% \begin{algorithm}[h]
+%     \caption{State Change Consistency Checking}\label{algo:eqcheck}
+%     \begin{algorithmic}[1]
+%         \Require $\mathcal{V}$, the set of contract state variables. 
+%         \Require $f$, a pre-partition function; $f'$, a post-partition function of $f$.
+%         \Ensure $isEquivalent$, a boolean flag indicating equivalence or not.
+%         \State let $\delta_0$ represent the symbolic values of variables in $\mathcal{V}$. 
+%         \State $\Phi_f \gets \textsc{symExe}(f, \delta_0)$ \Comment{Perform symbolic execution and $\Phi_f$ is the set of all execution paths.} \label{symexe:f} 
+%         \State $\Phi_{f'} \gets \textsc{symExe}(f', \delta_0)$ \Comment{Perform symbolic execution and $\Phi_{f'}$ is the set of all execution paths.} \label{symexe:f'}
+%         \For{$v \in \mathcal{V}$}
+%             \State $p \gets False$ \label{check:init}
+%             \State $q \gets False$
+%             \For{$\phi \in \Phi_f$}
+%                 \State $p \gets p \lor ({\phi \implies v = \textsc{eval}(\phi, v)})$
+%             \EndFor
+%             \For{$\phi \in \Phi_{f'}$}
+%                 \State $q \gets q \lor ({\phi \implies v = \textsc{eval}(\phi, v)})$
+%             \EndFor \label{check:mid}
+%             \If{$\textsc{SAT}(\lnot(p \equiv q))$}  \label{check:start}
+%                 \State Report ``$f$ and $f'$ are not functionally equivalent on $v$'' \label{check:endstart}
+%                 \State \Return False \label{check:endend}
+%             \EndIf 
+%         \EndFor 
+%         \State \Return True 
+% \end{algorithmic}
+% \end{algorithm}
+% \subsection{Symbolic Execution}
+% The execution of smart contracts relies heavily on persistent states stored on the blockchain, transaction environment data, and specific contract statements. These persistent states consist of contract state variables, while transaction messages include details such as the caller, callee, method invoked, and block timestamp. To model this execution, each contract statement is represented as a Hoare triple ${\delta}; s; {\delta'}$, capturing the program states before ($\delta$) and after ($\delta'$) execution. Unlike traditional programs, smart contracts do not crash; unexpected behaviors trigger transaction reversions, leaving the contract state unchanged. Although such reversions can impact availability (e.g., denial of service), they do not generally compromise safety and are thus excluded from our analysis. To conduct strongest postcondition analysis, we employ a source-level symbolic execution tailored to the Solidity language, which implements comprehensive small-step semantics~\cite{jiao2020semantic}.
+% For more details, readers can refer to the previous works~\cite{liu2024propertygpt,lin2022solsee}.
+
+% We highlight that we leverage modular verification to prove the equivalence.
+% During modular verification, we lift all state constraints by making all state variables symbolic.
+% Correctness can be safely ensured when the equivalence checking properties hold accordingly.
+% \subsection{Equivalence Criteria}
+% In general, equivalence between two programs are undecidable.
+% Nevertheless, in the field of program partitioning, typically new functionality is not allowed to be added so that we can verify the functional equivalence between pre-partition and post-partition programs.
+
+% The criteria of equivalence checking for smart contract functions are defined by two grounded properties: 
+% \begin{itemize}
+%     \item \textbf{State Change Consistency}. Given the same input, the state change of the pre-partition function is same as that of the post-partition function.
+%     \item \textbf{Return Value Consistency}. Given the same input, the return value of the pre-partition function is same as that of the post-partition function.
+% \end{itemize}
+% Note that we do not include consistency property about transaction reversion because if a function execution is roll backed due to transaction reversion, contract state remains unchanged, which can be indirectly implied by state change consistency. 
+% % \subsection{Symbolic Execution}
+
+% \Cref{algo:eqcheck} shows the algorithm for checking state change consistency.
+To perform the checking for state change consistency, we assemble all the collected symbolic execution paths for two contract functions.
+Next, for each program, the evaluation of every state variable along all the execution paths will be conjunct and then be checked against the others using SAT solvers like Z3~\cite{de2008z3}.
+We will raise functionally nonequivalent report if the checking fails.
+The checking of return value consistency is similar, and we elide it to save space.
+When state change and return value consistency remain true, the correctness of program partition is successfully verified.
+
+We highlight that we leverage modular verification to prove the equivalence.
+During modular verification, we lift all state constraints by making all state variables symbolic.
+Correctness can be safely ensured when the equivalence checking properties hold accordingly.
+
+% \paragraph{Integrity of Control Flow}
+% Control flow integrity \cite{abadi2009control}.
+
+% First,  control flow automaton of a contract function is used to protect the switch between a function partition running in normal world and the privileged function partition within TEE enclave.
+
+
+
+% \begin{algorithm}[t]
+% \small 
+% \caption{Dynamic Placement of Run-time CFI Checks}
+% \textbf{Input:} $Q$, $\Delta$, $f_{priv} = (\Delta_1,\; \preceq_{cf},\; \preceq_{df})$, $f_{normal} = (\Delta_2,\; \preceq_{cf},\; \preceq_{df})$ \Comment{privileged and normal slices}\\
+% \textbf{Output:} $\widehat{f_{priv}}$, $\widehat{f_{normal}}$ \Comment{instrumented privileged and normal slices}
+% \begin{algorithmic}[1]
+% \State $CF\_reports = \emptyset$
+% \State $CF\_checks = \emptyset$
+% \State $\Delta_2 \gets \Delta_2 \setminus \Delta_1$ \Comment{eliminate all statements shared.}
+% \State $\Phi \gets$ \textsc{FindEquivalenceClass}($\Delta, \preceq_{cf}$)
+% \For{$\phi \in \Phi$}
+%     \If{$\phi \cap \Delta_1 \neq \emptyset \; \land\; \phi \cap \Delta_2 \neq \emptyset $ }
+%     \State $CF\_reports = CF\_reports \cup \{(\textbf{id}(\phi), \phi \cap \Delta_1)\}$
+%     \State $CF\_checks = CF\_checks \cup \{(\textbf{id}(\phi), \phi \cap \Delta_2)\}$
+%     \EndIf
+% \EndFor
+% \State $\widehat{{f_{priv}}} = (\Delta_1, CF\_reports, \preceq_{cf}, \preceq_{df})$ 
+% \State $\widehat{f_{normal}} = (\Delta_2, CF\_checks, \preceq_{cf}, \preceq_{df})$ 
+
+% \State \textbf{return} $\widehat{{f_{priv}}}, \widehat{f_{normal}}$
+
+% \Procedure{\textsc{FindEquivalenceClass}}{$\Delta, \preceq_{cf}$}
+% \State $\Phi = \emptyset$
+% \For{$q \in \Delta$}
+    
+%         \State $found = false$
+%         \For{$\phi \in \Phi$}
+%             \If{$\exists p \in \phi$, \textsc{isEquivalent}$(p, q, \preceq_{cf})$} \Comment{$p$ and $q$ is control-flow path equivalent.}
+%                 \State $\Phi_0 \gets \Phi\setminus \{\phi\}$
+%                  \State $\Phi \gets \Phi_0 \cup \{\phi \cup \{q\}\}$
+%                 \State $found \gets true$
+%                 \State \textbf{break}
+%             \EndIf
+%         \EndFor
+%         \If{$found \neq true$}
+%          \State $\Phi \gets \Phi \cup \{\{q\}\}$  \Comment{add new equivalence class.}
+%         \EndIf
+        
+% \EndFor
+% \State \textbf{return} $\Phi$
+% \EndProcedure
+
+% \label{algorithm}
+% \end{algorithmic}
+% \end{algorithm}
+
+% \section{Code Instrumentation}
+
+% \subsection{Data Race Prevention}
+% \ye{Maybe use Data race prevention, which seems better to highlight the problem.}
+% \ye{solution could be temporal relationship between contract functions, where we can revisit transaction order dependencies to make the discussion more readable.}
+
+% Security policies derived from program partitioning delineate the integrity of control and information flow across the resulting contract partitions under concurrent environment encompassing different blockchains.
+
+% \paragraph{Prevention of Data Race}
+% Second, in case of the data race across different contract functions where another function access same state variables when the result of call to a privilege function partition await, we enforce Reader-Writer locks.
+% \ye{We should use a diagram to illustrate the first and second situation.}
+
+
+% \subsection{Transaction Abortion}
+
+% \paragraph{Revert Semantics}
+% In blockchain, all state changes will be roll backed to the beginning state if a revert action arise in a transaction that calls a contract function due to any requirement or assertion failure.
+% To preserve revert semantics, 
+% we impose restrictions on the partitioned smart contracts with the following two rules.
+% \begin{itemize}
+%     \item \textbf{Move revert operations earlier if possible}, in which no further code will be executed that may alter contract state, thus diminishing unnecessary communication with smart contracts on the TEE side.
+%     \item \textbf{Restore all modified state variables if reverted}, in which the correctness of revert semantics is enforced.
+% \end{itemize}
+
+% \paragraph{Discuss how to achieve both}

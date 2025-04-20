@@ -1,0 +1,100 @@
+\section{Method}
+In this work, we introduce DualNeRF, a system aiming at editing a target scene complying with a user-provided prompt $y$.
+Following IN2N \cite{haque2023instruct}, we start with reconstructing the target scene by a NeRF given a dataset of multiview images along with corresponding cameras $\mathcal{I} = \{I_j, P_j\}_{j=1}^{N}$, and then edit the scene based on IDU \cite{haque2023instruct} strategy.
+
+In this section, we first present an overview introduction of the dual-field representation of DualNeRF in Sec. \ref{sec: Dual-field Representation}.
+After that, we introduce how to combine simulated annealing (SA) strategy \cite{kirkpatrick1983optimization} into the pipeline of IDU to mitigate the problem of local optima in Sec. \ref{sec: Simulated Annealing Strategy}.
+We further use a consistency indicator based on CLIP \cite{radford2021learning} to filter out low-quality edits of IP2P therefore further improving the editing results in Sec. \ref{sec: Editing Result Filtering}.
+Implementation details of our model are shown in Sec. \ref{sec: Implementation Details}.
+
+\subsection{Dual-field Representation}
+\label{sec: Dual-field Representation}
+% We design a dual-field representation to stabilize the features of unedited regions during training. There are two neural networks representing two fields contained in DualNeRF, including a major field $f_S$ and an editing field $f_D$.
+DualNeRF contains two neural networks. One is set as the static field $f_S$, whose parameters are trained to faithfully reconstruct the original scene and frozen during editing for guidance signal providing. Another is designed as the dynamic field $f_D$, which is gradually enabled and trained during editing. Hidden features from the two fields fused by decoders output the final results. An overview of DualNeRF is shown in Fig. \ref{fig: overview}.
+
+\paragraph{Field Initialization.}
+Given dataset $\mathcal{I}$, we first train the static field $f_S$ to reconstruct the original scene for the initialization of the following editing stage. Modified from Equ. \ref{equ: NeRF}, the output of $f_S$ are two hidden features:
+\begin{equation}
+    (\mathbf{h}_{\delta}^{(S)}, \mathbf{h}_{c}^{(S)}) = f_S(\mathbf{x}, \mathbf{d})
+\end{equation}
+where $\mathbf{h}^{(S)}_{\sigma}$ denotes a density feature and $\mathbf{h}^{(S)}_{c}$ denotes a color feature. These two features are further decoded into $(\sigma, \mathbf{c})$ by a density decoder $D_{\sigma}$ and a color decoder $D_{c}$ respectively.
+% Thanks to the huge progress in NeRF, only one field $f_S$ is enough to reconstruct the target scene faithfully.
+A well-trained $f_S$ has two benefits: (1) It gives a good initialization of the following editing stage; (2) It stores authentic information about the original scene, which can be used as guidance to stabilize the editing process.
+
+\paragraph{Field Editing.}
+In the editing stage, a new dynamic field $f_D$ with the same architecture as $f_S$ is introduced into the model.
+Given a query point $\mathbf{x}$ and viewing direction $\mathbf{d}$, these two variables are sent into both fields, resulting in two pairs of hidden features: $(\mathbf{h}_{\delta}^{(*)}, \mathbf{h}_{c}^{(*)})$, where $* \in \{S, D\}$.
+The fusion of $f_S$ and $f_D$ is achieved by weighted sums of these hidden features:
+\begin{align}
+\mathbf{h}_{\delta} = (1 - w_{\delta})\mathbf{h}_{\delta}^{(S)} + w_{\delta}\mathbf{h}_{\delta}^{(D)} \\
+\mathbf{h}_{c} = (1 - w_{c})\mathbf{h}_{c}^{(S)} + w_{c}\mathbf{h}_{c}^{(D)}
+\end{align}
+where $w_{\delta}, w_{c} \in [0, 1]$ are the blending weights controlling the editing intensity brought from $f_D$. 
+
+During the editing stage, the parameters of $f_S$ are frozen to preserve features of the original scene, while the parameters of $f_D$ are trained to implement edits matched with prompt $y$. We gradually increase the values of $w_{\delta}$ and $w_{c}$ during editing, allowing the model to transfer from the original scene to the edited version smoothly.
+
+More concretely, $w_{\delta}$ and $w_{c}$ are set to $0$ at the beginning of the editing stage to initialize the editing process as the original scene. We increase them in a tanh formula up to upper bounds $w_{\delta}^{max}$ and $w_{c}^{max}$, as Equ. \ref{equ: w} shows:
+\begin{equation}
+    w_{*} = w_{*}^{max}\tanh(\lambda t)
+    \label{equ: w}
+\end{equation}
+where $* \in \{\delta, c\}$. $\lambda$ is a hyperparameter controlling the growing velocity of $w_*$ and $t$ represents the iteration number. Note that when the upper bounds are set to $0$, the scene remains as the original version without editing. When the upper bounds are set to $1$, the intensity of $f_S$ will gradually fade away after sufficiently long iterations.
+
+In practice, the value of the $w_{\delta}^{max}$ and $w_{c}^{max}$ are always set to less than $1$. In this way, the abundant and authentic features of the original scene stored in $f_S$ can be held and leveraged during iterations. These features serve as ``anchors" to guide the training process not drifting far away from the initial state, mitigating the impact of color jitters in unedited areas brought by IP2P's edits with distorted backgrounds. As a result, the editing progresses more stably, achieving local editing with a clearer and more restored background.
+
+\subsection{Simulated Annealing Strategy}
+\label{sec: Simulated Annealing Strategy}
+As we mentioned in Sec. \ref{sec: Instruct-NeRF2NeRF}, IN2N is prone to fall into local optima due to the mutual promotion between IP2P edits and NeRF optimization when facing artifacts. To solve this problem, a simulated annealing strategy is plugged into the pipeline of IDU.
+
+Specifically, we randomly jitter the value of $w_{\delta}$ and $w_c$ by multiplying a random scaler $\gamma \in [0, 1]$ in each dataset updating step. Note that if $\gamma = 1$, the model remains the latest version, while if $\gamma = 0$, the model retreats to the original scene. We randomly accept to render from a retreated model with $\gamma < 1$ with probability
+\begin{equation}
+    p(\gamma) = \exp(\frac{\gamma - 1}{T_t})
+\end{equation}
+where $T_t$ is the temperature in iteration $t$ with a logarithmic decaying expression starting from an initial temperature $T_0$:
+\begin{equation}
+    T_t = \frac{T_0}{\lg(10 + t)}
+\end{equation}
+
+Rendering from a retreated model outputs a more natural result when artifacts should have appeared. This will be more friendly to IP2P as IP2P is trained on a high-quality dataset with few artifacts. In this way, our simulated annealing strategy endows the model with the ability to address the issue of local optima.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=1.0\linewidth]{fig/clip3.pdf}
+    \caption{\textbf{Edits with Their CLIP-based Consistency.} The right bottom image is the original image $I$, while the rest images are three IP2P edits based on the prompt "Make it Autumn". $I'_1$ is inconsistent with both original image $I$ and the prompt $y$, which leads to the lowest consistency score $\mathcal{S}$. $I'_2$ transfers the original image to an Autumn scenery but fails to restore the original image. $I'_3$ is the best edit with high consistency to both $I$ and $y$, resulting in the highest $\mathcal{S}$. These examples demonstrate the ability of $\mathcal{S}$ to filter out low-quality edits.}
+    \label{fig: clip consistency}
+\end{figure}
+
+\subsection{Editing Result Filtering}
+\label{sec: Editing Result Filtering}
+A CLIP-based consistency indicator $\mathcal{S}$ is further used to measure the editing quality of an editing result $I'$. Given the original image $I$ and a prompt $y$, the CLIP-based consistency of $I'$ is defined as Equ. \ref{equ: clip}:
+\begin{equation}
+    \mathcal{S}(I' | I, y) = \cos(E_{I}(I'), E_{I}(I)) \cdot \cos(E_{I}(I'), E_{T}(y))
+    \label{equ: clip}
+\end{equation}
+% \begin{equation}
+%     \mathcal{S}(I' | y) = \frac{<E_{I}(I'), E_{I}(I)>}{||E_{I}(I')||_2 \cdot ||E_{I}(I)||_2} \cdot \frac{<E_{I}(I'), E_{T}(y)>}{||E_{I}(I')||_2 \cdot ||E_{T}(y)||_2}
+%     \label{equ: clip}
+% \end{equation}
+% \begin{equation}
+%     \mathcal{S}(I' | y) = <E_{I}(I'), E_{I}(I)> \cdot <E_{I}(I'), E_{T}(y)>
+%     \label{equ: clip}
+% \end{equation}
+where $\cos(\cdot, \cdot)$ denotes the cosine similarity (normalized within $[0, 1]$) between two vectors.
+$E_{I}$ and $E_{T}$ are the image encoder and text encoder of CLIP.
+This consistency indicator considers the consistency between both the edited image $I'$ with the original image $I$ and $I'$ with the text prompt $y$.
+Only edits satisfying both consistencies simultaneously obtain a high value of $\mathbf{S}$.
+Examples of edits with different consistency indicators $\mathbf{S}$ are shown in Fig. \ref{fig: clip consistency}.
+% where $<\cdot, \cdot>$ denotes the inter product operation between two vectors.
+% $E_{I}$ and $E_{T}$ are the image encoder and text encoder of CLIP. This consistency indicator measures the consistency between the edited image $I'$ with the text prompt $y$, where higher values of $S$ indicate higher obedience towards $y$ by $I'$.
+We use $\mathcal{S}$ to regulate the intensity of loss calculated from rays in the corresponding image. Specifically, the loss function in Equ. \ref{equ: nerf loss} is modified as follows:
+\begin{equation}
+    L_{rgb} = \sum_{I_i \in \mathcal{I}}\sum_{\mathbf{r} \in \mathcal{R}_i}\frac{\mathcal{S}(I_i' | I_i, y)}{\bar{\mathcal{S}}}||\hat{C}(\mathbf{r}) - C(\mathbf{r})||^2_2
+    \label{equ: nerf loss new}
+\end{equation}
+where $\mathcal{R}_i$ represents the rays sampled from image $I_i$ in the current batch. $\bar{\mathcal{S}}$ is the mean value of all $\mathbf{S}$'s of different views for normalization. In this way, editing results with higher consistency with the original image and input prompt contribute more to the training of the model than the low-quality ones. This process can be seen as a dataset-cleaning operation. Note that the value of $S$ will be cached and used until updated in the next round.
+
+% Note that we do not consider the consistency between $I'$ and the original image $I$ in $\mathbf{S}$, since we find that the cosine similarity between their CLIP features highly depends on the viewing angle. Empirically, frontal views usually have higher CLIP-based consistency between $I'$ and $I$ than the rear views, even if the edits in rear views have higher visual quality. This leads to a bias towards edits in frontal views, which goes against our expectations.
+
+\subsection{Implementation Details}
+\label{sec: Implementation Details}
+The architecture of the two fields is implemented by \textit{nerfacto} provided in NeRFStudio \cite{nerfstudio} due to its high effectiveness and efficiency. The upper bounds of the blending weights are set to $w^{max}_{\delta} = w^{max}_c = 0.1$, which controls the maximum strength of the modification brought by the dynamic field $f_D$ at a moderate intensity. The growing velocity $\lambda$ of $w_*$ takes the value of $0.005$, which leads to an appropriate speed to smoothly introduce $f_D$ into the model. The two decoders $D_{\sigma}$ and $D_{c}$ are empirically designed as two activation functions, namely a truncated exponential function and a sigmoid function, which cause minimal impacts to the hidden features while being strong enough to merge features in a meaningful way. More details can be seen in the supplementary material. During the IDU process with our simulated annealing strategy, the temperature of SA is initialized as $T_0 = 1$ and dropped in a logarithmic way. The training of our model uses both the RGB loss in Equ. \ref{equ: nerf loss} and LPIPS loss \cite{8578166}. The model is optimized for $15k$ iterations for editing, which takes about $1$ hour on a single NVIDIA GeForce RTX 3090. Other hyperparameters follow the settings in \cite{haque2023instruct} for a fair comparison. The code will be released later.

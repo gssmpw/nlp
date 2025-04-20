@@ -1,0 +1,990 @@
+\documentclass{article}
+
+
+% if you need to pass options to natbib, use, e.g.:
+%     \PassOptionsToPackage{numbers, compress}{natbib}
+% before loading neurips_2024
+
+
+% ready for submission
+
+%\usepackage{neurips_2024}
+% \usepackage[nonatbib]{neurips_2024}
+\usepackage[square,numbers,sort&compress]{natbib}
+\bibliographystyle{unsrtnat}
+
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{wrapfig}
+
+
+% to compile a preprint version, e.g., for submission to arXiv, add add the
+% [preprint] option:
+%     \usepackage[preprint]{neurips_2024}
+
+
+% to compile a camera-ready version, add the [final] option, e.g.:
+\usepackage[final,nonatbib]{neurips_2024}
+
+
+% to avoid loading the natbib package, add option nonatbib:
+%    \usepackage[nonatbib]{neurips_2024}
+
+\usepackage[utf8]{inputenc} % allow utf-8 input
+\usepackage[T1]{fontenc}    % use 8-bit T1 fonts
+\usepackage{hyperref}       % hyperlinks
+\usepackage{url}            % simple URL typesetting
+\usepackage{booktabs}       % professional-quality tables
+\usepackage{amsfonts}       % blackboard math symbols
+\usepackage{nicefrac}       % compact symbols for 1/2, etc.
+\usepackage{microtype}      % microtypography
+\usepackage{xcolor}         % colors
+
+\title{Aligner-Encoders: \\
+           Self-Attention Transformers Can Be Self-Transducers}
+
+
+% The \author macro works with any number of authors. There are two commands
+% used to separate the names and addresses of multiple authors: \And and \AND.
+%
+% Using \And between authors leaves it to LaTeX to determine where to break the
+% lines. Using \AND forces a line break at that point. So, if LaTeX puts 3 of 4
+% authors names on the first line, and the last on the second line, try using
+% \AND instead of \And before the third author name.
+
+
+\author{
+    Adam Stooke \\
+    Google, USA \\
+    \texttt{astooke@google.com} \\
+    \And
+    Rohit Prabhavalkar \\
+    Google, USA
+    \And
+    Khe Chai Sim \\
+    Google, USA \\
+    \And
+    Pedro Moreno Mengibar\thanks{Work performed while at Google, USA.} \\
+}
+
+
+\begin{document}
+
+
+\maketitle
+
+
+\begin{abstract}
+Modern systems for automatic speech recognition, including the RNN-Transducer and Attention-based Encoder-Decoder (AED), are designed so that the encoder is not required to alter the time-position of information from the audio sequence into the embedding; alignment to the final text output is processed during decoding. We discover that the transformer-based encoder adopted in recent years is actually capable of performing the alignment internally during the forward pass, prior to decoding. This new phenomenon enables a simpler and more efficient model, the ``Aligner-Encoder''. To train it, we discard the dynamic programming of RNN-T in favor of the frame-wise cross-entropy loss of AED, while the decoder employs the lighter text-only recurrence of RNN-T without learned cross-attention---it simply scans embedding frames in order from the beginning, producing one token each until predicting the end-of-message. We conduct experiments demonstrating performance remarkably close to the state of the art, including a special inference configuration enabling long-form recognition. In a representative comparison, we measure the total inference time for our model to be 2x faster than RNN-T and 16x faster than AED.  Lastly, we find that the audio-text alignment is clearly visible in the self-attention weights of a certain layer, which could be said to perform ``self-transduction''.
+
+\end{abstract}
+
+
+\section{Introduction}
+\label{introduction}
+
+% Sequence transduction requires mapping between a pair of sequences of different lengths, which necessitates finding an alignment for placing information from where ever it appears in the input into position in the output. \Rohit{The first sentence feels clunky to me.  How do feel about saying something like: ``Sequence transduction -- i.e., finding a mapping between an input sequence $\mathbf{x}$, and the output sequence $\mathbf{y}$ -- is ubiquitous task finding application in many areas, e.g., machine translation~\citep{something1}, automatic speech recognition (ASR)~\citep{something2}, etc.
+% % The machine learning model trained for this purpose must account for the fact that the two sequences might have very different lengths, necessitating a way to find an alignment (either implicitly, or explicitly), which can place information from where ever it appears in the input to its corresponding location in the output." Or something like that.}
+
+The task of sequence transduction requires mapping from an input sequence to an output sequence.  It appears in several widespread applications including machine translation and automatic speech recognition (ASR).  In ASR, which is the focus of this paper, the two sequences lie in completely different modalities, and the audio input representation is typically much longer than the output text.  Thus, in addition to identifying and converting speech sounds, the model must find an ``alignment'' that moves information from wherever it appears in the input sequence to wherever it belongs in the output.  Among other issues, the many possible variations in the pace of pronunciation make transduction a challenging problem.
+
+
+
+
+% The task of sequence transduction requires mapping from an input sequence to an output sequence.  It appears in several widespread applications including machine translation and automatic speech recognition (ASR).  A transduction model must account for the fact that the two sequences might have very different lengths, not to mention altogether different representations, which necessitates finding an alignment that places information from wherever it appears in the input to wherever it belongs in the output.  In ASR, the audio input is typically much longer than the output text, and the many possible variations in the pace of speech leads to a challenging alignment problem, despite it being monotonic.  
+
+More than a decade ago, and almost a decade apart, two powerful algorithms relying on dynamic programming were developed to perform the sequence transduction task with recurrent neural networks (RNNs).  The motivation behind these algorithms was that RNNs require training every output frame in the sequence---with one output per input frame, they needed to be trained with alignments already prepared.  The new algorithms allowed training without prepared alignments by computing the probability of the label marginalized over~\emph{all possible alignments} as the optimization objective.  The differences in sequence length are accommodated by learning to output ``blank'' symbols in between true labels and post-processing them out at inference time.  The first algorithm, Connectionist Temporal Classification (CTC)~\citep{graves2006connectionist}, models the output frames as conditionally independent, and this limitation was overcome in the follow-on work RNN-Transducer (RNN-T)~\citep{graves2012sequence}, which introduced auto-regressive decoding to achieve better performance.
+
+% \Rohit{At the risk of self-promotion, I would suggest these two recent E2E reference surveys:} .
+
+
+A third algorithm appeared shortly after, called attention-based encoder-decoder (AED).  It uses a learned mechanism to account for alignments~\citep{chorowski2014end-to-end,chorowski2015attention-based,chan2015listen, bahdanau2016end-to-end}; the encoder is followed by a recurrent decoder that cross-attends at every step between its RNN state and the entire encoder embedding sequence to produce its next state.  The cross-entropy loss is applied straightforwardly between the plain label sequence and the leading output frames, with no blank symbol and no dynamic programming required.  The resulting model produces its output auto-regressively until an end-of-sentence (\texttt{<EOS>}) token halts decoding. AED models, together with CTC and RNN-T, have propelled end-to-end deep neural networks to become the best performing ASR systems across academia and industry (\textit{e.g.}, see surveys~\citep{Li2022-E2ESurvey,PrabhavalkarEtAl24-E2ESurvey}).
+
+Despite their great successes, each of these algorithms has its downsides.  Implementing the probability summations for CTC and especially RNN-T require non-trivial effort.  A naive formulation of the principle is intractable to compute, requiring a dynamic programming approach, which in turn has been the subject of optimization efforts by expert practitioners~\citep{rnnt-efficient-implementation,forward-backward-efficiency, mahadeokar2021alignment, kuang2022pruned}.  Beyond that, RNN-T training requires computing potentially unwieldy tensor quantities to do with cross-pairing every frame of input with every token of output.  Both models suffer inefficiencies in decoding.  RNN-T processes all frames recurrently while producing a typically much shorter output sequence.  AED requires computing over the entire encoder embedding sequence at every decoding step, which leads to slow operation from the high compute load within the auto-regressive loop.
+
+In an effort to resolve these difficulties, we ask the question: with the advent of transformer-based encoders~\citep{vaswani2017attention,dong2018speech-transformer,karita2019comparative,tian2019self-attention,yeh2019transformer,wang2020transformer,transformer-transducer,gulati2020conformer}, can the ASR \emph{encoder} itself learn to perform the alignment?  The answer we found is: yes, it can.  Our main contribution is to show that it is now possible to train neural network speech recognizers with light-weight decoders in the style of RNN-T, but with the simple frame-wise cross-entropy loss of AED.  The resulting networks provide accuracy remarkably close to state-of-the-art models while being more efficient at training and decoding than any previous model.  No explicit dynamic programming is employed; instead, the encoder learns to perform the alignment internally during the forward pass.  The encoded embedding frames are decoded consecutively from the beginning, one at a time, in conjunction with a small recurrent network that only reads in the previous label, producing exactly one label per frame until emitting \texttt{<EOS>}.
+
+Having originated in the era of long short-term memory (LSTM)~\citep{hochreiter1997long,gers2000learning} encoders, the preceeding algorithms all allow the encoder to process information in-place in the time dimension, resulting in embeddings with relevant information in roughly the same position in the sequence as it appeared in the input.  For several years now, however, ASR systems have benefited from the adoption of more powerful transformer encoders, but without changing their role.  Our Aligner-Encoders are different in that, simultaneous to encoding, they perform the additional task of moving the relevant information to the beginning of the embedding sequence into a label-aligned position.  As it is performed solely through the self-attention mechanism within the forward pass of the encoder, one might call this a ``self-transducer''.  The previous style of information flow is contrasted with ours in Figure~\ref{fig-aligner-encoder}.  A main benefit of our model utilizing an Aligner-Encoder is that it is dramatically simpler to conceptualize, implement, and use.
+
+% \begin{wrapfigure}{R}{0.67\textwidth}
+%     \begin{center}
+%     \vskip -0.2in
+%     % \centerline{\includegraphics[width=0.65\columnwidth]{figures/aligner_encoder.png}}
+%     \includegraphics[width=0.65\textwidth]{figures/aligner_encoder.png}
+%     \caption{Information flow through an Aligner-Encoder versus traditional encoders learned by CTC, RNN-T, or AED.}
+%     \label{fig-aligner-encoder}
+%     \end{center}
+%     \vskip -0.1in
+% \end{wrapfigure}
+
+\begin{figure}
+    \begin{center}
+    \vskip -0.2in
+    % \centerline{\includegraphics[width=0.65\columnwidth]{figures/aligner_encoder.png}}
+    \includegraphics[width=0.8\textwidth]{figures/aligner_encoder.png}
+    \caption{Information flow through an Aligner-Encoder versus traditional audio encoders.}
+    \label{fig-aligner-encoder}
+    \end{center}
+    \vskip -0.1in
+\end{figure}
+
+
+
+
+This paper is organized as follows.  First, we describe Aligner-Encoder models and relate them to RNN-T and AED.  Next, we relate other works which have aimed at improving RNN-T modeling effectiveness or efficiency.  Then we report experiments demonstrating the accuracy of Aligner models while also finding limitations for generalizing to long test utterances.  In response, we introduce techniques which can be employed at inference-time to provide good long-form performance without any additional training.  In further experiments, we analyze how and when Aligner-Encoders perform the alignment and make the surprising discovery that it can happen primarily within a single self-attention layer.  Lastly, since ASR alignments are monotonic, we demonstrate that Aligners can at least readily handle \textit{reverse} alignments, making our model promising for future work in non-monotonic applications such as machine-translation or speech-translation.
+
+
+\section{Model}
+\label{model}
+
+\subsection{Aligner-Encoder Model}
+
+The Aligner-Encoder model combines the best elements of RNN-T and AED systems into a more compact form.  By requiring the encoder itself to text-align its embedding, we avoid using 1) dynamic programming to sum probabilities in the loss and 2) full-sequence cross-attention in the decoder (in all models we refer to everything inside the auto-regressive portion as the ``decoder'').  It may be simplest to first lay out our model, which is formulated using the same components as RNN-T, and afterwards draw contrasting points with the heritage.  
+
+We begin with an input sequence $\mathbf{x}=(x_1, x_2, ..., x_T)$ of length $T$, and output sequence $\mathbf{y}=(y_1, y_2, ..., y_U)$ of length $U\leq T$.  An \emph{encoder} network, $f_\text{enc}$, processes the input sequence into an acoustic embedding sequence, $\mathbf{h}=(h_1, h_2, ..., h_{T'})$, where each frame of the embedding sequence can depend on every frame of input, and typically $T'\leq T$ with subsampling.  A \emph{prediction network}, $f_\text{pred}$, processes text labels with forward recurrence only to produce a text embedding sequence, $\mathbf{g}=(g_1, g_2, ..., g_U)$.  The acoustic and text embeddings are fed into a \emph{joint network}, $f_\text{joint}$, to produce the final prediction vector of dimension $V$ according to the vocabulary, for each frame, with softmax probability normalization.  The difference in our model is that we enforce the alignment \emph{at the encoder output} by restricting the model to use the acoustic and text embedding frames in a one-to-one fashion (Equation $(3)$).  The entire model is written by its recurrence relations as:
+\begin{align}
+    \mathbf{h} &= f_\text{enc}(\mathbf{x})   \\
+    g_i &= f_\text{pred}(g_{i-1}, y_{i-1}),  \quad i \leq U  \\
+    P(y_i|\mathbf{x},y_{<i}) &= f_\text{joint}(h_i, g_i), \quad i \leq U
+\end{align}
+% \Rohit{I feel like a diagram would help.}
+The encoder and the decoder--which includes both the prediction and joint networks--are parameterized and learned together in an end-to-end manner, with total parameters $\theta$.  We maximize the log probabilities of the correct labels, resulting in the familiar cross-entropy loss:
+\begin{equation}
+    \mathcal{L}_{Aligner}(\theta)=-\sum_{i=1}^{U}\log P(y_i|\mathbf{x},y_{<i}; \theta)
+\end{equation}
+The loss only applies to encoder frames within the length of the label, $T'\leq U$; all remaining frames ($T'>U$) are ignored.   Hence the \textit{encoder} must also learn to be an \textit{aligner}.  
+
+We seed the prediction network with a start-of-sentence token, \texttt{<SOS>}, at the first step, $y_0$, and empty state $h_0=0$.  As is often the case with AED and other uses of cross-entropy loss, we find label smoothing to be a beneficial regularizer and always use it~\citep{szegedy2016rethinking,chorowski2016towards,ChiuEtAl18-sota} (weight $0.1$).  During inference the label length is unknown, so the model must predict it, as in AED.  We train the model to always predict the end-of-sentence token, \texttt{<EOS>}, as the final token of every training example\footnote{We include the \texttt{<EOS>} in the label count $U$, without loss of generality.}, so decoding proceeds token-by-token until \texttt{<EOS>} is predicted.
+% \Rohit{I feel like this might be easier to explain if you describe RNN-T and LAS first. But you're also tight on space, so not sure if that's feasible.}
+
+It is also possible to formulate a non-autoregressive (non-AR) Aligner, which applies a decoder, $f_\text{ind}$, to the embedding frames independently, as in CTC:
+\begin{align}
+    P(y_i|\mathbf{x})=f_\text{ind}(h_i)
+\end{align}
+and it can be trained under the same loss.  During inference, all tokens are predicted independently, and any tokens after the earliest \texttt{<EOS>} in the sequence are discarded.  We include an experiment with this formulation; however, we found its performance to be significantly worse than CTC in all but the shortest-utterance datasets.
+
+
+\subsection{Advantages over RNN-T \& AED}
+
+Given that previous models were developed to overcome contemporary neural encoders' inability to align, the new model naturally brings simplifications.  RNN-T trains by explicitly marginalizing over all possible alignments in the loss.  This can be visualized in a label-frame decoding lattice (see Figure 1 in~\citep{graves2012sequence}), where each node represents an \{encoder-frame, text-frame\} pair, and every pairing is a valid state to be considered, resulting in a $U\times T$ rectangular grid (abbreviating $T'$ as $T$).  Beyond requiring a sophisticated dynamic programming implementation to calculate tractably (involving forward and backward probabilities scanned across the lattice), the marginalization still leads to computing all $U\times T\times V$ logits of the lattice, a potentially memory-intensive step (it is computing Equation ($3$) over all pairs of indices as $f_\text{joint}(h_i,g_j)$).  The Aligner loss can be viewed as prescribing only the main diagonal of the lattice to be valid, reducing the realized logits to the bare minimum $U\times V$.
+
+Savings come during inference, as well.  The decoder in AED operates with $O(U\times T)$ complexity, since it cross-attends to the entire encoder embedding sequence at every step, for $U$ steps.  Furthermore the constant factor is often relatively large in practice since a more powerful decoder network is needed for computing the attention (the recurrence relation is $g_i=f_\text{dec,AED}(\mathbf{h},g_{i-1},y_{i-1})$, compare at our Equation ($2$) which lacks $\mathbf{h}$ or even $h_i$).  The RNN-T decoder has complexity $O(T + U)$, since it must emit a blank at every frame to advance to the end of the lattice in a addition to the steps emitting a label.  In contrast, by preparing the alignment within the encoder, our model reduces decoder complexity to $O(U)$, the most efficient possible for auto-regressive token prediction.  In practice our constant factor will also be small like RNN-T.  
+
+One final savings relative to RNN-T comes when using beam search during inference, which can significantly improve overall accuracy.  The emissions of blank tokens in RNN-T means that the same text hypothesis can be represented by different paths through the decoding lattice.  Thus a proper search requires a routine to combine the probabilities from equivalent lattice paths at every step.  Known as ``path merging'', it can actually be an expensive operation, leading others to sometimes approximate the search without it, despite the potential loss of beam diversity (\textit{e.g.}, see discussion in~\citep{rao2017exploring}).  Since our model, like AED, does not emit any blank tokens, path merging does not apply. 
+
+
+\section{Related Works}
+\label{related}
+
+% \adam{collected the comments on frame reduction here, this is a good place to talk about that}
+
+% \Rohit{In your formulation it is suggested that $|\mathbf{h}| == |\mathbf{x}|$, which is not usually the case in other models in the literature for ASR. Do you use any kind of frame rate reduction? In any case, I think it could help to clarify this point. In my survey paper, I use $T'$ for the acoustic, $x$, input and $T$ for the encoder, $h$, output.}
+
+% \Rohit{I think we should also discuss the various standard techniques such as frame reduction and how this compares.}
+
+Before end-to-end ASR, the previous generation of ``hybrid'' ASR systems~\citep{bourlard1996hybrid} relied on a separate base system to provide frame-level alignments which could then be used to train frame-level neural network acoustic models.  Most modern ASR systems use an end-to-end framework; the most prominent modeling techniques are CTC~\citep{graves2006connectionist}, RNN-T~\citep{graves2012sequence}, and AED~\citep{chorowski2015attention-based,chan2015listen}.
+
+A number of works have aimed at modifying the base RNN-T model in order to gain efficiency or efficacy.  In Monotonic RNN-T~\citep{monotonicrnnt}, the loss and decoder are modified to step forward every frame, preventing multiple token emissions per label and speeding up the decoder complexity to $O(T)$.  More recently, ~\citep{kuang2022pruned} proposed a method to reduce memory usage of the RNN-T loss, especially for cases with large vocabulary size such as Chinese character-based, by using a linearized joint network first to identify a relevant sub-region of the lattice likely to contain the true alignment.  They only compute the full joint network on that sub-region and still train successfully.  Another issue with RNN-T systems arises when trying to treat the prediction network as a language model, which can be improved through text-only training, because its language modeling function is polluted by having to predict blanks.  To ameliorate this, multiple works~\citep{variani2020hybrid,chen2022factorized,meng2023modular} have introduced a separate network component for predicting blanks, and re-formulated the overall prediction model accordingly, resulting in much greater receptiveness to language training.  One aim of our design was to avoid the use of blank tokens entirely, although in the present work we do not pursue additional text training.  
+
+Monotonic alignments have also been developed for attention-based systems~\citep{raffel2017online}, requiring newly devised loss functions to enforce monotonicity differentiably and encourage discreteness.  Integrate-and-fire systems are another approach proposed to limit the context window needed for cross-attention to the encoder embedding, by introducing a soft monotonic alignment mechanism~\citep{dong2020cif,deng2023label-synchronous,zhang24cif-t}.  It steps forwards through the encoder frames one at a time, accumulating weighted information from the embedding until an activation threshold is reached, upon which a token is emitted. CTC and attention-based systems have previously been combined~\citep{watanabe2017hybrid,tang-etal-2023-hybrid} resulting in improved learning and decoding, and it is not uncommon to train AED models with a CTC auxiliary loss.  We did not pursue the analogous combination of non-AR and AR decoders for Aligners, although it would be simple to implement.  Another interesting, concurrent line of work is the Bayes-CTC~\cite{tian2022bayes} and Bayes-Transducer~\cite{tian2023bayes} models, which add a modulating factor to the respective losses in order to encourage earlier token emission in decoding; however, only our simpler model achieves full text alignment with no blank embedding frames between tokens.
+
+A common way to improve the efficiency of ASR systems is to downsample the time dimension within the encoder, known as frame reduction (\textit{i.e.}, $T'<T$;~\citep{wang2023massive}).  In addition to reducing encoder complexity, which scales as $O(T^2)$ with self-attention, frame reduction yields decoder efficiencies.  It was necessary in the original Listen, Attend Spell (LAS) model~\cite{chan2015listen}  to enable learnability for the cross-attention by presenting a manageable number of frames to the decoder.  In RNN-T it reduces the number of decoder steps, which scale with $T$, and can in some circumstances be carried out to an extreme, packing multiple labels per frame~\cite{prabhavalkar2024extreme}.  In the few cases we tried, we found Aligners to have similar robustness to downsampling as RNN-T, but we did not study this in-depth.  Aligners are like CTC in that they cannot downsample the encoder to fewer frames than the length of the text sequence, although perhaps they could be trained to decode multiple tokens per frame.  
+
+% \adam{Rohit, anything else to say bout frame reduction?}
+
+
+% \Rohit{CTC and RNN-T model the alignment between the input acoustics and the output label sequence \emph{explicitly} as a latent variable which is marginalized out to compute the overall label probability. This allows the model to train from scratch, without the need for ground-truth alignments, at the cost of a more complicated procedure to compute the loss using dynamic programming.
+% LAS, on the other hand models the alignments \emph{implicitly} through a cross-attention mechanism between the autoregressively decoded labels and the input acoustic sequence. This greatly simplifies the loss computation at the cost of a more expensive per-step label computation.
+% The proposed technique combines the benefits of both approaches -- it uses the simplified prediction network and joint network structure of the RNN-T model, which allows for full autoregressive decoding without the need for explicitly modeling the alignment. The central insight of our approach is that the encoder itself can serve as an aligner if we explicitly indicate that decoding should be terminated by producing an EOS label (as in LAS).
+% }
+
+% \Rohit{I think it might be good to also focus on computational savings. If you decide to focus on that then I would suggest citing related works there.}
+
+
+\section{Experiments}
+\label{experiments}
+
+We conducted a range of experiments to explore the performance of Aligners and compare them against previous models on an equal footing.  After describing the common configurations and datasets used, we present three different sets of experiments.  The first explores the performance of basic Aligner models, the second studies techniques to employ at test-time to attain long-form recognition, and the final set examines the alignment process occurring within the encoders.
+
+\subsection{Datasets}
+
+We experiment on three U.S. English datasets with very different characteristics.  The first is LibriSpeech-960 hour (LS)~\citep{panayotov2015librispeech}.  The second is a Voice Search (VS) dataset comprised of real traffic, totalling over 100M utterances and nearly 500k hours of speech, with an average duration of 3.4 seconds; utterances are anonymized before processing.  The majority of the utterances are pseudo-labeled by a teacher model~\citep{DBLP:conf/interspeech/HwangSHS22}, and a small portion are human transcribed.  Only 5\% of the queries are greater than 7.6 seconds long.  The test sets for VS include a main set which covers many common types of utterances, and several rare-word sets generated using TTS from specific domains--maps, queries, and news. Lastly, we include a long-form dataset drawn from random YouTube videos (YT).  The training set is comprised of utterances with pseudo-labels generated by a previous ASR system~\citep{DBLP:conf/interspeech/HwangSHS22}, cleaned to ensure no speaker overlap occurs, and ranging from 5-15 seconds each.  The total training set size is roughly 670K hours.  The test set includes 30 hours of long-form audio, at an average of 8 minutes per example, spanning a range of topic sources including lifestyle, entertainment, sports, gaming, and society. In all datasets, the audio input is represented using log-mel features with a 32ms window size at a 10ms stride.
+
+\begin{wraptable}{R}{0.47\textwidth}
+\vskip -0.25in
+\caption{Settings used with each dataset: LibriSpeech, Voice Search, and YouTube.}
+\label{table-settings}
+\vskip 0.1in
+\begin{small}
+\begin{tabular}{lcccr}
+\toprule
+Setting                & LS & VS & YT \\
+\midrule
+Log-Mel Features       & 80 & 128 & 128 \\
+2-D Conv Layers        & 2 & 2 & 3  \\
+Enc Dimension          & 512 & 768 & 1024 \\
+Enc \# Layers          & 17 & 24 & 24     \\
+Enc \# Params          & 100M & 300M & 600M \\
+LSTM Size              & 1x640 & 1x256 & 1x1024 \\
+Vocab Size             & 1024 & 4096 & 4096 \\
+\bottomrule
+\end{tabular}
+\end{small}
+\vskip -0.1in
+\end{wraptable}
+
+\subsection{Neural Networks Specifications}
+
+We used the same neural encoder architecture for every algorithm, with settings adjusted for each dataset as listed in Table~\ref{table-settings}.  Our networks begin with learnable 2-D convolutional subsampling layers, with kernel size 3 and stride 2, 128 features in the first layer and 32 thereafter.  We employ state-of-the-art Conformer encoders~\citep{gulati2020conformer}, which include in each layer: a feed-forward unit, a multi-headed self-attention layer, a 1-D convolution layer for localized processing, followed by an outgoing feed-forward unit and finally residual connection.  The number of layers and model dimension vary by dataset, as shown in the table.  We did not find RNN-T nor Aligner experiments to be highly sensitive to decoder dimensions--they can operate with surprisingly small prediction networks--although results sometimes did improve slightly with larger prediction networks when also using a wider beam search.  
+
+
+
+All our models use a word-piece tokenizer~\citep{wu2016google}, as is common in state-of-the-art systems.  Word pieces may be as small as a single letter, or could be an entire word, such as ``wednesday''.  Unlike phonemes, word pieces of a given vocabulary exhibit a wide range in duration, not to mention complexity, of audio content associated with them.  Although this likely makes the alignment problem more difficult, word piece vocabularies are very effective because they cover the text distribution efficiently.  For label smoothing, we estimate the word-piece prior on-the-fly using batch-wide label counts.
+
+To enhance the beam search, we apply label smoothing debiasing~\citep{liang2022debias}, which essentially removes low-probability tokens from the posterior and then re-normalizes it.  Similar to~\citep{liang2022debias}, we find that a relatively large debiasing parameter of 2 (so the threshold becomes $2 / V$) is helpful, and we use it with a modest beam size of 6 in our experiments for a small but consistent improvement in accuracy.
+
+% \begin{table}[t]
+% \caption{Settings used for Aligner experiments with each dataset: LibriSpeech, Voice Search, and YouTube.}
+% \label{table-settings}
+% \vskip 0.15in
+% \begin{center}
+% \begin{small}
+% \begin{sc}
+% \begin{tabular}{lcccr}
+% \toprule
+% Setting                & LS & VS & YT \\
+% \midrule
+% Log-Mel Features       & 80 & 128 & 128 \\
+% 2-D Conv Layers        & 2 & 2 & 3  \\
+% Enc Dimension          & 512 & 768 & 1024 \\
+% Enc \# Layers             & 17 & 24 & 24     \\
+% Enc Approx \# Params   & 100M & 300M & 600M \\
+% LSTM Size              & 1x640 & 1x256 & 1x1024 \\
+% Vocab Size             & 1024 & 4096 & 4096 \\
+% \bottomrule
+% \end{tabular}
+% \end{sc}
+% \end{small}
+% \end{center}
+% \vskip -0.1in
+% \end{table}
+
+
+
+
+
+\subsection{Base Model Results}
+
+\begin{wraptable}{R}{0.5\textwidth}
+\vskip -0.25in
+\caption{WER (\%) on the Voice Search test sets. VS: Main Test, and rare-words RM: Maps, RN: News, RQ: Search Queries}
+\label{table-VS}
+% \vskip 0.1in
+\begin{center}
+\begin{small}
+\begin{sc}
+\begin{tabular}{lcccc}
+\toprule
+                & VS & RM & RN & RQ \\
+\midrule
+RNN-T            & 3.6 & 12.6 & 14.6 & 20.5 \\
+Aligner          & 3.7 & 12.5 & 13.1 & 20.4  \\
+\midrule
+CTC              & 4.3 & 14.3 & 17.8 & 23.8 \\
+Non-AR Aligner  & 4.5 & 15.3 &  27.3 & 23.5 \\
+\bottomrule
+\end{tabular}
+\end{sc}
+\end{small}
+\end{center}
+\vskip -0.1in
+% \vspace{-10pt}
+\end{wraptable}
+
+Table~\ref{table-VS} shows results in Voice Search, including the rare-word test sets, and Aligners perform comparably to RNN-T in all cases.  We also compare CTC and non-AR Aligners, which perform nearly as well in Voice Search.  We found that increasing the vocabulary size to 32K improved the performance of the non-AR Aligner, yet it still suffers from many deletions on the NEWS rare-word set, which contains longer utterances.  Our non-AR model performed relatively poorly on LibriSpeech and YouTube.  For sequences beyond a very short length, an auto-regressive decoder, however small, is essential for producing a high quality final output from the encoder embedding.
+
+
+
+In LibriSpeech, we report results comparing CTC, RNN-T, AED, and Aligners in Table~\ref{table-librispeech}.  All models used the same 17-layer conformer encoder architecture and dimensions, except for differences in relative position attention, described in the following paragraph.  Performance of our Aligner models was remarkably close to RNN-T, matched or beat AED, and clearly beat CTC.  For each model, we report the best score from a small number of runs and checkpoints.  Full training settings are provided in the appendix, along with a brief commentary on the relative performance between RNN-T and AED.   
+
+\begin{wraptable}{R}{0.5\textwidth}
+\vskip -0.25in
+\caption{WER (\%) on LibriSpeech.}
+\label{table-librispeech}
+\begin{center}
+\begin{small}
+\begin{sc}
+\begin{tabular}{lccc}
+\toprule
+            & dev & test-clean & test-other \\
+\midrule
+CTC         & 2.6 & 2.8 & 6.4 \\
+RNN-T       & 2.1 & 2.1 & 4.6 \\
+AED         & 2.2 & 2.4 & 5.5 \\
+\midrule
+Aligner & 2.2 & 2.3 & 5.1  \\
+\bottomrule
+\end{tabular}
+\end{sc}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{wraptable}
+
+
+
+
+The distribution of training utterance lengths in LibriSpeech has a sharp drop-off after 17 seconds, and we observed both AED and Aligners losing performance when generalizing to longer test utterances, which run as long as 36 seconds.  (See Tables~\ref{table-test-clean-times},\ref{table-test-other-times} in the appendix for a breakdown by test utterance duration.)  To improve performance of these models, we randomly concatenated a small subset of utterances in each training batch (\textit{e.g.}, 15\%), creating some examples up to 36 seconds.  Thus, with adequate training, Aligners were able to self-transduce sequences of up to 900 frames.  Learned relative attention encoding~\cite{dai2019transformer} trained slowly, so AED, CTC, and our model were trained with the faster Rotary Position Embedding~\cite{su2024roformer} (RNN-T achieved slightly better test scores with learned relative encoding, reported in the table).  In the following section, we discuss ways to use our model to perform long-form recognition to arbitrary lengths beyond what is seen in training.
+
+
+
+% Overall, AED and Aligner models in their base form slightly under-perform relative to RNN-T, for a specific reason.  Table~\ref{table-test-clean-times} shows scores separated according to utterance length.  The training data includes many examples up to 18 seconds long, but very longer. Therefore we measure trained-length performance up to 18 seconds, ``near'' generalization to between 18-23 seconds, and ``far'' generalization beyond 23 seconds.  We present ``Test Clean'' because it has the highest number of long utterances. 
+
+% It can be seen that RNN-T generalizes the best to long utterances, whereas performance of the attention-based decoding in AED degrades, and the Aligner is even more susceptible to this issue.  This is likely explained by the attention mechanism in AED working in-the-loop of the auto-regressive decoding, and thus it receives more information at each step to inform its alignment, whereas the Aligner's attention has the more difficult task of completing its alignment before decoding begins, in a sense out-of-the-loop.  The RNN-T model's alignment mechanism is the simplest--a controlled scan forward through the encoder embedding sequence--and hence the easiest to generalize.  If length generalization is not a concern, then the Aligner model using the conformer architecture has shown to perform comparably to the best existing systems.  But these findings motivates our efforts to improve the long-form ability of Aligner systems, described in the following subsection.
+
+% \begin{wraptable}{R}{0.5\textwidth}
+% \caption{WER (\%) on LibriSpeech Test Clean set by utterance duration.  Base models only with no long-form configuration.}
+% \label{table-test-clean-times}
+% \vskip 0.1in
+% \begin{center}
+% \begin{small}
+% \begin{sc}
+% \begin{tabular}{lccccr}
+% \toprule
+%             & $<$ 18s & 18-23s & $>$ 23s & All \\
+% \midrule
+% CTC         & 3.1 & 2.7 & 4.1 & 3.1 \\
+% RNN-T       & 2.6 & 1.8 & 3.7 & 2.6 \\
+% AED         & 2.5 & 2.7 &  17.1 & 3.2\\
+% \midrule
+% Aligner     & 2.7 & 4.0 & 34.2  & 4.5 \\
+% Aligner-LF  & 2.7 & 3.8 & 5.2 & 2.9 \\
+% \bottomrule
+% \end{tabular}
+% \end{sc}
+% \end{small}
+% \end{center}
+% \vskip -0.1in
+% \end{wraptable}
+
+
+
+
+
+% \begin{table}[h]
+% \caption{WER (\%) on LibriSpeech test utterances up to the training length, 18 seconds. Dev: Dev Clean, Test: Test Clean, Other: Test Other.}
+% \label{table-librispeech-18}
+% \vskip 0.15in
+% \begin{center}
+% \begin{small}
+% \begin{sc}
+% \begin{tabular}{lcccr}
+% \toprule
+%           & Dev-18 & Test-18 & Other-18 \\
+% \midrule
+% CTC         & 2.9 & 3.1 & 7.3 \\
+% RNN-T       & 2.5 & 2.6 & 5.7  \\
+% LAS         & 2.3 & 2.5 &  5.9 \\
+% Aligner     & 2.5 & 2.6 & 5.7  \\
+% \bottomrule
+% \end{tabular}
+% \end{sc}
+% \end{small}
+% \end{center}
+% \vskip -0.1in
+% \end{table}
+
+
+
+% \begin{table}[h]
+% \caption{WER (\%) on LibriSpeech. Dev: Dev Clean, Test: Test Clean, Other: Test Other.  Base models only with no long-form configuration.}
+% \label{table-VS}
+% \vskip 0.15in
+% \begin{center}
+% \begin{small}
+% \begin{sc}
+% \begin{tabular}{lcccr}
+% \toprule
+%           & Dev & Test & Other \\
+% \midrule
+% CTC         & 2.9 & 3.1 & 7.2 \\
+% RNN-T       & 2.4 & 2.6 & 5.6  \\
+% LAS         & 3.2 & 3.2 &  6.5 \\
+% Aligner     & 4.1 & 4.5 & 6.8  \\
+% \bottomrule
+% \end{tabular}
+% \end{sc}
+% \end{small}
+% \end{center}
+% \vskip -0.1in
+% \end{table}
+
+
+\subsection{Long-Form Recognition}
+
+It is not always practical to train with examples as long as the desired usage, and for any given Aligner-Encoder architecture there is likely some maximum alignable length.  So it may be necessary to perform recognition on utterances longer than a trained model's capability.  Our baseline method for comparing long-form recognition is ``blind segmenting'': 1) cut the audio into fixed-length, non-overlapping segments, 2) transcribe them separately, and 3) concatenate the resulting text segments.  Perhaps the main shortcoming of blind segmenting is that recognition at the boundaries is prone to error, where the audio might cut in the middle of a word.  One applicable solution is to use overlapping segments with an appropriate routine to stitch the hypothesis together in post-processing~\citep{chiu2021rnntgeneralize,kang2021partially}.  Here, we instead describe how to improve continuity using the model itself, using only inference configurations which require no further training.
+
+
+
+In our approach, cutting and re-concatenating the sequence happens within the model--called ``chunking'' to distinguish from the baseline.  We preserve some continuity by cutting the audio only after the 2-D convolutional feature layers.  The chunks are processed independently in parallel through the conformer, after which they are re-concatenated \textit{before} decoding.  The decoder processes the full-length embedding sequence into the full transcription hypothesis, using awareness of the chunk boundaries.  Within each chunk, the decoder ignores frames after the first \texttt{<EOS>} emission, and it resumes decoding at the beginning of the next chunk.  Ideally, the decoder's prediction network will carry its state forward across the chunk boundaries to evenly incorporate all tokens.
+
+When we experimented with chunk sizes close to the training length, however, it led to increased deletions near the chunk ends.  It was actually better to reset the prediction network state.  This is understandable as the decoder was only ever trained to begin each utterance with a blank state, and it may be helping to count frames until \texttt{<EOS>}. The best performance, however, came from a middle approach: at the chunk boundary we reset the prediction network state but then ``prime'' it by re-processing the last several tokens through it.  We found state-priming to reduce the number of errors at the boundary without raising later deletions.  
+
+\begin{wraptable}{R}{0.5\textwidth}
+\vskip -0.25in
+\caption{WER (\%) on YouTube long-form test set.}
+\label{table-YT}
+\vskip 0.1in
+\begin{center}
+\begin{small}
+\begin{sc}
+\begin{tabular}{lccr}
+\toprule
+          & 15s Segmented & Unsegmented  \\
+\midrule
+RNN-T       & 7.6 & 6.8   \\
+Aligner     & 7.6 & 7.3   \\
+\bottomrule
+\end{tabular}
+\end{sc}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{wraptable}
+
+For testing, we turn to the YouTube domain, where the training utterances ranged from 5-15 seconds long but test utterances spanned several minutes.  Table~\ref{table-YT} compares results from RNN-T and the Aligner-Encoder.  They achieved equal WER ($7.6\%$) with a 15-second blind segmenter, due to equivalent errors at the boundaries.  In the unsegmented arrangement, the RNN-T,  with local attention of width 256, generalized well to the full utterance length; its WER improved to $6.8\%$\footnote{It is not automatically the case that RNN-T models exhibit good length generalization; it is by some combination of deliberate preparation and chance that our cases do.}.  Inside the Aligner, we applied a chunking period of 14 seconds (176 embedding frames).  We found it best to reset the prediction network at the chunk boundaries and prime it with 10 tokens of history, which achieved $7.3\%$ WER ($7.5\%$ without state-priming).  While falling short of the RNN-T in this case, the Aligner did improve performance by smoothing the chunk boundaries, even without having been trained to do so.  This result demonstrates our model's capability for long-form recognition, and could possibly be improved, such as by introducing additional training for this mode.
+
+\begin{wrapfigure}{R}{0.55\textwidth}
+  \begin{center}
+  \vskip -0.3in
+    \includegraphics[width=0.53\textwidth]{figures/attention_probs.png}
+  \end{center}
+  \vskip -0.2in
+  \caption{Self-attention probabilities from a single head at different layers in a 17-layer Aligner-Encoder performing audio-to-text alignment.}
+  \label{fig-atten-probs}
+  \vskip -0.4in
+\end{wrapfigure}
+
+
+% An obvious first approach to extend a duration-limited system to perform long-form speech recognition is to separate the audio into shorter segments and stitch the resulting hypotheses back together.  Fortunately, this is a viable approach with Aligners; in our experiments with such a ``blind'' segmenter, the Aligner correctly emits the EOS to finish decoding every segment, even when the audio cuts out in the middle of a word.  The downside of this approach is of course the information loss at the boundaries.  While an overlapping segmenter system could be used to stitch the hypothesis together in post-processing~\citep{chiu2021rnntgeneralize}, here we explore ways to improve continuity using only the model itself.  All of the methods we propose in this section are applied to a given model only at test time, after the conclusion of normal training, and require no further learning.  
+
+% Chiefly, we explore methods to cut the segments inside the model.  To distinguish from an external segmenter, and in reference to chunkwise attention proposed in~\citep{zhang2023usm} to promote length generalization, we refer to the operation as ``chunking'' when done internal to the model.  We introduce a ``chunker'' layer into the model, which separates the input sequence into units of equal length for processing them independently (\textit{i.e.}, folded into the batch dimension).  Some continuity is kept by placing the chunker layer after the initial 2-D convolutional feature layer.  The conformer portion of the encoder receives the chunked features, processes them in parallel, and then reassembles the chunks into the unified sequence at its output, prior to the decoder.  The decoder itself is made aware of the chunk boundaries, as it will need to turn off after the EOS resulting in each chunk, and then turn back on at the start of the next one.  We experimented with overlapping the chunks so that adjacent ones receive a small number of the same input frames at their boundary.  Ideally, the prediction network will carry its state forward across the chunk boundaries to smoothly integrate token predictions there.  
+
+% In our experiments with short chunking periods relative to the training length, we did find best results when carrying the full prediction state across the boundary.  For chunk periods closer to the training length, however, propagating the old state led to more deletions later in the chunk, so it was better to reset the prediction network state.  This is understandable as the decoder was only ever trained to begin each utterance with a blank state, and it may be helping to count frames until EOS.  A middle ground that we found to give the best performance is to reset the prediction network state but then prime it by re-processing the last several tokens.  This reduced the number of (false) insertions due to the boundary without raising deletions.  Predictably, chunk overlap reduces deletions, but increases insertions in the final hypothesis, requiring a balance.
+
+% Our best results with the Aligner, Long-Form (LF) on LibriSpeech were given in the bottom row of Table~\ref{table-test-clean-times}.  We used a chunk size of 448 frames, or 18 seconds, an overlap of 4, and we reset the prediction network state at each boundary and primed it with a history of 4 past tokens.  The chunk boundaries are not smoothed perfectly, but the Aligner-LF is capable of decoding the longest test utterances and reaches a total score very close to RNN-T.  Possibly a larger capacity decoder could help more.  The long-form model has surpassed the base AED model.  Although segmenting might help with AED, it is more difficult to carry over or prime the decoder state in AED since it requires the entire embedding sequence as input to the recurrent unit.  Results on the Dev Clean and Test Other sets were consistent with these.
+
+% We extended these results to the YouTube domain, where the training set contains utterances only 5 to 15 seconds in length, but the test utterances span several minutes.  Table~\ref{table-YT} compares results with RNN-T and the Aligner, which achieve equal WER with a 15-second blind segmenter.  Moving to unsegmented format, we found it best to use no overlap--possibly due to the additional 2-D convolution subsampling layer used here.  But with the slightly larger prediction network used here it was best to feed in a recent token history length of 10.  We applied chunk size of 176 frames, or 14 seconds.  Without segmenting, the RNN-T performance improves, showing strong generalization.  Although it does not reach the same level as RNN-T, the long-form Aligner model improves, as well.  The model is able to smooth segment boundaries, even without ever having been trained to do so.  
+
+
+
+% We also experimented with moving the chunker later, after some of the conformer layers.  But this did not improve performance, even when we trained encoders with small-context local self-attention in the lower layers.  LibriSpeech models benefited from positional embedding, typically injected immediately before the first conformer layer, and we found it important to compute the positions separately within each chunk.
+
+
+\subsection{Alignments}
+
+\subsubsection{Self-Attention Probabilities}
+
+To study how the encoder predicts the alignment, we examine the self-attention probabilities it computes during the forward pass.  Figure~\ref{fig-atten-probs} shows self-attention probabilities (every row sums to one) from the same head at different layers within one of our 17-layer encoders trained on LibriSpeech. A striking pattern emerges.  One might expect the alignment to happen gradually in a network replete with residual connections, and indeed the self-attention in layer 4 is highly diagonal along the sequence; its output positions (vertical) draw from very near their own position from the input (horizontal).   By layer 13, however, this pattern changes completely, and information concentrated in the front of the sequence appears to be distributed broadly.  Suddenly, in the next two layers, the audio-to-text alignment is clearly visible.  The label contains 12 word-pieces, and precisely that many output positions receive information from points distributed monotonically along the inputs to these layers.  The remaining output positions are possibly populated with filler values--these positions in the final output embedding receive no training.  The alignment is complete even before the final layer, where an unrelated distribution is seen.  
+
+% \begin{figure}[h]
+% \vskip 0.2in
+% \begin{center}
+% % \centerline{\includegraphics[width=0.9\columnwidth]{figures/attention_probs.png}}
+% \includegraphics[width=0.6\columnwidth]{figures/attention_probs.png}
+% \caption{Example self-attention probabilities from a single head at different layers during computation of a 17-layer Aligner-Encoder forward pass.  The early layers act primarily on local information, but in several layers near the end, a pattern resembling the audio alignment is clearly visible.  The horizontal axis is input position and the vertical axis is output position.}
+% \label{fig-atten-probs}
+% \end{center}
+% \vskip -0.2in
+% \end{figure}
+
+
+
+In this network, all the attention heads showed the same alignment operation happening in the 14th and 15th layers, for every input example we observed.  Early to middle layers performed different mixtures of diagonal (local) and non-diagonal (global) attentions for different heads, which were less interpretable.  Overall, the self-attention layers appear to be primarily performing audio encoding roughly in-place for many layers, and then they very explicitly perform the full alignment within as little as two layers.  Interestingly, positions near the beginning and end of the sequence are perhaps used as margins for bookkeeping, where the training utterances often contain silence anyway.
+
+The alignment itself is useful in many applications, and can be estimated from token emission positions when decoding with RNN-T.  Our model has obscured that information, but the observed behavior affords the possibility of extracting alignments during inference.  The bottom subplot of Figure~\ref{fig-good-alignment} shows the average of all attention heads in Layer 15.  Seen side by side, they closely track the RNN-T alignment, which is likely close to ground truth.
+
+\subsubsection{Embedding Alignment}
+
+To further study the alignment process, we also examined the intermediate embeddings themselves by the following procedure.  Given the converged Aligner-Encoder model, we trained an RNN-T model of the same size, which is randomly initialized except that the parameter values from the beginning layers of the Aligner are used in the corresponding layers of the new encoder.  The Aligner weights were kept frozen, so that the portion of the model trained by RNN-T receives as input the intermediate Aligner embedding.  Finally, we could measure alignments through the RNN-T decoder as usual--we computed the full forward-backward probabilities of the decoding lattice.  By repeating this procedure using different numbers of Aligner-Encoder layers as the foundation, we traced the alignment progression of the internal representation through the forward pass of the original model.
+
+The result is shown in Figure~\ref{fig-good-alignment}, where the suddenness of the process is apparent.  Within a single layer the representation shifts from its original layout to become fully front-aligned with the output.  This is the same layer that exhibited the most pronounced alignment self-attention probabilities previously.  In the figure, each subplot is independently normalized, and the decoding lattice probabilities (computed from the forward and backward passes) are re-computed using a high temperature to exaggerate the tails of the distributions, which are tightly peaked.  The bottom subplot shows the self-attention probabilities averaged over all heads in Layer 15, normalized by row but not temperature-adjusted.  The hot spots track closely with the original RNN-T alignment---note the lattice calculation fills in probability mass where the blank token is to be emitted, whereas the Aligner self-attention ignores those segments.  The close correspondence of the pauses is especially visible.
+
+
+% \begin{figure}[h]
+% \vskip 0.2in
+% \begin{center}
+% \centerline{\includegraphics[width=.65\columnwidth]{figures/good_alignment.png}}
+% % \includegraphics[width=0.6\textwidth]{figures/good_alignment.png}
+% \caption{Example lattice probabilities obtained by training RNN-T models on top of different numbers of frozen layers from an Aligner model, the top one having none.  The plots reveal that the alignment is performed within a single self-attention layer, near the output of the 17-layer network.  All models successfully decode the utterance.  The bottom subplot is the self-attention probabilities averaged over all heads, from the layer that induced the alignment shift.}
+% \label{fig-good-alignment}
+% \end{center}
+% \vskip -0.2in
+% \end{figure}
+
+\begin{wrapfigure}{R}{0.6\textwidth}
+  \begin{center}
+  \vskip -0.5in
+    \includegraphics[width=0.58\textwidth]{figures/good_alignment.png}
+  \end{center}
+  \caption{Decoding lattice probabilities ($U$ vs $T$) from RNN-T-on-Aligner and self-attention weights exhibiting successful alignment, within a specific layer.}
+  \label{fig-good-alignment}
+  \vskip -0.1in
+\end{wrapfigure}
+
+\subsubsection{Failure Mode Analysis}
+
+
+
+
+Using the same diagnostic technique, we can examine the failure mode of poor length generalization.   Figure~\ref{fig-bad-alignment} shows such a case, for an utterance that is 1.5x longer than any training example.  The model is only able to align a portion of the utterance, explaining why sometimes many deletions occur from dropping the latter part of the text.  Interestingly, the RNN-T model trained atop the 15 frozen Aligner-Encoder layers (as in the previous subsection) still assigns some probability to the remainder of the label sequence, in a somewhat aligned fashion but pushed to the tail of the embedding sequence.  This part is not decoded successfully.  As we increased the number of Aligner layers used, we observed that the RNN-T hypotheses began to lose tail words several layers prior to the apparent alignment layer.  Along with the self-attention visualization of Figure~\ref{fig-atten-probs}, this supports the conclusion that the Aligner works for several layers to prepare for the alignment operation; the over-length sequences already begin to be disrupted earlier.  Separately, we note that for sequences which are near the length-capacity of the all-Aligner model, when deletions begin to occur, we observed them to often happen somewhere in the middle.
+
+\begin{wrapfigure}{R}{0.6\textwidth}
+  \begin{center}
+  \vskip -0.6in
+    \includegraphics[width=0.58\textwidth]{figures/bad_alignment.png}
+  \end{center}
+  \caption{Decoding lattice probabilities ($U$ vs $T$) from RNN-T-on-Aligner and self-attention weights exhibiting a failure mode for an utterance 1.5x longer than trained.}
+  \label{fig-bad-alignment}
+  \vskip -0.1in
+\end{wrapfigure}
+
+
+
+\subsubsection{Reverse Alignment}
+
+We conducted one final experiment to demonstrate the likely applicability of Aligner-Encoders to tasks other than ASR.  Specifically, we desired to show that our model has greater flexibility in aligning information than only the monotonic and \textit{increasing} alignment relationship of standard ASR.  To do so, we constructed the extreme case of \textit{decreasing} alignment by completely reversing the audio input, so frames at the end of the audio input correspond to the beginning of the text output, and vice versa.  Experimenting in LibriSpeech, the resulting model achieved similar performance as the regular model on utterances within the training length.  Further, the self-attention weights exhibited the same behavior as in the forward model, except that in the aligning layer the weights trace from the upper-left to lower-right, showing the sequence reversal in action (compare against the bottom panel of Figure~\ref{fig-good-alignment}).  We include alignment plots for this model in the appendix, Figure~\ref{fig-reverse-alignment}.  The equal ability to completely reverse the order of the information in the encoder embedding strongly suggests that our model could perform non-monotonic tasks, as well, which require more varied information re-ordering.  Two prominent non-monotonic tasks where Aligner-Encoders have potential to simplify modeling include machine translation (MT) (\textit{e.g.}~\cite{bahdanau2015neural}) and automatic speech translation (AST) (\textit{e.g.}~\cite{berard2016listen,liu-etal-2021-cross,chuang-etal-2021-investigating,xue22022large-scale}).
+
+
+% \begin{figure}[h]
+% \vskip 0.2in
+% \begin{center}
+% \centerline{\includegraphics[width=.7\columnwidth]{figures/bad_alignment.png}}
+% % \includegraphics[width=0.6\textwidth]{figures/good_alignment.png}
+% \caption{Alignment analysis on an utterance that is over 1.5x longer than any training example.  The latter portion of the utterance is left out of the alignment, and instead appears to be pushed to a position roughly corresponding to the maximum training length. In these cases the resulting RNN-T model generally does not successfully decode text beyond the initial, aligned segment.  A high temperature is used to exaggerate the weight on the low probability lattice points.  The bottom subplot is the self-attention weights averaged over all heads from the aligning layer, no temperature applied.}
+% \label{fig-bad-alignment}
+% \end{center}
+% \vskip -0.2in
+% \end{figure}
+
+\subsection{Computational Efficiency}
+
+
+
+
+Considering training speed, memory usage, and inference speed, we observed favorable comparisons for our model owing to its reduced complexity.  While the exact numbers will depend on many hardware and implementation details, we present a representative case using our 100M-parameter encoder LibriSpeech models in Table~\ref{table-compute}.  Notably, the RNN-T spent roughly 290ms per training step in the decoder and loss (forward + backward propagation), whereas our model required only 29ms, a 10x gain.  Our RNN-T loss implementation is highly optimized, so the majority of the gains came from eliminating the scan associated with the $T$ dimension of the joint network output.  The peak memory usage for our model decreased by 18\% (by 1.4G per accelerator)\footnote{Total training time was roughly a day and a half.}.  The 4-layer AED decoder trained with a step time essentially as fast as ours, thanks to good parallelization of transformers, and did tend to converge in significantly fewer steps (see~\ref{sec:librispeech_appndx}).  
+
+\begin{wraptable}{R}{0.52\textwidth}
+\vskip -0.25in
+\caption{Example measured compute times for our LibriSpeech models (lower is better).}
+\label{table-compute}
+\begin{center}
+\begin{small}
+\begin{sc}
+\begin{tabular}{lrrr}
+\toprule
+(milliseconds)     & AED & RNN-T & Aligner \\
+\midrule
+\multicolumn{4}{l}{Training Step: (Encoder=560ms)} \\
+% \hspace{2mm}Encoder         & 560 & 560 & 560 \\
+\hspace{2mm}Decoder+Loss    & 31 & 290 & 29 \\
+\hspace{1mm}Total           &  591  & 850  & 589 \\
+\midrule
+\multicolumn{4}{l}{Inference: (Encode=32ms; T=300,U=100)} \\
+% \hspace{2mm}Encode          & 32   & 32    & 32 \\
+\hspace{2mm}Decode Step     & 8.5  &  0.19 & 0.19 \\
+\hspace{2mm}Decode         & 850  & 76  & 19 \\
+\hspace{1mm}Total           & 832  &  108 &  51 \\
+\bottomrule
+\end{tabular}
+\end{sc}
+\end{small}
+\end{center}
+\vskip -0.2in
+\end{wraptable}
+
+The inference speed of our model, however, was by far the fastest, especially relative to AED.  We profiled all models using 11.5 seconds of audio, a batch size of 8, and beam search of size 6 (effective decoder batch size 48).  The decode step for the Aligner and RNN-T\footnote{We disabled path merging for RNN-T.} (LSTM + Joint network) measured a mere 190$\mu$s.  As discussed earlier, we can estimate the total decode time as the step time multiplied by the text length $(U)$ for our model, versus multiplying by the sum of the audio and text lengths $(T+U)$ for the RNN-T, resulting in substantial savings.  We approximate with $T=300, U=100$.   Turning to AED, each step through the transformer decoder was almost two orders of magnitude slower, at 8.5ms (and $U$ steps are executed).\footnote{Our implementation included both self-attention and cross-attention in all layers, and a decode cache.}  The forward pass itself required 5ms per step, and re-ordering the decoder state as part of the beam search occupied the other 3.5ms. The re-ordering time was negligible in our model due to the minuscule LSTM state.  Including the encoder, the total inference time of our model is estimated at 2x faster than RNN-T and 16x faster than AED in this scenario.
+
+
+
+% \section{Discussion}
+% Put some things here about applicability to MT and AST, what to do if T<U, streaming, using a pre-trained model, V2 embedding, TTS, extending long-form ... basically all the open questions and to-dos (and remove some of those from the conclusion).
+
+
+\section{Conclusion}
+
+We have shown that transformer-based encoders are able to perform audio-to-text sequence alignment internally during a forward pass, using only self-attention (\textit{i.e.}, prior to decoding, unlike previous models).  This finding enables the use of a much simpler ASR model, the Aligner-Encoder, which has a simple training loss and achieves lower decoding complexity than past models.  A key design point of our model is to keep the benefit of auto-regressive modeling while removing as much computation as possible from the auto-regressive loop.  Desirable extensions to our model for ASR that would require further study include: use in streaming recognition, ability for multilingual recognition, and incorporation of traditional pretrained encoders, to name a few.  Fusion with an external language model~\citep{chorowski2016towards} could be simplified relative to RNN-T owing to the absence of blank tokens, and for the same reason our model may be more receptive to training on other losses such as from text-only data.  Looking beyond ASR, application to machine (text) translation would require some modification to permit output sequences longer than the input, although speech translation would not.  Altogether, Aligner-Encoders and their newly identified ability to learn self-transduction present promising opportunities for future research and application.
+
+
+\begin{ack}
+The authors would like to acknowledge the numerous members of the Google Speech Team who contributed either directly or indirectly through work on a shared code base, data preparation and maintenance, experiment and evaluation infrastructure, and furthermore by providing guidance and answering questions pertaining to these elements and other past research experience.  We also thank the several anonymous reviewers who provided valuable feedback resulting in significant improvements in the quality of this paper. 
+\end{ack}
+
+
+
+
+\bibliography{main}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\clearpage
+\appendix
+\section{Appendix / supplemental material}
+
+\subsection{LibriSpeech -- Expanded Settings and Results}
+
+\begin{table}[h]
+\caption{LibriSpeech common training settings.}
+\label{table-training}
+% \vskip 0.15in
+\begin{center}
+\begin{small}
+\begin{sc}
+\begin{tabular}{lc}
+\toprule
+Setting                       & Value \\
+\midrule
+Learning rate                 & 5.0   \\
+Learning rate decay           & square-root   \\
+Learning rate warmup (steps)  & linear (10,000) \\
+Optimizer                     & Adam \\
+Optimizer beta-1, beta-2      & 0.9, 0.98 \\
+Optimizer EMA decay           & 0.9999 \\
+Clip grad norm                & 5.0 \\
+L-2 regularizer weight        & 1e-6 \\
+Batch size                    & 2,048 \\
+Training steps                & 150,000 \\
+Variational Noise scale       & 0.075 \\
+Variational Noise variables   & text embedding, LSTM \\
+Spectrum Augmentation         & time \& freq mask \\
+Conformer Conv 1-D Kernel     & 10 (RNN-T: 32) \\
+Self-Attention Heads          & 8 \\
+Text Embedding Size           & 128 (AED: 512) \\
+Label Smoothing Weight        & 0.1 (RNN-T: N/A) \\
+
+\bottomrule
+\end{tabular}
+\end{sc}
+\end{small}
+\end{center}
+% \vskip -0.1in
+\end{table}
+
+
+
+\begin{table}[h]
+\caption{WER (\%) on LibriSpeech Test-Clean set by utterance duration, including models trained with concatenated training examples covering up to the maximum test length of 36s.  The number of test utterances in each category is 2466, 89, and 65, in order of length.}
+\label{table-test-clean-times}
+\vskip 0.1in
+\begin{center}
+\begin{small}
+\begin{sc}
+\begin{tabular}{lccccr}
+\toprule
+Test-Clean      & $<$ 17s & 17-21s & $>$ 21s & & All \\
+\midrule
+CTC            & 2.8 & 2.7 & 3.5 & & 2.8 \\
+RNN-T          & 2.1 & 1.9 & 2.8 & & 2.1 \\
+AED            & 2.3 & 2.1 & 15.3 & & 3.3 \\
+Aligner        & 2.4 & 7.0 & 28.0 & & 4.8 \\
+\midrule
+AED-Concat     & 2.4 & 2.1 & 2.8 & & 2.4 \\
+Aligner-Concat & 2.2 & 2.1 & 2.9 & & 2.3 \\
+\bottomrule
+\end{tabular}
+\end{sc}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table}
+
+
+\begin{table}[h]
+\caption{WER (\%) on LibriSpeech Test-Other set by utterance duration, including models trained with concatenated training examples covering up to the maximum test length of 36s.  The number of test utterances in each category is 2834, 70, and 35, in order of length.}
+\label{table-test-other-times}
+\vskip 0.1in
+\begin{center}
+\begin{small}
+\begin{sc}
+\begin{tabular}{lccccr}
+\toprule
+Test-Other      & $<$ 17s & 17-21s & $>$ 21s & & All \\
+\midrule
+CTC            & 6.6 & 6.0 & 4.3 & & 6.4 \\
+RNN-T          & 4.7 & 4.4 & 3.1 & & 4.6 \\
+AED            & 5.4 & 5.4 & 24.2 & & 6.3 \\
+Aligner        & 5.2 & 8.4 & 29.2 & & 6.5 \\
+\midrule
+AED-Concat     & 5.6 & 5.6 & 3.0 & & 5.5 \\
+Aligner-Concat & 5.2 & 5.3 & 3.3 & & 5.1 \\
+\bottomrule
+\end{tabular}
+\end{sc}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table}
+
+
+\subsection{LibriSpeech -- AED versus RNN-T Performance}
+\label{sec:librispeech_appndx}
+While historically AED has out-performed RNN-T on LibriSpeech, this appears to have changed with the introduction of the Conformer~\cite{gulati2020conformer}.  To this point, there are several relevant factors worth noting for our case.  Both models receive positional encoding following the feature convolution layers.  Our RNN-T is trained and operated in a non-streaming mode (\textit{e.g.}, with non-causal attention).  We trained AED with label smoothing (weight of 0.1) to prevent overfitting.  Our AED models did often converge much faster, sometimes in as few as 25k training steps; we conducted a small hyperparameter search over learning rate and schedule to ensure against overfitting.  Lastly, our AED decoder is a 4-layer transformer with 18M parameters (total model parameters 128M), which is already significantly larger than the 3.5M-parameter LSTM decoder for the RNN-T.  A 148M-parameter conformer AED was reported in~\cite{kim2023branchformer} to achieve $2.16\%$ and $4.74\%$ on Test-Clean and Test-Other, respectively, which is better than our smaller AED baseline but still less good than our RNN-T, which we keep as the relevant SOTA for comparison.
+
+
+\subsection{Reverse Alignment Experiment Figure}
+
+\begin{figure}[h]
+  \begin{center}
+    \includegraphics[width=0.6\textwidth]{figures/reverse_alignment.png}
+  \end{center}
+  \caption{Self-attention weights in an Aligner-Encoder (from a single head) trained on reversed audio; the reverse alignment is clearly visible in layers 15 and 16. (LibriSpeech, 17-layer encoder).}
+  \label{fig-reverse-alignment}
+\end{figure}
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+% \clearpage
+% \section*{NeurIPS Paper Checklist}
+
+
+%%% BEGIN INSTRUCTIONS %%%
+% The checklist is designed to encourage best practices for responsible machine learning research, addressing issues of reproducibility, transparency, research ethics, and societal impact. Do not remove the checklist: {\bf The papers not including the checklist will be desk rejected.} The checklist should follow the references and follow the (optional) supplemental material.  The checklist does NOT count towards the page
+% limit. 
+
+% Please read the checklist guidelines carefully for information on how to answer these questions. For each question in the checklist:
+% \begin{itemize}
+%     \item You should answer \answerYes{}, \answerNo{}, or \answerNA{}.
+%     \item \answerNA{} means either that the question is Not Applicable for that particular paper or the relevant information is Not Available.
+%     \item Please provide a short (1–2 sentence) justification right after your answer (even for NA). 
+%   % \item {\bf The papers not including the checklist will be desk rejected.}
+% \end{itemize}
+
+% {\bf The checklist answers are an integral part of your paper submission.} They are visible to the reviewers, area chairs, senior area chairs, and ethics reviewers. You will be asked to also include it (after eventual revisions) with the final version of your paper, and its final version will be published with the paper.
+
+% The reviewers of your paper will be asked to use the checklist as one of the factors in their evaluation. While "\answerYes{}" is generally preferable to "\answerNo{}", it is perfectly acceptable to answer "\answerNo{}" provided a proper justification is given (e.g., "error bars are not reported because it would be too computationally expensive" or "we were unable to find the license for the dataset we used"). In general, answering "\answerNo{}" or "\answerNA{}" is not grounds for rejection. While the questions are phrased in a binary way, we acknowledge that the true answer is often more nuanced, so please just use your best judgment and write a justification to elaborate. All supporting evidence can appear either in the main paper or the supplemental material, provided in appendix. If you answer \answerYes{} to a question, in the justification please point to the section(s) where related material for the question can be found.
+
+% IMPORTANT, please:
+% \begin{itemize}
+%     \item {\bf Delete this instruction block, but keep the section heading ``NeurIPS paper checklist"},
+%     \item  {\bf Keep the checklist subsection headings, questions/answers and guidelines below.}
+%     \item {\bf Do not modify the questions and only use the provided macros for your answers}.
+% \end{itemize} 
+ 
+
+%%% END INSTRUCTIONS %%%
+
+
+% \begin{enumerate}
+
+% \item {\bf Claims}
+%     \item[] Question: Do the main claims made in the abstract and introduction accurately reflect the paper's contributions and scope?
+%     \item[] Answer: \answerYes{} % Replace by \answerYes{}, \answerNo{}, or \answerNA{}.
+%     \item[] Justification: The paper is carefully scoped to describe a new, simplified model for ASR which is enabled by a newly-observed learnable capability of self-attention.  Numerous experiments showcase the new model and compare it against the pre-existing state of the art systems.
+%     \item[] Guidelines:
+%     \begin{itemize}
+%         \item The answer NA means that the abstract and introduction do not include the claims made in the paper.
+%         \item The abstract and/or introduction should clearly state the claims made, including the contributions made in the paper and important assumptions and limitations. A No or NA answer to this question will not be perceived well by the reviewers. 
+%         \item The claims made should match theoretical and experimental results, and reflect how much the results can be expected to generalize to other settings. 
+%         \item It is fine to include aspirational goals as motivation as long as it is clear that these goals are not attained by the paper. 
+%     \end{itemize}
+
+% \item {\bf Limitations}
+%     \item[] Question: Does the paper discuss the limitations of the work performed by the authors?
+%     \item[] Answer: \answerYes{} % Replace by \answerYes{}, \answerNo{}, or \answerNA{}.
+%     \item[] Justification: The paper discusses a primary limitation we discovered relative to some previous models, which is inability to generalize to longer sequence lengths (some previous models share this limitation).  Significant experiments were conducted to address this limitation, with good success but more could be done.  Possibly other limitations exist which we did not explore thoroughly, such as: is more data required to train our model versus the previous models--none of our standard experimental settings showed an effect, but they also would not be considered low-resource datasets.  We do not hide that our model is very slightly lower recognition performance than the best RNN-T models with the same settings in most of our experiments--we make no claims to achieve a new state-of-the-art in terms of WER.  We have also not claimed to be able to operate our model in streaming fashion, which may be seen by some as a limitation.
+%     \item[] Guidelines:
+%     \begin{itemize}
+%         \item The answer NA means that the paper has no limitation while the answer No means that the paper has limitations, but those are not discussed in the paper. 
+%         \item The authors are encouraged to create a separate "Limitations" section in their paper.
+%         \item The paper should point out any strong assumptions and how robust the results are to violations of these assumptions (e.g., independence assumptions, noiseless settings, model well-specification, asymptotic approximations only holding locally). The authors should reflect on how these assumptions might be violated in practice and what the implications would be.
+%         \item The authors should reflect on the scope of the claims made, e.g., if the approach was only tested on a few datasets or with a few runs. In general, empirical results often depend on implicit assumptions, which should be articulated.
+%         \item The authors should reflect on the factors that influence the performance of the approach. For example, a facial recognition algorithm may perform poorly when image resolution is low or images are taken in low lighting. Or a speech-to-text system might not be used reliably to provide closed captions for online lectures because it fails to handle technical jargon.
+%         \item The authors should discuss the computational efficiency of the proposed algorithms and how they scale with dataset size.
+%         \item If applicable, the authors should discuss possible limitations of their approach to address problems of privacy and fairness.
+%         \item While the authors might fear that complete honesty about limitations might be used by reviewers as grounds for rejection, a worse outcome might be that reviewers discover limitations that aren't acknowledged in the paper. The authors should use their best judgment and recognize that individual actions in favor of transparency play an important role in developing norms that preserve the integrity of the community. Reviewers will be specifically instructed to not penalize honesty concerning limitations.
+%     \end{itemize}
+
+% \item {\bf Theory Assumptions and Proofs}
+%     \item[] Question: For each theoretical result, does the paper provide the full set of assumptions and a complete (and correct) proof?
+%     \item[] Answer: \answerNA{} % Replace by \answerYes{}, \answerNo{}, or \answerNA{}.
+%     \item[] Justification:
+%     \item[] Guidelines:
+%     \begin{itemize}
+%         \item The answer NA means that the paper does not include theoretical results. 
+%         \item All the theorems, formulas, and proofs in the paper should be numbered and cross-referenced.
+%         \item All assumptions should be clearly stated or referenced in the statement of any theorems.
+%         \item The proofs can either appear in the main paper or the supplemental material, but if they appear in the supplemental material, the authors are encouraged to provide a short proof sketch to provide intuition. 
+%         \item Inversely, any informal proof provided in the core of the paper should be complemented by formal proofs provided in appendix or supplemental material.
+%         \item Theorems and Lemmas that the proof relies upon should be properly referenced. 
+%     \end{itemize}
+
+%     \item {\bf Experimental Result Reproducibility}
+%     \item[] Question: Does the paper fully disclose all the information needed to reproduce the main experimental results of the paper to the extent that it affects the main claims and/or conclusions of the paper (regardless of whether the code and data are provided or not)?
+%     \item[] Answer: \answerYes{} % Replace by \answerYes{}, \answerNo{}, or \answerNA{}.
+%     \item[] Justification: We provide a complete description of the model, and make an effort to convey the relevant settings for training and evaluation (see appendices).  Furthermore, we strove to change settings as little as possible from those employed with previous models, showing that it should likely be relatively straightforward to adopt the new model.  Lastly, one of the main benefits of the new model is its simplicity--since it uses standard deep learning components and removes complications relative to previous models, the description should suffice for reproduction.
+%     \item[] Guidelines:
+%     \begin{itemize}
+%         \item The answer NA means that the paper does not include experiments.
+%         \item If the paper includes experiments, a No answer to this question will not be perceived well by the reviewers: Making the paper reproducible is important, regardless of whether the code and data are provided or not.
+%         \item If the contribution is a dataset and/or model, the authors should describe the steps taken to make their results reproducible or verifiable. 
+%         \item Depending on the contribution, reproducibility can be accomplished in various ways. For example, if the contribution is a novel architecture, describing the architecture fully might suffice, or if the contribution is a specific model and empirical evaluation, it may be necessary to either make it possible for others to replicate the model with the same dataset, or provide access to the model. In general. releasing code and data is often one good way to accomplish this, but reproducibility can also be provided via detailed instructions for how to replicate the results, access to a hosted model (e.g., in the case of a large language model), releasing of a model checkpoint, or other means that are appropriate to the research performed.
+%         \item While NeurIPS does not require releasing code, the conference does require all submissions to provide some reasonable avenue for reproducibility, which may depend on the nature of the contribution. For example
+%         \begin{enumerate}
+%             \item If the contribution is primarily a new algorithm, the paper should make it clear how to reproduce that algorithm.
+%             \item If the contribution is primarily a new model architecture, the paper should describe the architecture clearly and fully.
+%             \item If the contribution is a new model (e.g., a large language model), then there should either be a way to access this model for reproducing the results or a way to reproduce the model (e.g., with an open-source dataset or instructions for how to construct the dataset).
+%             \item We recognize that reproducibility may be tricky in some cases, in which case authors are welcome to describe the particular way they provide for reproducibility. In the case of closed-source models, it may be that access to the model is limited in some way (e.g., to registered users), but it should be possible for other researchers to have some path to reproducing or verifying the results.
+%         \end{enumerate}
+%     \end{itemize}
+
+
+% \item {\bf Open access to data and code}
+%     \item[] Question: Does the paper provide open access to the data and code, with sufficient instructions to faithfully reproduce the main experimental results, as described in supplemental material?
+%     \item[] Answer: \answerNo{} % Replace by \answerYes{}, \answerNo{}, or \answerNA{}.
+%     \item[] Justification: We conducted experiments on two proprietary datasets, which cannot be released, and to balance this we also conducted experiments on open-source data which is already fully available.  We are also unable to release code, however as discussed under reproducibility, we share full details of the implementation settings, and by the simpler nature of our model, it requires no coding tricks relative to previous models.
+%     \item[] Guidelines:
+%     \begin{itemize}
+%         \item The answer NA means that paper does not include experiments requiring code.
+%         \item Please see the NeurIPS code and data submission guidelines (\url{https://nips.cc/public/guides/CodeSubmissionPolicy}) for more details.
+%         \item While we encourage the release of code and data, we understand that this might not be possible, so “No” is an acceptable answer. Papers cannot be rejected simply for not including code, unless this is central to the contribution (e.g., for a new open-source benchmark).
+%         \item The instructions should contain the exact command and environment needed to run to reproduce the results. See the NeurIPS code and data submission guidelines (\url{https://nips.cc/public/guides/CodeSubmissionPolicy}) for more details.
+%         \item The authors should provide instructions on data access and preparation, including how to access the raw data, preprocessed data, intermediate data, and generated data, etc.
+%         \item The authors should provide scripts to reproduce all experimental results for the new proposed method and baselines. If only a subset of experiments are reproducible, they should state which ones are omitted from the script and why.
+%         \item At submission time, to preserve anonymity, the authors should release anonymized versions (if applicable).
+%         \item Providing as much information as possible in supplemental material (appended to the paper) is recommended, but including URLs to data and code is permitted.
+%     \end{itemize}
+
+
+% \item {\bf Experimental Setting/Details}
+%     \item[] Question: Does the paper specify all the training and test details (e.g., data splits, hyperparameters, how they were chosen, type of optimizer, etc.) necessary to understand the results?
+%     \item[] Answer: \answerYes{} % Replace by \answerYes{}, \answerNo{}, or \answerNA{}.
+%     \item[] Justification: The body of the paper describes the main points of training and model settings, and the appendix includes more detailed settings.
+%     \item[] Guidelines:
+%     \begin{itemize}
+%         \item The answer NA means that the paper does not include experiments.
+%         \item The experimental setting should be presented in the core of the paper to a level of detail that is necessary to appreciate the results and make sense of them.
+%         \item The full details can be provided either with the code, in appendix, or as supplemental material.
+%     \end{itemize}
+
+% \item {\bf Experiment Statistical Significance}
+%     \item[] Question: Does the paper report error bars suitably and correctly defined or other appropriate information about the statistical significance of the experiments?
+%     \item[] Answer: \answerNo{} % Replace by \answerYes{}, \answerNo{}, or \answerNA{}.
+%     \item[] Justification: Due to computation constraints, we elected to explore training multiple different datasets (including their own hyperparameter searches) as a better use of resources to build confidence in the method, rather than running more repeats of the same setting for any given dataset to produce true confidence intervals.  As we do not claim SOTA, our results do not hinge too closely on the exact precision of model performance, and we do not report an excessive number of significant digits.
+%     \item[] Guidelines:
+%     \begin{itemize}
+%         \item The answer NA means that the paper does not include experiments.
+%         \item The authors should answer "Yes" if the results are accompanied by error bars, confidence intervals, or statistical significance tests, at least for the experiments that support the main claims of the paper.
+%         \item The factors of variability that the error bars are capturing should be clearly stated (for example, train/test split, initialization, random drawing of some parameter, or overall run with given experimental conditions).
+%         \item The method for calculating the error bars should be explained (closed form formula, call to a library function, bootstrap, etc.)
+%         \item The assumptions made should be given (e.g., Normally distributed errors).
+%         \item It should be clear whether the error bar is the standard deviation or the standard error of the mean.
+%         \item It is OK to report 1-sigma error bars, but one should state it. The authors should preferably report a 2-sigma error bar than state that they have a 96\% CI, if the hypothesis of Normality of errors is not verified.
+%         \item For asymmetric distributions, the authors should be careful not to show in tables or figures symmetric error bars that would yield results that are out of range (e.g. negative error rates).
+%         \item If error bars are reported in tables or plots, The authors should explain in the text how they were calculated and reference the corresponding figures or tables in the text.
+%     \end{itemize}
+
+% \item {\bf Experiments Compute Resources}
+%     \item[] Question: For each experiment, does the paper provide sufficient information on the computer resources (type of compute workers, memory, time of execution) needed to reproduce the experiments?
+%     \item[] Answer: \answerYes{} % Replace by \answerYes{}, \answerNo{}, or \answerNA{}.
+%     \item[] Justification: We discuss the compute resources, memory, and time of execution in the computational efficiency section.  Our experiments are more efficient but require a similar amount of compute as established ASR systems.
+%     \item[] Guidelines:
+%     \begin{itemize}
+%         \item The answer NA means that the paper does not include experiments.
+%         \item The paper should indicate the type of compute workers CPU or GPU, internal cluster, or cloud provider, including relevant memory and storage.
+%         \item The paper should provide the amount of compute required for each of the individual experimental runs as well as estimate the total compute. 
+%         \item The paper should disclose whether the full research project required more compute than the experiments reported in the paper (e.g., preliminary or failed experiments that didn't make it into the paper). 
+%     \end{itemize}
+    
+% \item {\bf Code Of Ethics}
+%     \item[] Question: Does the research conducted in the paper conform, in every respect, with the NeurIPS Code of Ethics \url{https://neurips.cc/public/EthicsGuidelines}?
+%     \item[] Answer: \answerYes{} % Replace by \answerYes{}, \answerNo{}, or \answerNA{}.
+%     \item[] Justification: Any data potentially containing PII has been anonymized prior to use.  Our method introduces no new potential societal impacts distinct from existing ASR systems.
+%     \item[] Guidelines:
+%     \begin{itemize}
+%         \item The answer NA means that the authors have not reviewed the NeurIPS Code of Ethics.
+%         \item If the authors answer No, they should explain the special circumstances that require a deviation from the Code of Ethics.
+%         \item The authors should make sure to preserve anonymity (e.g., if there is a special consideration due to laws or regulations in their jurisdiction).
+%     \end{itemize}
+
+
+% \item {\bf Broader Impacts}
+%     \item[] Question: Does the paper discuss both potential positive societal impacts and negative societal impacts of the work performed?
+%     \item[] Answer: \answerNA{} % Replace by \answerYes{}, \answerNo{}, or \answerNA{}.
+%     \item[] Justification: Our work introduces no new societal impacts distinct from existing ASR systems.
+%     \item[] Guidelines:
+%     \begin{itemize}
+%         \item The answer NA means that there is no societal impact of the work performed.
+%         \item If the authors answer NA or No, they should explain why their work has no societal impact or why the paper does not address societal impact.
+%         \item Examples of negative societal impacts include potential malicious or unintended uses (e.g., disinformation, generating fake profiles, surveillance), fairness considerations (e.g., deployment of technologies that could make decisions that unfairly impact specific groups), privacy considerations, and security considerations.
+%         \item The conference expects that many papers will be foundational research and not tied to particular applications, let alone deployments. However, if there is a direct path to any negative applications, the authors should point it out. For example, it is legitimate to point out that an improvement in the quality of generative models could be used to generate deepfakes for disinformation. On the other hand, it is not needed to point out that a generic algorithm for optimizing neural networks could enable people to train models that generate Deepfakes faster.
+%         \item The authors should consider possible harms that could arise when the technology is being used as intended and functioning correctly, harms that could arise when the technology is being used as intended but gives incorrect results, and harms following from (intentional or unintentional) misuse of the technology.
+%         \item If there are negative societal impacts, the authors could also discuss possible mitigation strategies (e.g., gated release of models, providing defenses in addition to attacks, mechanisms for monitoring misuse, mechanisms to monitor how a system learns from feedback over time, improving the efficiency and accessibility of ML).
+%     \end{itemize}
+    
+% \item {\bf Safeguards}
+%     \item[] Question: Does the paper describe safeguards that have been put in place for responsible release of data or models that have a high risk for misuse (e.g., pretrained language models, image generators, or scraped datasets)?
+%     \item[] Answer: \answerNA{} % Replace by \answerYes{}, \answerNo{}, or \answerNA{}.
+%     \item[] Justification:
+%     \item[] Guidelines:
+%     \begin{itemize}
+%         \item The answer NA means that the paper poses no such risks.
+%         \item Released models that have a high risk for misuse or dual-use should be released with necessary safeguards to allow for controlled use of the model, for example by requiring that users adhere to usage guidelines or restrictions to access the model or implementing safety filters. 
+%         \item Datasets that have been scraped from the Internet could pose safety risks. The authors should describe how they avoided releasing unsafe images.
+%         \item We recognize that providing effective safeguards is challenging, and many papers do not require this, but we encourage authors to take this into account and make a best faith effort.
+%     \end{itemize}
+
+% \item {\bf Licenses for existing assets}
+%     \item[] Question: Are the creators or original owners of assets (e.g., code, data, models), used in the paper, properly credited and are the license and terms of use explicitly mentioned and properly respected?
+%     \item[] Answer: \answerNA{} % Replace by \answerYes{}, \answerNo{}, or \answerNA{}.
+%     \item[] Justification: 
+%     \item[] Guidelines:
+%     \begin{itemize}
+%         \item The answer NA means that the paper does not use existing assets.
+%         \item The authors should cite the original paper that produced the code package or dataset.
+%         \item The authors should state which version of the asset is used and, if possible, include a URL.
+%         \item The name of the license (e.g., CC-BY 4.0) should be included for each asset.
+%         \item For scraped data from a particular source (e.g., website), the copyright and terms of service of that source should be provided.
+%         \item If assets are released, the license, copyright information, and terms of use in the package should be provided. For popular datasets, \url{paperswithcode.com/datasets} has curated licenses for some datasets. Their licensing guide can help determine the license of a dataset.
+%         \item For existing datasets that are re-packaged, both the original license and the license of the derived asset (if it has changed) should be provided.
+%         \item If this information is not available online, the authors are encouraged to reach out to the asset's creators.
+%     \end{itemize}
+
+% \item {\bf New Assets}
+%     \item[] Question: Are new assets introduced in the paper well documented and is the documentation provided alongside the assets?
+%     \item[] Answer: \answerNA{} % Replace by \answerYes{}, \answerNo{}, or \answerNA{}.
+%     \item[] Justification:
+%     \item[] Guidelines:
+%     \begin{itemize}
+%         \item The answer NA means that the paper does not release new assets.
+%         \item Researchers should communicate the details of the dataset/code/model as part of their submissions via structured templates. This includes details about training, license, limitations, etc. 
+%         \item The paper should discuss whether and how consent was obtained from people whose asset is used.
+%         \item At submission time, remember to anonymize your assets (if applicable). You can either create an anonymized URL or include an anonymized zip file.
+%     \end{itemize}
+
+% \item {\bf Crowdsourcing and Research with Human Subjects}
+%     \item[] Question: For crowdsourcing experiments and research with human subjects, does the paper include the full text of instructions given to participants and screenshots, if applicable, as well as details about compensation (if any)? 
+%     \item[] Answer: \answerNA{} % Replace by \answerYes{}, \answerNo{}, or \answerNA{}.
+%     \item[] Justification:
+%     \item[] Guidelines:
+%     \begin{itemize}
+%         \item The answer NA means that the paper does not involve crowdsourcing nor research with human subjects.
+%         \item Including this information in the supplemental material is fine, but if the main contribution of the paper involves human subjects, then as much detail as possible should be included in the main paper. 
+%         \item According to the NeurIPS Code of Ethics, workers involved in data collection, curation, or other labor should be paid at least the minimum wage in the country of the data collector. 
+%     \end{itemize}
+
+% \item {\bf Institutional Review Board (IRB) Approvals or Equivalent for Research with Human Subjects}
+%     \item[] Question: Does the paper describe potential risks incurred by study participants, whether such risks were disclosed to the subjects, and whether Institutional Review Board (IRB) approvals (or an equivalent approval/review based on the requirements of your country or institution) were obtained?
+%     \item[] Answer: \answerNA{} % Replace by \answerYes{}, \answerNo{}, or \answerNA{}.
+%     \item[] Justification: 
+%     \item[] Guidelines:
+%     \begin{itemize}
+%         \item The answer NA means that the paper does not involve crowdsourcing nor research with human subjects.
+%         \item Depending on the country in which research is conducted, IRB approval (or equivalent) may be required for any human subjects research. If you obtained IRB approval, you should clearly state this in the paper. 
+%         \item We recognize that the procedures for this may vary significantly between institutions and locations, and we expect authors to adhere to the NeurIPS Code of Ethics and the guidelines for their institution. 
+%         \item For initial submissions, do not include any information that would break anonymity (if applicable), such as the institution conducting the review.
+%     \end{itemize}
+
+% \end{enumerate}
+
+\end{document}

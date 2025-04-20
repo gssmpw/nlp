@@ -1,0 +1,217 @@
+% what the innovations are and how they were achieved
+
+% \fix{2 pages max}
+
+Training deep neural networks on a single GPU involves processing subsets of
+the data called batches through the layers of a DNN in the forward pass to
+compute a loss, computing the gradient of the loss in a backward pass via
+backpropagation, and updating the parameters (also called ``weights'') in the
+optimizer step. These three steps are repeated iteratively until all batches
+have been consumed, and this entire training process is referred to as an
+epoch. We now describe our novel approach to scaling the computation in the
+steps described above in the context of large multi-billion parameter neural
+networks on thousands of GPUs.
+
+\subsection{A Four-Dimensional Hybrid Parallel Approach}
+\label{sec:hybrid}
+
+We have designed a hybrid parallel approach that combines data parallelism with
+three-dimensional (3D) parallelization of the matrix multiplication routines.
+
+\vspace{0.08in}
+\noindent{\bf Data Parallelism:}
+% When using only data parallelism, we first instantiate a full copy of the
+% neural network on every GPU, and then divide the input batch into equal-sized
+% {\em shards} among these GPUs.
+In order to use a hybrid approach that combines data with tensor
+parallelism, we organize the total number of GPUs, $G$, into a virtual 2D
+grid, $G_{\mathrm{data}} \times G_{\mathrm{tensor}}$. This results in
+$G_{\mathrm{data}}$ groups of $G_{\mathrm{tensor}}$ GPUs each. We use data
+parallelism across the $G_{\mathrm{data}}$ groups, and tensor parallelism
+within each group. Each $G_{\mathrm{data}}$ group collectively has a full copy of the neural
+network and is tasked to process a unique shard of the input batch. At the end of an input batch,
+all groups have to synchronize their weights by issuing all-reduces
+on their gradients after every batch (this is also referred to as an
+iteration).
+
+\vspace{0.08in}
+\noindent{\bf 3D Parallel Matrix Multiplication (3D PMM):}
+Next, we use each GPU group, composed of $G_{\mathrm{tensor}}$ GPUs to
+parallelize the work within their copy of the neural network.  This requires
+distributing the matrices, and parallelizing the computation within every layer
+of the neural network across several GPUs. Note that most of the computation in 
+transformers is comprised of large matrix multiplications within fully connected (FC) layers.
+Hence, in this section, we will focus on parallelizing FC layers with a 3D 
+PMM algorithm.
+
+We now describe how a single layer is parallelized, and the same method is
+applied to all the layers in the neural network.  Each FC layer computes one
+half-precision (fp16 or bf16) matrix multiplication (input activation, $I$
+multiplied by the layer's weight matrix, $W$) in the forward pass and two
+half-precision matrix multiplications (MMs) in the backward pass
+($\frac{\partial L}{\partial O} \times W^{\top}$ and $I^{\top} \times
+{\frac{\partial L}{\partial O}}$, where $L$ is the training loss, and $O$ is
+the output activation.) Thus, parallelizing an FC layer requires parallelizing
+these three MM operations across multiple GPUs.
+
+% \begin{figure}[h]
+%     \centering
+%       \includegraphics[width=3in]{figs/fc.pdf}
+%       \caption{Computation in the forward pass of a fully-connected (FC) layer with input $I$ and layer weights $W$. 
+%       The output, $O$ is a matrix multiplication of $I$ and $W$. We assume $I \in \mathbb{R}^{m \times k}$, 
+%       $W \in \mathbb{R}^{k \times n}$, and  $O \in \mathbb{R}^{m \times n}$. \label{fig:schematic-fc}}
+% \end{figure}  
+
+We adapt Agarwal et al.'s 3D parallel matrix multiplication
+algorithm~\cite{agarwal-3d}, for parallelizing our MMs. The 3D refers to
+organizing the workers (GPUs) in a three-dimensional virtual grid.  So, we
+organize the $G_{\mathrm{tensor}}$ GPUs further into a virtual 3D grid of
+dimensions $G_x \times G_y \times G_z$
+(Figure~\ref{fig:schematic-agarwal-data-dist}).  We do 2D decompositions of
+both $I$ and $W$ into sub-blocks and map them to orthogonal planes of the 3D
+grid. In the figure below, $I$ is distributed in the $XZ$ plane, and copied in the $Y$ dimension. $W$ is distributed in the $XY$ plane and copied along the $Z$ dimension. Once each GPU has a unique sub-block of I and W, it can compute a
+portion of the $O$ matrix, which can be aggregated across GPUs in the $X$
+direction using all-reduces.
+
+\begin{figure}[h]
+    \centering
+%       \includegraphics[width=\columnwidth]{figs/schematic/agarwal-final.png}
+      \includegraphics[width=\columnwidth]{figs/mm.pdf}
+      \caption{Parallelization of a matrix multiply in an FC layer with Agarwal's 3D parallel matrix
+multiplication algorithm~\cite{agarwal-3d} on eight GPUs organized in a
+$2\times2\times2$ topology. We use $G_x$, $G_y$, and $G_z$ to refer to
+the number of GPUs along the three dimensions of the virtual grid topology.}
+      \label{fig:schematic-agarwal-data-dist}
+\end{figure}
+
+We modify Agarwal's algorithm to reduce memory consumption, and instead of
+making copies of $W$ along the $Z$-axis, we further shard $W$ along the
+$Z$-axis and denote these sub-shards as $\hat{W}$.
+Algorithm~\ref{alg:3d-tensor} presents the forward and backward pass operations
+on GPU $g_{i,j,k}$, and we can observe that the sharding of $W$ results in
+all-gather operations before the local matrix multiplication on each GPU can proceed.
+
+\begin{algorithm}[h]
+    {\small 
+    \caption{Tensor parallel algorithm for ${g}_{i,j,k}$ in a $G_{x} \times
+G_{y} \times G_{z}$ grid. Communication operations highlighted in blue.} 
+    \label{alg:3d-tensor}
+    \begin{algorithmic}[1]
+    \setlength{\lineskip}{5pt}
+    \Function{tensor\_parallel\_forward\_pass}{$I_{k,j}$, $\hat{W}_{j,i}$}
+        \State  $W_{j,i}$ = $\Call{\comm{${\text{all-gather}}_{z}$}}{\hat{W}_{j,i}}$
+        \State  $\hat{O}_{k,i} = I_{k,j} \times {W}_{j,i}$
+        \State $O_{k,i}$ $\gets$ \Call{\comm{${\text{all-reduce}}_{y}$}}{$\hat{O}_{k,i}$}
+        \State // Cache $I_{k,j}$ and $W_{j,i}$  for the backward pass
+        \State \Return $O_{k,i}$
+    \EndFunction
+    \State
+    \Function{tensor\_parallel\_backward\_pass}{$\frac{\partial L}{\partial O_{k,i}}$}
+        \State Retrieve  $I_{k,j}$ and $W_{j,i}$  from cache 
+        \State $\hat{\frac{\partial L}{\partial I_{k,j}}}$ $\gets$ $\frac{\partial L}{\partial O_{k,i}} \times {W}^{\top}_{j,i}  $
+        \State $\frac{\partial L}{\partial I_{k,j}}$ $\gets$ \Call{\comm{${\text{all-reduce}}_{x}$}}{$\hat{\frac{\partial L}{\partial I_{k,j}}}$}
+        \State ${\frac{\hat{\partial L}}{\partial \hat{W}_{j,i}}}$ $\gets$ $ I^{\top}_{k,j}  \times {\frac{\partial L}{\partial O_{k,i}}} $
+        \State ${\frac{\partial L}{\partial \hat{W}_{j,i}}}$ $\gets$ \Call{\comm{$\text{reduce-scatter}_{z}$}}{$ \frac{\hat{\partial L}}{\partial \hat{W}_{j,i}} $}
+        \State \Return $\frac{\partial L}{\partial I_{k,j}}$, ${\frac{\partial L}{\partial \hat{W}_{j,i}}}$
+    \EndFunction
+    \end{algorithmic}
+    }
+\end{algorithm}
+
+In the forward pass, after the local (to each GPU) matrix-multiply on line 3,
+we do an all-reduce to aggregate the output activations (line 4). In the
+backward pass, there are two matrix multiplies on lines 11 and 13, and
+corresponding all-reduce and reduce-scatter operations in lines 12 and 14 to
+get the data to the right GPUs.
+
+\vspace{0.08in}
+\noindent\textbf{Parallelizing an entire network:} 
+The approach of parallelizing a single layer in a deep neural network can be
+applied to all the layers individually. Let us consider a 2-layer neural
+network.  If we use Algorithm~\ref{alg:3d-tensor} to parallelize each layer,
+the output $O$ of the first layer would be the input to the other. However,
+notice in Figure~\ref{fig:schematic-agarwal-data-dist} that $O$ is distributed
+across the 3D virtual grid differently than the input $I$. So to ensure
+that the second layer can work with $O$, we would need to transpose its weight
+matrix -- essentially dividing its rows across the $X$-axis and columns across
+the $Y$-axis. This transpose needs to be done once at the beginning of
+training.  Hence, to parallelize a multi-layer neural network, we simply
+`transpose' the weights of every other layer by swapping the roles of the
+$X$- and $Y$- tensor parallel groups.
+
+Note that the 4D algorithm (data + 3D PMM) discussed in this section is a generalization of
+various state-of-the-art parallel deep learning algorithms. For example, if one
+were to employ only the $Z$ axis of our PMM algorithm to parallelize training, it
+would reduce to Fully Sharded Data Parallelism (FSDP)~\cite{fsdp} and
+ZeRO~\cite{sc2020zero}. Similarly, if we employ the $Z$ axis of 3D PMM and data
+parallelism simultaneously, then our algorithm reduces to Hybrid Sharded Data
+Parallelism~\cite{fsdp} and ZeRO++~\cite{wang2023zero}. If we use the $X$
+axis of our 3D PMM algorithm along with the `transpose' scheme discussed in the
+previous paragraph, our 4D algorithm reduces to Shoeybi et al.'s
+Megatron-LM~\cite{megatronlm}. Finally, when all four dimensions of our 4D algorithm are being used, this is similar to a hybrid scheme that combines data parallelism, FSDP, and two-dimensional tensor parallelism.
+
+
+\subsection{A Performance Model for Identifying Near-optimal Configurations}
+\input{comm-model}
+
+
+\subsection{Automated Tuning of BLAS Kernels} \label{sec:blas-tune}
+\input{blas_tune}
+
+
+\subsection{Overlapping Asynchronous Collectives with Computation}
+
+We use non-blocking collectives implemented in NCCL and RCCL on NVIDIA and AMD
+platforms respectively. This enables us to aggressively overlap the collective
+operations in AxoNN with computation, which can minimize communication
+overheads.
+
+\vspace{0.08in}
+\noindent{\bf Overlapping All-reduces with Computation (OAR):}
+In this performance optimization, we overlap the all-reduce across the
+$X$-tensor parallel groups in the backward pass (Line 12 of
+Algorithm~\ref{alg:3d-tensor}) with the computation in Line 13. Once this
+computation has completed, we wait on the asynchronous all-reduce.
+Note that for layers with `transposed' weight matrices, this communication happens across the $Y$-tensor parallel groups.  
+
+\vspace{0.08in}
+\noindent{\bf Overlapping Reduce-scatters with Computation (ORS):}
+Next we overlap the reduce-scatters in the backward pass (line 14 of
+algorithm~\ref{alg:3d-tensor}). The outputs of this reduce-scatter are the
+gradients of the loss w.r.t.~the weights. These outputs are not needed until
+the backward pass is completed on all the layers of the neural network and we
+are ready to start issuing the all-reduces in the data parallel phase.
+Exploiting this, we issue these reduce-scatters asynchronously and only wait on
+them once all layers have finished their backward pass. This allows us to
+overlap the reduce-scatter of one layer with the backward pass computations of
+the layers before it.
+
+\vspace{0.08in}
+\noindent{\bf Overlapping All-gathers with Computation (OAG):}
+Our next optimization overlaps the all-gather operations in the forward pass
+(line 2 of Algorithm~\ref{alg:3d-tensor}) with computation. We observe that
+this all-gather operation does not depend on any intermediate outputs of the
+forward pass. Leveraging this, we preemptively enqueue the all-gather for the
+next layer while the computation for the current layer is ongoing. At the start
+of training, we generate a topological sort of the neural network computation
+graph to determine the sequence for performing the all-gathers. Subsequently,
+we execute them preemptively in this order.
+
+Figure~\ref{fig:opt} shows the performance improvements from the three
+successive collective overlap optimizations (OAR: Overlap of all-reduces, ORS:
+Overlap of reduce-scatters, and OAG: Overlap of all-gathers). The baseline here
+refers to the scenario with no communication overlap. We also show the breakdown of the total time per
+batch into computation and communication. As we can see, the times spent in
+computation do not change significantly, however, the time spent in non-overlapped
+communication reduces with successive optimizations, leading to an overall
+speedup. For the 80B model in the figure, we see a performance improvement of 18.69\%
+over the baseline on 8,192 GCDs of Frontier.
+
+\begin{figure}[h]
+    \centering
+      \includegraphics[width=\columnwidth]{figs/breakdown_communication}
+      \caption{The impact of overlapping non-blocking collectives with
+computation on the training times of different sized models on 8,192 GCDs of Frontier.}
+\label{fig:opt}
+\end{figure}
+

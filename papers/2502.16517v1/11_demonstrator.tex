@@ -1,0 +1,223 @@
+\section{Case study}
+\label{section:demonstrator}
+
+We study our ideas through a smoothed particle hydrodynamics (SPH) code written in C++.
+SPH describes fluid flow using moving particles that carry distributions such as velocity and physical properties, thereby representing the underlying fluid dynamics.
+The method finds applications in a variety of application
+domains~\cite{Lind:2020,Price:2012:SPH}, notably in computational astrophysics (see for example {\sc
+gadget}-2~\cite{Springel-g2:2005} or SWIFT~\cite{Schaller:2024:Swift}).
+
+
+
+
+\subsection{Algorithm blueprint}
+
+
+SPH's particles move in space through an explicit time-stepping---we employ leapfrog---and exchange quantities between each other. 
+SPH derives these particle-particle interactions through integral formulations over the underlying partial differential equations, where quantities of interest are approximated through functions with local support. 
+We employ the quartic spline (M5) kernel~\cite{Monaghan:1985:Kernel}, which can be seen as prototype for more complex interaction kernels~\cite{Denhen:2012:SPHConvergence}.
+
+The core compute steps of \added[id=TW]{per time step of a baseline} algorithm \added[id=new]{for any SPH code} read as follows:
+
+
+\begin{enumerate}
+  \item \added[id=copy]{We determine the smoothing length of each particle, i.e.~the
+  interaction area (circle or sphere around a particle) as well as its \emph{density}. Per particle, this initial step studies all
+  nearby neighbouring particles, computes the local density, and finally decides if to shrink
+  or increase the interaction radius.} Changing the radius triggers a 
+  recomputation of the density, as we now have to take more or fewer particles into
+  account, i.e.~the process repeates iteratively until each particle reaches
+  its termination criterion.
+  \item \added[id=copy]{We compute the \emph{force} acting on each particle. The force
+  is the sum over all forces between a particle and its neighbours within the interaction radius.}
+  \item We \emph{kick} the particle by half a time step, i.e.~we accelerate it.
+  \item We \emph{drift} a particle, i.e.~update its position.
+  \item We \emph{kick} a second time, i.e.~add
+  another acceleration. This step also resets various temporary properties of each particle, preparing them for the next density calculation.
+\end{enumerate}
+
+
+% The code runs through a series of algorithmic steps per particle where either
+% the particles interact with each other or update their quantities.
+% The interaction steps are computationally intense and dominate the runtime.
+
+\noindent
+\added[id=copy]{
+We focus exclusively on SPH with hydrodynamics, i.e.~ignore long-term
+interactions such as gravity.
+More complex physical models start from this baseline algorithmics \cite{Schaller:2024:Swift}.
+Consequently, our particles have a small, finite
+interaction radius---which may change over time, but is always small---and the arising interaction matrix is sparse and localised:
+Let $N$ be the particle count.
+The force and density calculation are in $\mathcal{O}(N^2)$ yet iterate solely 
+over their neighbourhood.
+The kicks and drifts update a particle without any particle--particle interaction and hence are genuinly in $\mathcal{O}(N)$.
+}
+
+
+
+Like most major SPH codes, our work employs a mesh helper structure where particles are sorted a priori into cells.
+The cells are chosen such that two particles may interact if and only if they reside within neighbouring cells.
+This reduces the cost of the force and density calculations:
+Rather than looping over all particles in the domain, we loop over cells, launching one \emph{compute kernel} per cell.
+This kernel in turn loops over the particles within the cell and examines only those neighbouring particles that are bucketed into vertex-connected neighbour cells.
+We contine to have an $\mathcal{O}(N^2)$ algorithm locally, but $N$ is the upper bound on the number of particles per cell.
+It is way smaller than the total particle count.
+
+
+In our code base, we employ a spacetree formalism \cite{Weinzierl:2015:pidt} to create the mesh and sort the particles into the leaves of the tree.
+The tree facilitates dynamic mesh refinement and coarsening, which in practice keeps $N$ per cell close to constant for most cells.
+$N \approx ppc$ (particles per cell).
+Further to that, using a tree spawning cells allows us to implement domain decomposition straightforwardly:
+Mesh cells are distributed over nodes and threads, and all particles follow the ownership of the cells they are sorted into.
+Consequently, we have to maintain a set of ghost cells and ghost particles:
+Each local cell must access all neighboring cells and their particles for force and density calculations.
+If a particle sits in a neighbouring cell not assigned to the local node, we have to maintain a copy of this particle locally, and update its properties after each algorithm step.
+
+
+Any interacting particle pair must occupy neighbouring cells.
+Sorting particles into the mesh and the mesh management itself are not free.
+Therefore, codes tend to enlarge cells bigger, increasing $N$.
+This raises computational load per kernel call, but overall reduces compute time.
+It remains a dark art, i.e.~empiric knowledge what reasonable cell sizes and particle counts are.
+
+
+
+\subsection{Particle memory layout and data flow}
+
+We model individual particles as structs.
+This naturally translates the physical model into software. 
+The resulting AoS storage benefits particle sorting into the mesh: when particles move, we must update cell membership. 
+Moving and sorting are comparatively inexpensive operations in our code base, but they synchronise all other compute steps:
+As long as not all particles are in the right place, we cannot trigger any follow-up computations.
+Therefore, we use a struct-centric data model that ensures minimal data movements, as we can copy whole structs at once, and makes particle movements as well as halo data exchange simple.
+Indeed, our codebase stores particle structs on the heap and uses lists of pointers within the mesh to index these scattered memory regions, i.e.~we employ an array of structs (AoS) with pointer indirection.
+
+
+
+The structs modelling particles in our code can hold from a few quantities up to hundreds of doubles, depending on the physical model.
+Our benchmark code works with a default memory footprint of 272 bytes per particle.
+Some of these bytes encode administration information, others store physical
+properties.
+For many steps, only few data members enter the equations implemented by the compute kernels.
+The density calculation starts from the density and smoothing length of the
+previous time step and updates those two quantities plus some others such as the neighbour count, the rotational velocity vector, and various derivative properties.
+Smoothing length, density and further properties then feed into the force
+accumulation which eventually yields an acceleration per particle.
+Kicks are relatively simple, i.e.~add scaled accelerations onto the velocity.
+The second kick in our implementation also resets a set of predicted values
+which feed into the subsequent density calculation.
+Drifts finally implement a simple Euler time integration step, i.e.~a tiny
+daxpy.
+
+
+Although pointer-indexed AoS is our primary modeling technique, we can instruct the particle sorting to ensure continuous memory storage of particles within cells. 
+It then moves around data throughout any resort ensuring that all particles of one cell end up in one continuous chunk of memory.
+Consequently, we can loop through the particles within one cell with a normal loop enabling coalesced memory access.
+For the $\mathcal{O}(N^2)$ algorithms, we can loop over chunk pairs of particles.
+
+
+
+
+\subsection{Vanilla compute kernel version}
+
+\input{code-snippets/blueprint.tex}
+
+We discuss our baseline implementation, i.e.~the starting point of any optimisation, by means of the density loop (Listing~\ref{algorithm:demonstrator:blueprint}), which is schematically the same as the force loop. 
+Kicks and drifts lack the outer loop and therefore are simpler.
+
+
+\begin{figure}
+ \begin{center}
+  \includegraphics[width=0.25\textwidth]{sketches/active-vs-local.pdf}
+ \end{center}
+ \caption{
+  A compute kernel updates all local particles (red circles) within a cell.
+  These particles depend upon their neighbours within the cell plus particles hosted by neighbouring cells (blue squares).
+  The set of potentially influencing particles---if particles really interact is subject to a particle-specific interaction radius---is named active set and yields a superset of the local particles.
+  \label{figure:demonstrators:active-vs-local}
+ }
+\end{figure}
+
+In our code, we distinguish active from local particles, with local particles being all particles within a cell and active particles all potential interaction partners (Figure~\ref{figure:demonstrators:active-vs-local}). 
+The local particles therefore are a subset of the active particles.
+As we have an $\mathcal{O}(N^2)$ algorithm per cell, we see that the code becomes a nested \texttt{for}-loop.
+Each loop runs over a C++ container which hosts pointers to the particles; as long as we make no further assumptions on the particle storage order.
+
+
+Semantically, it makes no difference whether we loop over the active or local particles in the outer loop.
+We may permute them.
+% However, the distinction of active vs.~local particle implicitly clarifies that we always write to the local particle.
+% From a vectorisation point of view, it hence seems to be advantageous to make the inner loop run over the local particle such that we neglect concurrent writes to the same position (accumulation).
+
+
+The actual semantics, i.e.~physics, are injected through two function calls (\texttt{DensityPredicate} and \texttt{Density}).
+The latter contains all updates to particles, while the predicate ensures that we update the right particles:
+For example, it checks that only particles within the interaction radius are taken into account,
+and that we avoid self-interaction.
+
+
+% At this point, we exploit a generic compute kernel realisation which has no knowledge of the fact that our data accesses are coalesced.
+% The decision to loop over pointers results from the fact that we started from the Swift code written in native C, and wanted to stay as close to the code base administering arrays as possible.
+% Obviously, our code could be refactored differently. 
+
+
+
+\subsection{Manually tweaked compute kernel}
+
+\input{code-snippets/manually-converted-blueprint.tex}
+
+\added[id=copy]{Converting AoS into SoA is an evergreen in high-performance computing,
+once we have committed to AoS as development data structure (cmp.~for example}
+\cite{Gallard:2020:Roles,Gallard:2020:ExaHyPEVectorisation,Homann:2018:SoAx,Hundt:2006:StructureLayoutOptimisation,Intel:MemoryLayoutTransformations,Jubertie:2018:DataLayoutAbstractionLayers,Reinders:2016:XeonPhi,Springer:2018:SoALayout,Strzodka:2011:AbstractionSoA,Sung:2012:DataLayoutTransformations,Vikram:2014:LLVM,Xu:2014:SemiAutomaticComposition}).
+In the present example, a programmer would insert a memory allocation to hold arrays of the input data (Listing~\ref{algorithm:demonstrator:blueprint-rewritten}).
+The term SoA suggests that these arrays are packaged into a struct of its own.
+We omit this packaging here, i.e.~we work with arrays directly.
+The signatures of the two core routines have to be amended to operate on the temporary data.
+Finally, we have to convert the temporary SoA data backinto AoS, i.e.~update the original.
+
+\begin{concept}
+  In a \emph{temporary} reformulation, the data is only kept for a well-defined, short time in SoA format.
+\end{concept}
+
+\begin{concept}
+  A \emph{local} rewrite converts into the SoA format over a well-defined building block such as a loop. If it ripples through multiple functions, it only propagates along the call tree.
+\end{concept}
+
+\noindent
+While not challenging in itself, rewriting the code is obviously tedious and error-prone.
+Therefore, we propose to let a compiler realise this rewrite:
+
+\begin{concept}
+  A \emph{guided} AoS-to-SoA conversion requires the programmer to explicitly instruct the compiler for which code blocks to convert the data into SoA.
+\end{concept}
+
+
+\noindent
+Any programmer rewriting AoS manually into SoA naturally only converts those members of a struct into an array or vice versa that are actually used later on or have changed, respectively:
+As the density calculation reads the positions of a particle yet never alters them, the final update loop would not mirror back the positions into the original data structure.
+Our work proposes to deploy all of these steps and considerations to a tool, i.e.~the compiler:
+
+\begin{concept}
+  An \emph{automatic} conversion deploys the task to identify which members of a struct need converting into an array to a tool, i.e.~no user interaction is required. Furthermore, it also generates all the conversion routines. 
+\end{concept}
+
+
+\noindent
+Previous work referred to this minimal subset of a struct over a code block as a view \cite{Radtke:2024:AoS2SoA}.
+Other literature refers to this as peeling \cite{Hundt:2006:StructureLayoutOptimisation}.
+We generalise the notion of a view in our work:
+
+\begin{concept}
+ A \emph{view} is a logical concept over a struct. A view knows which members of this struct are read, which are written and how they are stored in a given region of a program.
+\end{concept}
+
+\noindent
+Working with a view means that code can be written over structs or pairs of structs, respectively, even though the underlying data structure is SoA.
+The view ought to hide the memory layout details from the rest of the code.
+It also hides the that only some struct members are read or written and hence converted into another ordering.
+With views, the core routines \texttt{DensityPredicate} and \textsc{Density} do not have to be altereed even if the compiler decides to change the underlying memory layout.
+
+
+Our manual conversion illustrates that temporary, local conversion into SoA incurs unavoidable data movement costs. 
+The implicit hope that motivates these conversions is that speedups---achieved through improved vectorisation within loop bodies or more efficient cache use in nested loops---will compensate for this overhead and yield overall faster execution.

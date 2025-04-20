@@ -1,0 +1,130 @@
+
+\section{Methodology}
+\label{sec:method} 
+
+In this section we propose a feedback-loop-based bias mitigation approach to ELMs, designed to iteratively detect and correct biases during inference without model retraining. 
+The methodology consists of three key stages: model optimization for edge deployment, introduction of the context-aware feedback loop, and deployment of cloud and desktop models.
+
+For edge deployment, we used the Llama2-7B model with pre-trained weights acquired as defined in~\cite{touvron2023llama}. 
+The Llama2-7B model uses a unidirectional transformer architecture that allows for a faster interface as compared to any bidirectional version. 
+The code used in our work is an extension of Karpathy’s repository~\cite{githubGitHubKarpathyllama2c}, which provides a C-based re-implementation of the Llama2's forward pass and integrates $INT8$ quantization. 
+For server-based analysis the Gpt-4o-mini, Gemini-1.5-flash, and Grok-beta models are used through calling the respective APIs, while for local deployment the Ollama~\cite{13} framework is used to deploy the Gemma2 and Mistral models.
+
+
+%****************************************************************************************************
+
+\subsection{Edge LLMs setup and optimization}
+\label{subsec:model-optimization} 
+
+We used pruning and quantization which are discussed in Sections~\ref{subsec:pruning} and~\ref{subsec:quant}, whereas Section~\ref{subsub:feedback} defines the proposed feedback loop. 
+
+%---------------------------------
+
+\subsubsection{Pruning}
+\label{subsec:pruning} 
+
+We used a straightforward serialization format for sparse matrices, enabling their representation with memory usage directly proportional to the count of non-zero elements. 
+Each file begins with a fixed-size header that includes a field, $n\_bytes$, which specifies the total number of entries in the matrix, encompassing both zero and non-zero values. 
+Following the $\lceil \log_2(n\_bytes) \rceil$ bytes bitvector, each bit represents an entry in the matrix. A bit is assigned a value of $1$ for non-zero entries and $0$ for zero entries, indicating the presence or absence of data, with the bitvector arranged in row-major order to represent an array of all non-zero entries.
+
+For the value lookup, the corresponding bit of the $bitvector$ was checked, and only if the entry is found to be non-zero, we iterate through the $bitvector$. 
+This method added additional computational costs but enabled the efficient instantiation of large sparse matrices in memory. 
+Further, L1-pruning~\cite{l1} was applied by removing the proportion of parameters through the smallest L1 norm, and analyzed on a single feed-forward layer. The base $FP32$ precision required $224.8$ MB, whereas 30\% pruned weights required $176.2$ MB, and 50\% pruned weights $134.6$ MB of memory.
+
+%---------------------------------
+
+\subsubsection{Quantization ($INT8$)}
+\label{subsec:quant} 
+
+Absmax quantization~\cite{dettmers2022gpt3} has been used to quantize weights to $INT8$. The weights were grouped into channels of size $n$, so that the error caused by the high-magnitude weights can be reduced. 
+For $\mathbf{X}_{F_{32}} \in \mathbb{R}^{x \times y}$, where $n$ divides ${x \times y}$, let $N={xy}/{n}$ denote the total number of groups for which the $z^{th}$ group is $\mathbf{X}_{F_{32\_z}} \in \mathbb{R}^{n \times N}$ where $z=1,2,3,..., n$. 
+For each group, the weights are quantized in an 8-bit range through dividing by the scaling factor, defined as $x_z = \frac{\max(|\mathbf{X}_{F_{32_k}}|)}{127}, \quad \text{where } \max(|\mathbf{X}_{F_{32_z}}|)$ defines the maximum. 
+The full quantized weight matrix was obtained through combining the quantized groups back to the initial tensor shape. Following this, the quantized weights were stored with the scaling factor which also resulted in the $INT8$ model requiring $1.12$$\times$ more memory than the $FP32$$/4$ one. 
+The product of both is used to find the original weights, and the error was calculated through taking the $L1$ norm of the difference. 
+Through this, the max re-construction error is found to be $0.006$ across all the pre-trained Llama2 weights with a batch size of $64$. 
+As shown in Table~\ref{tab:memory_requirement}, running a forward pass of $FP32$ requires a total memory size of $26.96$ GB, while the quantized $INT8$ pass requires $7.56$ GB. 
+Here $w_w$, $w_x$, $w_y$, $w_z$ were the weights used for multi-head attention, while $w_a$, $w_b$, and $w_c$ were the weights for feed-forward layers.
+
+
+
+\begin{table}[t]
+\centering
+%\footnotesize 
+\caption{Memory requirement (in Bytes) for a Llama2 layer.}
+\label{tab:memory_requirement}
+%\setlength{\tabcolsep}{5pt} 
+%\renewcommand{\arraystretch}{1.6} % Adjust row height
+\begin{tabular}{|l|r|r|}
+\hline
+\textbf{Layers} & \textbf{$FP32$} & \textbf{$INT8$} \\ \hline
+Token Embedding & 524,288,000 & 139,264,000 \\ \hline
+$w_w$ & 2,147,483,648 & 671,088,640 \\ \hline
+$w_x$ & 2,147,483,648 & 671,088,640 \\ \hline
+$w_y$ & 2,147,483,648 & 671,088,640 \\ \hline
+$w_z$ & 2,147,483,648 & 671,088,640 \\ \hline
+RMS Weight$_{\text{att}}$ & 524,288 & 139,264 \\ \hline
+RMS Weight$_{\text{ffn}}$ & 524,288 & 139,264 \\ \hline
+$w_a$ (feedforward) & 5,771,362,304 & 1,533,018,112 \\ \hline
+$w_b$ (feedforward) & 5,771,362,304 & 1,533,018,112 \\ \hline
+$w_c$ (feedforward) & 5,771,362,304 & 1,533,018,112 \\ \hline
+RMS Weight$_{\text{final}}$ & 16,384 & 4,352 \\ \hline
+$w_{\text{final}}$ & 524,288,000 & 139,264,000 \\ \hline
+\textbf{Total Size} & \textbf{26,953,646,080} & \textbf{7,562,219,776} \\ \hline
+\end{tabular}
+\end{table}
+
+
+Furthermore, our work reported the time taken to process one token during inference for both $FP32$, and $INT8$. It was found that the $FP32$ model required $202.06$ sec/token, while the $INT8$ model only $6.20$ sec/token, which is a speedup of about 32~$\times$. 
+The heap allocated for the forward pass for $INT8$ was $8.6$ GB, while for $FP32$ was $41.6$ GB including the memory overhead required for holding runtime variables, tokenizer, weights, and sampler.
+
+
+%---------------------------------
+
+\subsubsection{Feedback loop}
+\label{subsub:feedback}
+
+With the aim of mitigating the bias found in the deployed optimized model, an iterative feedback loop was introduced to load the weights for each of the transformer layers in the forward pass. 
+The weights for each layer were stored in an additional file that loaded the weights for one layer at a time to perform a segmented forward pass. 
+The selection for the weights followed a context-aware sliding window approach that operates on a fixed window size of $32$, meaning that at any given time, the system considers a batch of $32$ layers while updating the weight distribution dynamically. 
+The parameter $n_{base}$ defines the baseline weight distribution for bias correction, essentially serving as a prior for iterative process. Hence, it determines how aggressively the model corrects deviations from an unbiased baseline, influencing how weights are adjusted in subsequent layers. 
+This allows the system to progressively refine its bias mitigation instead of applying any static corrections. This in turn prevents bias from propagating while maintaining computational efficiency. 
+The weights were predefined and specific to the prompts further evaluated in this work (Section~\ref{sec:eval}). 
+This approach was very resource demanding, as it requires very frequent fetch requests, but effectively helped in reducing the bias of the model by $79.28$\%, as shown in Table~\ref{tab:llama-comparison}. It is important to note that the feedback loop does not modify the pre-trained weights of the model at runtime. Instead, it adjusts the weight application process by dynamically re-weighting layer contributions based on real-time bias observations.
+
+Another potential way to reduce the model intensive computation requirement is through parallelizing the computation. The reason for not selecting the parallelizing approach in this work was to address a wider range of edge devices including the ones with single-core processors. However, the availability of memory is still a challenge for implementing the proposed feedback loop when it comes to resource-constrained edge devices.
+
+Overall, with the introduction of the feedback loop the time required to process one token during inference increased from $6.20$ sec/token to $57.86$ sec/token. This is nearly 9$\times$ slower, which was primarily due to the additional disk reads required. In addition, the model processes the initial tokens generation not quickly and eventually slows down for further tokens by any $1.2$$\times$. 
+
+
+%****************************************************************************************************
+
+\subsection{Cloud LLMs Setup}
+
+We use three cloud-based LLMs: GPT-4o-mini, Gemini-1.5-Flash, and Grok-Beta. 
+Figure~\ref{img:cloud-arc} provides a high-level overview of the experimental architecture. 
+The exact floating-point (FP) precision used by these models remains undisclosed by their respective organizations, making it challenging to directly compare their numerical computation methods with open-source models deployed on a desktop machine. 
+The Python code for invoking the models, introducing the prompt, and then processing the response to quantify the results for analysis were executed on a Jupyter Notebook~\cite{jupyterProjectJupyter}, hosted on a Google Colab instance. 
+These notebooks interacted seamlessly with a virtual machine container on Google Cloud Platform (GCP), ensuring an uninterrupted communication with the models.
+
+We used the default versions of all dependencies and libraries as available on December 5, 2024. However, the httpx library version was pinned to $0.27.2$ to mitigate potential issues related to browser proxy misconfigurations, which was found when attempting to perform the compute with higher version of httpx. 
+To maintain system stability and avoid exceeding rate limits, all requests were sent sequentially, with a cooling period of $30$ seconds between each request. The responses received from the models, initially in JSON format, were converted to string format for pre-processing and subsequent evaluation.
+
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.95\linewidth]{fig/cloud-llm-arc.png}
+  \caption{High-level LLM model API interaction architecture on a Google Cloud Platform (GCP) hosted environment.} 
+  \label{img:cloud-arc}
+\end{figure}
+
+
+%****************************************************************************************************
+
+\subsection{Desktop LLMs Setup}
+
+The Ollama~\cite{13} framework allows running multiple open-source LLMs locally for the end-user system. In our study, the Gemma2 and Mistral models were deployed on a M1 Mac computer running macOS Sonoma $14.5$. 
+Using the Ollama (ARM64 version) platform, the model files were directly pulled from the Ollama Hub through terminal commands and integrated into the local environment for the purpose of evaluation. 
+Both models were executed using $FP32$ to maintain numerical stability and ensure maximum model accuracy. While lower precision formats such as FP16 are often used for inference efficiency, $FP32$ was chosen to preserve the full precision of model computations and avoid potential quantization-induced biases or inaccuracies. 
+
+To effectively optimize this evaluation process, a custom Python script was developed to iteratively invoke the model call for prompt input. Due to limited control over models through Ollama, a cooling period of $60$ seconds was incorporated in between every successive call to prevent any overloading. 
+Despite this optimization, a latency of approximately $3.5$ seconds was observed in generating the model outputs, which should probably be attributed to the system's hardware constraints.

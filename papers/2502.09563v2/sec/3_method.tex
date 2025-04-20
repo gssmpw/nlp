@@ -1,0 +1,112 @@
+
+
+% \vspace{-0.8em}
+\section{Method}
+\label{sec:method}
+Given uncalibrated wide-angle captures, we aim to develop an algorithm that produces high-quality reconstructions using 3D Gaussians. Our method is designed to be robust against severe distortion in the peripheral regions of images and various wide-angle lens effects.
+First, we extend Gaussian Splatting to support a broader range of camera models, including fisheye lenses, as discussed in~\cref{sec:iresnet}. To model lens distortion, we introduce a hybrid distortion field, enabling our approach to generalize across diverse real-world scenarios involving cameras with varying distortions.
+Second, we replace the traditional single-plane projection in 3DGS with a cubemap representation and introduce a distance-sorting strategy accordingly, as detailed in~\cref{sec:cubemap}.
+Finally, we derive an efficient optimization for camera parameters, supporting self-calibration with distortion, as described in~\cref{sec:opt_cam}.
+
+
+\subsection{Background of Gaussian Splatting} 
+A 3D Gaussian $G(x) = e^{-(x-\mu_i)^T\Sigma_i^{-1} (x-\mu_i)}$ is parameterized by center $\mu_i\in\mathbb{R}^3$, covariance $\Sigma_i$, opacity $\sigma_i$, and color $C_i$, represented using spherical harmonics. The 3D Gaussians are projected~\cite{zwicker2001ewa} into $\mu_i^{2D} = \pP(\mu_i, \Theta)$ and $\Sigma^{2D}=J_\pP^T\Sigma J_\pP$, where $J_\pP\in\mathbb{R}^{3\times 2}$ is the affine approximation of the projection $\pP$ at point $\mu_i$, parameterized by $\Theta$. 
+For a pixel location $u$, the RGB color is produced with alpha blending~\cite{kopanas2021point,yifan2019differentiable}:
+\begin{align}
+\label{eq:alpha_blending}
+    \hat{I}(u) = \sum_{i=1}^{|G|}C_i\alpha_i\prod_{j\in \mathcal{N}_{<i}(G)}(1-\alpha_j),
+\end{align}
+where $\mathcal{N}(G)$ is an ordered index of Gaussians sorted by depth, and $\alpha_i$ depends on $\sigma_i$, $\Sigma_i^{2D}$, and $\mu_i^{2D}$. Finally, this set of 3D Gaussians is optimized using the L1 loss and D-SSIM~\cite{baker2022dssim} loss, along with adaptive control~\cite{kerbl20233d}.
+
+\subsection{Lens Distortion Modeling}
+\label{sec:iresnet}
+In this section, we extend the Gaussian Splatting technique to accommodate a broader class of camera lenses, including fisheye and wide-angle cameras, by modeling lens distortion.
+Lens distortion is typically captured by a distortion function defined in camera coordinates.
+A distortion function $\dD_\theta:\mathbb{R}^2 \to \mathbb{R}^2$ parameterized by $\theta$ maps pixel locations from a rectified image to locations in a distorted image.
+Ideally, the mapping $\dD_\theta$ should be:
+1) expressive enough to model various lens distortions,
+2) well-regularized so that it can be optimized together with the 3D scene, and
+3) efficient, ensuring that it does not add significant computational overhead.
+While existing methods have explored using parametric camera models, grid-based methods, and deep-learning methods, none of these approaches perfectly satisfy all three criteria.
+
+
+
+% \vspace{-1.em}
+\paragraph{Grid-based method.}
+The simplest way to implement a generic camera model is to explicitly optimize for the distortion in a grid of pixel coordinates and apply bilinear interpolation to extract a continuous distortion field:
+\begin{align}
+    \dD_\theta(\textbf{x}) = \textbf{x} + \interp{\textbf{x}, \theta}, 
+\end{align}
+where the optimizable parameters $\theta\in \mathbb{R}^{H\times W\times 2}$ define an $H\times W$ grid storing 2D vectors representing the distortion. The bilinear interpolation function is given by $\interp{\textbf{x}, \theta} = W(\textbf{x}, \theta)\cdot\theta$, where $W(\textbf{x}, \theta)\in \mathbb{R}^{H\times W}$ represents the bilinear interpolation weights at location $\textbf{x}$.
+Such a grid-based method is both expressive and efficient, as $W(\textbf{x}, \theta)$ is sparse, and increasing the grid resolution allows for modeling more complex functions.
+However, the grid-based method lacks the smoothness required to model lens distortion properly, leading to overfitting and suboptimal solutions (\cref{fig:pipeline} Top).
+
+
+
+
+% \vspace{-1.em}
+\paragraph{Invertible Residual Networks.} An alternative way to model distortion is by using a neural network with an appropriate inductive bias.
+NeuroLens~\cite{xian2023neural} proposes using an invertible ResNet~\cite{behrmann2019invertible} to represent non-linear lens distortions as a diffeomorphism.
+Specifically, the deformation mapping is modeled by a residual network:
+\begin{align}
+\label{eq:invert}
+    \dD_\theta(\textbf{x}) = F_L \circ \cdots \circ F_1(\textbf{x}), \quad F_i(z) = z + f^{(i)}_{\theta_i}(z), 
+\end{align}
+where $f^{(i)}_{\theta_i}$ is a neural block parameterized by $\theta_i$ with a Lipschitz constant bounded by 1 (\ie, $|f^{(i)}_\theta(x) - f^{(i)}_\theta(y)| < |x-y|$ for all $x$, $y$, and $\theta$). $f^{(i)}_{\theta_i}$ represents a residual block with four linear layers. $L$ denotes the total number of blocks, which is 5 in our case, and the circle denotes function composition.
+Such constraints make the network invertible, and its inverse can be obtained using a fixed-point algorithm~\cite{behrmann2019invertible}. In the supplementary, we also provide additional comparisons and insights between iResNet and a regular ResNet.
+
+While an invertible ResNet offers both expressiveness (\ie, the ability to model various lenses) and regularization, it is computationally prohibitive to apply it directly to 3DGS. 
+To backpropagate gradients to the alpha-blending weights $\alpha_i$ when rendering an image in \cref{eq:alpha_blending}, the computational graph for the backward passes of $\dD_\theta$ must be maintained for each Gaussian. This is infeasible due to the large number of 3D Gaussians in a single scene, often reaching millions and leading to out-of-memory errors.
+This limitation motivates us to develop a more efficient solution that leverages the inherent inductive bias of the invertible ResNet while maintaining computational efficiency.
+
+
+
+% \vspace{-1.em}
+\paragraph{Hybrid Distortion Field.}
+Given that the grid-based method is efficient yet tends to overfit, while the invertible ResNet has an appropriate inductive bias but is not efficient, we propose a hybrid method that combines the advantages of both.
+Specifically, we use the invertible ResNet to predict the flow field on a sparse grid and apply bilinear interpolation to each projected 2D Gaussian:
+\begin{align}
+\label{eq:hybrid_field}
+    \dD_\theta(\textbf{x}) = \textbf{x} + \interp{\textbf{x}, \rR_\theta(\textbf{P}_c) - \textbf{P}_c},
+\end{align}
+where $\textbf{P}_c\in \mathbb{R}^{H\times W\times 2}$ is a sparse grid of fixed control points (pixel locations, where $H\times W$ represents the resolution of control points rather than image resolution), and $\rR_\theta$ is an invertible ResNet parameterized by $\theta$. 
+
+Unlike existing hybrid neural fields~\cite{muller2022instant}, where networks are applied after grid interpolation, our approach uses iResNet to predict displacement vectors on a sparse grid, with bilinear interpolation applied to produce a continuous displacement field, as shown at the bottom of~\cref{fig:pipeline}. 
+The advantage of this architecture is that we only need to compute the expensive forward and backward ResNet mappings for locations at $\textbf{P}_c$, which scales with the grid resolution and is independent of the number of Gaussians in the scene.
+The additional operation required for each Gaussian is $\interp{\cdot}$, which is computationally affordable and parallelizable.
+
+
+
+\subsection{Cubemap for Large FOV}
+\label{sec:cubemap}
+In order to apply our method to cameras with larger FOV, we extend the single-planar perspective projection to a cubemap projection~\cite{wan2007isocube,jiang2021cubemap}. Mathematically, single-planar projection requires upsampling in the peripheral regions, and the sampling rate increases drastically as the FOV approaches 180\si{\degree}. In contrast, rendering with a cubemap maintains a relatively uniform pixel density from the image center to the edges, making it ideal for wide-angle rendering.
+
+% \vspace{-1.em}
+\paragraph{Single-Planar Projection.} Given the parameters estimated from SfM~\cite{schoenberger2016sfm}, the parametric model is then applied to reproject the raw image into perspective images, as shown in the blue box in~\cref{fig:hilbert_180}. These reprojected images are then used for reconstruction through perspective-based pipelines like NeRF~\cite{mildenhall2021nerf} or 3D Gaussian Splatting (3DGS)~\cite{kerbl20233d}. However, this process stretches the pixels in the peripheral regions, and the effect becomes more pronounced when the images are reprojected to larger FOV perspectives, as shown in the orange box.
+More specifically, the stretching rate of each pixel is defined by the inverse of~\cref{eq:fisheye}, which exhibits a trend similar to $\tan(r)$, where $r$ is the FOV angle from the center of the raw image. When the FOV of the reprojected image is 110\si{\degree} (as in the blue example), the upsampling rate from the blue circle to the box is approximately 1.4. However, when the FOV increases to 170\si{\degree}, as in the orange example, this rate increases to 11.4, inevitably sacrificing a significant amount of high-frequency information for reconstruction.
+
+Moreover, to preserve central details, the resolution of undistorted images needs to be higher, as the pixel density at the center of the raw image should ideally match that of perspective ones. For example, when undistorting a fisheye image in~\cref{fig:hilbert_180}, the resulting perspective image in the orange region would have an extremely high resolution, making it computationally expensive to render. A common solution is to crop away the periphery, following COLMAP's solution~\cite{schoenberger2016sfm}, but this strategy contradicts our intention of using a fisheye camera to capture wide-angle information.
+
+% \vspace{-1.em}
+\paragraph{Multi-Planar Projections.} Inspired by the representation of environment maps using cubemaps~\cite{greene1986environment} and hemi-cube~\cite{Cohen:1985:hemicube} in computer graphics, we propose representing extreme wide-angle renderings with cubemap projections, each covering 90\si{\degree} FOV and oriented orthogonally to one another, as illustrated in~\cref{fig:hilbert_cubemap}. By resampling across the cubemap faces, we can render perspective or distorted images with FOVs even larger than 180\si{\degree}. Fast rasterization is first applied to obtain each face of the cubemap. For each rendered pixel, we look up its corresponding position in the constructed cubemap. Our hybrid distortion field then resamples from the lookup table to achieve the distorted rendering. In practice, it is not necessary to render all faces of the cubemap at once, as the number of cubemap faces may vary for different FOV camera lenses.
+
+The resampling step involves only a simple coordinate transformation along with our hybrid field distortion. The distance from the shared camera center to each plane is normalized to 1. To render a pixel outside the 90\si{\degree} FOV at $(x, y, -1)$ where $x>1$ and $|y|<1$, for instance, the pixel on the right face can be obtained as $(\frac{-1}{x}, \frac{y}{x}, -1)$ in camera coordinates, looking toward the right side. When considering lens distortion, the sampling mapping is distorted according to~\cref{eq:hybrid_field}, altering the lookup on the right face to $(\frac{-1}{x'}, \frac{y'}{x'}, -1)$, where $(x', y') = \dD_\theta(x, y)$. By doing so, the entire distortion field can be directly applied to the cubemap for large FOV rendering. The entire resampling process is fully differentiable, making it directly applicable in our hybrid distortion field as a plug-and-play module.
+
+% \vspace{-1.em}
+\paragraph{Gaussian Sorting.} 
+3DGS~\cite{kerbl20233d} constructs an ordered set $\mathcal{N}(G)$ of Gaussians before alpha blending~\cite{kerbl20233d}. Gaussians are sorted based on their orthogonal projection distance to the image plane. This approach is valid as long as a single Gaussian is not projected onto multiple faces. However, with the cubemap representation, Gaussians can span the boundary between two faces, leading to multiple projections with inconsistent ordering across faces. This discrepancy introduces intensity discontinuities at the boundaries.
+To address this issue, we replace the original sorting strategy with a distance-based approach, ordering Gaussians by their distance from the camera center. This ensures that the rasterization order remains consistent across all cubemap faces, thereby alleviating intensity discontinuities. 
+Due to the affine approximation used in~\cite{kerbl20233d,zwicker2001ewa}, the 2D covariance of Gaussians near cubemap face boundaries still has a slight influence on the final rendering, which we further discuss in~\cref{sec:discussions} and the supplementary material.
+
+\subsection{Optimization of Camera Parameters} 
+\label{sec:opt_cam}
+Our pipeline differentiates all camera parameters. We theoretically derive the gradient for all camera parameters, including extrinsics and intrinsics, making the camera module completely differentiable and capable of being optimized alongside distortion modeling. All gradient calculations are implemented with a native CUDA kernel. A comprehensive mathematical derivation and experimental results are provided in the supplementary.
+
+
+
+
+
+% \subsection{Other Lens Effects}
+% \TODO{TBD}
+% entrance pupil shift
+% \label{sec:shift}

@@ -1,0 +1,763 @@
+\section{Introduction}
+Optimizing compilers have become indispensable as programming languages rely on them to unravel high-level abstractions into lean and performant code~\cite{lattnerMLIRCompilerInfrastructure2020,hosteColeCompilerOptimization2008,lattnerLLVMCompilationFramework2004}.
+
+General-purpose compiler middle-ends typically perform general-purpose optimizations such as common subexpression elimination~\cite{10.5555/286076}. Compilers for domain-specific languages perform domain-specific optimizations such as algebraic optimizations~\cite{chrislattnerMLIRScalingCompiler2021,10.5555/286076}. The front-ends of higher-level language compilers can be customized to generate IR that is already optimized for specific targets, such as GPUs, and then fed to the back-ends~\cite{besardEffectiveExtensibleProgramming2019}. Many compilers can also be configured to enable context-specific optimizations, e.g., to sacrifice precision for performance.  
+
+However, none of those existing optimization pipelines is well suited to support domain-specific and context-specific optimization of code written in a high-level scientific programming language that is used across many domains, such as Julia~\cite{bezansonJuliaFastDynamic2012}.
+In such a language, software libraries build on the generic language infrastructure to provide high-level domain-specific APIs to application developers. 
+
+Ideally, those application developers should be able to enjoy domain-specific optimizations for free, i.e., without having to manually tune or rewrite their code, and without facing restrictions on their freedom to exploit the language's rapid prototyping features. Furthermore, it should be easy for application developers to specify or select which context-specific optimization they want to see enabled. In addition, when multiple libraries are being reused and composed in an application, be it top-level libraries that provide orthogonal functionality or higher-abstraction-level libraries that provide more abstract APIs on top of lower-level code, the optimization opportunities coming with those libraries should be composable. They should be composable with each other and with the general-purpose and target-specific optimizations that are provided in the main compiler flow and in the target-specific extensions thereof. 
+
+This inevitably involves solving a phase-ordering problem because some optimizations create opportunities for further optimizations, while others are incompatible and rule each other out.
+Finally, to obtain a thriving ecosystem of domain libraries, the development of such libraries and the corresponding support for domain-specific optimization should not require the involvement of compiler experts. 
+
+It then follows that a generic compiler infrastructure is needed that enables developers of domain-specific libraries to specify domain-specific and context-specific optimization opportunities at an abstraction level similar to that of their libraries' APIs, and that ensures sufficient composability. 
+
+With our research, we aim to provide that generic compiler infrastructure. In this paper, we present a system that allows programmers, not necessarily compiler developers, to express their domain-specific knowledge as rewrite rules in Julia.
+Our work is based in part on ideas developed for the Cranelift compiler~\cite{fallinAegraphsAcyclicEgraphs2023}, which in turn uses e-graphs and equality saturation, first introduced by \citeauthor{nelsonTechniquesProgramVerification1979}~\cite{nelsonTechniquesProgramVerification1979} and \citeauthor{tateEqualitySaturationNew2009}~\cite{tateEqualitySaturationNew2009}, respectively.
+Equality saturation is a rewrite technique that elegantly deals with the phase ordering problem by representing the potential results of rewrites while still representing the original program as well.
+
+When writing and executing code, users should not take these rewrite rules into account anymore, but instead can focus on writing simple and readable code that maps well on their mental model of the computations. The compiler then automatically evaluates all relevant rewrites and picks the optimal program. By building on e-graphs and equality saturation, the phase ordering problem is no longer an issue.
+Rewrite rules are applied without removing information from the e-graph, which means that application of a rewrite cannot prevent other rules from firing.
+%\todo{give example with broadcasting code, rewrite opportunities hidden behind call barriers, and control flow}
+
+This paper's contributions are as follows:
+\begin{itemize}
+\item the first use of equality saturation in a high-level, dynamically typed programming language optimizer, including for code containing control flow;
+\item \emph{CFG skeleton relaxation} to enable rewriting on functions with side-effects; 
+\item a novel ILP formulation to enable value reuse in (rewritten) expressions; 
+\item a novel e-class analysis to track type information for type-constraint rewrite rules;
+\item a demonstration on a number of examples; 
+\item an analysis of the required compilation time.
+\end{itemize}
+
+
+This paper is structured as follows. Section~\ref{sec:background} provides background. Section~\ref{sec:rewriter} presents our rewriting system. Section~\ref{sec:usecase} presents its capabilities on use cases. Section~\ref{sec:compiletime} analyzes its compilation time. Sections ~\ref{sec:limitations} and~\ref{sec:related work} discuss limitations and related work. Finally, Section~\ref{sec:conclusions} draws conclusions.% \changed{and discusses potential future work}.
+
+\section{Background}
+\label{sec:background}
+\paragraph{E-Graphs}
+\begin{figure}
+    \centering
+    \includegraphics[width=0.4\linewidth]{figures/egraph_example.pdf}
+    \Description{On the right an e-graph with four e-class nodes is shown for the expression a times two divided by 2: one e-class for each operator and one for each distinct operand values. On the left, an extension of the e-graph is shown in which the equivalent of a times 2 in the form of a shifted to the left by one is included. This graph has two more nodes for the extra shift operation and the extra operand value of 1, but the e-nodes for the times and shift operations form one e-class because of the equivalence.}
+    \caption{Example e-graph encoding equivalences~\cite{willseyEggFastExtensible2021}. Left: original e-graph representing the term $(a \times 2) / 2$. Right: e-graph after introducing the equivalence $a \times 2 \leftrightarrow a << 1$.}
+    \label{fig:e-graph}
+\end{figure}
+The e-graph data structure compactly represents a congruence relation on different expression trees~\cite{nelsonTechniquesProgramVerification1979,willseyEggFastExtensible2021}.
+It consists of a collection of \emph{e-classes} that can each contain multiple \emph{e-nodes} representing expression trees that are equivalent to each other according to some user-defined equivalence relation.
+Each e-node can have multiple children, represented by e-classes.
+As an example, the left side of Figure~\ref{fig:e-graph} shows the e-graph representation for the expression $(a \times 2) / 2$.
+In case $a$ represents an integer, a potential equivalent expression for $a \times 2$ is $a << 1$.
+We can encode this equivalence by adding a new e-node to the appropriate e-class, as shown on the right side of Figure~\ref{fig:e-graph}. Because the constant expression 1 is not equivalent to any of the e-classes already present, it is added to a newly created e-class.
+The strength of e-graphs lies in the fact that both equivalent representations are encoded in the graph at the same time.
+\paragraph{Equality Saturation}
+Besides in theorem solvers~\cite{demouraEfficientEMatchingSMT2007,nelsonTechniquesProgramVerification1979,demouraZ3EfficientSMT2008}, e-graphs are often used for equality saturation~\cite{willseyEggFastExtensible2021,cheliMetatheoryjlFastElegant2021,tateEqualitySaturationNew2009}.
+Equality saturation is a term rewriting technique that applies rewrites not by overwriting the original term but by adding the rewritten term to an e-class that represents the original term.
+By building on e-graphs for term rewriting, it is possible to represent a much larger amount of rewritten, equivalent expressions without the exponential explosion that can occur with naive approaches.
+The advantage of not discarding expressions when they get rewritten is that the ordering in which rewrites are applied cannot prevent certain rewrites from firing. 
+
+\paragraph{Extraction}
+Once no more new rules can be applied or some timeout is reached during equality saturation, one typically wants to determine the optimal expression contained in the e-graph~\cite{willseyEggFastExtensible2021,goharshadyFastOptimalExtraction2024}.
+In its simplest form, extraction starts from a root e-class where one e-node needs to be picked to be extracted. Recursively, all the child e-classes of the picked e-node need to be extracted as well.
+The end result is a directed, connected graph of e-nodes.
+
+In many use cases, especially in program optimization, the extracted graph cannot contain cycles.
+In such cases, more refined extraction techniques are needed.
+One such technique, which considers additional constraints from our problem domain, is discussed in Section~\ref{sec:extraction}.
+
+\section{A Rewrite-Based Compiler Middle-End}
+\label{sec:rewriter}
+Our system allows programmers to specify custom rewrite rules.
+These rules are then applied on an e-graph representing the code of a function. Once the rules are applied and the e-graph is saturated, the compiler will try to extract the optimal code embedded within. Some example rules are 
+\begin{align*}
+&\code{sin(\char`\~x::Number)\char`\^2 + cos(\char`\~x::Number)\char`\^2} \rightarrow \code{1}
+\\
+&\code{translate(\char`\~p, 0, 0)} \rightarrow \code{\char`\~p}
+\end{align*}
+
+
+Rules have a left-hand and right-hand side consisting of a Julia code expression, where the \code{\char`\~} prefix is used to indicate unbound variables. The \code{::} notation is used to specify the types of variables for which the rule can be applied. \code{sin}, \code{cos}, and \code{translate} are the names of called functions. A rewrite rule can be applied whenever the pattern of function calls, literals, and variables on its left-hand side matches a code fragment. 
+
+As shown, the two sides of a rewrite rule are specified as regular Julia code expressions, with the addition of unbound, optionally typed, variables.
+This syntax is able to cover all rewrites where a single expression tree is replaced with a new expression tree.
+This syntax does not allow rules matching \emph{multi-patterns}~\cite{jiaTASOOptimizingDeep2019,MLSYS2021_cc427d93}. These patterns can match multiple expression trees and rewrite them each, potentially reusing variables in multiple output expressions.
+
+\subsection{Incorporating Rewrites in the Compiler}
+\label{sec:compiler flow}
+
+\begin{figure}
+    \centering
+    \includegraphics[width=0.65\linewidth]{figures/compilation_pipeline.pdf}
+    \caption{The native Julia compilation pipeline.}
+    \Description{On top, the Julia compiler pipeline is shown: Julia code is parsed into an AST, which is lowered to Julia IR, for which Julia Codegen produces LLVM IR, which is further compiled by LLVM Codegen. On the bottom, the figure zooms in on additional stages that are executed on the Julia IR. These are macro expansion and control flow destructuring to yield untyped IR, type inference and constant propagation that produce typed IR, inlining to obtain inlined IR and finally SROA and simplification to yield optimized IR.}
+    \label{fig:julia_compilation}
+\end{figure}
+
+As in most compiler middle-ends, this optimization will operate on an intermediate representation (IR) that supports optimizations while still preserving high-level language-specific information~\cite{lattnerMLIRCompilerInfrastructure2020,liMirCheckerDetectingBugs2021,swiftSIL}. In our case, this is the Julia compiler's SSA-based IR~\cite{bezansonJuliaFastDynamic2012}. 
+
+Figure~\ref{fig:julia_compilation} shows the flow of the compiler. When a function needs to be executed, the just-ahead-of-time flow is invoked on it. We will call this the current function. The compiler first lowers the current function's AST into an SSA-based IR. On this IR, it applies type inference, constant propagation, function inlining, and a small number of other basic optimizations. From this Julia IR, the compiler then generates LLVM IR, to which many more optimizations are applied by the LLVM compiler before it generates assembly code for the target architecture. 
+
+There are two places where it makes sense to apply our rewrite optimizations: right before inlining, and after inlining and optimizations.
+Before inlining, the current function's IR still contains function calls as they were written by the programmer.
+At this stage in the compilation, high-level rewrite rules can typically be matched and applied, i.e., rules involving functions of high-level abstract APIs.  
+
+In some cases, it might be useful to also apply rewrites to code in which function calls have already been inlined.
+After inlining, it is possible that code from different function bodies down the call chain of the current function ends up in its IR. This can uncover additional rewrite opportunities. 
+
+%Except for rewrites that match code from function calls that have ended up in the same function body due to inlining, we do not yet support interprocedural rewrites.
+%In Julia, inlining behavior can be steered by annotating function definitions or calls with \code{@inline} or \code{@noinline} macros but in future work the rewrite system could take into account code at different call depths.
+
+Our current prototype implementation performs the rewriting optimization both before and after inlining, but we note that the most interesting rewrites fire before inlining, when high-level API usage has not yet vanished from the code.
+For this reason, the example snippets of IR in this paper contain code that has not been inlined yet.
+
+\subsection{From IR to E-Graph and Back Again}
+\label{sec:conversion}
+\begin{figure}
+    \centering
+    \includegraphics[width=0.55\linewidth]{figures/conversion.pdf}
+    \caption{Top-left: a Julia function that computes a number's power; top-right: the corresponding Julia IR that is generated  for two integer arguments.
+    Bottom: the e-graph and CFG skeleton of this Julia function.}
+    \Description{Top left: a simple Julia function that computes x to the power n and that prints a message to illustrate the impact of side effects. Top right: the corresponding Julia IR that is generated if the power function is generated for two integer arguments. It consists of four basic blocks, one of which includes two phi functions. Bottom left: the e-graph for the expressions in the function consisting of 11 e-classes, including classes for the phi functions and for the side effect. Bottom right: the CFG skeleton of the function, which looks like the CFG itself, and in which each node refers to certain e-classes in the e-graph where the control flow depends on expressions modeled by those e-classes.}
+    \label{fig:conversion}
+\end{figure}
+To apply rewrites on the Julia IR of a function, we first convert it to an e-graph.
+For this, we employ the methods introduced in the Cranelift compiler~\cite{fallinAegraphsAcyclicEgraphs2023}.
+Each function call is added to an e-graph, while control flow statements (\code{goto}, \code{goto if not}, \code{phi}, and \code{return}) are added to an external data structure called the CFG skeleton.
+Function calls that have side effects are also added to the CFG skeleton.
+Each statement in the CFG skeleton refers to the e-nodes on which it depends.
+Figure~\ref{fig:conversion} shows an example Julia function \code{pow} together with its corresponding IR, e-graph, and CFG skeleton.
+In addition to the control flow statements, the call to \code{println} has been stored in the CFG skeleton because calling that function produces side effects.
+In this representation, the \code{phi} nodes are leaf nodes. Their dependencies are not included in the e-graph. This implies (i) that the e-graph does not contain sufficient information to reconstruct all control flow of the original code, and (ii) that rewrites including \code{phi}-node dependencies are not supported. It is the CFG skeleton that provides the extra information needed to reconstruct valid IR. 
+
+The need to support control flow stems from a number of common code patterns of expressions that are split over multiple basic blocks for the sake of code conciseness, readability, and maintainability. The most important case concerns if-then-else patterns in which different expressions are computed under different conditions, and of which a common subexpression is computed beforehand. Five idioms for which such patterns occur are the following:
+\begin{description}
+\item [Keyword Arguments (kwargs)] It is quite common that part of a function depends on a kwarg, e.g., to perform extra checks or to modify the behavior. See, e.g., the use of the \code{flipkernel} kwarg in NNLib.jl.\footnote{\url{https://github.com/FluxML/NNlib.jl/blob/81e6cd1843dbd2baf2b7b2efd00e942f4f040a2d/src/fold.jl\#L186-L191}.}
+\item [LAPACK-style wrappers with \code{uplo}/\code{fmt}/\code{trans}/... chars] BLAS/LAPACK-like libraries often use characters to indicate the format of an array (transposed or not, upper/lower triangular, etc.). Such checks are then independent of the values calculated beforehand. For example, in the LinearAlgebra.jl\footnote{\url{https://github.com/JuliaLang/LinearAlgebra.jl/blob/master/src/bidiag.jl\#L1414-L1448}.} standard library, the costly operation \code{blks = findall(...)} is first computed, after which there is a branch based on \code{uplo}, followed by a reuse of \code{blks}. Another example is CUDA.jl's CUSPARSE wrappers: Plenty of API calls (which are a prime use case for e-graph based rewriting) occur outside of \code{fmt} checks, others occur inside such checks.\footnote{\url{https://github.com/JuliaGPU/CUDA.jl/blob/860eb88e40053b2709ef949f2eaf593c59bcecf1/lib/cusparse/generic.jl\#L48-L70}.}
+\item [API Version Checks] Continuing on the subject of API calls, it is common that certain API uses are conditional on the version of the library. For example, CUDA.jl includes checks such as \code{CUSPARSE.version()} $\geq$ \code{v"11.7.2"}.\footnote{\url{https://github.com/JuliaGPU/CUDA.jl/blob/860eb88e40053b2709ef949f2eaf593c59bcecf1/lib/cusparse/generic.jl\#L304-L335}.}
+\item [Low-level Math] In scalar ‘mathy’ code, this pattern is also common. The absolute cost of operations outside the if is then often not that great, but when it comes to optimizing very high-performance code, it can make a difference. Some examples can be found in the standard float.jl and math.jl libraries.\footnote{\url{https://github.com/JuliaLang/julia/blob/9118ea7565feae13d5b47654a3c245c0df36e753/base/float.jl\#L320-L328}}\footnote{\url{https://github.com/JuliaLang/julia/blob/9118ea7565feae13d5b47654a3c245c0df36e753/base/math.jl\#L756-L766}.}
+\item [Imperative Type Checks] For readability, or to avoid too many methods, imperative type checks are also sometimes used in Julia instead of multiple dispatch. Several examples can be found in the standard libraries.\footnote{\url{https://github.com/JuliaGPU/CUDA.jl/blob/860eb88e40053b2709ef949f2eaf593c59bcecf1/lib/cusolver/linalg.jl\#L35-L48}, \url{https://github.com/JuliaLang/julia/blob/9118ea7565feae13d5b47654a3c245c0df36e753/base/abstractarray.jl\#L2485-L2497}, \url{https://github.com/JuliaLang/julia/blob/9118ea7565feae13d5b47654a3c245c0df36e753/base/intfuncs.jl\#L592-L606}.}
+\end{description}
+
+All of these patterns involve divergent control flow, which our work can handle without problems. 
+%If the expressions in those diverging paths are later used in further super-expressions after the control has converged again, the current lack of support for rewrites involving \code{phi}-nodes prevents the global optimization of the expressions and the super-expressions. %\bds{Ik zou denken dat het dupliceren van de code na de if-then-else en het verplaatsen ervan naar de then en else gedeeltes alles wel zou kunnen oplossen? Maar misschien moet dit gewoonweg nog niet besproken worden.} 
+
+
+
+To convert an e-graph back to IR, the statements in the CFG skeleton are then used as starting points. % for extraction from the e-graph.
+This ensures that side effects and control flow are kept intact.
+IR is created by materializing each statement in the CFG skeleton as well as all its dependencies in the e-graph.
+Using the \emph{scoped elaboration} algorithm~\cite{fallinAegraphsAcyclicEgraphs2023}, materialization occurs only for values that have not yet been materialized in statements that dominate the current statement in the CFG. Otherwise, the previously materialized SSA value is reused.
+
+Like MLIR and the Swift Intermediate Language (SIL)~\cite{swiftSIL,MLIRRationale}, Cranelift's SSA IR format uses basic block arguments, which are bound by the branch operations in a block's predecessors, to represent control-dependent data flow. Julia's SSA IR, by contrast, uses phi-nodes. 
+Basic block arguments are more convenient for materializing statements in the e-graph because all information regarding out-of-block uses of expressions that need to be materialized within a block are then explicitly represented within that block itself. 
+
+For this reason, our code representation differs from existing uses of e-graphs and CFG skeletons in that it contains both phi-nodes and basic block arguments. 
+Take, for example, the two \code{goto \#2} statements in the Julia IR in Figure~\ref{fig:conversion}.
+Since the destination block (\code{\#2}) contains two phi nodes, the goto statements in the CFG skeleton pass the respective values as arguments.
+The e-graph itself still stores phi node values, but these are now handled as basic block arguments.
+During conversion from IR to e-graph and back from e-graph to IR, a conversion between phi nodes and basic block arguments is therefore performed. 
+
+Our implementation uses Metatheory.jl, a Julia equality saturation package based on egg~\cite{cheliMetatheoryjlFastElegant2021,willseyEggFastExtensible2021}.
+
+\subsection{Rules and Types}
+\label{sec:types}
+One of the defining features of the Julia programming language is multiple dispatch.
+This feature allows users to define a new method of a function for a specific combination of argument types.
+The fact that the semantics of a function call are not only decided by syntax but also by the type of their arguments necessitates a way to represent this information in rewrite rules as well.
+For example, a user might want to rewrite matrix multiplications into a function call to some external BLAS library.
+This means that a call to \code{Base.:*}, a function in Julia's base library, should be rewritten, but only if its arguments are matrices.
+
+Users can specify type constraints in the rewrite rules by associating a type with an unbound variable.
+For example, a rule for rewriting a matrix multiplication can be written as
+$$
+\code{\char`\~A::AbstractMatrix * \char`\~B::AbstractMatrix} \rightarrow \code{blas\_call(\char`\~A, \char`\~B)}.
+$$
+
+%where the \code{\char`\~} prefix is used to indicate unbound variables.
+
+We designed a novel e-class analysis for tracking types in the e-graph.
+For each e-class, this analysis maintains the most specific type that is compatible with all the e-nodes in that class.
+During e-graph construction, this type is simply the same as the types of statements in the source Julia IR.
+When two e-classes with a different associated type are merged, the resulting e-class is determined by the \code{typejoin} function.
+For rewrite rules that introduce a new function call, such as the rewrite of a matrix multiplication into \code{blas\_call}, we run Julia's type inference using the types stored in the e-classes.
+Similarly, if the type associated with an e-class changes, we rerun type inference for all e-classes containing e-nodes that depend on the changed e-class.
+
+\subsection{Constants in the E-Graph}
+Rewrite rules are usually symbolic in nature.
+They match an expression and replace that expression with a new one, plugging in any matched variable.
+Modern equality saturation frameworks such as egg~\cite{willseyEggFastExtensible2021} and Metatheory.jl~\cite{cheliMetatheoryjlFastElegant2021}, which was used in this work, also support \emph{dynamic rewrites}. When dynamic rewrite rules are applied, the right-hand side is first executed (potentially using additional e-class analysis data) and the original code is rewritten into the result of that execution, rather than into the right-hand side itself. 
+
+When literals are part of the e-graph, dynamic rewrites can be used to perform simple constant propagation.
+In normal Julia code, literals of primitive types as well as composite types with a known size can appear directly in the IR.
+The values of these literals are embedded in the e-graph.
+The e-classes containing the corresponding e-nodes of the literals have an inferred type associated with them, but compared to e-classes containing nonliteral e-nodes, the actual value of that type is available as well.
+We extend rewrite rule type annotations with a special \code{Comptime\{T\}} type that allows to match against the type of the actual values in the e-graph instead of the inferred type stored in the e-class.
+Using $\Rightarrow$ instead of $\rightarrow$ to signify dynamic rewrite rules, a rule such as 
+{
+$$ 
+\code{\char`\~a::Comptime\{Integer\} + \char`\~b::Comptime\{Integer\}} \Rightarrow \code{\char`\~a + \char`\~b}
+$$
+}
+
+\noindent will match any addition between two integer literals and insert the result of this addition in the respective e-class. %\footnote{Note the use of $\Rightarrow$ instead of $\rightarrow$ to signify that this is a \emph{dynamic} rewrite rule.}
+
+Dynamic rewrite rules also open opportunities for partial evaluation-like optimization~\cite{10.5555/286076,futamuraPartialEvaluationComputation1999} beyond the constant propagation capabilities of the Julia compiler. 
+The compiler does not propagate dynamic array arguments as their values could be mutated at any time.
+With dynamic rewrite rules, a programmer can override this default behavior.
+% When a function is invoked on an array holding known constants, the existing compiler does not propagate those constants into the function body. Compiled functions can then be reused for later invocations on arrays that hold different values. 
+% With dynamic rewrite rules, a programmer can override the default propagation of the compiler.
+To achieve this, we extended the rewrite rule format with rules of the form 
+{ $$ \code{function.arg[2]}\Rightarrow \code{W}.$$}
+
+This rule introduces an equivalence between the function's second argument in its e-graph and the constant \code{W}. A constant array holding \code{W}'s contents is added as an equivalent e-node to that argument's e-class in the e-graph, to which dynamic rewrite rules can then be applied. An interesting case is, for example, when \code{W} is a matrix holding the constant weights of a neural network layer.
+Computations that only depend on \code{W} or other compile-time-known variables can then be partially evaluated.
+% Computations to which such a \code{W} is passed can then be partially evaluated for it. 
+
+%Since reasoning over control flow cannot be made in general based on the e-graph, as discussed in Section~\ref{sec:conversion}, constant propagation breaks down at \code{phi} nodes.
+%In the future this could be solved by representing control flow fully in the e-graph.
+
+\subsection{Rewrites in the Presence of Side Effects}
+We depend on the static effect analysis built in the Julia programming language to decide whether a function call has side effects.
+This analysis determines several program properties for every statement in the IR of a function.
+The program property \code{effect\_free} signals whether a statement is free from externally semantically visible side effects.
+A limitation of Cranelift's approach using the CFG skeleton is that there is no way to rewrite instructions with side effects.
+In Cranelift, this is less of a concern as the code that is rewritten is lower level and typically contains a large amount of simple, low-level instructions, many of which are pure.
+In high-level Julia code, however, the IR we work on generally is much smaller and consists only of a few calls to high-level functions.
+Because these functions have more complex behavior than simple, low-level instructions, they also often include behavior with side effects. 
+Still, it should be possible for developers to rewrite function calls that have side effects.
+For example, a user might want to rewrite an expression containing a function that allocates and returns an array.
+
+To enable this, we introduce a technique called \emph{CFG skeleton relaxation}.
+We allow users to create rewrite rules that match against functions with side effects.
+When such a rule matches an expression in the e-graph and the rewrite is applied by adding the equivalence to the e-graph, all function calls that are part of the matched rule are removed from the CFG skeleton.
+%This ensures that function calls with side effects are conserved as long as rewriting them with rules.  rewrites those function calls.
+
+However, the ability to ignore the effect analysis and overwrite function calls with side effects is not without risks.
+Users who are unaware of certain side effects might unknowingly remove them and run into hard-to-debug bugs.
+We mitigate this problem somewhat by requiring an explicit prefix \code{unsafe} in front of the rules that are allowed to remove elements from the CFG skeleton.
+
+Although this raises the bar somewhat to specify and use rewrite rules that unintentionally break the intended semantics of a rewritten piece of code, the risk of using rules incorrectly is obviously not mitigated completely. Semantic rule verification is outside the scope of this work. A rewrite rule might be semantically correct in one domain but incorrect in another, such as reduced precision in deep learning, so correctness is up to the rule author. Bad rules can introduce bugs.
+
+
+\subsection{Extraction}
+\label{sec:extraction}
+\begin{figure}
+    \centering
+    \includegraphics[width=0.55\linewidth]{figures/extraction.pdf}
+    \caption{Example function where equality saturation reveals opportunities for reuse. \captioncode{tr} and \captioncode{det} can be rewritten as a sum and a product over the eigenvalues stored in \captioncode{eig}. Optimal e-nodes for extraction are shaded gray.}
+    \Description{Example function where equality saturation reveals opportunities for reuse. Based on some condition, the function returns either the trace of matrix A or its determinant. The invocations to the functions tr and det that compute the trace respectively the determinant, can be rewritten as a sum and a product over the eigenvalues stored in eig, which is the variable in which the eigenvalues are already stored after a call to the eigen function. The Julia IR is shown next to the source code, and the e-graph is chosen, which consists of 9 e-classes totaling 11 e-nodes. The nine optimal e-nodes, one for each e-class, for extraction are shaded gray.}
+    \label{fig:extraction}
+\end{figure}
+When Julia IR is generated from an optimized e-graph and its corresponding CFG skeleton, each statement in the CFG skeleton is considered a root node for e-graph extraction. This means that, in contrast to most work on e-graph-based optimizers, we essentially need to run multiple extractions to recover our program.
+These extractions are not independent of each other.
+Take, for example, the code and corresponding IR and e-graph in Figure~\ref{fig:extraction}.
+The function \code{f} computes and returns two different values \code{eig} and \code{x} derived from matrix \code{A}. \code{eig} stores the eigen vectors and values, and \code{x} stores the trace or the determinant of the matrix, depending on control flow.
+In this example, two rules from a collection of linear algebra identities have been applied:
+{
+\begin{align*}
+& \code{tr(\char`\~A)} \rightarrow \code{sum(eigen(\char`\~A).values)}
+\\
+& \code{det(\char`\~A)} \rightarrow \code{prod(eigen(\char`\~A).values)}
+\end{align*}
+}
+
+These give rise to the extra e-nodes in the e-classes containing \code{det} and \code{tr}.
+Intuitively, we can see that an optimal extraction might be one in which the result of the call to \code{eigen} is reused to compute the determinant and/or trace instead of explicitly calling those functions.
+Indeed, that extraction is valid since the call to \code{eigen} dominates both the call to \code{det} and to \code{tr} so its result is available at those call sites.
+
+We formulate the problem of finding an optimal extraction as an ILP problem.
+\citeauthor{heImprovingTermExtraction2017}~\cite{heImprovingTermExtraction2017} propose an ILP description for e-graph extraction that ensures an acyclic extracted graph, which is important for further elaboration to produce linearized IR.
+We adapt and extend their description to take into account e-node reuse from dominating extractions.
+
+\begin{figure}
+    \centering
+    \includegraphics[width=0.2\linewidth]{figures/egraph_notation.pdf}
+    \caption{E-graph with 5 e-classes. E-node $n$ has 2 child e-classes. Both e-nodes in $c$ have the same two e-node parents.}
+    \Description{An example E-graph with 5 e-classes. E-node n has 2 child e-classes. E-class c contains e-node n, and another, unnamed e-node. Both e-nodes in e-class c have the same two e-node parents. In this graph, nodes are additionally tagged with annotations that illustrate for e-node n the sets p(n) and chi(n).}
+    \label{fig:egraph_notation}
+\end{figure}
+Let the e-graph be represented by a set of e-nodes $N$, and a set of e-classes $C$. Let $\left\{n | n \in c\right\}$ be the set of e-nodes that are contained in e-class $c \in C$, and let $\chi(n)$ be the set of children e-classes of a particular e-node $n \in N$.
+We associate with each e-node $n$ a set of e-nodes $p(n)$ defined as:
+\[
+% \exists n' \in p(n) : n \in \chi(n')
+\{n' \mid \exists c \in \chi(n') : n \in c\}
+\]
+
+That is, the set of e-nodes $n'$ that have a child e-class containing $n$.
+Figure~\ref{fig:egraph_notation} shows an e-graph in which the different parts have been annotated with this notation.
+
+We represent the statements contained in the CFG skeleton as the set $I$.
+All of these statements cause a different expression to be extracted from the e-graph, rooted at each $i \in I$.
+For each statement $i \in I$ the statements that dominate $i$ are represented by the set $d(i)$.
+Each statement $i$ depends on a number of e-class arguments represented by the set $r(i)$.
+
+Finally, we associate a cost $M(n)$ with every e-node $n$ such that our optimization problem becomes:\footnote{Changes to the formulation by \citeauthor{heImprovingTermExtraction2017}~\cite{heImprovingTermExtraction2017} are highlighted in blue.}
+\begin{align}
+\min \quad & \sum_{\highlight{i \in I}, n \in N} M(n) \cdot w_n^{\highlight{(i)}}\nonumber
+\\
+\underset{\highlight{\forall i \in I}}{\text{subject to}}
+& \sum_{n' \in c}\left( w^{\highlight{(i)}}_{n'} + \highlight{\sum_{j \in d(i)} w_{n'}^{(j)}}  \right) \ge w_n^{\highlight{(i)}}, \forall \begin{array}[t]{l} n \in N \\ c \in \chi(n) \end{array}
+\\
+& \highlight{w^{(i)}_{n} \le \sum_{n' \in p(n)} w^{(i)}_{n'}, \quad \forall n \in N, c \in \chi(n)}
+\\
+& \sum_{n \in c} \left( w_n^{\highlight{(i)}} + \highlight{\sum_{j\in d(i)}{w_n^{(j)}}} \right) \geq 1, \quad \forall c \in r\highlight{(i)}
+\\
+& \left(1 - v_{\Psi,c}^{\highlight{(i)}}\right) + \left(1 - w_n^{\highlight{(i)}}\right) \geq 1, \quad \forall  \begin{array}[t]{l} \Psi \in \mathcal{A} \\ c \in \Psi \\ n \in \mathcal{N}_{\Psi}^{c} \end{array}\nonumber
+\\
+& v_{\Psi,c}^{\highlight{(i)}} + \sum_{n \in \mathcal{N}_{\Psi}} w_n^{\highlight{(i)}} \geq 1, \quad \forall \Psi \in \mathcal{A}, c \in \Psi\nonumber
+\\
+& \sum_{c \in \Psi} v_{\Psi,c}^{\highlight{(i)}} \geq 1, \quad \forall \Psi \in \mathcal{A}\nonumber
+\\
+& w_n^{\highlight{(i)}}, v_{\Psi,c}^{\highlight{(i)}} \in \{0, 1\}, \quad \forall \Psi \in \mathcal{A}, c \in \Psi, n \in N\nonumber.
+\end{align}
+
+Where, for each e-node $n$ and statement $i$ from the CFG skeleton, we have introduced a binary variable $w_n^{(i)}$.
+These variables indicate whether the e-node is selected for the extraction rooted at statement $i$.
+Furthermore, following the work by \citeauthor{heImprovingTermExtraction2017}~\cite{heImprovingTermExtraction2017}, each $\Psi \in \mathcal{A}$ is a \emph{class cycle}, a collection of classes that contain e-nodes that form a cycle by depending on other classes in the cycle.
+The e-nodes in an e-class $c$ that participate in a class cycle $\Psi$ are represented by the set $\mathcal{N}_{\Psi}^{c}$.
+For each class $c$ in each class cycle $\Psi$, we introduce the binary variables $v_{\Psi,c}^{(i)}$ that are used to enforce acyclicity in the extracted graph.
+$v_{\Psi,c}^{(i)}$ is assigned 1 if none of the e-nodes in e-class $c$ that participate in the class cycle are selected.
+For a more complete overview and proof of acyclic extraction we refer to the work by \citeauthor{heImprovingTermExtraction2017}~\cite{heImprovingTermExtraction2017}.
+To take into account the dominance information from the CFG skeleton, we adapted their formulation in a few ways.
+
+We adapt constraint (1) to ensure that an e-node can only be selected if for each child e-class an e-node is also selected, \emph{or if an e-node is already selected in a dominating extraction $j$}.
+
+To prevent e-nodes from being selected in dominating extractions when they are not needed there, we introduce constraint (2).
+This constraint prevents an e-node from being selected if there is no e-node selected at the same extraction that depends on that e-node.
+
+Constraint (3) ensures that at least one e-node in each e-class that is referenced by a root in the CFG skeleton is truly selected for extraction.
+Compared to the original ILP formulation by \citeauthor{heImprovingTermExtraction2017}~\cite{heImprovingTermExtraction2017}, we added an extra term to account for the fact that an e-node might have already been selected in a dominating extraction.
+
+The remaining constraints are completely analogous to the constraints by \citeauthor{heImprovingTermExtraction2017}~\cite{heImprovingTermExtraction2017} except for the addition that each constraint is added separately for each possible extraction root $i \in I$.
+
+We implement this ILP formulation in JuMP~\cite{lubinJuMP10Recent2023}, a domain-specific language embedded in Julia for expressing and solving mathematical optimization problems.
+For a solver, we resort to HiGHS~\cite{huangfuParallelizingDualRevised2018}.
+By default, our cost function $M(n)$ currently defaults to 1, reducing the optimization problem to choosing the least number of e-nodes.
+We allow users to manually alter the cost for calls to particular functions to overwrite this behavior.
+
+% \begin{align*}
+% \text{min} \quad & \sum_{n \in \tau} M(n) \cdot w_n \\
+% \text{subject to} \quad & \sum_{n' \in c} w_{n'} \geq w_n, \quad \forall n \in N, c \in \chi(n) \\
+% & \sum_{c \in \xi(n)}
+% & \sum_{n \in R} w_R = 1 \\
+% & (1 - v_{\Psi}^c) + (1 - w_n) \geq 1, \quad \forall \Psi \in \mathcal{A}, c \in \Psi, n \in \mathcal{N}_{\Psi}^{c} \\
+% & v_{\Psi}^c + \sum_{n \in \mathcal{N}_{\Psi}} w_n \geq 1, \quad \forall \Psi \in \mathcal{A}, c \in \Psi \\
+% & \sum_{c \in \Psi} v_{\Psi}^c \geq 1, \quad \forall \Psi \in \mathcal{A} \\
+% & w_n, v_{\Psi}^c \in \{0, 1\}, \quad \forall \Psi \in \mathcal{A}, c \in \Psi, n \in N
+% \end{align*}
+
+
+
+% The CFG skeleton keeps track of all e-classes that are depended on by the goto, phi, and return statements.
+% As discussed previously\todo{make sure scoped elaboration appears first}, the scoped elaboration algorithm will ensure extracted e-nodes will not be elaborated a second time if they have been elaborated in a dominating statement.
+% A greedy extraction approach, unaware of extractions made in dominating blocks, would end up extracting \code{tr} and \code{det} instead of the equivalent expression trees starting from \code{real}. This is because a greedy approach would take into account the cost of 
+% We know, however, that since 
+
+\section{Use Case Demonstration}
+\label{sec:usecase}
+To demonstrate the capabilities of our work, this section presents a number of use cases. This demonstration focuses on our main goal of allowing users and domain experts to express and exploit optimization opportunities in a convenient, flexible way. In other words, our use cases aim to demonstrate that our work can give developers the necessary control over optimizations without them having to become compiler experts and without restricting the flexibility and productivity they have come to expect from the Julia ecosystem. In contrast, our work aims to give developers more flexibility, meaning less restrictions, to write code without incurring a reduction in optimization opportunities.  
+
+Our work does not at all aim to squeeze more performance out of the Julia programming language and its compiler and run-time implementation. Indeed, any optimization that can be obtained with a rewrite rule can also be obtained by manually rewriting source code, such as by duplicating source code and then special-casing it. This section will hence not evaluate how much the performance of a piece of code can be improved with rewrite rules.
+
+
+\subsection{Domain Specific Rewrites}
+\begin{figure}
+    \centering
+    \includegraphics[width=0.45\linewidth]{figures/2D_transformations.pdf}
+    \caption{Example of domain-specific code used to apply 2D transformations to a point.
+    The function performs a series of transformations. With a handful of rules, these can be reduced to the identity transformation.}
+    \Description{Example of domain-specific code used to apply 2D transformations to a point.
+    The function performs a series of transformations: a horizontal translation over distance dx, a rotation over pi radians, a translation over cosinus squared plus sinus squared minus one, which equals zero, another rotation over pi radians, and a translation over minus dx. With a handful of rules, these can be reduced to the identity transformation.}
+    \label{fig:2D transformations}
+\end{figure}
+Figure~\ref{fig:2D transformations} shows a function that applies a sequence of similarity transformations on a 2D point.
+On close inspection, application of geometric properties, trigonometric identities, and algebraic simplifications can lead to the reduction of all these transformations to a single identity transform.
+Indeed, the translation on line~8 can be simplified to \code{p} by applying
+{
+\begin{align*}
+&\code{sin(\char`\~x::Number)\char`\^2 + cos(\char`\~x)\char`\^2} \rightarrow \code{1}
+\\
+&\code{\char`\~x::Number - \char`\~x} \rightarrow \code{0}
+\\
+&\code{translate(\char`\~p, 0, 0)} \rightarrow \code{\char`\~p}
+\end{align*}
+}
+
+After this translation has been eliminated, the two rotations by $\pi$ radians similarly end up not transforming the point.
+Lastly, the first and last rotations now cancel each other out as well.
+After all the corresponding rewrites, the optimized function simply returns its argument \code{p}.
+
+With this example, we also illustrate the necessity of CFG skeleton relaxation.
+The effect inference in the Julia compiler is unable to reason through the rotation matrix construction in the \code{rotate} function on line~2 in Figure~\ref{fig:2D transformations}.
+Because of this, the rewrite rule author is required to allow CFG skeleton relaxation for those rules where \code{rotate} is called by prefixing those rules with \code{unsafe}.
+
+
+\subsection{Aiding Multiple Dispatch}
+Instead of using rewrites purely for simplifying code, they can also be used to generate code that provides additional information to the Julia compiler' type system to trigger the execution of better performing function implementations through multiple dispatch. 
+An example in the domain of linear algebra is to automatically wrap certain matrix expressions in a new, more specific type that allows more efficient implementations for subsequent computations.
+Take, for example, the expression $A + B^T$ between two regular matrices $A$ and $B$.
+For the case where $A$ and $B$ are the same matrix, that is, $A+A^T$, we know that the result is a symmetric matrix.
+We can encode this fact by applying the following rewrite rule:
+$$ 
+\code{\char`\~A::AbstractMatrix + transp(\char`\~A)} \rightarrow\code{Symmetric(\char`\~A + transp(\char`\~A))}
+$$
+
+The \code{Symmetric} function from the \code{LinearAlgebra.jl} package takes the upper triangle of its argument and uses that to efficiently represent a symmetric matrix. 
+More importantly, it returns a value of type \code{Symmetric}. Other functions in that linear algebra package, e.g., for solving eigenproblems, have specialized implementations for symmetric matrices. After rewriting with the above rule, those specialized implementations will now be called automatically thanks to the multiple dispatch system knowing that they are invoked on type \code{Symmetric} instead of on a more generic matrix type. 
+
+Another example is the expression $P^T B P$, which is symmetric if B is symmetric as well.
+Again, this fact can be encoded with the following rule:
+$$ 
+\code{\char`\~P::AbstractMatrix * \char`\~B::Symmetric * \char`\~P} \rightarrow\code{Symmetric(\char`\~P * \char`\~B * \char`\~P)}
+$$
+Both these examples build on the abstractions of the Julia standard library, but the same concepts can also be applied to operations and types in other, external packages.
+
+\subsection{Multi-Line Broadcast Fusion}
+\label{sec:multi-line broadcast fusion}
+\begin{figure}
+    \centering
+    \includegraphics[width=0.35\linewidth]{figures/dot_broadcasting.pdf}
+    \caption{Julia code that uses broadcasting syntax. The \captioncode{relu} function is broadcasted over \captioncode{A} and \captioncode{B} is added to the result using broadcasting addition.}
+    \Description{Julia code that uses broadcasting syntax: using the dot operator, a elementwise ReLu operation and an elementwise addition are applied to vectors A and B. In other words, the relu function is broadcasted over matrix A and vector B is added to the result using broadcasting addition.}
+    \label{fig:broadcast_dot}
+\end{figure}
+\begin{figure}
+    \centering
+    \includegraphics[width=0.45\linewidth]{figures/expanded_broadcasting.pdf}
+    \caption{Syntactic lowering applied for the broadcasting expression in Figure~\ref{fig:broadcast_dot}. \captioncode{broadcasted} builds a lazy representation of the broadcast operation. \captioncode{materialize} allocates the result array and computes its values.}
+    \Description{Julia code example of materialize(broadcasted(+,broadcasted(relu,A),B)) to illustrate syntactic lowering applied for the broadcasting expression in the previous figure showing a broadcasting expression. The broadcasted function builds a lazy representation of the broadcast operation. The materialize function allocates the result array and computes its values.}
+    \label{fig:broadcast_expanded}
+\end{figure}
+
+Julia's broadcasting mechanism allows users to apply functions element-by-element on one or more arguments containing multiple elements.
+Syntactically, this is done by adding a \code{.} between the function and its argument list.
+The top of Figure~\ref{fig:broadcast_dot} shows two broadcast operations.
+\code{relu.(A)} applies the scalar \code{relu} function to each element of the matrix \code{A}.
+Next, the \code{.+} call computes the addition between the result and a vector \code{B}.
+Although the two arguments to \code{.+} have a different shape, the operation can take place because the shapes are compatible.
+
+Broadcasting in Julia is implemented by transforming expressions containing this special \emph{dot syntax} into calls to the standard library functions \code{broadcasted} and \code{materialize}.
+Figure~\ref{fig:broadcast_expanded} shows the result of this transformation on the broadcasting expression in Figure~\ref{fig:broadcast_dot}.
+A call to \code{broadcasted} builds a lazy representation of the broadcast result. Different lazy broadcast objects can be nested; it is only when \code{materialize} is called that the final result object is allocated and filled with computed values.
+As such, different operations within multiple \code{broadcasted} calls are fused when \code{materialize} is called.
+This leads to less memory being used because temporary arrays are not materialized and potentially better run-time performance because there are fewer function calls.
+This operator fusion is especially beneficial for code that is executed on the GPU, as kernel launches can take a significant amount of time, and because kernel fusion can significantly reduce the required number of memory accesses~\cite{besardEffectiveExtensibleProgramming2019}. 
+
+A limitation of Julia's broadcasting lowering is that fusion cannot occur across broadcast expressions on different lines.
+This is because replacing the dot syntax with calls to \code{broadcasted} and \code{materialize} is a syntactical transformation that is performed during AST lowering, which operates statement by statement. A potential optimization is hence to eliminate superfluous calls to \code{materialize}.
+Rewrite rules make this easy.
+Take for example the rule
+$$ \code{broadcasted(\char`\~f, materialize(\char`\~x))} \rightarrow \code{broadcasted(\char`\~f, \char`\~x)}.$$
+
+This rule will remove the intermediary materialization for any call of the form \code{f.(x)} where \code{x} is a variable that was defined on a different line with a broadcast expression itself.
+In the example code in Figure~\ref{fig:deep learning original}, fusion will now be applied despite the two dot operators occurring in two different statements on two separate lines. This example illustrates how the system we propose not only supports domain-specific optimization, but at the same time enables optimization of common code patterns involving only core Julia primitives. 
+
+An important detail is that here, once more, CFG skeleton relaxation is required, since \code{materialize} ends up calling a foreign C function function which the compiler cannot deem effect-free, poisoning the remainder of the effect analysis.
+In practice, this means the rule needs to be prefixed with \code{unsafe}.
+
+Using PkgEval.jl, a tool to automatically evaluate the tests of Julia packages, we evaluated how many times the above rule's pattern occurs in real-life code in 3153 different packages.
+In total, we found 514 instances where code containing this pattern was executed, spread over 232 different packages.
+This pattern occurs, for example, when a broadcasted expression is used in different branches and is factored out by the programmer as a code simplification measure.
+Applying the rewrite rule does not undo the deduplication but only removes the superfluous call to \code{materialize}.
+Note that the discussed rule only matches expressions where the outer broadcasted function is a unary function.
+
+For other patterns, e.g., an expression where the outer broadcasted function is a binary function, separate rules need to be written.
+Table~\ref{tab:rule counts} gives an overview of how many times different multi-line broadcasting patterns were found in our analysis.
+The three last patterns are different configurations of broadcasting a binary function. Note that the matches for these three patterns are not independent: a match against the last pattern, which will result in two invocations of \code{materialize} being optimized out, implies the two other patterns can be matched and applied as well, each optimizing out only one \code{materialize} invocation. When the final code is extracted in such cases, the expression from the e-class containing the least materialize calls will be chosen.
+
+\begin{table}[t]
+    \centering
+    \begin{tabular}{l|c|c}
+        \hline
+         \makecell{\textbf{LHS pattern of rewriting rule }} & \makecell{\textbf{Count}}  & \makecell{\textbf{Distinct Packages}} \\
+        \hline
+        \code{broadcasted(\char`~f, materialize(\char`~x))} & 514 & 232 \\
+        \code{broadcasted(\char`~binop, materialize(\char`~x), \char`~y)} & 1232 & 348 \\
+        \code{broadcasted(\char`~binop, \char`~x, materialize(\char`~y))} & 1044 & 283 \\
+        \code{broadcasted(\char`~binop, materialize(\char`~x), materialize(\char`~y))} & 231 & 93 \\
+        \hline
+    \end{tabular}
+    \caption{Number of matches for different multi-line broadcasting patterns in an analysis of 3153 Julia packages. These patterns can all be rewritten to $\captioncode{broadcasted(\char`\~f, \char`\~x)}$ and $\captioncode{broadcasted(\char`\~binop, \char`\~x, \char`\~y)}$.}
+    \label{tab:rule counts}
+\end{table}
+% This does not mean deferring materialization is beneficial in all the cases where we detected the pattern.
+% For example, if an intermediary value is materialized and used multiple times in different places, it does not make sense to postpone and recompute the computation multiple times.
+
+\subsection{Extending Broadcasting with Domain-Specific Batched Operations}
+\begin{figure}
+    \centering
+    \includegraphics[width=0.45\linewidth]{figures/deep_learning_original.pdf}
+    \caption{Instead of making use of specialized functions and having to adhere to their APIs, a user can write straightforward code in the core programming language.}
+    \Description{
+    Julia code example of a function called forward that computes the forward pass of a single-layer neural network. Apart from network inputs, weights, and activation function, the forward function takes a boolean argument called training, and an argument called p_drop which is the probability value used in dropout operation.
+    The function starts by assigning the logits variable, which is computed by a matrix multiplication between the weights and input, and a broadcasted addition with the bias vector.
+    Using an if statement, depending on whether the training flag is set true or false, the dropout function is applied before broadcasting the activation function on the result and returning it.
+    }
+    \label{fig:deep learning original}
+\end{figure}
+
+\begin{figure}
+    \centering
+    \includegraphics[width=0.47\linewidth]{figures/deep_learning_rewritten.pdf}
+    \caption{Manually rewritten source code that calls an optimized implementations of certain computations.}
+    \Description{
+    Julia code of the same neural network computation as the previous figure, after rewrite transformations. Now, the branch where no dropout is applied directly a specialized function called fused_dense_bias_activation. The branch where dropout is applied still first computes the logits variable, applies the dropout function, and returns the value after applying the activation function.
+    }
+    \label{fig:deep learning rewritten}
+\end{figure}
+In high-performance contexts, programmers often sacrifice code simplicity and readability in pursuit of achieving the highest possible performance.
+For example, instead of writing deep learning layers and non-linear activation functions using core language constructs, programmers often resort to using frameworks or libraries that contain optimized implementations of matrix multiplications, activation functions, attention computation, and others~\cite{elshawiDLBenchComprehensiveExperimental2021,parvatSurveyDeeplearningFrameworks2017}.
+This works well for most common use cases but falls apart when a programmer requires custom behavior that is not yet supported by the framework.
+In those cases, the programmer is required to rewrite parts of the program to stop using the framework and instead depend on a different framework or the core language.
+
+Instead of having to opt out of framework functionality and rewriting code, it would be much better if one could write simple, readable code and have the frameworks themselves automatically discover opportunities to use their better performing implementations. 
+Our rewrite system gives framework authors the option for implementing such discovery and optimization almost for free.
+
+As an example, take the code in Figure~\ref{fig:deep learning original} that shows an implementation of the forward pass of a single fully connected feedforward layer.
+There already exist several Julia packages that allow us to compute such operation more efficiently~\cite{faingnaertFlexiblePerformantGEMM2022,innesFashionableModellingFlux2018,innesFluxElegantMachine2018}.
+For example, the programmer could rewrite the code as shown in Figure\ref{fig:deep learning rewritten} to use the optimized \code{fused\_dense\_bias\_activation} function from the Lux.jl deep learning framework~\cite{palLuxExplicitParameterization2023}. A disadvantage of such manual rewriting is that the code becomes less readable for someone not familiar with the Lux.jl APIs. Moreover, the use of that specific framework's optimized implementation, which is in essence a decision about a non-functional aspect of the code, is then hard-coded in the code that specifies the functionality. This requires the developers and the maintainers of this code to be knowledgable in the code's application domain as well as in the Lux.jl framework. Switching to other frameworks in the future will require rewriting code. Clearly, hard coding the dependence on Lux.jl and its APIs in the code has a number of downsides.
+
+With our system, instead of rewriting the original code of Figure~\ref{fig:deep learning original}, it suffices to add a rewrite rule that maps the original code pattern onto the optimized \code{fused\_dense\_bias\_activation} function:\footnote{Type annotations have been left out for the sake of conciseness of this rule, but they are needed to make sure to only match when \code{W} and \code{x} are matrices, and \code{b} is a vector.}
+{
+\begin{align*}
+& \code{materialize(broadcasted(\char`\~$\sigma$, broadcasted(+, \char`\~W * \char`\~x, \char`\~b)))}
+\\
+&\quad\rightarrow \code{LuxLib.fused\_dense\_bias\_activation(\char`\~$\sigma$, \char`\~W, \char`\~x, \char`\~b)}
+\end{align*}
+}
+Combined with the multi-line broadcast rewriting rule explained above, which rewrites the original code into a single line without the intermediary variable \code{logits}, this rule maps the single-line broadcast expression onto a call to the library function \code{LuxLib.fused\_dense\_bias\_activation}, which will yield compiled code equivalent to what would be obtained with the code in Figure~\ref{fig:deep learning rewritten}.
+
+This example illustrates how our approach allows for a better separation of concerns. Another advantage is that alternative rewrite rules can be provided for different Julia packages that provide different optimized implementations for similar functionality.
+Different rewrite rules also don't obfuscate each other.
+All rewrite rules can be represented in the e-graph.
+Only during extraction is the final optimized code materialized, optionally based on user-defined extraction costs for different functions.
+As such, rewrite rules from different authors are fully interoperable.
+
+%Instead of having to separate the computations fully for the case where \code{fused\_dense\_bias\_activation} can be used, the programmer can write code, focusing on clarity, while still enjoying the same optimizations.
+Similarly, without changing the source code, different rewrites can still occur by applying different sets of rewrite rules that can for example be offered by different Julia packages.
+
+
+This example also illustrates how our system supports the composition of high-level, domain-specific optimizations with optimizations of core Julia primitives. In this way, our system's scope is much broader than recent equality~saturation based optimizers such as Cranelift. 
+
+\section{Compilation Time Evaluation}
+\label{sec:compiletime}
+%\bds{I have significantly changed the message of the first paragraph of this section: Julia sells itself as a JIT language on its website, so we cannot directly contradict this.}
+
+
+Julia is a just-ahead-of-time compiled language for scientific computing. By default, Julia automatically compiles a native, type-specialized version of a function just ahead of the first time it is to be executed on some combination of argument types. Julia hence positions itself somewhere between typical ahead-of-time compilers such as LLVM and gcc and just-in-time compilers such as Cranelift or the compilers used in a Java VM. Compilation speed is hence important for Julia. 
+
+Alternatively, a user can request ahead-of-time compilation of functions and optionally invoke our rewriting rule-based optimization, depending on whether or not the investment in compilation time might yield a positive return on investment. As scientific software most often has relatively long execution times, compilation times are therefore not as critical as in more traditional JIT compilers. Still, we aim for interactive compilation speeds with our work to allow for rapid prototyping.
+
+% \subsection{Complexity Analysis}
+% \todo[inline]{Todo: add brief complexity analysis of the different steps.}
+
+\subsection{Complexity of E-Graph Construction}
+In general, termination for equality saturation is not guaranteed since application of rewrite rules can introduce new rewrite opportunities indefinitely.~\cite{willseyEggFastExtensible2021,suciuSemanticFoundationsEquality2025}
+In practice, this issue is most often tackled by equality saturation timeouts in combination with heuristic schedulers that ensure that all rewrite rules get a chance to be applied by implementing a rule application back-off mechanism~\cite{cheliAutomatedCodeOptimization2021,MLSYS2021_cc427d93}.
+The non-terminating behavior of equality saturation
+is due to repeated application of rule application and rebuilding the e-graph by joining newly discovered equivalences.
+The actual construction of the e-graph, however, is not concerned with this loop and does, in fact, execute in polynomial time.
+
+
+% \subsubsection{Worst Case Complexity for E-Graph Construction}
+We reimplemented the algorithm introduced for Cranelift~\cite{fallinAegraphsAcyclicEgraphs2023} in Julia.
+This algorithm starts by computing the dominator tree of the input SSA code.
+We reuse the dominator tree construction implementation from the Julia compiler.
+This implementation is based on an algorithm from \citeauthor{georgiadisLineartimeAlgorithmsDominators2005}'s thesis~\cite{georgiadisLineartimeAlgorithmsDominators2005}, and runs in linear time with respect to code size.
+IR statements are visited in a pre-order dominator tree traversal to ensure that all dependencies of the current statement have already been visited.
+For each statement, the e-class dependencies are looked up and an e-node is constructed. If the e-node is not part of the e-graph yet, it is inserted in a new e-class, otherwise an existing e-class is associated with the statement.
+At the same time that the e-graph is being constructed, the CFG skeleton is being built.
+This involves pushing the corresponding e-classes of effectful statements in a CFG structure which has a worst case runtime complexity of $\mathcal{O}(N)$, where $N$ is the code size, but an amortized complexity of $\mathcal{O}(1)$.
+
+Since no equalities are introduced yet during e-graph construction time, inserting new e-classes in the e-graph does not require running the relatively expensive rebuilding procedure.
+As such, e-graph construction only requires inexpensive hash map lookups and insertions for each statement, which have a worst case runtime complexity of $\mathcal{O}(N)$ but an expected worst case runtime of $\mathcal{O}(1)$.
+
+Overall, the worst case runtime complexity of our e-graph construction is $\mathcal{O}(N^2)$ but on average and in practice, as will be discussed in Section~\ref{sec:experimental compile time}, the worst case runtime complexity is $\mathcal{O}(N)$.
+
+% # This file implements the Semi-NCA (SNCA) dominator tree construction
+% # described in Georgiadis' PhD thesis [LG05], which itself is a simplification
+% # of the Simple Lenguare-Tarjan (SLT) algorithm [LG79]. This algorithm matches
+% # the algorithm choice in LLVM and seems to be a sweet spot in implementation
+% # simplicity and efficiency.
+
+% (rebuilding uses Tarjan algorithm but during construction the e=graph does not contain cycles so it can run in linear time)
+
+\subsection{Experimental Compilation Time Evaluation}
+\label{sec:experimental compile time}
+\begin{figure}
+    \centering
+    \includegraphics[width=0.75\linewidth]{figures/compilation_profile.pdf}
+    \caption{Time spent in different phases of the compiler when optimizing the \code{forward} function in Figure~\ref{fig:deep learning original} with the rewrite rules discussed before.}
+    \Description{A graph showing the compilation time for different parts of our rewrite optimizations.
+    The graph consists of three vertical bar charts next to each other, representing time spent in the pre-inlining, post-inlining, and finalizations stage.
+    Each bar chart is divided in different colors indicating the time needed for specific compilation steps.
+    The different compilation steps are: IR to e-graph conversion, e-graph saturation, e-graph to ir conversion, type reinference, invocation queueing, ILP problem construction, ILP solver (HiGHS), optimized function insertion, inlining pass, llvm optimization and code generation, and other.}
+    \label{fig:compilation profile}
+\end{figure}
+
+Figure~\ref{fig:compilation profile} shows the compilation times spent in different steps of the whole optimization pipeline for optimizing the \code{forward} function from Figure~\ref{fig:deep learning original}.
+Important to note is that these numbers include the time spent optimizing \emph{each} function in the call graph of the top-level function.
+For the \code{forward} method, the call graph consists of 43 methods that each pass through the full optimization pass.
+The chart partitions the optimization flow and its compilation time into three stages.
+All benchmarks were run on a machine with a 6-core Intel i7-9750H processor and 24GB RAM.
+The code was run on Julia v1.11.0 (commit 501a4f25c2b), with LLVM 16.0.6.
+
+\subsubsection{Pre-Inlining} In this first stage, rewrites are applied before the code body of the function is inlined.
+Due to the small number of rules, e-graph saturation only takes a small portion of the work in this stage.
+Similarly, ILP problem construction and solving runs quickly because non-inlined code consists of few statements, leading to a small ILP problem to solve.
+In this stage, a larger part of the run time is spent reinferring the types in the generated IR.
+This also includes replacing dynamic function calls with static invocations of the correct methods if enough type information is available to make this decision.
+The last step of this stage consists of collecting the non-inlined IR of each method that is invoked, and adding this IR to the top of a worklist.
+Methods invoked within a function end up at the top of the worklist and are fully optimized before the second stage of the current function can begin.
+
+\subsubsection{Post-Inlining} The second stage starts by replacing each method invocation with the optimized variant if rewrites were applied to it.
+Next, we have the default inlining pass that is also invoked during regular Julia compilation.
+In this second stage, conversion from IR to e-graph takes much longer because the inlined code consists of many more nodes.
+For the same reason, e-graph saturation takes longer as well.
+Because there are no rules to apply post-inlining in this instance, no time is spent on ILP, and type re-inference runs faster.
+
+To assess the scalability of the conversion from IR to e-graph and back, Figure~\ref{fig:conversion profile} shows those times for IRs of different sizes. The IR dataset was collected by running the optimizer on the \code{factorize} function from Julia's linear algebra standard library and on the many functions that are part of this function's call graph. Both conversions clearly scale linearly with the number of statements.
+
+E-graph to IR conversion does not meaningfully show up in the compilation times in Figure~\ref{fig:compilation profile} because this operation is only executed if actual changes to the e-graph were made, which happens infrequently in this instance.
+Similarly, re-inference times in the post-inlining stage do not take much time because this step is only applied when the e-graph has changed.
+This is in contrast to the pre-inlining stage, where part of the re-inference procedure needs to be executed either way to prepare the IR for inlining in the next stage.
+\begin{figure}
+    \centering
+    \includegraphics[width=0.55\linewidth]{figures/conversion_profile.pdf}
+    \caption{Conversion times for converting from IR to e-graph and back, for IR of different lengths.}
+    \Description{
+    A scatter plot showing the time needed to convert from IR to e-graph and vice versa. The x-axis shows the number of IR statements, the y-axis shows the time needed in microseconds.
+    Datapoints for IR to e-graph conversion are shown with an orange, plus-shaped marker, and e-graph to IR is shown using an red, triangle-shaped marker.
+    Both cases a similar linear trend upwards.
+    }
+    \label{fig:conversion profile}
+\end{figure}
+
+\subsubsection{Finalization} During the last stage, the functions that were enqueued in the previous stage have been optimized and are inserted if rewrites were applied to them.
+Finally, compilation is passed on to LLVM to generate an executable, native function from the optimized IR.
+This step takes more than a third of the total time.
+
+In Figure~\ref{fig:compilation profile}, \emph{Invocation Queueing}, \emph{Inlining}, and \emph{LLVM Compilation} are steps that are not specific to our compilation flow but are also taken in the native Julia compiler.
+In the example discussed above, 80\% of the total time is spent in these steps.
+The Julia compiler hides much of the compilation costs by caching the compiled code.
+Tighter integration of our optimization into the Julia compiler could thus lead to faster compile times as well.
+As briefly noted in Section~\ref{sec:compiler flow}, rewrite rules will be applied more often on IR before inlining because that IR contains function calls roughly as they were written by a programmer.
+In IR to which inlining has been applied, on the other hand, it is difficult to anticipate which function calls will end up visible, making it less productive to write rules targeting IR at this level.
+For this reason, a worthwhile trade-off might be to disable rewrites in the second, post-inling stage.
+This would eliminate the high cost of the IR to e-graph conversion that is included in the middle bar in Figure~\ref{fig:compilation profile}.
+
+\subsubsection{ILP Construction and Solving}
+Table \ref{tab:ilp} shows the time required to construct and solve the ILP problem for several examples discussed in this paper. 
+With the exception of the code for simplifying 2D transformations in Figure~\ref{fig:2D transformations}, e-classes do not contain many equivalences, leading to fast problem construction and solving.
+For the 2D transformation example, particular rewrite rules, e.g., those that combine two subsequent rotations into one rotation, give rise to an infinite number of rewrite opportunities.
+In these instances, saturation runs until a timeout is reached.
+If fast compilation times are required for pathological cases like the one shown, we can fall back to a greedy extraction algorithm.
+In the future, better scheduling of rules and detection of these cases could limit the amount of e-graph blow-up as well.
+
+
+\begin{table}[t]
+    \centering
+    \begin{tabular}{l|rrrr}
+        \hline
+         & \makecell{\textbf{Construction}\\\char`\[ms\char`\]} & \makecell{\textbf{Solve}\\\char`\[ms\char`\]} & \textbf{E-Classes} & \textbf{E-Nodes} \\
+        \hline
+        Fig.~\ref{fig:extraction} & 1.57 & 0.78 & 26 & 28 \\
+        Fig.~\ref{fig:2D transformations} & 508.35 & 168.97 & 337 & 1,002 \\
+        Fig.~\ref{fig:deep learning original} & 1.17 & 1.09 & 21 & 23 \\
+        \hline
+    \end{tabular}
+    \caption{Time needed to construct and solve the ILP problems for different examples discussed in this work.}
+    \label{tab:ilp}
+\end{table}
+
+% \jm{Post-Inlining rewrites don't have much use because function calls that end up in this IR are unpredictable ==> it is not productive to write rules at this level.
+% \\
+% The second stage of the compilation could thus be simplified by getting rid of "IR to E-Graph", "Saturation", and "Re-Inference"(?).
+% \\
+% What remains important is "optimized function insertion" (barely visible) and "inlining".
+% \\
+% We could also get rid of "Invocation queueing" in phase 2 (and optimized function insertion in phase 3) because there is no real use recursing in function calls in inlined code because these function calls have already been visited (??? experiment shows that new functions are still added in phase 2 ???)}
+
+\section{Limitations}
+\label{sec:limitations}
+\paragraph{Control Flow and Inlining}
+As discussed in Section~\ref{sec:conversion}, our approach to converting IR to an e-graph using the CFG skeleton currently does not allow applying rewrites that alter control flow.
+Similarly, rewrite opportunities where part of an expression is hidden behind a function call are in general not considered.
+We optimize each function separately, applying rewrite rules both before and after inlining is applied.
+Other intermediate representations, discussed further in Section~\ref{sec:related work}, could be used to represent the entire program in an e-graph and allow rewriting across call boundaries and control flow.
+
+\paragraph{Saturation and Extraction}
+In this work, we have proposed an ILP formulation for optimal e-graph extraction.
+The problem of extracting e-nodes from a general e-graph is NP-hard, which means that there is no guarantee that an optimal solution can be found~\cite{goharshadyFastOptimalExtraction2024}.
+Currently, when the ILP solver is unable to find a solution, we fall back to a greedy extraction algorithm that is built into Metatheory.jl.
+In this work, we chose a simple cost model that treats the cost of nodes independent of other nodes.
+A more complex cost model could take into account more complex behavior that depends on multiple nodes at once.
+
+\paragraph{Rule Expressiveness}
+As discussed in Section~\ref{sec:rewriter}, our rule syntax takes one Julia expression and transforms it into another.
+This is an intuitive syntax for expressing rewrite rules, but does not fully cover all the possible rules a developer could possibly want to express.
+For one, the rewrite rules can only be used to rewrite a \emph{single} expression into another expression.
+Multi-pattern rewrite rules to match against and to rewrite multiple expressions at once are currently not supported.
+We also do not yet support rewrite rules matching against functions calls taking an unknown, variable amount of variables.
+This means that in certain cases, a developer has to rewrite multiple similar rules to match the same function with different numbers of arguments.
+
+
+\section{Related Work}
+\label{sec:related work}
+\subsection{Equality Saturation}
+Equality saturation and its use as a code optimization tool was first introduced by \citeauthor{tateEqualitySaturationNew2009}~\cite{tateEqualitySaturationNew2009}, where it was used to optimize Java bytecode.
+\citeauthor{willseyEggFastExtensible2021}~\cite{willseyEggFastExtensible2021} introduced algorithmic improvements for equality saturation providing asymptotic speed-ups.
+This has led to an explosion of new work exploring different applications for equality saturation, from optimizing tensor programs~\cite{wangSPORESSumproductOptimization2020,MLSYS2021_cc427d93,smithPureTensorProgram2021}, to compiler verification~\cite{steppEqualityBasedTranslationValidator2011,kourtaCaviarEgraphBased2022}, optimizations for specialized hardware~\cite{ustunIMpressLargeInteger2022,vanhattumVectorizationDigitalSignal2021,matsumuraSymbolicEmulatorShuffle2023}, and other purposes~\cite{panchekhaAutomaticallyImprovingAccuracy2015,chandrakananandiRewriteRuleInference2021}.
+
+Metatheory.jl~\cite{cheliMetatheoryjlFastElegant2021} provides a framework for equality saturation in Julia.
+It has already been used for code optimization on symbolic representations of Julia code to speed up PDE solvers~\cite{gowdaHighperformanceSymbolicnumericsMultiple2022}. That work, however, only handles pure, symbolic programs, as it operates on a symbolic representation of Julia code obtained through manual expression building or tracing through heavily restricted, straight-line code. In contrast to our work, that existing use of Metatheory.jl does hence not allow the presence of general control flow or side effects.
+
+To the best of our knowledge, by introducing type propagation in the e-graph, we are the first to apply equality saturation to a dynamic programming language.
+This allows rewrites to coexist and complement Julia's multiple dispatch feature, as discussed in Section~\ref{sec:usecase}.
+
+\subsection{Intermediate Representations and E-Graphs}
+Cranelift, a compiler back-end for WebAssembly and Rust, is among the first to use e-graphs and equality saturation in a production-grade compiler~\cite{fallinAegraphsAcyclicEgraphs2023}. While we reuse ideas and methods first introduced in the Cranelift compiler, we implemented our framework as a standalone project, not reusing any Cranelift components. Our code is integrated in the Julia compiler using user-land compiler extensions.
+
+The Cranelift compiler does not do full equality saturation, but only recognizes equalities the first time a node is inserted in the e-graph.
+This implies that it is possible for equalities to remain undiscovered, but it obviates the fixed-point loop present in full equality saturation and ensures there are no cycles in the e-graph which allows for a more efficient representation of the graph in memory and leads to easier extraction.
+We use the same e-graph representation of code as used in Cranelift, but by utilizing an extraction scheme that enforces acyclic extraction, the optimizer is able to carry out full equality saturation.
+Whereas Cranelift and our work operate on IR that is complemented by a CFG, other work has sought to find alternative IR formats that allow representing control flow fully in the e-graph.
+\citeauthor{tateEqualitySaturationNew2009}~\cite{tateEqualitySaturationNew2009} have introduced Program Expression Graphs (PEGs) which represent constructs such as loops as special expressions and show that PEGs can be used to do equality saturation.
+Similarly, Regionalized Value State Dependency Graphs (RVSDGs)~\cite{bahmannPerfectReconstructabilityControl2015,reissmannRVSDGIntermediateRepresentation2020} represent control flow as (nested) expressions.
+A research prototype already exists using RVSDGs in conjunction with equality saturation for a simple toy language~\cite{optir2022}.
+Our approach remains closer to the original SSA-based IR of the source language, allowing less expensive conversion routines.
+
+\citeauthor{willseyEggFastExtensible2021} introduced e-class analyses to associate additional metadata with each e-class~\cite{willseyEggFastExtensible2021}. The metadata is kept up to date throughout the equality saturation process by potential modifications whenever new information is available, for example, when e-classes are merged. An exemplary existing use case for an e-class analysis is constant propagation, where each e-class can optionally carry a constant value. To track types in the e-graph, we designed a novel e-class analysis, as discussed in Section~\ref{sec:types}
+
+
+\subsection{Extraction}
+We based our ILP optimal extraction formulation on the work of \citeauthor{heImprovingTermExtraction2017}~\cite{heImprovingTermExtraction2017}.
+Recent work proposes other formulations, for example by looking at e-graphs through the lens of circuits~\cite{sunEgraphsCircuitsOptimal2024}, or finite state automata~\cite{y.wangEGraphsVSAsTree2022}.
+These formulations can lead to faster extraction or provide termination guarantees under particular assumptions.
+Cranelift operates in a Just-In-Time context where fast and reliable extraction is crucial.
+For this reason, they use an extraction algorithm that greedily tries to minimize the total number of nodes, without taking into account node reuse in extracted expressions or from expressions that dominate them.
+In contrast to Cranelift's greedy algorithm, we have introduced an ILP formulation that aims for node reuse from other nodes within an extracted expression, as well as from nodes in expressions that dominate them in the CFG. 
+
+\subsection{Julia Code Optimization}
+Other works exist that aim to improve the performance of Julia code with custom optimizations.
+Symbolics.jl~\cite{gowdaHighperformanceSymbolicnumericsMultiple2022} can be used to transform scientific machine learning code into a symbolic representation at which point simplifications can be applied.
+Finch.jl~\cite{ahrensFinchSparseStructured2024,ahrensLoopletsLanguageStructured2023} uses a custom IR to represent iteration patterns of loop nests over sparse or structured arrays.
+We instead focus on optimizing code in Julia's own IR format, allowing users of our system to target any Julia code.
+
+%\subsection{Rewriting Systems}
+%\todo[inline]{If we want to, we can discuss other rewriting systems, such as suggested by reviewers at CC'25. This is not absolutely necessary, however.}
+
+\section{Conclusion and Future Work}
+\label{sec:conclusions}
+We have developed a novel system that allows Julia developers to write domain-specific rewrite rules that are automatically applied using equality saturation and that works in the presence of control flow and side effects.
+Through an e-class analysis, we keep track of the most specific type of all equivalent terms and use this information to support type-constrained rewrite rules.
+Unlike previous work, our system can rewrite dynamically-typed code.
+We introduce a technique called CFG skeleton relaxation that allows rewrite rules to nullify side effects in the original code.
+We have adapted an ILP formulation for optimal, acyclic e-graph extraction to take into account value reuse from dominating statements.
+Finally, we show how this system can perform rewrites on high-level domain-specific code and how the use of equality saturation solves the phase ordering problem.
+
+In the future, our work can be extended to support rewriting control flow and apply rewrites that span different call depths.
+Further improvements to our extraction scheme could also lead to more efficient code being generated.
+
+All artifacts will be made available upon acceptance of the paper.

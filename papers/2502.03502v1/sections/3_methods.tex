@@ -1,0 +1,155 @@
+\section{\ours{}}
+\label{sec:method}
+Given an input LR video $I^\textrm{LR}$ consisting of $N$ frames $\{I^\textrm{LR}_1, \cdots, I^\textrm{LR}_N\}$, \ours{} produces an HR video $I^\textrm{HR}$.
+\cref{fig:main} illustrates the overall framework of \ours{}, which is built upon the SVD framework~\cite{svd}.
+To begin, \ours{} upsamples $I^{LR}$ using bicubic interpolation to match the target resolution, and obtains an upscaled video $I^\textrm{up}$.
+It then embeds $I^\textrm{up}$ into the latent space using the VAE encoder~\cite{ldm}, obtaining a latent representation $l$, which consists of $[l_1, \cdots, l_N]$ stacked along the channel dimension where $l_i$ represents the latent of the $i$-th upsampled video frame $I^\textrm{up}_i$.
+To generate an HR video, \ours{} initializes the latent representation $x_T$ of $I^\textrm{HR}$ as random noise, where $T$ is the number of diffusion sampling steps, and $x_T$ is a tensor with the same size as $l$.
+
+At each diffusion sampling step $t$,
+$x_t$ and $l$ are first concatenated in an interleaved manner, i.e., $[x_{t,1}, l_1, \cdots, x_{t,N}, l_N]$, where $x_{t,i}$ is the noisy latent of the $i$-th HR video frame.
+The concatenated latents are then split into spatio-temporal tiles.
+We refer to each tile as $x'_{t,m,n}$ where $m$ and $n$ are spatial and temporal indices.
+Each tile is processed through a denoising U-Net, and the processed tiles are merged to obtain the latent representation $x_{t-1}$ at the next sampling step $t-1$.
+We utilize spatio-temporal tiles of size $64\times64\times14$ in the latent space, corresponding to $512\times512\times14$ in the image space with a scaling factor of 8. In line with previous approaches~\cite{zhou2024upscaleavideo, yang2023mgldvsr}, spatially and temporally neighboring tiles overlap by 50\%.
+Overlapped tiles are blended in the tile merging step in our pipeline using gaussian blending.
+To achieve spatial and temporal consistency, \ours{} alternatingly applies either SAP or TAP at each sampling step.
+This process is repeated until $t$ reaches $0$.
+Finally, $x_0$ is fed to a decoder, producing the HR video $I^\textrm{HR}$.
+
+\ours{} employs a tile-based approach to handle lengthy videos with large frames with a video diffusion prior.
+However, na\"ively splitting a video into tiles may introduce spatial and temporal inconsistencies.
+In image diffusion models like latent diffusion model (LDM)~\cite{ldm}, self-attention layers of the denoising U-Nets play a crucial role in ensuring spatial consistency within an image.
+Likewise, video diffusion models such as SVD~\cite{svd} leverage self-attention to achieve spatially and temporally coherent results.
+Specifically, the self-attention operation is defined as:
+\begin{equation}
+    \text{SA}(\bm{Q},\bm{K},\bm{V}) = \text{softmax} \left( \frac{\bm{QK}^\top}{\sqrt{d}} \right) \bm{V},
+    \label{eq:self_attention}
+\end{equation}
+where $\bm{Q}$, $\bm{K}$ and $\bm{V}$ are query, key, and value in the matrix representations, respectively, and $d$ is the attention feature dimension.
+For a certain spatial and temporal position in a video, the self-attention operation calculates the correlation between the query at position and keys at other positions, and aggregates values based on these correlations. As a result, the synthesized content of any region within the video is harmonized with the rest of the video.
+However, when a video is split into tiles, each tile undergoes an independent attention process, resulting in spatial and temporal inconsistencies. To address this, \ours{} extends the self-attention operations using SAP and TAP, allowing attentions to be efficiently computed across tiles.
+In \cref{ssec:SSI,ssec:TFI}, we describe SAP and TAP to achieve spatial and temporal consistency across tiles.
+We then explain DSSAG to further enhance VSR quality in \cref{ssec:DSSAG}.
+
+\subsection{Spatial Attention Propagation}
+\label{ssec:SSI}
+To achieve spatial consistency across tiles, SAP extends self-attention operations for each tile to incorporate information from different tiles. However, due to the quadratic computational complexity of attention, na\"ive extension of self-attention operations is practically infeasible.
+Instead, to avoid the quadratic increase of the computational complexity, SAP leverages subsampled features that represent the entire areas of video frames and injects them into the self-attention operations for each tile.
+
+\cref{fig:main}(b) illustrates the SAP scheme.
+At diffusion sampling step $t$ for SAP, we feed each tile $x'_{t,m,n}$ to the denoising U-Net.
+Then, at each self-attention layer, we compute key/value pairs, and subsample them in a spatially uniform manner with respect to a predefined sampling rate $s_\textrm{SAP}$.
+Finally, we aggregate the subsampled key/value pairs for all $m \in \{1,\cdots,M\}$, obtaining the subsampled sets of keys and values, $K_{t,n}$ and $V_{t,n}$.
+Once $K_{t,n}$ and $V_{t,n}$ are obtained, we inject them into the self-attention operation of each tile.
+Specifically, let us denote the query, key, and value sets computed from tile $x'_{t,m,n}$ as $Q_{t,m,n}$, $K_{t,m,n}$, and $V_{t,m,n}$, respectively.
+We construct new sets of keys and values $\hat{K}_{t,m,n}$ and $\hat{V}_{t,m,n}$ by merging $K_{t,m,n}$ and $K_{t,n}$, and $V_{t,m,n}$ and $V_{t,n}$, respectively.
+Finally, we perform the self-attention operation using the extended keys and values, i.e.,
+\begin{equation}
+    \text{SA}(\bm{Q}_{t,m,n},\bm{\hat{K}}_{t,m,n},\bm{\hat{V}}_{t,m,n}) = \text{softmax} \left( \frac{\bm{Q}_{t,m,n}\bm{\hat{K}}_{t,m,n}^\top}{\sqrt{d}} \right) \bm{\hat{V}}_{t,m,n},
+    \label{eq:self_attention_SSI}
+\end{equation}
+where $\bm{Q}_{t,m,n}$, $\bm{\hat{K}}_{t,m,n}$, and $\bm{\hat{V}}_{t,m,n}$ are matrix representations of $Q_{t,m,n}$, $\hat{K}_{t,m,n}$ and $\hat{V}_{t,m,n}$, respectively.
+We apply the SAP scheme specifically to the first two and last two spatial self-attention layers, as these layers play a crucial role in capturing and synthesizing HR details.
+
+\subsection{Temporal Attention Propagation}
+\label{ssec:TFI}
+
+\cref{fig:main}(c) illustrates the TAP scheme for cross-tile temporal consistency.
+TAP bidirectionally propagates information from a tile to its neighbor. Specifically, at each diffusion sampling step for TAP, the propagation is performed in either the forward or backward direction.
+Without loss of generality, we describe the TAP scheme in the forward direction in the following.
+
+At diffusion sampling step $t$, we process each tile $x'_{t,m,n-1}$ using the denoising U-Net, and extract keys and values from the self-attention layers.
+We then sample a pair of subsets from the extracted keys and values, which we denote $K'_{t,m,n-1}$ and $V'_{t,m,n-1}$, respectively.
+The subsampled sets $K'_{t,m,n-1}$ and $V'_{t,m,n-1}$ are then injected to the self-attention operation for the temporally subsequent tile $x'_{t,m,n}$.
+Specifically, at each self-attention layer for $x'_{t,m,n}$, we construct new sets of keys and values $\hat{K}_{t,m,n}$ and $\hat{V}_{t,m,n}$ by merging $K_{t,m,n}$ and $K'_{t,m,n-1}$, and $V_{t,m,n}$ and $V'_{t,m,n-1}$, respectively.
+We perform the self-attention operations using the extended keys and values using \cref{eq:self_attention_SSI}.
+Similar to SAP, we apply the TAP scheme to the first two and last two spatial self-attention layers.
+
+To sample $K'_{t,m,n-1}$ and $V'_{t,m,n-1}$, we select $L$ frames whose keys have the largest standard deviations from tile $x'_{t,m,n-1}$. This selection is based on the observation that frames with more varied and sharp details produce distinct keys, leading to larger standard deviations. In our experiments, we set $L=4$. We then use the keys and values from these samples as $K'_{t,m,n-1}$ and $V'_{t,m,n-1}$. For a detailed analysis of this sampling strategy, refer to the supplementary material.
+
+\subsection{Detail-Suppression Self-Attention Guidance}
+\label{ssec:DSSAG}
+
+To improve the quality of VSR, \ours{} adopts DSSAG.
+In this subsection, we first briefly review the previous guidance approaches: CFG~\cite{cfg}, SAG~\cite{sag}, and PAG~\cite{pag}.
+We then describe DSSAG in detail.
+
+\paragraph{CFG}
+To improve sampling quality, CFG~\cite{cfg} utilizes both a conditional noise and an unconditional noise for denoising at each sampling step. Specifically, CFG is defined as:
+\begin{equation}
+    \epsilon_\textrm{CFG}(x_t)=\epsilon_\theta(x_t)+(1+s)(\epsilon_\theta(x_t,c)-\epsilon_\theta(x_t)),
+    \label{eq:cfg}
+\end{equation}
+where $x_t$ is a latent of a synthesized image at diffusion sampling step $t$, $\epsilon_\theta$ is a denoising U-Net, which is parameterized by $\theta$, $s$ is the CFG scale parameter, and $c$ is the class condition.
+\cref{eq:cfg} emphasizes the class-related components in the latent, resulting in the final synthesized image better reflecting the class condition $c$.
+
+\paragraph{SAG}
+Both SAG~\cite{sag} and PAG~\cite{pag} improve high-frequency details in synthesized images by introducing perturbation to the high-frequency details in the estimation of the unconditional noise. Specifically, a generalized form of the diffusion guidance can be defined as:
+\begin{equation}
+    \epsilon_\textrm{DG}(x_t)=\epsilon_\theta(\hat{x}_t)+(1+s)(\epsilon_\theta(\hat{x}_t, h_t)-\epsilon_\theta(\hat{x}_t)),
+    \label{eq:diffusion_guidance}
+\end{equation}
+where $h_t$ is a condition, and $\hat{x}_t$ is a perturbed sample that lacks $h_t$.
+Based on this generalized form, SAG is defined as:
+\begin{equation}
+    \epsilon_\textrm{SAG}(x_t)=\epsilon_\theta(b(x_t))+(1+s)(\epsilon_\theta(x_t)-\epsilon_\theta(b(x_t))),
+    \label{eq:SAG}
+\end{equation}
+where $b$ is a blurring operation that detects local regions with high-frequency details using self-attention scores, and blurs the detected regions, while keeping the noise in $x_t$ intact.
+The missing high-frequency details in $b(x_t)$ corresponds to $h_t$ in \cref{eq:diffusion_guidance}, i.e., $h_t = x_t - b(x_t)$.
+\cref{eq:SAG} amplifies high-frequency details synthesized by the conditional model, eventually leading to synthesis results with higher-quality details.
+SAG applies blurring only to regions with high-frequency details to keep image structure intact, as blurring the entire image may destroy image structures, causing synthesis results with inaccurate image structures.
+
+\paragraph{PAG}
+PAG proposes a simpler approach, which is defined as:
+\begin{equation}
+    \epsilon_\textrm{PAG}(x_t)=\epsilon^\text{PAG}_\theta(x_t)+(1+s)(\epsilon_\theta(x_t)-\epsilon_\theta^\text{PAG}(x_t)),
+    \label{eq:PAG}
+\end{equation}
+where $\epsilon^\text{PAG}_\theta(x_t)$ estimates noise from a perturbed version of $x_t$.
+To achieve this, PAG replaces the self-attention score matrix with an identity matrix in the self-attention layers in $\epsilon^\text{PAG}_\theta(x_t)$, i.e., it replaces the self-attention operations with $SA_\text{perturb}(\bm{Q},\bm{K},\bm{V})=\bm{V}$.
+As a result, $\epsilon^\text{PAG}_\theta(x_t)$ does not leverage spatially distant information for noise estimation, estimating less accurate noise from $x_t$, which is analogous to noise estimation from a perturbed version of $x_t$.
+
+SAG and PAG noticeably improve image synthesis quality, especially when combined with CFG. However, integrating them with CFG incurs substantial computational costs. Using $\epsilon_\theta(x_t,c)$ instead of $\epsilon_\theta(x_t)$ in \cref{eq:SAG,eq:PAG} allows this combination, but it necessitates running the denoising U-Net three times for SAG due to its blurring function. With PAG, the fixed level of perturbation complicates balancing the effects of CFG and PAG when combined. Consequently, PAG and CFG are typically applied separately, also leading to denoising U-Net three times.
+
+\input{tables/table1}
+
+\paragraph{DSSAG} To enhance high-frequency details, DSSAG offers a simpler approach without additional computational costs. The core idea of DSSAG is as follows.
+As estimating noise from a noisy image is equivalent to estimating a noise-free image, we assume that the denoising U-Net of a diffusion model estimates a noise-free image in the following.
+For estimating a noise-free image, the self-attention layers in a denoising U-Net find image regions with similar high-frequency details, by computing weights based on the similarities between queries and keys. Then, they aggregate information from different image regions based on their weights.
+As noted by Wang~\etal~\shortcite{wang2018non}, this self-attention mechanism closely resembles bilateral filter~\cite{tomasi1998bilateral} and non-local means filter~\cite{buades2005nonlocal}, both of which are renowned structure-preserving filters.
+Inspired by this, we introduce an additional parameter $\gamma$ to control the weighting function of the self-attention operation, similar to the weighting parameters in bilateral and non-local means filters.
+
+Specifically, we extend the self-attention operation as:
+\begin{equation}
+    SA(\bm{Q},\bm{K},\bm{V},\gamma) = \text{softmax}\left(\frac{\bm{Q}\bm{K}^\top}{\max(\gamma^2qk,1)\sqrt{d}}\right)\bm{V},
+    \label{eq:SA_gamma}
+\end{equation}
+where $q$ and $k$ represent the largest absolute values among the elements of $\bm{Q}$ and $\bm{K}$, respectively.
+We adopt $q$ and $k$ to adaptively control the weights to the scales of the keys and values. $\max(\cdot,1)$ is adopted to make \cref{eq:SA_gamma} reduce to the conventional self-attention operation, when $\gamma$ is small.
+\cref{eq:SA_gamma} performs in a similar manner to the non-local means filter. Thanks to the similarity-based weighting function, it preserves salient image structures.
+Moreover, $\gamma$ allows control over the blurring strength.
+Assigning a large value to $\gamma$ results in larger weights for keys less similar to the queries, causing the information from different image regions to be more blended. Consequently, the denoising U-Net estimates a blurrier image with fewer high-frequency details as shown in \cref{fig:DSSAG}.
+
+\input{figures_folder/dssag_method}
+
+Leveraging the extended self-attention operation in \cref{eq:SA_gamma}, we define DSSAG and its combination with CFG as:
+\begin{eqnarray}
+    \epsilon_\text{DSSAG}(x_t)\!\!\!\!\!\!&=&\!\!\!\!\!\! \epsilon'_\theta(x_t)+(1+s)\left(\epsilon_\theta(x_t)-\epsilon'_\theta(x_t)\right)~~~\text{and}\\
+    \epsilon_\text{CFG\&DSSAG}(x_t)\!\!\!\!\!\! &=&\!\!\!\!\!\! \epsilon'_\theta(x_t)+(1+s)\left(\epsilon_\theta(x_t,c)-\epsilon'_\theta(x_t)\right),
+    \label{eq:CFG_DSSAG}
+\end{eqnarray}
+where $\epsilon'_\theta$ is a denoising U-Net whose self-attention operations are replaced with \cref{eq:SA_gamma}.
+$\epsilon'_\theta$ does not require any training and shares the same parameters with $\epsilon_\theta$.
+DSSAG offers a couple of distinct benefits compared to SAG~\cite{sag} and PAG~\cite{pag}.
+It does not need additional high-frequency detection or blurring operations, as \cref{eq:SA_gamma} already incorporates these in its weighting and aggregation mechanism.
+Furthermore, DSSAG provides smooth control over blur strength, unlike PAG, enabling seamless integration with CFG without any additional computational costs.
+
+We apply DSSAG to the first two and last two spatial self-attention layers in the denoising U-Net, as done for SAP and TAP.
+During the iterative sampling process of \ours{}, we set $\gamma$ adaptively to the noise level of the diffusion model, so that $\gamma$ is initially large and gradually decreases as the sampling proceeds.
+Specifically, we set $\gamma_t$ at diffusion sampling step $t$ as:
+\begin{equation}
+    \gamma_t = \left(\frac{\ln{\sigma_t}-\ln{\sigma_T}}{\ln{\sigma_0}-\ln{\sigma_T}}\right)^{\rho}, %\frac{1}{\rho}}
+\end{equation}
+where $\sigma_t$ is the noise level at $t$, and $\rho$ is a parameter to control the detail suppression strength, which is set to $0.5$ in our experiments.

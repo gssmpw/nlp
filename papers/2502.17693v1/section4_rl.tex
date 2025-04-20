@@ -1,0 +1,120 @@
+\section{Solving the optimization problem}\label{sec:algo}
+
+\begin{figure*} %
+\centering
+\captionsetup{justification=centering,margin=0.4cm}
+\includegraphics[width=0.75\textwidth]{images/system_wide_v2.png}
+\caption{Predictive Response Optimization system design}\label{fig:architecture}
+\end{figure*}
+
+In this section we describe a strategy to approximate solutions to the optimization problem (\ref{eq:objective})-(\ref{eq:constraints}). Our strategy combines elements of reinforcement learning (RL) with model predictive control (MPC) and consists of two components:
+\begin{enumerate}
+\squeezelist
+	\item Optimizing actions $\mathbf{a}$ at entity level,
+	\item Optimizing multipliers $w$ to enforce global constraints.
+\end{enumerate}
+Figure~\ref{fig:architecture} provides an overview of the system components and the design choices for each component. 
+
+We will show that entity-level action optimization can be described as a \emph{contextual multi-armed bandit problem}. By introducing suitable modeling assumptions, we are able to decide actions asynchronously for each entity, at arbitrary time intervals. Similarly, our approach to finding optimal multipliers can be seen as a form of stochastic \emph{model predictive control} (MPC) aimed at enforcing global constraints. Other works combining RL with MPC include ~\cite{arroyo2022reinforced,zanon2020safe}. 
+ 
+\subsection{Optimizing action selection}\label{sec:model}
+
+In  reinforcement learning (RL) terminology, the optimization system (a.k.a.~\textit{agent}) acts within an {\em environment}. The agent takes an {\em action} chosen from a set of possible actions depending on the agent's {\em state} and then receives an application-specific {\em reward}. The choice of action is based on the agent's {\em policy}, which in addition to selecting actions to maximize the expected reward (``exploit''), also strives to gain information (``explore'') to improve the policy itself ~\cite{sutton2018reinforcement}.
+
+Maximization of (\ref{eq:reward}) can be readily framed as an RL problem by defining the state $\mathbf{x}$ as in (\ref{eq:state}) and the set of actions $\mathcal{A}$ as in (\ref{eq:action_set}). Equation (\ref{eq:reward}) defines the reward as a weighted sum of the values contributed by each entity towards each metric (in our example, the amount of spam content and number of erroneous deletions). Each of these metrics is a cumulative quantity aggregating data with timestamps between the time $t_0$ when an action is chosen and a future time $t_1$. We call the interval $\tau = [t_0, t_1]$ the {\em time horizon}. The environment is modeled via the state and the metric functions.
+
+After applying an action, an entity's behavior may change, altering the received reward (i.e., metric values) over the time horizon $\tau$. In our example, if we temporarily ban an account $e$ from sharing content, then $Abuse_1(e)$ counting number of spam posts may decrease but $Cost_1(e)$ counting number of non-spam posts blocked may increase (relative to their values if no action were taken). 
+
+In more general RL problems, the reward is a function of transitioning from state $\mathbf{x}$ to state $\mathbf{x}'$ via action $\mathbf{a}$: $r(\mathbf{x},\mathbf{a},\mathbf{x}')$~\cite{sutton2018reinforcement}; however in Equation~\eqref{eq:reward} we simply have $r(\mathbf{x},\mathbf{a},\mathbf{x}') = r(\mathbf{x},\mathbf{a})$ (i.e., the \textit{contextual multi-armed bandit} setting \cite{Li_2010}).  In other words, instead of modeling state transitions from multiple agent actions as a Markov decision process~\cite{puterman2014markov}, we aim to predict the incremental reward from each individual action, thus simplifying the RL problem.
+
+The goal of the RL problem is to maximize the cumulative reward over multiple action-selection events (also known as the \textit{return}). Without loss of generality, action selection can be viewed as sampling $\mathbf{a}$ from a probability distribution $\Pi(A \mid \mathbf{x})$ conditioned on the state $\mathbf{x}$; here $A$ is a random variable taking values in $\AAA$ and we call the distribution $\Pi$ the \emph{policy}~\cite{sutton2018reinforcement}. (Note that this framing includes the case when actions are chosen deterministically.) 
+
+Our approach to maximizing cumulative reward is to first build a predictive model $\pi(R \mid \mathbf{x},\mathbf{a})$ describing the probability distribution for the next reward value (\ref{eq:reward}) modeled as a random variable $R$ conditioned on a given pair of states and actions $(\mathbf{x},\mathbf{a}) \in \mathcal{X} \times \AAA$. We then implicitly define our policy $\Pi$ by its sampling mechanism:
+\begin{equation}\label{eq:general_policy}
+\mathbf{a} \gets \Pi(A \mid \mathbf{x}) := \argmax_{\mathbf{z} \in \AAA} \Big( r \gets \pi(R \mid \mathbf{x}, \mathbf{z}) \Big)
+\end{equation}
+
+In our example of spam posts, we realize the policy in \eqref{eq:general_policy} by building a predictive model for the reward function \eqref{eq:example_reward}, predicting the reward for each component of the action vector $\mathbf{z} \in \AAA$, and setting $\mathbf{a}$ to be the action vector $\mathbf{z}$ with the greatest reward.
+
+Our sampling approach is derived from {\em Thompson sampling}~\cite{thompson1933likelihood,agrawal2012analysis}; in particular, the variability inherent in the model $\pi$ allows us to balance exploration and exploitation (a classic challenge in reinforcement learning) by tuning model parameters~\cite{sutton2018reinforcement}.  Exploration is necessary to improve the model's understanding of how different actions impact each metric in various regions of the feature space. It is particularly important in adversarial environments, as malicious actors may learn to work around certain enforcement actions, rendering a previously heavily exploited enforcement action ineffective (see Section~\ref{ss:adaptation} for an example). Exploration is also useful as a mechanism to onboard newly developed enforcement actions to the system (see Section~\ref{ss:new_action} for an example). 
+
+\subsection{Reward models}\label{sec:reward_prediction}
+
+In general, taking action on one entity may affect other entities' metrics. For instance, when banning a user account for spamming, other users will not be exposed to the spam anymore. However, modeling all possible interactions is prohibitively expensive. Therefore, in the model described in this section we neglect the impact of actions taken on a given entity to metrics for other entities.  This decoupling allows us to determine actions in real time whenever a decision for a particular entity is needed. Formally, we set
+\begin{equation} \label{eq:decoupling_entities}
+\pi (R\mid \mathbf{x},\mathbf{a}) = \prod_{e \in \mathcal{E}} \hat \pi (R_e\mid {x}_e,a_e),
+\end{equation}
+where $R_e$ is a random variable modeling the portion of the reward contributed by entity $e$, the contextual features $x_e$ summarize all information about entity $e$ that is deemed useful to predict future metric values, and $\hat \pi$ is a (global) model that predicts rewards at the entity level given the contextual features $x_e$ and the action $a_e$ applied to $e$. 
+Examples of features relevant for abuse minimization at user-account level include:
+\begin{itemize}
+\squeezelist
+    \item Account properties such as age, classifier scores\ifanon\else~\cite{xu2021deep}\fi, number of sessions, or frequency of requests;
+    \item Time series of metric values for the user;
+    \item History of prior actions taken on the account (e.g., a vector of whether each action was taken the day before, 2 days before, and so on);
+    \item Classifier scores for the account's content (e.g., probability of spam);
+    \item IP statistics such as number of requests in a time window or number of accounts using the IP;
+    \item Request features such as requested URL or browser type.
+\end{itemize}
+
+Let $\mathcal{T}$ be the \emph{training window}; i.e., a set of timestamps in the past for which we have entity-level historical data. For each $t \in \mathcal{T}$, let $x_e^t$ be the value of the feature vector (i.e., state) $x_e$ at time $t$, let $a_e^t$ be the action taken on entity $e$ at time $t$, and let $m_j^t$ be the value of the metric $m_j$ starting at time $t$ (i.e., over the period $[t, t+t_1-t_0]$). For each metric $m_j$ and action $A_k \in \mathcal{A}$, we construct datasets
+\[
+\mathcal{D}_{jk} = \left\{\left(x_e^t, m^t_{j}(e \mid x_e^t, a_e^t)\right) \quad \forall e \in \mathcal{E},\ t \in \mathcal{T} : a_e^t = A_k\right\}
+\]
+that document historical (state, metric-value) pairs for each action and metric. In our spam example, $\mathcal{D}_{1k}$ is the dataset consisting of all (feature-vector, $Abuse^*$-value) pairs for the entities $e$ that received action $A_k$ at some time during the training window, while $\mathcal{D}_{2k}$ is the corresponding set of (feature-vector, $Cost^*$-value) pairs.
+
+In our implementation we sample $t \gets \mathcal{T}$ in such a way that the amount of data decreases exponentially as the timestamp $t \in \mathcal{T}$ goes back in time, biasing the dataset towards recent information while still keeping a fraction of older data. When first deploying the system (the ``cold-start problem''), these datasets can be initialized with data collected from a baseline rule-based system. Subsequently, they consist of data collected after applying actions chosen by the RL system.
+
+After constructing the datasets, we model the metric values $m^t_{j}$ as noisy Gaussian samples
+\[
+m^t_{j}(e \mid x_e^t, a_e^t) \gets \mathcal{N}( \nu_j(x_e^t,a_e^t), \epsilon) 
+\]
+where $\nu_j$ ($j  = 1, \ldots, N$) are realizations of independent Gaussian Processes (see \cite{williams2006gaussian}) with mean zero and kernel (covariance function)
+\begin{equation}\label{eq:kernel}
+K_j((x_1,a_1),(x_2,a_2)) = (\phi_j(x_1)^T \phi_j(x_2))\cdot \delta(a_1,a_2).
+\end{equation}
+Here the maps $\phi_j: \mathcal{X}\rightarrow \mathbb{R}^D$ represent ``feature transformations'': functions that process the raw input features, extract interactions, and output $D$-dimensional numerical vectors. For example, $\phi_j$ might include taking $\log$ of account age to reduce skew, applying one-hot encoding to categorical features~\cite{one-hot}, or combining action history data to create a summary feature ``number of times blocked in the last 14 days.'' The function $\delta(x,y)$ is 1 if $x = y$ and 0 otherwise.
+
+Given the modeling assumptions above, we can use Gaussian Process Regression~\cite{williams1998prediction} to obtain predictive distributions $\nu_j$ for all metrics $m_j$. In view of our assumption that the metrics appearing in Equation~\eqref{eq:reward} are independent, we obtain reward models of the form
+\begin{equation}\label{eq:model_structure}
+	\hat \pi (R_e \mid x_e, a_e) = \mathcal{N}\left(\sum_{j=1}^N w_j\cdot \mu_{j}(x_{e},a_e),\sum_{j=1}^N w_j^2 \cdot \sigma_{j}^2(x_{e},a_e) \right).
+\end{equation}
+Moreover, in view of the kernel structure, we have
+\begin{equation}
+\label{eq:decoupling_actions}
+	\mu_{j}(x_{e},a_e) = \mu_{jk}(x_e), \quad  \sigma_{j}^2(x_{e},a_e) = \sigma_{jk}^2(x_{e}) 
+\end{equation}
+\noindent where $k$ is the index in $0, \ldots, \abs{\mathcal{A}}-1$ such that $a_e  = A_{k} \in \mathcal{A}$, and the functions $\mu_{jk}$ and $\sigma^2_{jk}$ are defined as
+\begin{equation}\label{eq:inference}
+\mu_{jk}(x) = \phi_j(x)^T \theta_{jk}, \quad \sigma_{jk}^2(x)  =  \epsilon  \cdot \left( \phi_j(x)^T  \Sigma_{jk} \phi_j(x) \right).
+\end{equation}
+The parameters $\theta_{jk}$ and $\Sigma_{jk}$ can be learned by pooling historical data across all entities to train $N \cdot \abs{\mathcal{A}}$ independent models (one for each metric $m_j$ and action type $k$). Specifically, we can compute
+\begin{align}
+\label{eq:compute_sigma} \Sigma_{jk} & =  \left(X_{jk}^T X_{jk} + \lambda_{jk} \cdot I_D\right)^{-1} \quad  \in \mathbb{R}^{D \times D}, \\
+\label{eq:compute_theta} \theta_{jk} & =  \Sigma_{jk} \cdot X_{jk}^T \cdot Y_{jk} \quad \in \mathbb{R}^D, 
+\end{align}
+where $X_{jk}$ is a $\abs{\mathcal{D}_{jk}} \times D$ matrix with rows $\phi_j(x_e^t)$ for all $(e,t)$ in the dataset $\mathcal{D}_{jk}$, $Y_{jk}$ is a $\abs{\mathcal{D}_{jk}}$-dimensional column vector containing the corresponding metric values $m_{j}^t$, and $I_D$ is the $D \times D$ identity matrix. We set Ridge regularization parameters $\lambda_{jk}$ by optimizing generalized cross-validation scores~\cite{golub1979generalized}, while the noise variance $\epsilon$ is a global parameter that can be used to control the rate of exploration. (In our experiments we set $\epsilon = 0.05$.) In our spam example with two metrics and three actions, this process gives us 6 predictive models, each described by $D^2+D$ parameters $\Sigma_{jk}$, $\theta_{jk}$.
+
+\myparagraph{Computational complexity.} For the training step, since the parameter computations~\eqref{eq:compute_sigma}--\eqref{eq:compute_theta} are linear, they can still be feasible for datasets $\mathcal{D}_{jk}$ with millions of entries and feature dimensionality $D$ in the hundreds. In particular, the limiting step is the matrix multiplication and inversion of \eqref{eq:compute_sigma}, which is $O\left(D^2 (D + \abs{\mathcal{D}_{jk}})\right)$ in our implementation.
+
+For the inference step, the simplicity of the models described in \eqref{eq:model_structure}--\eqref{eq:inference} (where the limiting step is $O(D^2)$) enables us to process a very large volume of requests at inference time, interpret model weights, and understand the directional impact of features on predictions and decisions. However, we find in practice that we must frequently update the model because the highly non-stationary nature of both the adversarial and business landscapes results in constant shifts in both cost budgets and system effectiveness. (See Sections~\ref{ss:business} and~\ref{ss:adaptation} for examples.) 
+
+\subsection{Enforcing business constraints} \label{sec:mpc}
+The multipliers $w_{j}$ (Equation~\eqref{eq:reward}) control the tradeoffs amongst the various abuse and cost metrics. While reinforce-ment-learning approaches often leverage a single model that predicts a ``quality estimate'' of the state resulting from a particular action applied to a given state~\cite{mnih2015human}, by instead decomposing the reward into a weighted combination of individual metric models we can adjust these metric tradeoff weights ``on the fly'' without model retraining. This property allows us to make quick adjustments if we observe the system being ``too harsh'' (i.e., cost constraints are violated) or ``too lenient'' (i.e., we are not using our entire cost budget). We adjust the multipliers automatically using a controller 
+designed to maximize the estimated reward aggregated over all entities and  over a future time period, while attempting to satisfy the budget constraints for the system (Section~\ref{sec:business_constraints}).  Our approach can be interpreted as an instance of stochastic Model Predictive Control (MPC)~\cite{mesbah2016stochastic} with multiple control variables. 
+
+In MPC, a model of the system or ``plant'' to be controlled (in our case the RL ``environment'') may be specified via state space or a transfer function, or learned via means such as system identification. Then, using this plant model, MPC will predict the plant's outputs for various controller outputs. These predictions can be at multiple time horizons, e.g., +1 second, +1 day, etc. MPC will select the controller outputs that are predicted to yield values closest to the plant's desired output. Additional constraints can also be applied, e.g., limiting the plant outputs to a certain range. 
+
+The MPC framework is well suited to our goal of minimizing abuse while enforcing the business constraints for our system. As described previously, we continually learn and update our reward models. Using these models, we can leverage the prior day's data to predict the overall action and metric distributions for a variety of metric tradeoff weights, i.e., the ``simulation'' in MPC. This process is a form of multi-variable MPC where the control horizon is one step ahead. Then, if we set the metric tradeoff weights $w_j$ to be the parameters controlled by MPC, the controller can pick these parameters such that the constraints are met (in expectation). Note that using the prior day's data for simulation assumes the distribution of features and metrics does not shift substantially from one day to the next.
+
+Consider again the optimization problem described in Equations~(\ref{eq:objective})--(\ref{eq:constraints}), now assuming that the action vector $\mathbf{a}$ is obtained by sampling from the policy $\Pi$ defined in (\ref{eq:general_policy}).  Since $\Pi$ depends on the multipliers $w_j$ via (\ref{eq:decoupling_entities}) and (\ref{eq:model_structure}), we can now consider optimizing the objective (in expectation) with respect to $w$: 
+\begin{align*}
+\min_w \sum_{e \in \mathcal{E}} \sum_{j=1}^{N_A} \mathbb{E}\left[w_j \cdot m_{j}(e \mid \mathbf{a})\right], & \quad \mbox{subject to} \\
+\sum_{e \in \mathcal{E}} \mathbb{E} \left[w_j \cdot m_{j}(e \mid \mathbf{a})\right] \leq Budget_{j}, & \quad j = N_A+1, \ldots, N.
+\end{align*}
+We are now left with optimizing $N$ weights instead of $\#\mathcal{E}$ actions, which is a massive reduction in dimensionality. However, evaluating  the objective and constraints by summing over all the entities is still very costly. To further reduce the computational cost, we can use a smaller set $\mathcal{S}$ of entities sampled uniformly at random from all entities processed by the optimization system in the previous period (e.g., the previous day) and use the mean reward models learned previously to estimate the expectations, leading to the optimization problem
+\begin{align}
+\label{eq:mpc_objective}
+\min_w \sum_{e \in \mathcal{S}} \sum_{j=1}^{N_A} w_j \cdot \mu_{j}(x_e, a_e), & \quad \mbox{subject to} \\
+\sum_{e \in \mathcal{S}} w_j \cdot \mu_{j}(x_e,a_e) \leq b_j, & \quad j = N_A+1, \ldots, N,
+\end{align}
+where $b_j = s  \cdot Budget_j$ is a rescaled budged where the scaling factor $s$ can be used to account for the relative size of the sample set $\mathcal{S}$ compared to the entire set $\mathcal{E}$, or to incorporate forecasted metric increases from one period to the next (e.g. due to a planned product change). To solve this optimization problem we use a grid search centered around the current metric tradeoff weights $w$ to generate candidate weight sets. We then set the new weights to be the candidate weight set that minimizes the abuse metrics while remaining within the budget constraints set on the cost metrics. 
