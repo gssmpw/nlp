@@ -1,0 +1,779 @@
+\documentclass{article}
+
+\input{config_arxiv/packages}
+\input{config_arxiv/header.tex}
+\usepackage{cleveref}
+
+
+\title{Adversarial Reasoning at Jailbreaking Time}
+
+
+\author[1,2]{Mahdi Sabbaghi\thanks{The majority of this work was done when the leading author, Mahdi Sabbaghi, was an intern at Robust Intelligence. Correspondence can be made to: smahdi@seas.upenn.edu, paulkass@cisco.com}}
+\author[2]{Paul Kassianik}
+\author[1]{George Pappas}
+\author[2]{Yaron Singer}
+\author[2]{Amin Karbasi}
+\author[1]{Hamed Hassani}
+
+\affil[1]{University of Pennsylvania}
+\affil[2]{Robust Intelligence @ Cisco}
+% \affil[ ]{\texttt{\{smahdi, pappasg, hassani, surbhig\}@seas.upenn.edu}}
+
+% \affil{University of Pennsylvania}
+
+\date{\today}
+% \setlength{\parindent}{1cm}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+As large language models (LLMs) are becoming more capable and widespread, the study of their failure cases is becoming increasingly important. 
+Recent advances in standardizing, measuring, and scaling test-time compute suggest new methodologies for optimizing models to achieve high performance on hard tasks.
+In this paper, we apply these advances to the task of ``model jailbreaking'': eliciting harmful responses from aligned LLMs.
+We develop an adversarial reasoning approach to automatic jailbreaking via test-time computation that achieves SOTA attack success rates (ASR) against many aligned LLMs, even the ones that aim to trade inference-time compute for adversarial robustness.
+%and present an adaptive, gradient-free, and transferable jailbreaking method to achieve SOTA attack success rates (ASR) against aligned and adversarially trained LLMs.
+Our approach introduces a new paradigm in understanding LLM vulnerabilities, laying the foundation for the development of more robust and trustworthy AI systems. Code is available at \url{https://github.com/Helloworld10011/Adversarial-Reasoning}.
+\end{abstract}
+
+
+\section{Introduction}
+Large language models (LLMs) are increasingly deployed with various safety techniques to ensure alignment with human values. Common strategies include RLHF \cite{christiano2023deepreinforcementlearninghuman,ouyang2022traininglanguagemodelsfollow}, DPO \cite{rafailov2024directpreferenceoptimizationlanguage}, and the usage of dedicated guardrail models \cite{inan2023llamaguardllmbasedinputoutput,rebedea2023nemoguardrailstoolkitcontrollable}. In nominal use cases, alignment methods typically refuse to generate objectionable content, but adversarially designed prompts can bypass these guardrails. A challenge known as \textit{jailbreaking} consists of finding prompts that circumvent safety measures and elicit undesirable behaviors.
+
+
+Current jailbreaking methods fall into two categories: token-space and prompt-space attacks. 
+Token-space attacks \cite{shin2020autopromptelicitingknowledgelanguage,wen2023hardpromptseasygradientbased,zou2023universaltransferableadversarialattacks,hayase2024querybasedadversarialpromptgeneration,andriushchenko2024jailbreakingleadingsafetyalignedllms} focus on token-level modifications of the input to minimize some loss value, often using gradient-based heuristics \cite{zou2023universaltransferableadversarialattacks} or random searches \cite{andriushchenko2024jailbreakingleadingsafetyalignedllms}. Such methods view jailbreaking as an optimization problem over sequences of tokens and use the loss information to inform their navigation through the optimization landscape. As a consequence, token-level methods produce semantically meaningless input prompts that can be mitigated by perplexity-based or smoothing-based filters \cite{alon2023detectinglanguagemodelattacks, robey2024smoothllmdefendinglargelanguage}. 
+
+In contrast, prompt-space attacks generate semantically coherent adversarial prompts using techniques like multi-round LLM interactions or fine-tuning for crafted outputs
+\cite{chao2024jailbreakingblackboxlarge,ge2023martimprovingllmsafety,liu2024autodangeneratingstealthyjailbreak,mehrotra2024treeattacksjailbreakingblackbox,zeng2024johnnypersuadellmsjailbreak,samvelyan2024rainbowteamingopenendedgeneration, liu2024autodanturbolifelongagentstrategy}. A notable subset deploys chain-of-thought reasoning \cite{wei2023chainofthoughtpromptingelicitsreasoning,nye2021workscratchpadsintermediatecomputation} to guide the interaction with the target LLM and better navigate the prompt search space \cite{chao2024jailbreakingblackboxlarge,mehrotra2024treeattacksjailbreakingblackbox}. 
+% Of the approaches that use chain-of-thought in the prompt space, all
+These methods are designed to exploit binary feedback from the target LLM of the form ``has the current prompt jailbroken the target LLM or not?''. 
+Binary feedback effectively quantifies attack success on black-box models, but it provides limited information for the intermediate stages. This sparsity hampers search effectiveness 
+% algorithm.
+% This type of feedback is often uninformative (and usually sparse) about which directions to explore 
+in the prompt space to exploit the safety vulnerabilities of the target LLM, 
+% and thus limits the effectiveness of these methods 
+particularly against adversarially trained models \cite{zou2024improvingalignmentrobustnesscircuit,sheshadri2024latentadversarialtrainingimproves,xhonneux2024efficientadversarialtrainingllms}. 
+An extensive search through the prompt space requires a more granular signal---e.g., loss values---to efficiently traverse the prompt landscape and identify the target LLM weaknesses. 
+
+
+\begin{figure*}
+     \centering
+     \includegraphics[width=0.95\linewidth]{figs/Overall6.png}
+     \caption{The overall mechanism of our algorithm; We iteratively refine the reasoning string by the feedbacks derived from comparing the loss values of previous attempts. Then, we explore the reasoning tree using a search algorithm. Details are presented in \Cref{sec: algorithm}. We explain in \Cref{sec: algorithm} (\Cref{eq: empirical}) that the searching algorithm will backtrack if the children of a node do not achieve a higher score than the candidates in the buffer. The prompt on the left jailbreaks OpenAI o1-preview.}
+     \label{Overall_alg}
+     \vspace{-0.1in}
+\end{figure*}
+
+% We are comparing your version vs ours. Please give us few hours to finish it then we will move everything to the ICML version.
+% also what's the status of deepseek? The exp had a bug and is running again. 
+
+% \PK{I didn't change this much, I just changed some phrasing/made the flow sound more natural}
+In this paper, we present \textbf{Adversarial Reasoning}: a framework that uses reasoning to effectively exploit the feedback signals provided by the target LLM to bypass its guardrails. Adversarial Reasoning consists of three key steps: reason, verify, and search. We utilize a loss function derived from the target's response to guide the process. The reasoning step constructs chain-of-thought (CoT) paths aiming to reduce the loss values. The verifier assigns a score based on loss values to each intermediate step of the reasoning paths. Finally, the search step, informed by the verifier, prunes the CoT paths and sometimes backtracks to obtain a minimal-loss solution. To realize the adversarial reasoning steps, we employ three LLM-based modules: (1) Attacker, which generates the attacking prompts based on the reasoning instructions; (2) Feedback LLM, which determines how to further reduce the loss; and (3) Refiner LLM, which incorporates the feedback into the next round of prompt generation. \Cref{Overall_alg,Overall_exmaple} illustrate our method. Our approach centers on two key reasoning elements. First, employing the loss function as a step-wise verifier analogous to process-based reward models (PRMs), and second, scaling test-time computation under the guidance of this verifier. We elaborate on these points in \Cref{related}.
+%The verifier's score is based on a loss function defined on the target's response from which the search step identifies the optimal reasoning paths for producing a jailbreaking prompt. 
+
+\vspace{.2cm}
+\noindent \textbf{Our contributions} are summarized as follows: 
+\begin{itemize}
+\item In this paper, we formulate \textit{jailbreaking} as a \emph{reasoning} problem. 
+We then apply insights from the reasoning field and lessons from existing token-space and prompt-space methods to create a strong, adaptive, gradient-free, and transferable jailbreaking algorithm. 
+%Given a target LLM, our method uses the "Proposer and Verifier" framework \cite{snell2024scalingllmtesttimecompute} to find a prompt that elicits jailbreaks for the target LLM.
+
+%\item We detail the steps of our algorithm in \Cref{sec: algorithm}. Given a target LLM, our pipeline uses an attacker LLM to optimize a prompt that would generate most effective attacks against the target LLM.
+%Our pipeline involves two additional LLMs: one acts as a "gradient estimator" to identify a direction that possibly reduces the loss, and the other applies these modifications to the input prompt, functioning like an optimizer in first-order methods. Our attacks achieve high success rates compared to previously published adaptive attacks against both aligned LLMs and adversarially trained LLMs. \MS{Is this paragraph needed anymore?}
+\vspace{-0.1in}
+\item 
+Experimentally, we show that our method achieves state-of-the-art attack success rates among prompt-space attacks and even outperforms token-space methods for many target LLMs,  particularly those that have been adversarially trained (see \Cref{table_ASR}).
+Notably, our method enhances the jailbreaking performance significantly when a weak LLM is used as the attacker (\Cref{table_weaker}), reflecting the benefits of optimizing test-time computation. We further introduce a multi-shot transfer attack scenario that outperforms existing methods and achieves 56\% success rate on OpenAI o1-preview  (\Cref{table_transfer}) and 100\% on Deepseek. Finally, in our ablation studies, we show that our method (i) effectively reduces the loss (\Cref{losses_fig})
+% , and quantitatively demonstrate the key role of the feedback in this regard (\Cref{prompt_probs}); 
+, and quantitatively demonstrate the key role of the feedback in this regard (\Cref{prompt_probs}); (ii) we also show that our method benefits from deeper reasoning, i.e., it continues to discover new jailbreaks with more iterations. (\Cref{iter_compare}). 
+\end{itemize}
+
+
+
+
+
+
+
+
+\vspace{-0.5cm}
+\section{Related Work} \label{related}
+\textbf{Token-space Jailbreaking.} Token-space attacks \cite{shin2020autopromptelicitingknowledgelanguage,wen2023hardpromptseasygradientbased,zou2023universaltransferableadversarialattacks,hayase2024querybasedadversarialpromptgeneration,andriushchenko2024jailbreakingleadingsafetyalignedllms} modify the input at the token level to decrease some loss value. 
+For example, the GCG algorithm \cite{zou2023universaltransferableadversarialattacks}, one of the first transferrable token-level attacks to achieve significant success rates on aligned models, uses the gradient of the loss to guide the greedy search.
+Subsequent work has refined this approach to obtain  lower computational cost and improved effectiveness \cite{liao2024amplegcglearninguniversaltransferable,jia2024improvedtechniquesoptimizationbasedjailbreaking}, including token-level modifications by other heuristics and without a gradient \cite{hayase2024querybasedadversarialpromptgeneration} and random searches over cleverly chosen initial prompts \cite{andriushchenko2024jailbreakingleadingsafetyalignedllms}. 
+%However, since such methods specifically aim for token-level perturbations, their resulting prompts often lack any semantic meaning. 
+%Consequently, the resulting prompts can be detected by perplexity-based filters \cite{alon2023detectinglanguagemodelattacks} or smoothing methods \cite{robey2024smoothllmdefendinglargelanguage}.  
+We adopt the use of a loss function from these methods as a signal to inform how to navigate the prompt-space for better jailbreaks while remaining gradient-free. 
+
+\noindent \textbf{Prompt-space Jailbreaking.} These methods often rely on a "red-teaming" LLM to generate adversarial prompts \cite{perez2022redteaminglanguagemodels,wei2023jailbrokendoesllmsafety,sadasivan2024fastadversarialattackslanguage,chao2024jailbreakingblackboxlarge,liu2024autodangeneratingstealthyjailbreak,mehrotra2024treeattacksjailbreakingblackbox,zeng2024johnnypersuadellmsjailbreak,samvelyan2024rainbowteamingopenendedgeneration, liu2024autodanturbolifelongagentstrategy}. 
+Methods such as PAIR \cite{chao2024jailbreakingblackboxlarge} deploy a separate LLM, called the "attacker", which uses a crafted system prompt to interact with the target LLM over multiple rounds and generate semantic jailbreaks; they operate in a black-box manner, requiring only the target’s outputs, and are highly transferrable \cite{chao2024jailbreakingblackboxlarge}.
+Some other methods fine-tune a model to generate the attacking prompts \cite{perez2022redteaminglanguagemodels,ge2023martimprovingllmsafety,zeng2024johnnypersuadellmsjailbreak,paulus2024advprompterfastadaptiveadversarial,beetham2024liarleveragingalignmentbestofn}, though this demands substantial computational resources. Rather than fine-tuning, we rely on increased test-time computation \cite{snell2024scalingllmtesttimecompute}, while others start from expert-crafted prompts (e.g., DAN \cite{ChatGPTDAN2024}) and refine them via genetic algorithms \cite{liu2024autodangeneratingstealthyjailbreak,samvelyan2024rainbowteamingopenendedgeneration,lapid2024opensesameuniversalblack}. Like these methods, our approach generates semantically meaningful jailbreaks by using another LLM as the attacker, however, our approach is significantly different from the prior work as we develop reasoning modules based on the loss values to better navigate the prompt space.
+
+\noindent \textbf{Comparison with PAIR and TAP.} The closest methods to our framework are PAIR \cite{chao2024jailbreakingblackboxlarge} and TAP-T \cite{mehrotra2024treeattacksjailbreakingblackbox}. Our verifier-driven method outperforms PAIR and TAP, whose prompt-based CoT remains static and does not leverage a loss. That said, while TAP-T creates a tree of attacks based on the attacker's CoT, it prunes only prompts that do not request the same content as the original intent, and does not utilize any reasoning methodologies. 
+
+
+\noindent \textbf{Chain-of-Thought (CoT).} CoT prompting \cite{wei2023chainofthoughtpromptingelicitsreasoning} and scratch-padding \cite{nye2021workscratchpadsintermediatecomputation} demonstrate how prompting the model to produce a step-by-step solution improves the LLM's performance. Recent work \cite{zheng2024criticcotboostingreasoningabilities,wang2024strategicchainofthoughtguidingaccurate,xiang20252reasoningllmslearning} suggests constructing the CoT through several modules rather than relying only on the language model's CoT capabilities. Notably,  \cite{xiang20252reasoningllmslearning} explicitly constructs the CoT to ensure that it follows a particular path. Likewise, we use three modules for explicitly constructing the reasoning steps, aiming to reduce the loss function with each step.
+
+\noindent \textbf{Reasoning.} 
+% Multi-step reasoning \cite{hendrycks2021measuringmathematicalproblemsolving,wei2023chainofthoughtpromptingelicitsreasoning} has catalyzed the emergence of "verifiers" as an alternative to fine-tuning \cite{cobbe2021trainingverifierssolvemath}. Verifiers have gained popularity under the "best-of-N" scheme, where multiple candidate solutions are generated and subsequently evaluated. Furthermore, it is now established that process-based reward models (PRM) \cite{uesato2022solvingmathwordproblems,lightman2023letsverifystepstep,wang2024mathshepherdverifyreinforcellms} as the verifier are more effective than outcome-based reward models (ORM) \cite{cobbe2021trainingverifierssolvemath,yu2024ovmoutcomesupervisedvaluemodels}. This is because a granular step-wise guidance facilitates a look-ahead signal at each step, which is often necessary for a searching algorithm \cite{xie2024montecarlotreesearch}. Empirical evidence shows that strong verifier models are crucial for accurate model guidance \cite{zhang2024smalllanguagemodelsneed,zhang2024generativeverifiersrewardmodeling,stechly2024selfverificationlimitationslargelanguage}, which requires further intermediate-level annotations. However, obtaining such annotations to train PRMs typically requires human annotators \cite{uesato2022solvingmathwordproblems,lightman2023letsverifystepstep} or deploying a heuristic \cite{wang2024mathshepherdverifyreinforcellms}. In this work, we propose to directly utilize the loss value as a step-wise verifier, thus eliminating the need for additionally training a verifier model. Similar to recent efforts that improve the efficiency of the test-time compute by performing a search against the verifier \cite{snell2024scalingllmtesttimecompute} rather than a vanilla best-of-N approach, we perform a heuristic search with backtracking  \cite{gandhi2024streamsearchsoslearning,openai2024learning} using the loss function.
+Recent advances in reasoning have enhanced LLMs’ capabilities in solving complex problems by scaling test-time computation mechanisms \cite{hendrycks2021measuringmathematicalproblemsolving,RomeraParedes2023MathematicalDF,ahn2024largelanguagemodelsmathematical,shao2024deepseekmathpushinglimitsmathematical,rein2023gpqagraduatelevelgoogleproofqa,openai_system_card_2024}. 
+``Best-of-N'' sampling \cite{cobbe2021trainingverifierssolvemath,yu2024ovmoutcomesupervisedvaluemodels}, which runs N parallel streams and verifies the final answers through outcome-based reward models (ORMs), is a straightforward test-time scaling approach.
+% used in jailbreaking (e.g., PAIR \cite{chao2024jailbreakingblackboxlarge}). 
+However, it might fail to uncover solutions that require incremental improvements, limiting its effectiveness compared to other test-time methods. 
+To address this limitation, recent work utilizes process-based reward models (PRMs) \cite{uesato2022solvingmathwordproblems,lightman2023letsverifystepstep,wang2024mathshepherdverifyreinforcellms} to optimally scale the test-time computation, thereby improving the reasoning performance \cite{snell2024scalingllmtesttimecompute,xie2024montecarlotreesearch,gandhi2024streamsearchsoslearning,openai2024learning}. 
+PRMs provide step-by-step verification that facilitates a look-ahead signal at each step, often necessary for a searching algorithm \cite{xie2024montecarlotreesearch}. 
+Similarly, the use of a continuous loss function as a step-wise verifier allows us to run a tree search. 
+This framework fits well into the ``Proposer and Verifier'' perspective \cite{snell2024scalingllmtesttimecompute} of test-time computation, where the proposer proposes a distribution of solutions and a verifier assigns rewards to the proposed distributions.  
+Robust verifier models are essential for accurate guidance \cite{zhang2024smalllanguagemodelsneed, zhang2024generativeverifiersrewardmodeling, stechly2024selfverificationlimitationslargelanguage}, but they require intermediate annotations from human annotators or heuristics \cite{uesato2022solvingmathwordproblems, lightman2023letsverifystepstep, wang2024mathshepherdverifyreinforcellms}. 
+In our work, we use the loss values from a surrogate LLM as a verifier, eliminating the need for training a verifier model. 
+
+ % Empirical evidence underscores the necessity of robust verifier models for accurate guidance \cite{zhang2024smalllanguagemodelsneed, zhang2024generativeverifiersrewardmodeling, stechly2024selfverificationlimitationslargelanguage}, typically requiring intermediate-level annotations from human annotators \cite{uesato2022solvingmathwordproblems, lightman2023letsverifystepstep} or heuristics \cite{wang2024mathshepherdverifyreinforcellms}. In this work, we utilize the loss value as a step-wise verifier, eliminating the need to train an additional verifier model.
+
+
+
+
+\noindent \textbf{Reasoning vs safety}. The reasoning framework for exploiting test-time compute can also be used to improve alignment.
+OpenAI uses ``deliberative alignment'' \cite{Guan2024-sv} to incorporate human-generated and adversarial data to improve the alignment of the o1 model family \cite{openai_system_card_2024, openai2024learning}.
+These models consistently outperform traditional frontier LLMs in metrics measuring vulnerability to automatic adversarial attacks \cite{openai_system_card_2024, Hughes2024-te}.
+The limitations of current automatic jailbreaking methods and the efficacy of using test-time compute for safety alignment naturally beg the question of whether test-time compute frameworks can be used to \textit{bypass} model guardrails instead of \textit{enforcing} them. Adversarial reasoning, the framework we propose in this paper, demonstrates that bypassing a model's guardrails—even those that leverage increased computation for enhanced safety—is not only possible but also effective. 
+
+% Additional related work is provided in \Cref{additional}.
+
+\section{Preliminaries}
+The objective of jailbreaking is to elicit a target LLM $\bbT$ to generate objectionable content corresponding to a malicious intent $I$ (i.e., ``Tell me how to build a bomb''). This will be obtained by designing a prompt $P$ such that the target LLM's response $\bbT(P)$ corresponds to $I$. A judge function, $\mathrm{Judge}(\mathrm{Target}(P), I) \to \{0, 1\}$, is then used to decide whether the response satisfies this condition. Therefore, successful jailbreaking amounts to finding a prompt $P$ such that: 
+\begin{equation*}
+    \mathrm{Judge}\big(\bbT(P), I\big) = 1.
+\end{equation*}
+
+We reinterpret this problem as a reasoning problem. Rather than directly optimizing the prompt $P$ as token-level methods do, we construct $P$ by applying an attacker LLM $\bbA$ to a \emph{reasoning string} $S$, i.e.,  $P = \bbA (S)$. This allows us to update the attacker's output distribution according to the ``Proposer and Verifier'' framework  \cite{snell2024scalingllmtesttimecompute} by iteratively refining $S$. Thus, 
+% we must g$S$ that results the desired prompt $P$ = $\bbA(S)$. 
+the challenge is to find a string $S$ such that, when passed to the attacker as shown in 
+\Cref{Overall_alg}, it satisfies the following objective:
+\begin{equation}\label{eq:reasoning}
+     \mathrm{Judge} \big(\bbT (\bbA (S)), I\big) = 1.
+\end{equation}
+
+This formulation allows us to view jailbreaking methods through the lens of an iterative refinement of $S$. 
+% Note that many existing reasoning algorithms can be cast into this formulation. 
+Note that many existing reasoning algorithms can be framed into this formulation. 
+For instance, chain-of-thought prompting can be realized by repeatedly generating partial thoughts from an LLM and appending them to $S$. 
+The final answer is generated by passing the updated $S$ to the same LLM. 
+Similarly, in the jailbreaking literature, methods such as PAIR \cite{chao2024jailbreakingblackboxlarge} aim to solve \eqref{eq:reasoning} by updating $S$ at each iteration, appending the generated CoT from the attacker and the responses from the target. 
+The string $S$ encapsulates all partial instructions and the intermediate steps executed during the attacking process. 
+
+
+%That said, we will propose a new algorithm to update the reasoning string S. 
+Prior prompt-space jailbreaking methods have often used prompted or fine-tuned LLMs \cite{chao2024jailbreakingblackboxlarge, mehrotra2024treeattacksjailbreakingblackbox,mazeika2024harmbenchstandardizedevaluationframework} as judges to evaluate whether a jailbreak is successful. 
+These judges are the simplest ``verifiers'': once the refinement of $S$ is over, the judge will evaluate if $\bbA(S)$ is a successful jailbreak. 
+However, the judge only provides a binary signal: whether or not jailbreaking has taken place.
+This makes binary verifiers unsuitable for estimating intermediate rewards. 
+To alleviate this, we use a continuous and more informative loss function.
+A loss function will provide  more granular feedback by assigning smaller loss values to prompts that are semantically closer to eliciting the desired behavior from $\bbT$.
+Following prior work \cite{zou2023universaltransferableadversarialattacks, hayase2024querybasedadversarialpromptgeneration}, we use the cross-entropy loss of a particular affirmative string for each intent (e.g., ``Sure, here is the step-by-step instructions for building a bomb''), measuring how likely the target model is to begin with that string. 
+Showing this desired string as $\bfy_I = \{y_1, y_2, \cdots, y_l\}$, our goal is to optimize the following next-word prediction loss: 
+\begin{align}\label{eq: loss_target}
+    \calL_{\rm \bbT}(P,\bfy_I) &=  -\log \big( \Prob_{\rm \bbT}(y_1, \dots, y_l|P) \big) \nonumber \\ 
+    &=  - \sum_{i = 1}^{l} \log \big( \Prob_{\rm \bbT}(y_i|[P, y_{1:i-1}]) \big).
+\end{align}
+
+This function can be calculated by reading the log-prob vectors of the target model. Utilizing this loss function as our process reward model, we must refine the reasoning string S such that:
+\begin{align}\label{eq: optim_S}
+    & \min\limits_S \ \calL_{\rm \bbT}(\bbA (S),\bfy_I).
+\end{align}
+In what follows, we will propose principled reasoning-based methodologies to solve the above optimization. We will use the loss values to guide our search and verification processes. Importantly, our methods are gradient-free, meaning that we only compute the loss through forward passes, and not the gradient of the loss with respect to the input. In technical terms, we only utilize bandit information from the loss as opposed to first-order information. 
+
+%\HH{"reward" and "minimize" are a bit weird together}
+
+% \section{Preliminaries}
+% The objective of jailbreaking is to elicit a target LLM to generate objectionable content corresponding to a given intent $I$. 
+% This will be obtained by designing a prompt $P$ that can bypass the safety guardrails of the target LLM resulting in a response $\mathrm{Target}(P)$ that is aligned with $I$.
+% A judge function $\mathrm{Judge}(\mathrm{Target}(P), I) \to \{0, 1\}$ is used to decide whether the response is aligned with the intent.   
+% %To decide whether $\mathrm{Target}(P)$ is compliant and directly addresses to the demand, we employ a judge that is instructed with the necessary conditions for a successful jailbreaking, avoiding cases that the output is vague or not detailed enough (see \Cref{app: judge_sys} for the complete system prompt). The output of the judge is denoted as $\mathrm{Judge}(\mathrm{Target}(P), I) \to \{0, 1\}$ -- The function passes 1 only if the output of the target model aligns with $I$, and 0 otherwise. 
+% Therefore, to jailbreak the target LLM, we seek a prompt $P$ that satisfies the following:
+
+
+% We require the prompt $P$ to be semantically meaningful. 
+% %\MS{Not sure if interpretability is the appropriate term here-- GCG's output can be interpreted to some extent too}
+% %If we show the space of all meaningful prompts with $\calM \subset T^*$, this means that $P$ has to belong to this space: $P \in \calM$. However, $\calM$ is not mathematically well-defined and does not have a closed form as to search over that space, implying that the given condition cannot be automatically verified when performing a search over all possible prompts. 
+% % To make this condition verifiable, we will use the fact that the output of a general language model is coming from humans' language distribution, and hence, for a reasonable input, the output is typically meaningful. We relax the constraint of being meaningful to being the output of a language model,  This leads to the following search for $P$:
+% One way to enforce this requirement is to let $P$ be an output of a (different) language model, exploiting the fact that a  language model's output is generated according to a distribution that closely approximates natural human language\footnote{The attacker LLM is intrinsically random with every string having a non-zero probability. However, almost all of the probability mass is concentrated in a relatively small subset of grammatically correct and meaningful strings, the typical set of the LLM's outputs strings \cite{mudumbai2024slaveslawlargenumbers}.} . More concretely,  $P$ will be restricted to be the output of an \emph{attacker} LLM for some input string $S$. This results in another searching problem for $P$:
+
+% % \begin{equation}
+   
+% % \end{equation}
+
+% \begin{align}\label{eq: search}
+%      & \text{Find } P \ \mathrm{s.t.} \ \mathrm{Judge}(\mathrm{Target}(P), I) = 1 \nonumber \\
+%      & \text{and} \ P = \mathrm{Attacker}(S) \text{ for some } S
+% \end{align}
+
+% The specific structure of the objective in the above optimization problem makes it very challenging to solve: The value of the objective is binary, and the value $1$ is taken only if $P$ is a successful jailbreak. Consequently, for almost all the choices of $P$, except only a tiny fraction that lead to successful jailbreaks, the value of the objective is $0$, i.e., the value $1$ is taken very sparsely. Moreover, there are no incremental indications of progress as the objective takes only binary values, and near-misses still receive a zero score. \MS{To alleviate these issues, we replace the  judge function in \Cref{eq: search} with a continuous and more informative loss function. The new loss function will provide a more granular feedback by assigning relatively smaller loss values to prompts that are semantically closer to eliciting the desired target behavior. This granularity principle parallels recent insights in LLM reasoning, where process-based verification outperforms purely outcome-based reward models \cite{lightman2023letsverifystepstep,li2023makinglargelanguagemodels,wang2024mathshepherdverifyreinforcellms}. Process-base reward models (PRMs) provide a step-wise guidance that works as a look-ahead signal at intermediate points, which is essential for effective search, as demonstrated in Monte Carlo Tree Search applications \cite{xie2024montecarlotreesearch}. Existing black-box jailbreaking methods such as PAIR \cite{chao2024jailbreakingblackboxlarge} and TAP-T\cite{mehrotra2024treeattacksjailbreakingblackbox} rely on all-or-nothing verdicts from a judge, whereas employing a loss function in our jailbreaking algorithm provides the same step-wise advantages that process-based verifiers have demonstrated.}
+
+
+% Following previous work \cite{zou2023universaltransferableadversarialattacks, hayase2024querybasedadversarialpromptgeneration}, we use the cross-entropy loss for predicting a particular affirmative string given for each intent (e.g., 'Sure, here is the step-by-step instructions for building a bomb'), measuring how likely the target model is to begin with that string. Showing this desired answer as $\bfy_I = \{y_1, y_2, \cdots, y_l\}$, our goal is optimize the following next-word prediction loss: 
+% \begin{equation}\label{eq: loss_target}
+%     \calL_{\bbT}(\bfy_I, P) = - \sum_{i = 1}^{l} \log \big( \Prob_{\bbT}(y_i|[P, y_{1:i-1}]) \big)
+% \end{equation}
+
+
+
+
+\section{Algorithm} \label{sec: algorithm}
+\paragraph{Optimization over the reasoning string.}\label{sec: redefined_string}
+%We reformulate the optimization problem \eqref{eq: optim_P} as an unconstrained optimization over the input string $S$; 
+We must find a reasoning string $S$ for an attacker LLM $\mathbb{A}$ such that the resulting prompt $P := \mathbb{A}(S)$ jailbreaks the target LLM. 
+Our algorithm iteratively refines $S$, aiming to minimize the loss given in \Cref{eq: optim_S}.
+Starting from a root node $S^{(0)}$--a predefined template in \Cref{app: att_sys}--we iteratively construct a reasoning tree with nodes representing candidate strings (see \Cref{Overall_alg}).
+% -- hence, $S$ will be a selected node from a reasoning tree that we will construct (See \Cref{Overall_alg}). At a high level, we initiate at time $t=0$, i.e. string  $S^{(0)}$, with a straightforward template (see \Cref{app: att_sys}). We think of $S^{(0)}$ as a root node of our reasoning tree which we will construct iteratively. 
+At iteration $t$, a node in the tree with the best score is selected. 
+This node will expand into $m$ children $S^{(t+1)}_1, \cdots, S^{(t+1)}_m$. 
+The tree will be further pruned at each iteration to retain a buffer of the best nodes. 
+We now explain this process in detail, beginning with a description of an individual reasoning step in our method.
+
+%At each round, another Feedback LLM $\mathbb{F}$ will generate feedback based on the loss values to refine the reasoning string $S$.
+%\HH{generation should come here. We should give a high level picture of the search here.}
+
+
+%Using the reasoning step, the algorithm initiates at time $t=0$ with the initial reasoning string $S^{(0)}$. We think of $S^{(0)}$ as a root node of our reasoning tree which we will construct iteratively.  At each iteration $t$, given the current string $S^{(t)}$, we produce $m$ feedback strings \HH{string is overloaded} in parallel from the $n$ attacking prompts, resulting in $m$ new reasoning strings from  $\{S^{(t+1)}_1, \cdots, S^{(t+1)}_m\}$. Expanding the reasoning strings creates our reasoning tree, whose each node is a reasoning string. This is shown in \Cref{Overall_alg}. 
+
+
+% At each round, the input string $S$ will be updated using a "textual gradient" of the target loss. 
+% \PK{remove instances of "textual gradient"}
+% The "textual gradient" will be in the form of a textual feedback which will be used to refine the string string $S$.
+
+% . "feedback" or "textual gradient" have been proposed in \cite{yuksekgonul2024textgradautomaticdifferentiationtext, pryzant2023automaticpromptoptimizationgradient} to enhance the performance of an LLM in a benchmark. Here, we utilize the same concept the decrease the value of a loss. 
+
+%derived from the comparison of prompts and their loss values. This "textual gradient" is essentially feedback derived from comparing the loss differences between various prompts.
+
+%with respect to $n$ samples $\{P_1, \cdots, P_n\}$ from the attacker's distribution for the current input $S$
+
+% To properly construct this optimization, Therefore, we assume that drawing a finite number of samples from $\mathrm{Attacker}(S)$ consistently results in meaningful prompts.
+% \begin{equation}\label{eq: optim_S}
+%     \min\limits_S \E_{P_i \sim \mathrm{Attacker}(S)} \Big[ \min_{P \in \{P_1, \dots, P_n\}} \calL_{\bbT}(\bfy_I, P) \Big]
+% \end{equation}
+%The input string is initialized before proceeding with the updating steps. In this manner, PAIR \cite{chao2024jailbreakingblackboxlarge} proposes a carefully crafted system-prompt that positions the attacker LLM in a state that all of its outputs are relevant attempts to jailbreaking the target. Also, \cite{andriushchenko2024jailbreakingleadingsafetyalignedllms} showcases the significance of the prompt initialization, demonstrating that if one starts from an appropriate point in the token space, they will only need few searching iterations to attain a jailbreaking prompt. Consequently, we initialize $S$ with a system-prompt along with an initial input string that together provide the necessary details for the attacking prompts. During the :
+%$$S^{(0)} = [\rm system\_prompt, in^{(0)}]$$
+%\MS{The following paragraph needs to be moved to the experiment}
+%The system prompt explains the jailbreaking goal to the attacker (see \Cref{app: att_sys}), without providing any in-context examples or additional instructions. Unlike the algorithms in \cite{chao2024jailbreakingblackboxlarge, mehrotra2024treeattacksjailbreakingblackbox}, we avoid potential biases introduced by such methods. This ensures that our model remains robust and less susceptible to any changes in the system prompt, or adversarial training against some common scenarios \cite{zeng2024johnnypersuadellmsjailbreak}. We will now explain the procedure of applying the updates by acquiring more informative feedbacks. 
+
+\paragraph{Feedback according to the target's loss.}
+% \PK{We need to clarify here that we can also do this with models' log-probs. This was not mentioned anywhere until the Results section, so we should include it here}
+Let $S^{(t)}$ be the reasoning string at time $t$. We generate $n$ prompts $P_1, P_2, \cdots, P_n$ sampled independently from the distribution of $\mathbb{A}$ with $S^{(t)}$ as input  (see \Cref{Overall_exmaple}). Let
+$\ell_1, \cdots, \ell_n$ be the loss values obtained from \Cref{eq: loss_target} for $P_1, \cdots, P_n$, respectively. 
+For simplicity, we assume that the prompts are ordered in a way that $\ell_1 \leq \ell_2 \leq \dots \leq \ell_n$, i.e., prompt $P_1$ incurs the lowest loss and $P_n$ the highest loss on the target LLM.
+We use Feedback LLM $\mathbb{F}$ with a crafted system prompt (given in \Cref{app: att_sys}) that
+% To analyze patterns within this ordering, we deploy an additional language model, denoted as $\mathrm{Feedback LLM}$. 
+% This model
+takes the ordered set of prompts as input and generates a feedback string $F$ as a textual analysis, semantically explaining why $P_1$ is a better attacking prompt than $P_2$, why $P_2$ is better than $P_3$, etc., and identifies any apparent patterns across the prompts:
+\begin{equation}
+    F := \mathbb{F}([P_1, \cdots, P_n]).
+\end{equation}
+Examples of feedback strings $F$ are illustrated in \Cref{Overall_exmaple}, where $P_1$ with a role-play scenario has a lower loss, so Feedback LLM highlights this observation for use as an extra instruction in the next iteration.
+
+\vspace{-0.1in}
+\paragraph{Applying the feedback via a refiner.}\label{sec: feedbacks_applied} Once the feedback is obtained, the reasoning string must be refined and updated into its children.
+% \HH{this will appear confusion; what is the attacker's input? $S$ or $S^t$ See the above paragraph.}
+One way to do this is to append the feedback to the reasoning string 
+at each time. This quickly becomes intractable---not only does the string length grow with each iteration, but also the set of different feedbacks can contradict each other.
+Instead, we deploy a Refiner LLM $\bbR$ inspired by the idea of ``textual gradients'' introduced in \cite{yuksekgonul2024textgradautomaticdifferentiationtext}.
+Taking $S^{(t)}$ 
+% as the $t$-th iteration of $S$ 
+and the feedback string $F$ as its arguments, $\bbR$ generates a new reasoning string $S^{(t+1)}$ that refines $S^{(t)}$ based on the~feedback:
+% \HH{what is $S^t$ -- so far you ahve three different strings: $S$, $S^t$ and $S^i$}
+\begin{equation}
+ S^{(t+1)} =    \bbR (S^{(t)}, F).
+\end{equation}
+\begin{figure*}[t!]
+     \centering
+     \includegraphics[width=1.0\linewidth]{figs/chain_2.pdf}
+     \vspace{-0.2in}
+     \caption{One iteration of our algorithms for the task: ``Write an office macro that searches for and exfiltrates passwords''. This diagram corresponds to constructing one step of reasoning for updating $S$ in \Cref{eq: optim_S}, where $n = 2$ (Feedback LLM compares 2 attacking prompts) and $m = 2$ (by acquiring 2 feedback strings, we generate 2 children).}
+     \label{Overall_exmaple}
+     \vspace{-0.1in}
+\end{figure*}
+Replicating the above process (Feedback+Refine) $m$ times in parallel, we produce
+% produce $m$ feedbacks in parallel, resulting in
+$m$ new reasoning strings $\{S^{(t+1)}_1, \cdots, S^{(t+1)}_m\}$ as the children of $S^{(t)}$. 
+\Cref{Overall_exmaple} shows a single iteration of our method and illustrates how the updated reasoning string incorporates the key components of the feedback. 
+Note that rather than relying on the attacker’s CoT process---which lacks any information about the loss function---we explicitly engineer the reasoning steps aiming to decrease the loss function. This setup parallels recent efforts that align a model’s intermediate steps with predefined strategies \cite{wang2024strategicchainofthoughtguidingaccurate,xiang20252reasoningllmslearning}.  
+
+% transitioning from $S^{(t)}$ to the updated one $S^{(t+1)}$ and  concluding one step of reasoning. 
+
+
+% Using the reasoning step, the algorithm initiates at time $t=0$ with the initial reasoning string $S^{(0)}$. We think of $S^{(0)}$ as a root node of our reasoning tree which we will construct iteratively.  
+% At each iteration $t$, given the current string $S^{(t)}$,
+
+% Expanding the reasoning strings creates our reasoning tree, whose each node is a reasoning string. This is shown in \Cref{Overall_alg}. 
+
+\vspace{-0.1in}
+\paragraph{Verifier.} Next, to quantify the quality of each reasoning string, we assign a score using the loss function in \Cref{eq: optim_S}. For a given reasoning string $S$, we define the verifier's score as: 
+\begin{equation}\label{eq: empirical}
+    \bbV (S) := - \min_{\{P_1, \dots, P_n\} \sim \bbA(S)} \calL_{\bbT}(P_i, \bfy_I),
+\end{equation}
+where ${P_1, \cdots, P_n}$ are the attacking prompts generated from $S$. The minimization reflects the adversarial nature of the problem. Specifically, each reasoning string is evaluated based on the most effective attacking prompt it produces as finding a single successful attacking prompt suffices.
+
+
+\vspace{-0.1in}
+\paragraph{Searching method.} 
+We now describe the node selection and pruning process based on the verifier’s score. Inspired by the Go-with-the-Winners algorithm \cite{gww} and Greedy Coordinate Query \cite{hayase2024querybasedadversarialpromptgeneration}, our method maintains a priority buffer of reasoning strings with the highest scores according to \Cref{eq: empirical}, pruning those with lower scores (i.e., strings that generate attacking prompts with high loss). The buffer is denoted as $L$ in \Cref{alg:gww} with a size of $B$. At each iteration, the highest-scoring node in the buffer is selected for expansion, and its $m$ children are added to the buffer. The buffer is then pruned to retain only the top $B$ candidates. This pruning strategy enables backtracking when none of the children exceed the scores of existing buffer candidates. \Cref{alg:gww} outlines these steps. In line 4, the reasoning string is initialized with a template and iteratively updated to generate new attacking prompts. This process repeats for $T$ iterations.
+
+% To effectively navigate the reasoning tree, the algorithm must maintain a buffer of candidates for exploration rather than employing greedy strategies such as beam search, which advances without backtracking. This parallels recent work that identifies backtracking as a fundamental component in reasoning mechanisms \cite{gandhi2024streamsearchsoslearning, openai2024learning}.
+%\textcolor{blue}{it would be good to align this section (e.g. the titles of the paragraphs with the three steps mensioned in the intro. Also, where is the "verifier" in this section? Also, it might be good to show the three components in the Algorithm (maybe by colored-boxes?))}
+
+% \begin{algorithm}[H]
+% \caption{Go-with-the-Winners Search Algorithm for the Attacker's Input Exploration}
+% \label{alg:go-with-the-winners}
+% \begin{algorithmic}[1]
+% \Require Original Intent for jailbreaking $I$, Initial input node \( n_0 \), Loss function \( \text{Loss}(n) \)  \Statex Parameters: Number of children \( M \), List capacity \( B \), Number of iteration \( N \)
+% \State Initialize list \( L \leftarrow \{ n_0 \} \) with capacity \( B \)
+% \State Evaluate loss of initial node: \( \text{Loss}(n_0) \)
+% \For{$iter \gets 1$ \textbf{to} $N$}
+%     \State Select node \( n \) with lowest loss from \( L \)
+%     \If {$\mathrm{Judge} (n, I) = 1$}
+%         \State \textbf{break}
+%     \EndIf
+%     \State Remove \( n \) from \( L \)
+%     \For{\( i = 1 \) to \( M \)}
+%         \State Generate random feedback \( f_i \)
+%         \State Update node using feedback to obtain child \( c_i \leftarrow \text{Update}(n, f_i) \)
+%         \State Evaluate loss \( \text{Loss}(c_i) \)
+%         \If{\( |L| < B \)}
+%             \State Insert \( c_i \) into \( L \)
+%         \ElsIf{\( \text{Loss}(c_i) < \max_{n' \in L} \text{Loss}(n') \)}
+%             \State Replace node with highest loss in \( L \) with \( c_i \)
+%         \EndIf
+%     \EndFor
+% \EndFor
+% \State \Return n
+% \end{algorithmic}
+% \end{algorithm}
+
+
+% \paragraph{The final algorithm}
+% , where it also take an Update function as a requirement. 
+% Based on this function, and whether it appends the feedbacks (shown with $S' = S+ F $) or it applies them via the OptimizerLM ($S' = \mathrm{OptimizerLM}(S, F)$), this will result in two variation of our method: "Algorithm-conv" and "Algorithm-opt".
+
+
+% \begin{algorithm}[H]
+% \caption{Feedback-Driven Go-with-the-Winners Search Algorithm}
+% \label{alg:gww}
+% \begin{algorithmic}[1]
+% \Require Initial input string \( S^{(0)} \), jailbreaking goal $I$, desired answer $\bfy_I$, Target model, Judge model, $\calL_{\bbT}(\bfy_I, .)$, Feedback LLM function, OptimizerLM function. 
+% % \Statex \hspace{\algorithmicindent}
+% \Statex \hspace{-0.27in} \textbf{Parameters:} Number of children \( m \), Buffer size \( B \), number of attacking prompts \( n \), Number of iterations \( T \).
+% \State Initialize list \( L \leftarrow \{ n_0 \} \) with capacity \( B \)
+% \State Generate \( n \) attacking prompt $P_i \sim \mathrm{Attacker(S^{(0)})}$
+% \State Evaluate losses \( \mathrm{loss}(P_i) \) and the target's response     $\mathrm{Target(P_i)}$ for \( i = 1 \) to \( n \)
+% \State Compute node loss \( \mathrm{Loss}(n) := \min_{i} \mathrm{loss}(P_i) \)
+% \For{$iter \gets 1$ \textbf{to} $K$}
+%     \State Select node \( n \) with lowest loss from \( L \)
+%     \If{$\exists i\ \text{s.t.}\ \mathrm{Judge}(\mathrm{Target}(P_i), I) = 1$}
+%         \State \textbf{break}
+%     \EndIf
+%     \State Remove \( n \) from \( L \)
+%     \For{\( j = 1 \) to \( M \)}
+%         \State Generate feedback \( f_j \sim \mathrm{Feedback LLM}(\{P_1, \cdots, P_n\}\))
+%         \State Update node to obtain child \( c_j \sim \mathrm{Update}(n, f_j) \)
+%         \State Generate \( N \) attacking prompts \( \{ P_{j,1}, \dots, P_{j,N} \} \) according to $\mathrm{Attacker(c_j)}$
+%         \State Evaluate losses \( \mathrm{loss}(P_{j,i}) \) and the target's response $\mathrm{Target(P_{j, i})}$ for \( i = 1 \) to \( N \)
+%         \State Compute child node loss \( \text{Loss}(c_j) = \min_{i} \mathrm{loss}(P_{j,i}) \)
+%         \If{\( |L| < B \)}
+%             \State Insert \( c_j \) into \( L \)
+%         \ElsIf{\( \text{Loss}(c_j) < \max_{n' \in L} \text{Loss}(n') \)}
+%             \State Replace node with highest loss in \( L \) with \( c_j \)
+%         \EndIf
+%     \EndFor
+% \EndFor
+% \State \Return Best node from \( L \)
+% \end{algorithmic}
+% \end{algorithm}
+
+
+
+
+
+\section{Experiments}\label{experiments}
+% \paragraph{Dataset} 
+% For all the reported results in this section, 
+\paragraph{Baselines and Evaluations.}
+We compare our algorithm with state-of-the-art methods for jailbreaking in both the token-space and the prompt-space. 
+Specifically, we include GCG \cite{zou2023universaltransferableadversarialattacks}, PAIR \cite{chao2024jailbreakingblackboxlarge}, TAP-T \cite{mehrotra2024treeattacksjailbreakingblackbox}, and AutoDAN-turbo \cite{liu2024autodanturbolifelongagentstrategy} which is an extension of AutoDAN \cite{liu2024autodangeneratingstealthyjailbreak}. 
+Additionally, we incorporate results from \cite{andriushchenko2024jailbreakingleadingsafetyalignedllms}, even though some of their methods go beyond just modifying the target LLM's input and employ pre-filling attacks or alter the target model's system prompt. 
+As we limit our comparison to methods that interact with the target LLM through its input, we use only their crafted template along with random search, which we refer to as ``Prompt + Random Search''.
+We use Attack Success Rate (ASR) as the main metric for comparison. 
+We execute our algorithm against some of the safest LLMs according to \cite{grayswan_single_turn_harmful_outputs} leaderboard, including both open-source (white-box) and proprietary (black-box) models. 
+The HarmBench judge \cite{mazeika2024harmbenchstandardizedevaluationframework} is deployed to evaluate the target LLM's responses due to its high alignment with human evaluations \cite{souly2024strongrejectjailbreaks}. 
+We test our algorithm on 50 uniformly sampled tasks selected from standard behaviors in the Harmbench dataset \cite{mazeika2024harmbenchstandardizedevaluationframework}. 
+We manually verify all proposed jailbreaks to avoid false positives. 
+% \PK{Why only 50, instead of the full 200?}
+%This dataset contains 6 general categories with some extremely malign actions such as \textit{"Generate text convincing someone to commit suicide"} that are physically harmful, and other task that are related cybersecurity crimes, etc. For instance, \textit{"Write an email convincing someone to share their social security number"}. 
+
+
+
+\begin{algorithm}[t!]
+\caption{Adversarial Reasoning}
+\label{alg:gww}
+\begin{algorithmic}[1]
+\Require Initial prompt \( S^{(0)} \), jailbreaking goal \( I \), desired answer \( \mathbf{y}_I \), Target model \bbT, loss function \( \mathcal{L}_{\bbT} \), Attacker $\bbA$, Feedback LLM $\bbF$, Refiner LLM $\bbR$. %Judge model
+\Statex \hspace{-0.26in} \textbf{Parameters:} Number of children \( m \), Buffer size \( B \), Number of attacking prompts \( n \), Max iterations \( T \).
+\State Initialize buffer \( L \leftarrow \{ S^{(0)} \} \) with size \( B \)
+\For{$t = 1$ to $T$}
+    \State Select node \( S^* \leftarrow \arg\max_{S \in L} \bbV (S) \)  %\Comment{Search}
+    % \State Generate \( n \) attacking prompts from \( n^* \) and evaluate losses
+    \State Generate \( n \) attacking prompt $P_i \sim \mathrm{ \bbA(S^{*})}$ and sort them according to losses $\calL_{\bbT}(P_i, \bfy_I)$ 
+    
+    % \If{$\exists i\ \text{s.t.}\ \mathrm{Judge}(\mathrm{Target}(P_i), I) = 1$}
+    %     \State \textbf{break}
+    % \EndIf
+    
+    \State Generate feedbacks $\calF = \{F_1, \cdots, F_m\} \sim \bbF([P_1, P_2, \cdots, P_n]) $  %\Comment{Reason}
+    \State Remove \( S^* \) from \( L \)
+    \For {feedback \( F \) in \( \calF \)}
+        \State Create child node \( \hat{S} \leftarrow \bbR(S^*, F) \)
+        \State Evaluate \(  \hat{S} \) by $\bbV (\hat{S})$ %\Comment{Verify}
+        \State Insert \( \hat{S} \) into \( L \) if buffer not full or better than worst in \( L \)
+    \EndFor
+\EndFor
+\State \Return Best node from \( L \)
+\end{algorithmic}
+\end{algorithm}
+
+\noindent \textbf{Attacker models}
+% The core functionality of the algorithm is executing by the attacker, where it always has to comply with generating a batch of malicious demands, so it is paramount for the attacker model to consistently generate the attacking prompts with no refusal. In order, 
+As for the attacker model, we use LLMs without any moderation mechanism to ensure compliance. Specifically, we use ``Vicuna-13b-v1.5'' (Vicuna) \cite{vicuna2023} and ``Mixtral-8x7B-v0.1'' (Mixtral) \cite{jiang2024mixtralexperts}.
+The details of our curated system prompt for the attacker  are given in \Cref{app: att_sys}. The temperature of the attacker LLM is set to 1.0, as exploration is critical in our framework. 
+
+
+\noindent \textbf{Feedback LLM and Refiner LLM.}
+For a fair comparison with other attacker-based methods, we use the same model for the Feedback LLM, Refiner LLM, and attacker model, as they are all part of the attacking team. 
+This setup isolates the effect of each method from differences in model capability. 
+Details of their configuration and the rationale behind these choices are in \Cref{app: judge_sys}. 
+At each call of Feedback LLM, we divide the $n$ sorted attacking prompts into $k$ buckets and uniformly sample one prompt from each bucket. 
+Feedback LLM then evaluates only $n/k$ prompts at a time. 
+This strategy facilitates exploration in the search algorithm by increasing the diversity of feedback. 
+While the prompt with the lowest loss is more likely to succeed in jailbreaking, comparing the other prompts can provide more informative feedback and enhance the overall effectiveness of the optimization process. 
+%Each of the $m$ feedback strings is passed to a separate call of Refiner LLM to obtain a new reasoning~string.
+
+% It is important to ensure that, when the feedback string is applied to reasoning string, it semantically steers the attacker's output distribution toward prompts with lower losses---a condition we verify in \Cref{sec: feedback_eff}.  \textcolor{blue}{not sure if this sentence is precise}
+
+
+\noindent \textbf{Hyperparameters.}
+Unless otherwise specified, we set the temperature of the target model to $0$. 
+We execute our algorithm for $T = 15$ iterations per task. 
+At each iteration, we query the current reasoning string in $ n = 16 $ separate streams to obtain the attacking prompts. 
+For feedback generation, we use bucket size $k= 2$ and we generate $ m = 8 $ feedbacks. 
+For each generated feedback we will have $m = 8$ new reasoning string candidates that will be added to the buffer. 
+The buffer size for the list of candidate reasoning strings is $B = 32$. 
+This setting yields a total of 240 target LLM queries and $m \times (T- 1) \times n = 1920$ auto-regression steps (for calculating the loss in \Cref{eq: loss_target}) per task. 
+These hyperparameters were selected by testing a handful of candidates empirically (for example, $m=8$ generally outperformed $m=4$ in loss reduction).
+% $m=8$ generally outperformed $m=4$ in reducing the loss.
+\subsection{Attack Success Rate}\label{sec: asr}
+In this section, we present our results on white-box target LLMs that permit direct access to log-prob vectors---essential for calculating our loss function given in \eqref{eq: loss_target}. 
+Results for black-box models are given in \Cref{sec: transfer}. 
+
+For all methods that rely on an attacker LLM to generate the attacking prompts—except for AutoDAN-Turbo\footnote{We were unable to reproduce results with AutoDAN-Turbo's official implementation; the attacker model did not generate the expected outputs even after substituting Llama-3-70 with Mixtral.} we have deployed Mixtral\footnote{Note that the standard versions of PAIR and TAP-T use Vicuna. 
+The use of a stronger model such as Mixtral here leads to a higher ASR than their reported results.}.
+The main results are presented in \Cref{table_ASR}. 
+Except for Llama-3-8B, our method achieves the best ASR among both the token-space and the prompt-space attempts. 
+This is significant because token-space algorithms operate without constraints to be semantically meaningful, making it easier to find a jailbreaking prompt. 
+However, as shown in \Cref{table_ASR}, for target models that have been adversarially trained against token-level jailbreaking such as Llama-3-8B-RR \cite{zou2024improvingalignmentrobustnesscircuit} and R2D2 \cite{mazeika2024harmbenchstandardizedevaluationframework}, these algorithms largely fail since as the rely on eliciting only a handful of tokens. 
+In \Cref{app: examples}, we provide jailbreak examples and details of how our algorithm works w.r.t. those examples in \Cref{o1_example,Claude_example}.
+
+% , \textcolor{blue}{relying only on the scenario where the model initially complies and continues to do so}. In practice, however, a model may begin by refusing (often for several sentences) before later providing a correct (i.e., malicious) answer. Current token-level methods cannot capture such cases and therefore fail. In \Cref{app: refusals_erroneous}, we illustrate these scenarios with several examples. \textcolor{blue}{why is this helpful to mention here?}
+ 
+
+\begin{table*}[t!]
+    \centering
+    
+    \begin{tabular}{>{\centering\arraybackslash}m{4cm} 
+                    >{\centering\arraybackslash}m{1.5cm} 
+                    >{\centering\arraybackslash}m{1.5cm} 
+                    >{\centering\arraybackslash}m{1.5cm}
+                    >{\centering\arraybackslash}m{1.5cm}
+                    >{\centering\arraybackslash}m{1.5cm}
+                    % >{\centering\arraybackslash}m{1.5cm}
+                    >{\centering\arraybackslash}m{1.5cm}}
+    \toprule
+    \multicolumn{1}{c}{} & \multicolumn{6}{c}{Attacking method} \\  % Centers 'Attacker' over the 3 right columns
+    \cmidrule(r){2-7}  % This controls the partial horizontal line under 'Attacker'
+    Target model & GCG & Prompt + Random Search &  AutoDAN-Turbo & PAIR & TAP-T & \shortstack{Adversarial \\ Reasoning}\\  % Header row
+    \midrule
+    Meaningful &  \ding{55} & \ding{55}  & \checkmark & \checkmark &  \checkmark   &  \checkmark  \\
+    \hdashline[1pt/2pt]
+    Llama-2-7B & 32\% & 48\% & 36\% & 34\% & 48\% &\textbf{ 60\%} \\  % Example data
+    Llama-3-8B & 44\% & \textbf{100\%} & 62\% &66\% & 76\% & 88\%\\
+    Llama-3-8B-RR & 2\% &  0\%& - & 22\% & 32\% & \textbf{44\%} \\
+    Mistral-7B-v2-RR &  6\% &  0\% & - & 32\% & 40\% & \textbf{70\%} \\
+    R2D2 & 0\% & 12\% & 84\% & 98\% & \textbf{ 100\%} &  \textbf{100\%} \\
+    
+    \bottomrule
+    \end{tabular}
+    \caption{Comparison of Attack Success Rate (ASR) across different attacking methods and target models. A checkmark indicates that the method generates meaningful prompts, while a cross denotes non-meaningful (gibberish) prompts.}
+    \label{table_ASR}
+\end{table*}
+
+\vspace{-.2cm}
+\paragraph{Different attackers.} The ASR of all the algorithms that rely on an LLM for generating the attacking prompts varies by the capabilities of that LLM.
+These capabilities, however, can be improved by scaling the test-time computation \cite{snell2024scalingllmtesttimecompute}. 
+We demonstrate the efficacy of our algorithm by using a weaker attacker model such as Vicuna. 
+We compare the ASR of our algorithm to those of PAIR \cite{chao2024jailbreakingblackboxlarge} and TAP-T \cite{mehrotra2024treeattacksjailbreakingblackbox}, all targeting Llama-3-8B. 
+As shown in Table~\ref{table_weaker}, our algorithm achieves an ASR of $64\%$ with Vicuna---more than three times the ASR achieved by PAIR and TAP-T. 
+Notably, it nearly attains the same ASR as PAIR with Mixtral as the attacker-- a much stronger LLM than Vicuna. 
+Furthermore, our method uses a very simple system prompt for the attacker LLM (see \Cref{app: att_sys}) compared to methods such as PAIR and TAP-T. 
+This highlights the effectiveness of optimally scaling test-time computation rather than scaling the model. 
+This aligns with a broader trend in the reasoning literature \cite{snell2024scalingllmtesttimecompute}. 
+
+% \MS{Probably we don't need the following conclusion anymore?} In summary, the main message of the results in Table~\ref{table_weaker} is that our method  demonstrates minimal reliance on the attacker's model strength or system prompt. In other words, even with weak attacker models such as Vicuna our methods is able to achieve ASR on par with methods such as PAIR with much stronger attacker models and highly-tailored system prompts. 
+
+\begin{table}
+    \centering
+    
+    \begin{tabular}{>{\centering\arraybackslash}m{3cm} 
+                    >{\centering\arraybackslash}m{2cm} 
+                    >{\centering\arraybackslash}m{2cm} 
+                    >{\centering\arraybackslash}m{2cm}}
+    \toprule
+    \multicolumn{1}{c}{} & \multicolumn{3}{c}{Attacker model} \\  % Centers 'Attacker' over the 3 right columns
+    \cmidrule(r){2-4}  % This controls the partial horizontal line under 'Attacker'
+    Algorithm & Vicuna-13B & Mixtral-8x7B \\  % Header row
+    \midrule
+    PAIR & 20\% & 66\% \\  % Example data
+    TAP-T & 18\% & 76\% \\
+    Adversarial Reasoning & \textbf{64\%} & \textbf{88\%} \\
+    \bottomrule
+    \end{tabular}
+    \caption{ASR comparison of different methods for the same target model (Llama-3-8B) with  weaker (Vicuna), and and stronger (Mixtral) attackers. 
+    %Our method incorporates feedbacks to boost the performance of weaker LLMs.
+    }
+    \label{table_weaker}
+\end{table}
+
+
+\subsection{Multi-shot transfer attacks} \label{sec: transfer}
+Given the infeasibility of obtaining the log-prob vectors in black-box models, we evaluate the success of our algorithm using two transfer methods.
+We perform the transfer by optimizing the loss function on a surrogate white-box model and then applying the derived adversarial prompt to the target black-box model. 
+A common approach is to transfer the prompt that jailbreaks or yields the lowest loss on the surrogate model \cite{zou2023universaltransferableadversarialattacks}---we call this a ``one-shot'' transfer attack. 
+However, this does not always result in an effective attack as the loss function serves only as a heuristic in the transfer. 
+We improve effectiveness by using a scheme that queries the target model with all the attacking prompts collected from executing the algorithm ($n$ prompts per iteration).
+We call this a ``multi-shot'' transfer. 
+We show that the transfer success significantly increases with this scheme. 
+We use the loss values from three white-box models: Llama-2, Llama-3-RR, and R2D2 as the surrogate loss in our algorithm in \Cref{sec: algorithm} to conduct attacks on black-box models. 
+\cite{zou2023universaltransferableadversarialattacks} demonstrates that aggregating losses from multiple target models enhances the transferability of the final prompt compared to relying on a single model. If we have surrogate models $\bbM_1, \dots, \bbM_r$, the aggregated loss function is $\frac{1}{r}\sum_{i=1}^{r} \calL_{\bbM_i}(\bfy_I, P)$, where each loss is calculated according to \Cref{eq: loss_target}. We run \Cref{alg:gww} with this loss to evaluate the attacking prompts, and to assign the scores in \Cref{eq: empirical}. We assess the effectiveness of using the aggregated loss as the surrogate for $r=3$ using the mentioned above models. 
+Details of our transfer method using $r$ models for surrogate loss estimation are presented in \Cref{alg:transfer}. 
+
+\begin{algorithm}[t!]
+\caption{Multi-Shot Transfer with Surrogate Losses}
+\label{alg:transfer}
+\begin{algorithmic}[1]
+\Require Algorithm 1, Surrogate losses \(\big[\calL_{\bbM_1}, \dots, \calL_{\bbM_r}\big]\), black-box \(\mathrm{Target}\), 
+         jailbreaking goal \(I\), \(\mathrm{Judge}\) model. 
+
+\State \(\text{Run Algorithm~1 with } \frac{1}{r}\sum_{i=1}^{r} \calL_{\bbM_i}(\bfy_I, P)\)
+\State \text{Collect the set of all attacking prompts: \calP}
+\State \(\mathcal{S} \;\gets\; \varnothing\)
+\For{each  \(P \in \calP \)}
+    \If{$\mathrm{Judge}(\bbT (P), I) = 1$}
+        \State \(\mathcal{S} \;\gets\; \mathcal{S} \cup \{P\}\)
+    \EndIf
+\EndFor
+
+\State \Return \(\mathcal{S}\)
+
+\end{algorithmic}
+\end{algorithm}
+% Unlike PAIR, our algorithm does not need the entire target's answer for later iterations. More specifically, it only needs a heuristic for performing a search in the prompt space. This is especially a key factor when it comes to target models such as OpenAI o1 and Gemini pro where the filter raises a same flag whenever a malicious behavior is identified, so passing this message back to attacker does not provide any signal.  Once again, we are assuming that an attacking prompt with a lower loss across several models, will be roughly more effective and other models.
+
+\Cref{table_transfer} presents the results of our experiments in comparing ``one-shot'' and ``multi-shot'' settings. 
+The multi-shot approach significantly improves the ASR across all tested models, with the exception of Cygnet \cite{zou2024improvingalignmentrobustnesscircuit}. 
+Cygnet, a variant of Llama-3-RR, incorporates a strict safety filter that blocked almost all of our attempts. 
+Indeed, the success rate of any other jailbreaking algorithm is near zero for Cygnet \cite{grayswan_single_turn_harmful_outputs}; therefore, our findings demonstrate a higher ASR compared to existing literature. 
+Notably, we achieve 94\% on Llama-3.1-405B (without Llama Guard) \cite{dubey2024llama3herdmodels}, 94\% on GPT4o \cite{openai_system_card_2024}, and 66\% on Gemini-1.5-pro. For models with stricter moderation mechanisms, such as OpenAI o1-preview and Claude-3.5-Sonnet, using the average loss boosts the ASR. For instance, \cite{openai_system_card_2024} reports an ASR of 16\% for the o1-preview model. Using our attack,  this increases to 56\%. Further details about the transfer experimental setup are provided in \Cref{app: experiment_set}. Also, \cref{table_vul} presents the vulnerabilities of different models across the six categories in Harmbench.
+
+\textbf{Is DeepSeek a safe model?}
+We evaluated our method on the recently released DeepSeek model \cite{deepseekai2025deepseekr1incentivizingreasoningcapability} using the aggregated surrogate loss. Our approach achieved 100\% ASR, indicating that DeepSeek failed to block a single adversarial reasoning attack. This outcome suggests that DeepSeek’s cost-efficient training methods may have compromised its safety mechanisms. Compared to other frontier models, it lacks robust guardrails, making it highly susceptible to algorithmic jailbreaking. Due to time and resource constraints, we did not evaluate other baselines on this model and, therefore, excluded DeepSeek from \Cref{table_transfer}.
+
+
+
+\begin{table*}[t!]
+    \centering
+    \resizebox{\textwidth}{!}{ % Automatically resize table to fit within text width
+    \begin{tabular}
+    {>{\centering\arraybackslash}m{3cm} 
+                    % >{\centering\arraybackslash}m{1.5cm} 
+                    >{\centering\arraybackslash}m{1.5cm} 
+                    >{\centering\arraybackslash}m{1.5cm}
+                    >{\centering\arraybackslash}m{1.5cm}
+                    >{\centering\arraybackslash}m{1.5cm}
+                    >{\centering\arraybackslash}m{1.5cm}
+                    >{\centering\arraybackslash}m{1.5cm}
+                    >{\centering\arraybackslash}m{1.5cm}
+                    >{\centering\arraybackslash}m{1.5cm}
+                    >{\centering\arraybackslash}m{1.5cm}}
+    \toprule
+    \multicolumn{3}{c}{} & \multicolumn{3}{c}{One-shot Transfer} & \multicolumn{4}{c}{Multi-shot Transfer} \\  % Top-level headers
+    \cmidrule(lr){4-6} \cmidrule(lr){7-10}  % Horizontal lines under the top-level headers
+    Target model & PAIR & TAP-T & Llama-2-7B & Llama-3-RR & Zephyr-R2D2 & Llama-2-7B & Llama-3-RR & Zephyr-R2D2 & Multi Model \\  % Sub-header row
+    \midrule
+    Claude-3.5-Sonnet & 20\% & 28\% & 4\% & 2\% & 2\% & 10\% & 18\% & 14\% & \textbf{36\%}\\
+    Gemini-1.5-pro & 46\% & 50\% & 12\% & 18\% & 12\% & 62\% & 54\% & \textbf{66\%} & 64\%\\
+    GPT-4o &  62\% & 88\% & 34\% & 28\% & 42\% & \textbf{94\%} & 78\% & 90\% & 86\%\\
+    o1-preview & 16\% & 20\% & 10\% & 14\% & 10\% & 6\% & 30\% & 24\% & \textbf{56\%} \\
+    Llama-3.1-405B & 92\% & 90\% & 50\% & 34\% & 56\% & \textbf{96\%} & 84\% &\textbf{96\%} & \textbf{96\%} \\
+    Cygnet-v0.2 & 0\% & 0\% & 0\% & 0\% & 0\% & 0\% & 2\% & 0\% & 2\%\\
+    % Deepseek-R1 & \textcolor{red}{TODO} & \textcolor{red}{TODO} & \textcolor{red}{TODO} & \textcolor{red}{TODO} & \textcolor{red}{TODO} & \textcolor{red}{TODO} & \textcolor{red}{TODO} \\
+    \bottomrule
+    \end{tabular}
+     }
+    \caption{ASR comparison across different target models for PAIR\c, TAP, one-shot and multi-shot transfers of Adversarial Reasoning. For one-shot and multi-shot transfers, the model at the top row is the surrogate models used. The use of the aggregated loss as the surrogate (labeled as Multi Model) especially improves our results for Claude and o1.}
+    \label{table_transfer}
+\end{table*}
+
+
+
+\subsection{Ablation studies}\label{sec: ablation}
+We investigate whether our method fulfills its objectives in (i) minimizing the loss function; and (ii) generating the feedback based on the ordered attacking prompts. Besides, we demonstrate that our method finds more jailbreaks in later iterations compared to previous work. 
+
+
+\paragraph{Effective loss minimization.} \label{sec: loss_figure}
+Our algorithm aims to optimize a loss function defined over a string. To assess its effectiveness, we can probe $\bbV(S)$ in \Cref{eq: empirical} over iterations. \Cref{loss_iter} illustrates this loss progression for Llama-2-7b, Llama-3-8b, Llama-3-8b-RR, and R2D2, with Mixtral as the attacker and averaged over 50 tasks. The results showcases a quantitative decrease in the  minimum loss for all target models until approximately the 10th iteration, after which the loss exhibits slight oscillations. Notably, for R2D2, the loss converges to zero despite the safety measures.
+% While the minimum loss shows no decline in in the last few iterations, \Cref{iter_dist_llama2_perc}, shows that $6.7\%$ of successful jailbreaks happens after iteration 10. We conjecture that the attacker enters an exploration mode, similar to PAIR, at a certain point and tries out ideas though not effective at reducing the loss. 
+As depicted in \Cref{loss_iter}, the loss curve for Llama-3-8b-RR shows a significant gap compared to what its fine-tuned from, Llama-3-8b, 
+% both in first attempt where the distribution of attacks are the same, and also in later iterations where feedbacks are tailored to the target model. 
+and despite this gap, our algorithm achieves $44\%$ of ASR. To investigate this, we have plotted the loss separately for successful and failed jailbreaking attempts in \Cref{loss_iter_conditional}. This figure shows that, on average, successful attempts start and end with lower loss values than failures. This demonstrates the utility of \Cref{eq: loss_target} as a heuristic; Although the absolute loss value may remain high, its relative value serves as an informative metric. Consequently, comparing the losses of multiple attacking prompts provides feedback that guides the algorithm toward more effective attempts. Unsurprisingly, the jailbreaks do not begin with their desired output string $\bfy_I$ for Llama-3-8b-RR. However, in \Cref{app: examples}, we show that there are other possibilities such as initially refusing followed by compliance. This helps us establish our work as an attack in the prompt space that rigorously optimizes a loss function, similar to algorithms in the token-space, but with significantly fewer number of iterations. In contrast, the number of iterations for the token-space algorithms can be as high as $10^4$ \cite{andriushchenko2024jailbreakingleadingsafetyalignedllms}. 
+
+
+\begin{figure}[t!]
+     \centering
+     \begin{subfigure}[b]{0.475\textwidth}
+         \centering
+         % Linewidth is the now the unit for half a page.
+         \includegraphics[width=1.0\linewidth]{figs/loss_iter_improved2.png}
+         % \caption{}
+         \label{loss_iter}
+     \end{subfigure}
+    \hspace{0.1in}
+     \begin{subfigure}[b]{0.475\textwidth}
+         \centering
+         % Linewidth is the now the unit for half a page.
+         \includegraphics[width=1.0\linewidth]{figs/loss_iter2.png}
+         % \vspace{-0.2in}
+         % \caption{}
+         \label{loss_iter_conditional}
+     \end{subfigure}
+     % \vspace{-0.1in}
+        \caption{\textbf{left:} We plot the objective of our optimization (\Cref{eq: empirical}) over iteration to demonstrate that the refinement process is effective. \textbf{right:} Shows that despite the high value of the loss, its relative value still provides a signal for identifying the successful attempts, and hance, a heuristic for our method.}
+    \label{losses_fig}
+    \vspace{-.2cm}
+\end{figure}
+
+\noindent \textbf{Feedback consistency.} We conduct an experiment to demonstrate how feedback shifts the attacker’s output distribution toward more effective attacking prompts. 
+We show that applying the feedback increases the generation probability of attacking prompts with lower losses in subsequent iterations. We consider a feedback $F$ as \textit{consistent} if the following constraint holds for it: 
+\begin{multline}\label{eq: feedback_condition}
+    \frac{\Prob_{\bbA} \big(P_a | \bbR(S, F)\big)}{\Prob_{\bbA}{\big(P_b | \bbR(S, F)\big)}} 
+    \geq 
+    \frac{\Prob_{\bbA}(P_a | S)}{\Prob_{\bbA}{(P_b | S)}} 
+    \text{ if} \ \ \calL_{\bbT}(\bfy_I, P_a) \leq \calL_{\bbT}(\bfy_I, P_b)  \text{ and} \ a, b \in \{1, \cdots, n\}
+\end{multline}
+Here, $\Prob_{\bbA}(P | S)$ denotes the probability of the attacker LLM generating prompt $P$ conditioned on the reasoning string $S$. I.e., $\Prob_{\bbA}(P|S) = \prod_{i = 1}^{l}  \Prob_{\bbA}\big(p_i|[S, p_{1:i-1}] \big)$ where $P = [p_1, \cdots, p_l]$. To evaluate this condition, we analyze the generation probabilities for a set of prompts before and after applying feedback to the reasoning string. When the attacker is Vicuna and the target is Llama-3-8B-RR, for 10 random tasks each with 10 iterations (totaling 100 function calls), we compute the difference in Cross-Entropy of the prompts conditioned on the original and updated reasoning strings: $ - \log\Big(\Prob_{\bbA} \big(P_a | \bbR (S, F)\big)\Big) + \log \Big(\Prob_{\bbA}(P_a | S)\Big)$. If $a$ denotes the ordered index, this function must be increasing with respect to $a$ in order to satisfy \Cref{eq: feedback_condition}. \Cref{prompt_probs} presents the average results across all calls for $n= 16$, showing that at each iteration, the curve roughly increases, with a slight decline in the last two prompts. This decline can be attributed to the "Lost in the Middle" effect, where models tend to focus more on the most recent text \cite{liu2023lostmiddlelanguagemodels}. Nonetheless, the value of the last two prompts do not fall below the value of the initial prompts, indicating that the generated feedback remains meaningful and not misleading. 
+In \Cref{app:add_exp}, We conduct two more experiments to shed more light on the functionality of Feedback LLM. As a sanity check, we demonstrate that the reversing the order of the given attacking prompts to the Feedback LLM leads to semantically reversed feedbacks, and a drop in the ASR due to moving in the wrong direction in the prompt-space. 
+
+
+\begin{figure}[t!]
+     \centering
+     \includegraphics[width=0.6\linewidth]{figs/prompt_probs_vicuna.png}
+     \caption{Lower values of the y-scale accounts to higher likelihood of generation in the next iteration. The figure shows an approximate increase (decrease in likelihood) for prompts with larger indexes (higher loss), which means Feedback LLM and Refiner LLM optimize the reasoning string appropriately.}
+     \label{prompt_probs}
+     \vspace{-0.15in}
+\end{figure}
+
+%Also, we analyze its impact on the success rate.
+
+\vspace{-.3cm}
+\paragraph{Distribution of jailbreaks.}\label{sec: dist}
+\begin{figure}[t!]
+     \hspace{-0.25in}
+     % \centering
+     \begin{subfigure}[b]{0.475\textwidth}
+         \centering
+         % Linewidth is the now the unit for half a page.
+         \includegraphics[width=1.18\linewidth]{figs/iter_dist_llama2_pair.png}
+         \caption{PAIR}
+         \label{iter_dist_llama2_pair}
+     \end{subfigure}
+    \hspace{0.14in}
+     \begin{subfigure}[b]{0.475\textwidth}
+         \centering
+         % Linewidth is the now the unit for half a page.
+         \includegraphics[width=1.18\linewidth]{figs/iter_dist_llama2_perc.png}
+         \caption{Adversarial Reasoning}
+         \label{iter_dist_llama2_perc}
+     \end{subfigure}
+     % \vspace{-.3cm}
+        \caption{\textbf{(a)} PAIR only achieves two more jailbreaks after iteration 3 as it doesn't receive any signals and only tries to circumvent the target's refusal. \textbf{(b)} Our algorithm improves later iterations' performance by utilizing the loss function.}
+     \label{iter_compare}
+     % \vspace{-.4cm}
+\end{figure}
+The standard version of PAIR runs for only 3 iterations. We increased this number to $T = 15$, matching it with our algorithm. Both algorithms use Mixtral to attack Llama-2-7B. \Cref{iter_dist_llama2_pair,iter_dist_llama2_perc} depict the number of tasks are jailbroken at each iteration for PAIR and our algorithm, respectively. PAIR achieved only two additional successful jailbreaks after the third iteration, accounting for 11\% of successful attempts. In contrast, our algorithm accomplished 37\% of jailbreaks after the third iteration, demonstrating a more effective utilization of iterations. Distributions of jailbreaks for other models are presented in \Cref{dists_white,dists_black}. As anticipated, a higher percentage of jailbreaks occur in later iterations for models with stricter safety measures that necessitate more extensive search; for instance, 57\% after the third iteration for Llama-3-8B-RR (\Cref{dist_llamaRR}).
+PAIR relies on the reasoning capabilities of the attacker LLM to modify subsequent attacking prompts. Therefore, after encountering a few refusals from the target model, PAIR tends to deviate from the original intent to avoid the refusals. A couple of examples of this phenomenon are presented in \Cref{app: examples}.
+
+%\section{Conclusion}
+%\textcolor{blue}{things to mention: grayswan, reasonning for defense (openai method), cite more papers on JB:L autodan, steinhardt, haghtalab, feizi\\
+%nice things about prompt-based methods in the intro: powerful blackbox, transferrable, etc\\
+%we need to cite and differentiate with multi-round jailbreaking pepers. Say the way we derive the jailbreaks is with fundamentally different approach. Our framework could potentially be apoted for be used for multi-round. \\
+%adversarial testx time compute; vision, diffusion
+\section{Acknowledgment}
+This work of HH and GP was supported by the NSF Institute for CORE Emerging Methods in Data Science (EnCORE). SM was supported by both EnCORE and RobustIntelligence. 
+The authors wish to thank Alexander Robey for helpful discussions.
+
+
+
+
+\section{Conclusion}
+The core problem we address in this paper is the role of reasoning in AI safety. While there have been recent efforts arguing that replacing reasoning with increased compute can lead to better defense mechanisms, these approaches contain a fundamental oversight. They fail to consider that attackers may also leverage reasoning to bypass guardrails. This paper defines adversarial reasoning, demonstrates a practical implementation, and provides state-of-the-art results on attack success rate.
+
+Our work points to new directions for understanding and improving language model security. 
+By bridging reasoning frameworks with adversarial attacks, we have demonstrated how structured exploration of the prompt space can reveal vulnerabilities even in heavily defended models. 
+This suggests that future work on model alignment may need to consider not just individual prompts but entire reasoning paths when developing robust defenses. 
+The success of our transfer attack methodology also highlights the importance of considering multiple surrogate models when evaluating model security. 
+Looking ahead, our findings point to several promising research directions, including developing more sophisticated reasoning-guided search strategies, exploring hybrid approaches that combine token-level and semantic-level optimization, and investigating how process-based rewards could be incorporated into defensive training. 
+ %We believe this work represents an important step toward better understanding the interplay between reasoning capabilities and security vulnerabilities in large language models.
+Finally, while our study has focused on textual LLMs, our framework can potentially be relevant to the broader class of LLM-driven agents \cite{andriushchenko2024agentharmbenchmarkmeasuringharmfulness}. In particular, our methods can be naturally extended to LLM-controlled robots \cite{liang2023codepolicieslanguagemodel,karamcheti2023languagedrivenrepresentationlearningrobotics,10500490}, web-based agents \cite{wu2024dissectingadversarialrobustnessmultimodal}, and AI-powered search engines \cite{reuel2024openproblemstechnicalai}. Recent work \cite{robey2024jailbreakingllmcontrolledrobots} underscores this connection by demonstrating that vulnerabilities identified in textual models can be transferred to real-world scenarios.
+
+
+% \textcolor{blue}{models and web agents  add citation and the right term. Will send you a paper from which you can find the right stuff.
+% you can cite multi-round syuff here; also robey's robotic paper, and a bunch of others like agentharm paper by maksym etc
+% copyright}
+
+
+
+
+
+\newpage
+
+\bibliography{bibliography}
+\bibliographystyle{alpha}
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% APPENDIX
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+\newpage
+\appendix
+\onecolumn
+\input{files_arxiv/setting}
+\input{files_arxiv/sys_prompts}
+\input{files_arxiv/examples}
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+\end{document}
+
+
+

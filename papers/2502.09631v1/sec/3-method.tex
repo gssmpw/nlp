@@ -1,0 +1,199 @@
+\section{Method}
+\subsection{Background: Neural Cellular Automata}
+NCA operates on a 2D grid of cells with size $H\times W$, and each cell stores its state information in a vector with $C$ channels. 
+The first 3 channels are interpreted as R, G, and B values, and the cell states are initialized with zero values. 
+At each time step, the cell state updates once. 
+$\mathbf{S}^t \in \mathbb{R}^{H\times W\times C}$ denotes the \textit{cell states} at time $t$ and $s^t_{ij} \in \mathbb{R}^C$ represents the state of the cell at position ($i, j$).  
+The \textit{update rule} is a trainable PDE that determines how $s^t_{ij}$ changes over time depending on the cell state and its spatial gradients and Laplacian. 
+All cells share the same local update rule which comprises \textit{two steps}. 
+First, each cell state convolves a set of filters over its surrounding cells to form a \textit{perception vector} containing neighborhood information. 
+Then, the perception vector is passed through two Fully Connected layers and a random binary mask to determine the new cell state.
+
+NCA is notable for its low number of trainable parameters, self-emerged motion over synthesized texture, and strong generalizability.  
+A trained NCA exhibits temporal coherence and provides a manifold of solutions aligned with the style image, which can be perceived as motion. 
+Its generalizability to unseen situations is given by the shared update rule. 
+We exploit the emerging motion to simulate visually plausible stylized fluid advection, and use its generalizability to stylize unseen density fields at inference. 
+
+
+\subsection{Volumetric NCA Representation} 
+\label{sec:vnca}
+We define the Volumetric NCA grids on a 3D voxel-based representation. 
+To avoid confusion, we refer to the voxels in VNCA as ``cell'', and the voxels in the input density field as ``voxels''. 
+Note that the time step $t$ in NCA updates is not one-to-one mapped to the frames of the input smoke simulation. 
+As detailed in \Cref{sec:motion}, we map $N$ steps of cell state update to two adjacent density frames for an approximated fluid motion at inference time.  
+
+Our VNCA model is applied to each density frame $d: \mathbb{R}^3 \rightarrow \mathbb{R}$ for color and density stylization, instead of predicting the next density frame. 
+We construct our VNCA through a voxelized cube of resolution $H\times W\times D$. 
+The cell state at time $t$ is thus denoted as $\mathbf{S}^t \in \mathbb{R}^{H\times W\times D \times C}$, with $s^t_{ijk} \in \mathbb{R}^C$ as a vector denoting the $C$-channel cell state at cell ($i$, $j$, $k$).
+The first 3 channels represent R, G, and B values for the corresponding voxel in the input density field, respectively, and the 4th channel represents $\Delta d$ as the amount of density to be applied to the corresponding voxel for stylization, detailed in \Cref{sec:dvr}.
+All channels are initialized with 0s.
+
+\subsection{Update Rule}
+\label{sec:update}
+VNCA's update rule defines a partial differential equation (PDE) over the cell states:
+\begin{equation}
+    \mathbf{S}^{t+\Delta t} = \mathbf{S}^t + \frac{\partial \mathbf{S}^t}{\partial t}\Delta t,
+\end{equation}
+We solve this PDE by discretizing the 3D space using a voxelized grid and applying the update rule with fixed-sized time steps. \Cref{fig:update} illustrates the update rule along with the VNCA cell state. 
+
+
+\medskip
+\noindent{\textbf{Perception vector.}}
+To perceive information from all neighborhood cells in the context of a 3D voxel, we apply 3D convolutions with a set of filters to the cell states to obtain the discretized gradient and Laplacian at the cell's location and form its perception vector. 
+The filters are the Sobel operators and the 27-point variant of the discrete Laplace operator according to ~\citet{o2006family} as filters. 
+Their weights are frozen during training. 
+The perception vector $z_{ijk} \in \mathbb{R}^{5C}$ for $s_{ijk}$ is given by the concatenation of the cell state, the discretized gradient and laplacian: 
+\begin{equation}
+    z_{ijk} = s_{ijk} \;\Vert \; (\partial_\text{x}\mathbf{S}|_{ijk}) \; \Vert \;(\partial_\text{y}\mathbf{S}|_{ijk})\; \Vert \;(\partial_\text{z}\mathbf{S}|_{ijk})\;\Vert \;(\triangledown^2\mathbf{S}|_{ijk}). 
+\end{equation}
+
+\medskip
+\noindent{\textbf{Encoding Priors.}}
+The perception vector is designed to update the cell states towards an aligned style and visually plausible motion. 
+Therefore, the perception vector should be aware of essential information about the stylized objective.
+We thus encode the 1. spatial location of each cell, 2. the distribution of the input smoke density field, and 3. the velocity provided by the input smoke data at the current location and time step as three priors to the perception vector, so cell updates take these priors into account. 
+
+Specifically, we apply a 3-dimensional \textbf{positional encoding}~\cite{pajouheshgar2023dynca}, a \textbf{density encoding}, and a \textbf{velocity encoding} as shown in \Cref{fig:update}. 
+Our positional encoding tensor has three channels and is defined as: 
+ $\mathcal{P}_{ijk} = \left[\frac{2i + 1}{H} - 1, \frac{2j + 1}{W} - 1, \frac{2k + 1}{D} -1 \right]. $
+Using positional encoding improves the stability and consistency of the synthesized motion.  
+For density encoding, we append the 1-channel input density field $\mathcal{D}$ of the current smoke frame in training to the end of the perception vector to allow VNCA to be aware of the structure of input density.
+Density encoding encourages style features that closely match the input reference, as opposed to a "perforated" appearance. 
+The velocity encoding $\mathcal{V}$ is meant to interpolate the update for the desired advected density field. 
+It provides spatial inductive bias to help VNCA better match the advection of the input sequence, and produce visually plausible motion. We provide ablation studies in \Cref{sec:abl}
+
+
+\medskip
+\noindent{\textbf{Stochastic Update.}}
+We pass the encoded perception vector through a two-layer Multi-Layer Perceptron (MLP) $f_\theta$ with a ReLU activation to determine the updated state of each cell. Similar to the original NCA model, each cell update follows a geometric process~\cite{geometric-process} independently from the other cells. 
+This asynchronous cell update is implemented by applying a randomized binary mask $\mathcal{M}^t$ to MLP output:
+\begin{equation}
+    \frac{\partial s_{ijk}}{\partial t} = \mathcal{M}^t(f_\theta(z_{ijk} \; \Vert \; \mathcal{P}_{ijk}\; \Vert\; \mathcal{D}_{ijk})). 
+\end{equation}
+Each voxel in the random binary mask $\mathcal{M}$ is a Bernoulli random variable with probability $p=0.5$.
+This asynchronous cell update scheme improves the robustness and stability of VNCA and allows stylizing longer frame sequences.
+
+
+\subsection{Training}
+\label{sec:opt}
+We represent the volumetric temporal texture through a trained VNCA. 
+This allows for real-time stylization that aligns with both the reference image and the motion of the input smoke sequence. 
+\Cref{fig:optim} shows the training pipeline. 
+
+
+\medskip
+\noindent{\textbf{Differentiable Volume Rendering.}} 
+\label{sec:dvr}
+We represent the smoke data under the Eulerian framework. 
+To make training more efficient, we implement a lightweight differentiable volume rendering algorithm that measures the radiance for each ray $\mathbf{r}$ transmitted through an inhomogeneous participating medium~\cite{fong2017production}. 
+The original method calculates transmittance $\tau$ and a grayscale pixel intensity $I_{ij}$ corresponding to occupancy by accumulating the densities along the ray through equidistant sampling:
+\begin{equation}
+    \tau(k, \mathbf{r}) = e^{-\gamma\sum_k^D d(\mathbf{r}, k)}, \quad I_{ij} = \sum_{k=0}^D d(i,j,k)\tau(k, \mathbf{r}_{ij}),
+\end{equation}
+where k is the index of the voxel into the density dimension; $\mathbf{r}_{ij}$ is a ray vector traced from pixel ($i$, $j$) in the image space to the normal direction of our orthographic camera; d($\cdot$) is the density value in the volume grid; $\gamma$ is the transmittance absorption constant, which describes the rate at which the volume absorbs light. 
+
+Our implementation is based on this algorithm and incorporates colorization into the volume with a NeRF-styled volume renderer from ~\citet{mildenhall2020nerf}. 
+We assume that voxel ($i$, $j$, $k$) not only contains a density value $d(i,j,k)$ but also emits radiance $c(i,j,k)$ whose RGB value is assigned by the first three channels of the VNCA cell states. 
+The fourth channel of the VNCA cell states $\Delta d(i,j,k)\in [-0.5, 0.5] $ stores the residual update on the input density. 
+The RGB color of the pixel $P_{ij}$ is therefore defined as:
+\begin{equation}
+    \tau(k, \mathbf{r}) = \exp{-\gamma\sum_k^D \max(d(\mathbf{r}, k)( 1 + \Delta d(\mathbf{r}, k)), 0)},
+\end{equation}
+\begin{equation}
+\label{eq:render}
+P_{ij} = \sum^D_{k=0} c(k)\max(d(\mathbf{r}_{ij},k)(1 + \Delta d(\mathbf{r}_{ij},k)), 0)\tau(k, \mathbf{r}_{ij}). 
+\end{equation}
+In practice, we choose $C = 12$ channels for the state of each VNCA cell. The remaining 8 channels are hidden channels that do not participate in the loss computation. 
+We empirically observe that including hidden channels in the cell state stabilizes the training and increases stylization quality.
+
+\begin{figure}
+  \centering
+  \includegraphics[width=1.03\linewidth]{img/optim.pdf}
+  \caption{\textbf{Training.} At training, we use a single input frame for the \textit{Density Encoding} shown in Fig. 2. At each epoch, we apply the VNCA update rule for $n$ steps and record the cell state before and after the update. We then render the smoke stylized with cell state, using Eq.7, before and after the VNCA updates to get $P_b$ and $P_f$. We use $P_f$ to match the style image and extract motion between $P_b$ and $P_f$ to align with the fluid motion. }
+  \label{fig:optim}
+\end{figure}
+
+
+\medskip
+\noindent{\textbf{Appearance Supervision.}} 
+After obtaining the rendered image of the stylized smoke $P_f$, we use a pre-trained VGG16 network~\cite{vgg16} to extract the style information using deep feature representations~\cite{gatys2016image}. 
+The local cell communication in the update rule of VNCA is shared by all cells and the rendered 2D image involves contribution from all cells. 
+Given this inductive bias, using only a single rendered view at each epoch is sufficient for training VNCA to a converged solution that matches the reference image from all views,  contributing to our faster training compared to the baseline methods. 
+Note that we change the camera viewpoint across training epochs. 
+
+Our appearance loss is based on the style loss proposed by \citet{kolkin2019style} and consists of style-matching and moment-matching terms. 
+We extract two sets of VGG16 feature maps $F^r$ and $F^\psi$ of size $C'\times H' \times W'$ from the rendered image and the target style image, respectively. $C'$ and $H' \times W'$ represent the number of channels and the spatial dimensions of the VGG16 feature maps respectively.
+These feature maps are then flattened along the spatial dimensions to obtain the feature sets $A^r$ and $A^\psi$.
+We measure the style distance $D_c$ between features through the minimum cost of transporting from one set to another using cosine distance:
+\begin{equation}
+d_{c}(x, y) = 1 - \frac{x \cdot y}{\norm{x}_2 \norm{y}_2},
+\end{equation}
+% \vspace{-0.4cm}
+\begin{equation}
+D_c(A^r, A^\psi) = \frac{1}{H' \times W'}\sum_i\min_j d_{c}(A^r_i, A^\psi_j).
+\end{equation}
+The subscript is the feature vector index in the feature set.
+
+To encourage density modifications in the stylized output, we render the stylized smoke in \textit{grayscale}. 
+We then extract deep feature maps $F_{\textup{gray}}^r$ and $F_{\textup{gray}}^\psi$ and feature sets $A_{\textup{gray}}^r$ and $A_{\textup{gray}}^\psi$ from the rendered image and the grayscale stylized image as described above, and similarly define a distance for density pattern matching.  
+
+Our final style-matching term $\mathcal{L}_\text{style}$ combines the style distance between the grayscale and colored images:
+\begin{equation}
+    \begin{aligned}
+        \overleftrightarrow{D_c} (X, Y) = \max(D_c(X, Y), D_c(Y, X)) \\
+        \mathcal{L}_\text{style} = \overleftrightarrow{D_c}(A^r, A^\psi)+ \overleftrightarrow{D_c}(A_{\textup{gray}}^r, {A}_{\textup{gray}}^\psi).
+    \end{aligned}
+\end{equation}
+
+We additionally include a moment-matching term $\mathcal{L}_\text{moment}$ to align the magnitudes between colored features $A^r$ and $A^\psi$, and between grayscale features $A_{\textup{gray}}^r$ and $A_{\textup{gray}}^\psi$:
+\begin{equation}
+    \begin{aligned}
+        D_k(X, Y) = \frac{1}{C'} \norm{\mu_{X} - \mu_{Y}}_1 +  \frac{1}{C'^2} \norm{\Sigma_{X} - \Sigma_{Y}}_1 \\
+        \mathcal{L}_\text{moment} = D_k(A^r, A^\psi) + D_k({A}_{\textup{gray}}^r, {A}_{\textup{gray}}^\psi). 
+    \end{aligned}
+\end{equation}
+where $\mu_{X}$ and $\Sigma_{X}$ denote the mean and covariance of the feature set $X$. 
+Our overall appearance loss is the sum of the style-matching and moment-matching terms:
+\begin{equation}
+     \mathcal{L}_\text{app} = \mathcal{L}_\text{style} + \mathcal{L}_\text{moment}.
+\end{equation}
+In our experiments, we use deep features at different scales and sum our appearance loss over 5 layers of VGG16.
+
+\begin{figure}
+  \centering
+  \includegraphics[width=0.9\linewidth]{img/comp.pdf}
+  \caption{\textbf{Qualitative Stylization Comparison with TNST and LNST.} VNCA synthesizes stylization that closely matches the reference image, with superior quality than TNST and LNST indicated by our user study.}
+  \label{fig:comp}
+\end{figure}
+
+
+
+\medskip
+\noindent{\textbf{Flow-guided Motion Supervision. }}
+\label{sec:motion}
+Instead of explicitly simulating transport, we supervise the emerged motion of the synthesized temporal texture with the input velocity field to align with the smoke movement.
+Since a pre-trained model for estimating 3D motion vectors does not exist, it is costly and unfeasible to directly compare the 3D smoke motion and our volumetric temporal texture. 
+
+We project the velocity field of input smoke data onto a 2D camera plane with camera pose $\Phi$ and denote the projection as $\mathcal{J}^\psi \in \mathbb{R}^{H\times W\times 2}$ to supervise the texture motion. 
+The motion of our temporal texture can be quantified by comparing the variation of rendered views in adjacent time frames with camera pose $\Phi$.
+Specifically, let $P_b$ and $P_f$ be two rendered images of the stylized density field with VNCA from $\Phi$ during training, with $P_b$ as the image rendered before a random $n$ update steps is applied to VNCA, and $P_f$ as the image after the updates. 
+We use a pre-trained optical flow prediction network $\mathcal{F}_\text{OF}$~\cite{tesfaldet2018two} to predict the perceived motion between $P_b$ and $P_f$ given by $\mathcal{J}^r = \mathcal{F}_\text{OF}(P_b, P_f)$ as 2D vector. 
+We align the directions of the target vector field and the predicted vector by computing the cosine distance given by$\mathcal{L}_{dir}$:
+\begin{equation}
+\mathcal{L}_\text{dir} = \frac{1}{H\cdot W} \sum_{i, j}d_c(\mathcal{J}^r _{ij}, \mathcal{J}^\psi _{ij}). 
+\end{equation}
+
+To obtain a texture motion that has roughly the same magnitude as the input vector field, we normalize the predicted vector field with the number of update steps $n$ between $P_b$ and $P_f$ and the $N$ update steps we use between each pair of adjacent rendered views:
+\begin{equation}
+\mathcal{L}_\text{mag} = \frac{1}{H\cdot W} \sum_{i, j}  \left | \frac{N}{n} \cdot  \norm{\mathcal{J}^r_{ij}} _2 -\norm{\mathcal{J}^\psi_{ij}}_2 \; \right |.
+\label{eq:norm_loss}
+\end{equation}
+
+The final motion supervision loss $\mathcal{L}_{motion}$ is given by:
+\begin{equation}
+\mathcal{L}_\text{motion} =  \max(0, \mathcal{L}_\text{dir} - 1) \cdot \lambda_\text{mag}\mathcal{L}_\text{mag} + \lambda_\text{dir} \mathcal{L}_\text{dir},
+\end{equation} 
+such that the training prioritizes direction alignment between the target and predicted motion over their magnitudes.
+
+At each epoch, we condition one density field to ensure that the optical flow network is not biased by the motion of the input density sequence. We rotate the camera position between epochs for multiview flow-guided supervision of texture motion. 
+For inference, we apply $N$ update steps on the cell states for a visible motion on each pair of adjacent density fields. 

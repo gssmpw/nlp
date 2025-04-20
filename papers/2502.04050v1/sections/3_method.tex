@@ -1,0 +1,140 @@
+
+\section{PartEdit: Fine-Grained Image Editing}
+\label{sec:method}
+
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=\textwidth, keepaspectratio]{fig/method.pdf}
+    \caption{ An overview of our proposed approach for fine-grained part editing. For an object part $p$, we collect a dataset of images $\mathcal{I}^p$ and their corresponding part annotation masks $\mathcal{Y}^p$. To optimize a textual token to localize this part, we initialize a random textual embedding $\hat{E}$ that initially generates random cross-attention maps. During optimization, we invert images in $\mathcal{I}^p$ and optimize the part token so that the cross-attention maps at different layers and timesteps match the part masks in $\mathcal{Y}^p$. After optimizing the token, it can be used during inference to produce a localization mask at each denoising step. These localization masks are used to perform feature bending between the \colorbox[RGB]{251,229,214}{source} and the \colorbox[RGB]{226,240,217}{edit} image trajectories. Note that we visualize three instances of SDXL \citep{podell2024sdxl} for illustration, but in practice, this is done with the same model in a batch of three.}
+    \label{fig:method}
+\end{figure*}
+
+
+A common approach for editing images in diffusion-based methods involves manipulating the cross-attention maps \citep{hertz2022prompt,parmar2023zero,epstein2023diffusion}. 
+If the cross-attention maps do not accurately capture the editing context, \eg, for editing object parts, these methods are likely to fail, as demonstrated in \Cref{fig:teaser}.
+An intuitive solution to this problem is expanding the knowledge of the pre-trained diffusion models to understand object parts.
+This can be accomplished by fine-tuning the model with additional data of image/text pairs where the text is detailed.
+However, this approach can be costly due to the extensive annotation required for fine-tuning the model, and there is no guarantee that the model will automatically learn to identify object parts effectively from text.
+
+An alternative approach is leveraging token optimization \citep{zhou2022learning} to learn new concepts through explicit supervision of cross-attention maps.
+This was proven successful in several applications \citep{hedlin2023keypoints,khani2024slime,marcos2024ovam} as it allows learning new concepts while keeping the model's weights frozen.
+We leverage token optimization to perform fine-grained image editing of various object parts.
+We focus on optimizing tokens that can produce reliable non-binary blending masks \emph{at each diffusion step} to localize the editing region.
+We supervise the optimization using either existing parts datasets such as PASCAL-Part \citep{pascalpart}, and PartImageNet \citep{he2022partimagenet} or a few user-annotated images.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\subsection{Learning Part Tokens} 
+Our training pipeline for object part tokens is illustrated in \Cref{fig:method}.
+Given an object part $p$, we collect a set of images $\mathcal{I}^p= \{ I_1^p, I_2^p, \dots I_N^p \}$ and their corresponding segmentation masks of the respective parts $ \mathcal{Y}^p= \{ Y_1^p, Y_2^p, \dots Y_N^p \}$.
+We start by encoding images in $\mathcal{I}^p$ into the latent space of a pre-trained conditional diffusion model using the VAE encoder and then add random Gaussian noise that corresponds to timestep $t_{start} \leq T$ in the diffusion process.
+Instead of conditioning the model on the embedding $E$ of a textual prompt as explained in 
+\Cref{sec:prel}, we initialize a random textual embedding  $\hat{E} \in \mathrm{R}^{2 \times 2048}$ instead.
+This embedding $\hat{E}$ has two trainable tokens, where the first is optimized for the part of interest, and the second is for everything else in the image.
+Initially, this embedding will produce random cross-attention maps at different UNet blocks and timesteps.
+
+To train a token for part $p$, we optimize the first token in $\hat{E}$ to produce cross-attention maps $\hat{A}_{i,t}^p$ that corresponds to the part segmentation masks in $\mathcal{Y}^p$ at different denoising steps $t$ and UNet blocks $i$. 
+We employ the Binary Cross-Entropy (BCE) as a training loss for this purpose.
+For image $I_j^p \in \mathcal{I}^p$, a loss is computed as: 
+\begin{equation}
+    \mathcal{L}_j^p = \sum_{t} \sum_{i \in L}  Y_j^p \log(\hat{A}_{i,t}^p) + (1 - Y_j^p) \log(1 - \hat{A}_{i,t}^p) 
+\end{equation}
+where $t \in [t_{start}, t_{end}]$ are the diffusion timesteps that we include in the loss computation, and $L$ is the set of UNet layers.
+The loss is averaged over all pixels in ${L}_j^p$ and then over all images in $\mathcal{I}^p$.
+Note that the groundtruth segmentation masks $Y_j^p$ are resized to the respective size of the attention maps for loss computation.
+After optimizing the tokens, they are stored with the model as textual embeddings and are referred to as \texttt{<part-name>}.
+During denoising, these optimized tokens would produce a localization map for where the part is located in the image within the cross-attention modules.
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+\subsection{Choosing Timesteps and UNet Blocks to Optimize}
+Ideally, we would like to optimize over all timesteps and UNet layers.
+However, this is computationally and memory-expensive due to the large dimensionality of intermediate features in diffusion models, especially SDXL \citep{podell2024sdxl} that we employ.
+Therefore, we need to select a subset of layers and timesteps to achieve a good balance between localization accuracy and efficiency.
+
+To determine the optimal values for $t_{start}, t_{end}$, we analyze the reconstructions of noise-free predictions $\hat{x}_0$ as per \Cref{eq:ddim} to observe the progression of image generation across different timesteps.
+\Cref{fig:ts} shows that when optimizing over early timesteps $t_{start}=50, t_{end}=40$, the noise level is high, making it difficult to identify different parts.
+For intermediate timesteps, $t_{start}=30, t_{end}=20$, most of the structure of the image is present, and optimizing on these timesteps leads to good localization for big parts (\eg the head) across most timesteps during inference.
+Moreover, the localization of small parts, such as the eyes, becomes more accurate the closer the denoising gets towards $t=0$.
+Finally, optimizing on late timesteps, $t_{start}=10, t_{end}=0$, provides reasonable localization for big parts at intermediate timesteps but does not generalize well to early ones.
+Based on these observations,  we choose to optimize on intermediate timesteps for localizing larger parts due to their consistent performance during inference time across all timesteps. 
+For smaller parts, both intermediate and late timesteps offer satisfactory localization.
+
+Regarding the selection of layers $L$ for optimization, we initially include all UNet blocks during training and subsequently evaluate each block's performance using the mean Intersection over Union (mIoU) metric. 
+Our analysis reveals that the first eight blocks of the decoder are sufficient to achieve robust results, making them suitable for scenarios with limited computational resources. 
+Further details are provided in the \Cref{sec:choice_unet_layers}.
+
+After learning the part tokens, the diffusion model can now understand and localize parts through our optimized tokens.
+Next, we explain how we use them to perform fine-grained part edits.
+We start by describing our approach for the synthetic image setup where the diffusion trajectory is known; then, we explain how to perform real image editing.
+
+\begin{figure*}
+    \centering
+    % \includegraphics[width=\columnwidth]{fig/token_timesteps.pdf}
+    \includegraphics[width=\textwidth]{fig/token_timesteps.pdf}
+    \caption{The impact of the choice of which timesteps to include in the token optimization process. Intermediate timesteps achieve reasonable localization for both big and small parts.}
+    \label{fig:ts}
+\end{figure*}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\subsection{Part Editing} \label{sec:edit} 
+Given a source image $I^s$ that was generated with a source prompt $\mathcal{P}^s$, it is desired to edit this image according to the editing prompt $\mathcal{P}^e$ to produce the edited image $I^e$.
+To perform part edits, the editing prompt shall include one of the optimized part tokens that we refer to as \texttt{<part-name>}.
+As an example, a source prompt can be ``A closeup of a man'', and the editing prompt can be ``A closeup of a man with a robotic \texttt{<head>}'', where \texttt{<head>} is a part token.
+To apply the edit, we perform the denoising in three parallel paths (see \Cref{fig:method}).
+The first path is the source path, which includes the trajectory of the original image that originates from a synthetic image or an inverted trajectory of a real image.
+The second path incorporates the part tokens that we optimized, and it provides the part localization masks. 
+The final path is the edit path that is influenced by the two other paths to produce the final edited image.
+Since $\hat{E}$ has 2 tokens compared to 77 tokens in the source and the edit paths, we pad $\hat{E}$ with the background token to match the size of the other two embeddings.
+In the \Cref{sec:padding_strategy}, we provide more details on the choice of padding strategy.
+
+For each timestep $t$ and layer $i$, we compute the cross-attention map $\hat{A}_{t}^{i}$ for the embedding $\hat{E}$ to obtain attention maps highlighting the part $p$.
+For timesteps $t<T$, the attention maps from the previous step $t-1$ are aggregated across all layers in $L$ to obtain a blending mask $M_t$ as follows:
+\begin{equation}
+    M_t = \sum_{i \in L} \texttt{RESIZE}(\hat{A}_{t-1}^{i}) \ .
+\end{equation}
+The mask $M_t$ is min-max normalized in the range $[0,1]$.
+To perform a satisfactory edit, it is desired to edit only the part that is specified by the editing prompt, preserve the rest of the image, and seamlessly integrate the edit into the image.
+Therefore, we propose an adaptive thresholding strategy that fulfills this criterion given the aggregated mask $M_t$:
+\begin{equation}\label{eq:thresh}
+    \begin{aligned}        
+        \mathcal{T}(X) & = \begin{cases}
+                            1 & \text{if } X\geq \omega \\
+                            x & \text{if } k/2 \leq X < \omega \\
+                            0,              & X < k/2 \\
+                            \end{cases} , \ \\
+        & k =  \texttt{OTSU}(X) \ . \\
+    \end{aligned}
+\end{equation}
+where $\texttt{OTSU}$ is the OTSU thresholding \citep{otsu1975threshold}, $\omega$ is a tunable tolerance for the transition between the edited parts and the original object.
+We find that $\omega=3k/2$ achieves the best visual quality, and we fix it for all experiments.
+This criterion ensures suppressing the background noise and a smooth transition between the edited part and the rest of the object.
+Finally, we employ $M_t$ to blend the features between the source and the editing paths as:
+\begin{equation}\label{eq:feat_blend}
+    \hat{F}_{i,t}^e = \mathcal{T}(M_t) \ \hat{F}_{i,t}^e + (1-\mathcal{T}(M_t)) \ \hat{F}_{i,t}^s
+\end{equation}
+where $\hat{F}_{i,t}^s$ and $\hat{F}_{i,t}^e$ are the image features after attention layers for the source and the edited image, respectively.
+We apply this blending for timesteps in the range $[1,t_{e}]$ where $t_{e} \leq T$ and the choice of $t_{e}$ controls the locality of the edit.
+More specifically, a higher $t_{e}$ indicates higher preservation of the unedited regions, while a lower $t_{e}$ gives the model some freedom to add relevant edits in the unedited regions.
+We provide more details in \Cref{sec:abl}.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Real Image Editing}\label{sec:real}
+Our approach can also perform part edits on real images by incorporating a real image inversion method, \eg, Ledits++ \citep{brack2024ledits} or EF-DDPM \citep{huberman2024edit}.
+In this setting, the role of the inversion method is to estimate the diffusion trajectory $x_0 \dots x_T$ for a given real image.
+This estimated trajectory is then used as the source path in \Cref{fig:method}.
+To obtain the source prompt $\mathcal{P}^s$ of the real images, we use the image captioning approach, BLIP2 \citep{li2023blip}, which is commonly used for this purpose.
+Finally, the edit is applied where the localization and editing paths are similar to the synthetic setting.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\subsection{Discussion}
+Our approach is a text-based editing approach eliminating the need for the user-provided masks to perform fine-grained edits.
+Despite the fact that the token optimization process requires annotated masks for training, it can already produce satisfactory localization based on a single annotated image (see the \Cref{sec:map_localization}). %Appendix).
+Moreover, the localization masks produced by the tokens are non-binary, leading to a seamless blending of edits, unlike user-provided masks, which are typically binary.
+
+Another aspect is that our approach can be used in the context of image generation in case of complicated concepts that are difficult for diffusion models to comprehend from regular prompts.
+Examples of this scenario were shown in \Cref{fig:cattn}, where a direct generation process failed to generate the requested concepts.
+In that case, and with the help of the optimized part tokens, the user can specify different attributes for different parts of the object in the image.

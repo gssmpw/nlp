@@ -1,0 +1,246 @@
+\section{Bayesian Optimization for Query Plans}
+\label{sec:technique}
+
+Given our goal to perform offline optimization of queries while minimizing the cost of executing extra queries against the database, and given that we do not know how to efficiently explore the space of possible query plans, Bayesian optimization is a promising approach. Bayesian optimization (BO) enables optimization of expensive-to-evaluate, black-box functions while requiring relatively few evaluations of the expensive function. However, Bayesian optimization techniques operate over continuous, real-valued domains, whereas query plans are discrete tree structures.
+
+Prior work on Latent Space Bayesian Optimization (LSBO)
+% on drug discovery \cite{lolbo} 
+has allowed Bayesian optimization to be applied over other discrete, combinatorial spaces by using a deep autoencoder model (DAE) to transform a discrete, structured search space $\mathcal{X}$ into a continuous, numerical one $\mathcal{Z}$ \cite{Weighted_Retraining,ladder,gomez2018automatic,Huawei,eissman2018bayesian,kajino2019molecular, lolbo}.
+For example, \citet{lolbo} applied LSBO to problems in drug discovery using a DAE trained on string representations of molecules. 
+% has applied BO in the latent space of a deep autoencoder model (DAE) trained on string representations of molecules. 
+Inspired by this work, we define a string encoding format for query plans that can represent all possible query plans and in which each string decodes unambiguously to a particular query plan (\Cref{sec:string-format}). We train a variational autoencoder (VAE) on strings of this format using plans derived from a traditional query optimizer (\Cref{sec:technique-vae}). We perform BO in the latent space of this VAE (\Cref{sec:bo-background}), making novel contributions in the selection of timeouts (\Cref{sec:censored_observations}). Finally, we discuss different strategies for initializing the local BO process, as the quality of initialization points impacts BO performance (\Cref{sec:initialization_strategies}).
+
+\subsection{Query Plan String Format}
+\label{sec:string-format}
+Our first step towards optimizing query plans with Bayesian optimization is to build a string language for query plans that we encode and decode into a vector space. We first explain the desired properties of this string language. Then, we explain the string language we designed to have these properties. While we believe our string languages makes some good tradeoffs, in theory any string language with the desired properties could be equally effective.
+
+\sparagraph{Desiderata for string representations.} We identify two important attributes of our string language from prior work on molecular optimization. Maus et al.~\cite{lolbo} identify two essential properties that are key to success of a string language for Bayesian optimization (in the case of~\cite{lolbo}, the string language is called SELFIES \cite{selfies} and describes molecules). We translate those design constraints from the domain of~\cite{lolbo} to query optimization, and adopt these properties as requirements for our query plan language:
+\begin{enumerate}[leftmargin=*]
+    \item \textbf{Completeness.} Any valid query plan in $X$ must be representable as a string using the language. If this is not true, high-quality plans that are not representable will not be discoverable by our optimization algorithm.
+    \item \textbf{Decoding validity.} Any sequence of characters in the language must correspond to a unique and valid query plan. If latent codes of the DAE decode to invalid query plans, optimization would need to be done under additional feasibility constraints, which adds unnecessary complexity to the optimization problem. Validity was a primary goal of the models in both \citet{JTVAE} and \citet{maus2022local}.
+\end{enumerate}
+
+\edit{The ideal string representation would also be \emph{injective}, meaning that each unique string maps to a unique plan~\cite{geom_card_est}. We were unable to find a string representation with all three of these properties, so we settle for a complete representation with decoding validity that is not injective (the same plan might be represented by multiple strings). Taking this tradeoff is motivated by prior work: Maus et al.~\cite{bayes_latent} showed that a string representation with only completeness and decoding validity (SELFIES~\cite{selfies}) outperformed an injective representation with completeness (SMILES~\cite{weininger_smiles}). We leave the investigation of alternative string representations to future work.}
+
+\sparagraph{String language for query plans} We design an encoding format for binary-tree-structured query plan defining join orders and operators (henceforth, a ``join tree''). \edit{The join tree does not encode other aspects of the query such as selections, join and filter predictes, and aggregations. When the join tree is decoded to executable SQL, we translate the join tree to a hint string and prepend it to the original SQL text which contains these aspects of the query.} We observe that a join tree can be unambiguously reconstructed by knowing for each non-leaf node the left and right subtree that compose it, and that valid trees have left and right subtrees that are disjoint; we simply need an unambiguous way to identify these subtrees.
+
+In our encoding format, each join subtree is expressed as a 3 symbol sequence (left, right, operator). Each physical join operator ($h$ash, $m$erge, $n$ested loops) is given a unique symbol. The fully specified query plan is simply the concatenation of these sequences.
+
+The leaves of a join tree are always the tables being joined, so we define a unique symbol for each base table in the schema. However, we cannot define symbols for each possible join subtree, as doing so would be tantamount to defining a unique symbol for every possible query plan. Instead, we observe that after a table symbol is used once to specify a join subtree, it will never be used again, as any table will only ever appear as a leaf once. The same is true for each join subtree after it is specified to be the child of some larger subtree. As such, to the right of a particular join subtree sequence, the symbols composing the join instead refer to the larger subtree.
+
+\edit{For multiple occurrences of the same table under different aliases within the same query, we rename such aliases to be numbered (e.g. \texttt{movies1}, \texttt{movies2}, ...), and we define a unique symbol in our language per table-number pair. This does require choosing a maximum number of possible aliases of a single table; in our experiments we select the maximum occurrences of a particular table within the benchmark queries.}
+
+The leftmost occurrence of a table symbol in a plan string always references the base table itself, but subsequent occurrences represent the largest subtree that the table is part of. For example, in a join between three tables $A$, $B$, and $C$, $(A \bowtie_\text{hash} (B \bowtie_\text{merge} C))$, the valid encoding strings are $(B, C, \bowtie_\text{m}, A, B, \bowtie_\text{h})$ and $(B, C, \bowtie_\text{m}, A, C, \bowtie_\text{h})$.
+
+To fulfill our second requirement, decoding validity, we use a simple trick. We maintain state about the partially-specified join tree as we decode the string from left to right. If the decoder encounters a symbol that is not syntactically valid (e.g. a table in place of a join operator) or semantically valid (e.g. a table that is not part of the join), it deterministically resolves it to a symbol that is valid by constructing a list of all valid symbols and using the invalid symbol's integer value as an index into the list.
+
+\edit{We note that the choice of replacement symbol is arbitrary, but this scheme for ensuring decoding validity is preferable to more obvious ideas such as simply refusing and resampling when encountering invalid strings or decoding them to some default plan. Bayesian optimization will be performed over a vector space that decodes to potential plan strings. Rejecting strings would prevent the surrogate model learning about vast regions of the plan space. Decoding all invalid strings to some default plan would make vast regions of the space undifferentiated in performance. Our technique ensures that all strings decode to valid plans, that similar invalid strings are mapped to somewhat different valid query plans, and that these decodings are a valid function of the input string.}
+
+\edit{
+\sparagraph{Limitations} Our language does not represent subqueries and CTEs. When processing queries that contain such structures, they are left untouched, so the decoded query plan hint will not contain any reference to them or to tables only occurring within them.
+}
+
+
+
+
+
+
+\subsection{Encoding \& Decoding Query Plans} \label{sec:technique-vae}
+While BO can be applied to various search spaces, it is most straightforward in a continuous, real-valued domain. This presents a challenge when optimizing query plans, which are inherently discrete tree structures. To address this, we construct a mapping between query plans and points in a continuous domain. Having defined our string representation in \Cref{sec:string-format}, we train a deep autoencoder (DAE) model on these encoded strings. This process generates a \emph{latent space} – a continuous, real-valued domain that serves as a proxy for the discrete space of query plans, enabling application of BO techniques. Intuitively, the goal of the DAE is to construct a latent space in which similar query plans are mapped to similar vectors. This way, a search routine that finds a particularly good plan can look at the ``neighbors'' of that plan in the latent space for similar plans. The notions of ``similar'' and ``neighbors'' are both highly approximate: no actual neighborhoods or similarity scores are computed, but instead this property is \emph{implicitly} created when training the DAE.
+
+A DAE consists of an encoder $\Phi: X \to Z$ that maps from an input space $X$ to a latent space $Z$ (sometimes called a bottleneck~\cite{bottleneck}, as it is often lower dimensional than $X$ in order to force a degree of compression) and a decoder $\Gamma : Z \to X$ that maps from the latent space back to the input space. We use a type of DAE known as a variational autoencoder (VAE)~\cite{KingmaW13}, in which the encoder produces a distribution over latent points $\Phi(Z | X)$, and the decoder produces a distribution over $X$ given $Z$, $\Gamma(X | Z)$. The model is trained by maximizing the evidence lower bound (ELBO):
+$$
+\mathbb{E}_{\Phi(Z | X)}[\log \Gamma(X | Z) - \text{KL}(\Phi(Z | X) || p(Z) ]
+$$
+
+In training such a DAE, we construct a mapping $\Gamma : Z \to X$ that can produce string-encoded query plans given points in the latent space. The VAE regularization (the KL term, representing relative entropy) makes the search space smooth, facilitating more effective optimization. This is precisely what we need in order to perform BO: the surrogate model is defined over the latent space, and we evaluate the black-box function $f$ for points in the latent space by decoding the point to a string query plan through the DAE and executing them against the real database.
+
+\sparagraph{Training data} In order to train the DAE, we compute a large set of encoded query plans ($\sim$1 million) from the database schema. Importantly, this process does not require any query execution, and can be done exclusively with only metadata from the DBMS. The idea is to create a suitably diverse set of ``reasonable'' query plans so that the DAE can learn a smooth probability distribution of the space of query plans. By ``reasonable'' here, we do not mean that these plans must all be optimal, just that they must be somewhat representative of the \emph{family} of optimal query plans---\edit{the purpose of this is to create a space of plans in which points that are close to each other have similar performance characteristics. However, the space still contains points for \emph{all possible} query plans.}
+% that is, we hope that the optimal plan for any query is somewhat similar to at least one of the plans we generate as training data for the DAE.
+
+% To generate this set of plans, we first create a set of random join queries by assembling a graph $G_{R} = (V, E)$ representing PK-FK relationships in the schema (the ``reference graph''). For a schema containing a set of tables
+% $T = \left \{ t_1, t_2, ..., t_n \right \}$
+% with each table $t_i$ having attributes
+% $C^i = \left \{ c^i_1, c^i_2, ... c^i_m \right \}$
+% including PK-FK relationships between foreign keys $c^i_f$ and primary keys $c^j_p$ denoted by
+% $\text{Ref} \left( c^i_f, c^j_p \right )$,
+% \begin{gather*}
+%     V = T \\
+%     E = \left \{ (t_i, t_j) \mid t_i, t_j \in T \wedge \exists c^i_f \in C^i, c^j_p \in C^j : \text{Ref}(c^i_f, c^j_p) \right \}
+% \end{gather*}
+
+% We then expand this graph to include up to $k$ aliases with copies of tables. For a set of aliases
+% $K = \left \{ 1, 2, ... k \right \}$
+% the ``alias-$k$ reference graph'' $G^k_R = (V^k, E^k)$,
+% \begin{gather*}
+%     V^k = \left \{ t^a_i \mid t_i \in V \wedge a \in K \right \} \\
+%     E^k = \left \{ (t^a_i, t^b_j) \mid (t_i, t_j) \in E \wedge a, b \in K \right \}
+% \end{gather*}
+\edit{To generate this set of plans, we sample random PK-FK equijoin queries from the schema by constructing the ``alias-$k$ reference graph'' which contains $k$ nodes corresponding to each table and edges corresponding to all PK-FK references between tables. We choose $k$ equal to the highest number of aliases of the same table used in any query in the workload. From this alias-$k$ reference graph, we sample queries by selecting random connected subgraphs with varying numbers of vertices. Given a particular subgraph, we produce a query joining all table aliases with join predicates corresponding to all present edges.}
+% From $G^k_R$, we sample queries within the schema by selecting random connected subgraphs of varying numbers of vertices. Given a particular subgraph $G^{k\prime}_R = (V^{k\prime}, E^{k\prime})$ we produce the query joining all table aliases in $V^{k\prime}$ with join predicates corresponding to all references in $E^{k\prime}$
+
+For each sampled query, we plan the query using the existing default query optimizer (e.g. PostgreSQL), encode the plan in our string encoding format, and add it to the VAE training set. In order to expand the diversity of plans used to train the VAE, we additionally produce encoded plans using hints~\cite{url-pg_hints} to the default query optimizer (e.g. disable nested loops, disable sequential scans).
+
+Our training data generation process makes two key design choices: (1) sampling random queries from the database schema, and (2) generating query plans with the database's default optimizer. The first decision ensures that we have coverage for a wide variety of input queries. Our goal is to train the DAE once per schema, and then reuse the DAE for every query over the schema. The second decision ensures that the query plans we get are somewhat reasonable. For example, the underlying database optimizer is unlikely to pick a plan full of cross joins, and is likely to take advantage of index structures if applicable.
+
+
+\subsection{Background on Bayesian Optimization} \label{sec:bo-background}
+Given a query plan language and a trained DAE to translate query plan strings into vectors in a latent space (and back), we can now optimize queries inside of the latent space using Bayesian optimization (BO). Intuitively, BO in our application works by learning the relationship between the DAE's latent space and actual query plan latency. BO learns this relationship by repeatedly testing points sampled from the latent space. If the BO algorithm can get a good estimation of the relationship between the latent space and query latency, then good plans can be found. This section gives important background on the BO technique we use in this paper. Then, in Section~\ref{sec:censored_observations}, we explain some of the small changes we made to traditional algorithms to address query optimization specifically.
+
+% Bayesian optimization \cite{distill_bayesopt} is a method for optimizing black-box functions. For some multidimensional space of inputs $X$ and black-box evaluation function $f$, BO finds some $x \in X$ that minimizes $f(x)$. BO is typically deployed when $f$ is expensive to evaluate (e.g., $f$ requires executing a physical plan against a DBMS and measuring its runtime). Because of this constraint, BO techniques, unlike reinforcement learning techniques, are designed to be  \emph{sample-efficient}, requiring few evaluations of $f$.
+
+% BO works by iteratively refining a \emph{surrogate model} of $f$: it
+% \begin{enumerate*}
+%     \item initializes the surrogate model with some prior distribution,
+%     \item uses an \emph{acquisition function} to select points in the input space $x \in X$,
+%     \item evaluates $f(x)$ and
+%     \item updates the surrogate model with the point $(x, f(x))$
+% \end{enumerate*}
+
+% BO assumes that the true unknown function $f$ exhibits locality: observing a particular point $(x, f(x))$ suggests that points nearby $x' \approx x$ will have similar values of $f(x') \approx f(x)$. More evidence further refines the surrogate model, making it a better estimate of $f$. In our setting, $x$ is some representation of a query plan, and the unknown function $f$ returns the execution latency of that plan. %Evidence is obtained by actually executing the query plan represented by $x$ against a database.
+
+% In order to efficiently find good values $x$ that minimize $f(x)$, BO must balance exploration (finding out more about relatively unknown regions of $X$) with exploitation (focusing on promising regions of $X$ already known to have the lowest values seen for $f(x)$). Selecting points to sample is the role of the \emph{acquisition function.} Our approach utilizes \emph{Thompson sampling}~\cite{thompson} as its acquisition function.
+
+% \factcheck{Is everything from beginning of subsection to here correct?}
+\sparagraph{Bayesian Optimization} This section provides a brief overview of Bayesian Optimization (BO). For readers unfamiliar with BO, we recommend the comprehensive book by \citet{garnett_bayesoptbook_2023}. Our methodology builds upon the approach developed by \citet{eriksson2019scalable}, \edit{with specific novel modifications tailored for optimizing query plans and execution latency in a DBMS.}
+
+Bayesian Optimization is a method for optimizing black-box functions that are expensive to evaluate, aiming for \emph{sample efficiency}. Given an input space $\mathcal{X}$ and an unknown objective function $f: \mathcal{X} \rightarrow \mathbb{R}$, BO seeks to find an input $x^* \in \mathcal{X}$ that minimizes $f(x)$ in as few evaluations of $f$ as possible. This is particularly useful when each evaluation of $f(x)$ is costly---for example, when $f(x)$ involves executing a query plan in a DBMS to measure its runtime.
+
+BO operates by constructing a probabilistic surrogate model of the objective function, which is iteratively refined as new data is acquired. The general optimization procedure follows these steps:
+
+\begin{enumerate}[leftmargin=*]
+\item \textbf{Initialization}: Build a surrogate model of the objective function $f$.
+\item \textbf{Acquisition Function Optimization}: Use an acquisition function to select the next point $x_{\text{next}}$ to evaluate, balancing exploration and exploitation.
+\item \textbf{Evaluation}: Compute the true function value $f(x_{\text{next}})$ by executing the query plan corresponding to $x_{\text{next}}$.
+\item \textbf{Model Update}: Update the surrogate model with the new observation $(x_{\text{next}}, f(x_{\text{next}}))$, and repeat steps 2--4.
+\end{enumerate}
+
+To efficiently navigate the search space, BO leverages the surrogate model along with the acquisition function to select promising candidate plans while minimizing the number of expensive evaluations. In this work, we use \emph{Thompson Sampling}~\cite{thompson} as the acquisition function.
+
+\sparagraph{Local BO} Standard BO methods can struggle with high-dimensional or discrete optimization problems, such as those encountered in query plan optimization, due to the curse of dimensionality and the combinatorial explosion of the search space. To address this, we incorporate methods from the local BO literature, specifically \emph{TuRBO}~\cite{eriksson2019scalable}. TuRBO maintains a hyper-rectangular ``trust region'' within the input space, which constrains the region from which points are sampled. By dynamically adjusting the size and location of these trust region based on the the optimization success / failure, TuRBO can balance global exploration with local exploitation, allowing for efficient optimization in high-dimensional spaces. \footnote{\edit{Though called ``local BO'', this is a \emph{global} optimization process that can produce results significantly different from the initialization points. Local BO methods are the most competitive methods in high-dimensional spaces, as established in Eriksson et al. ~\cite{eriksson2019scalable}.}}
+
+\sparagraph{Right-Censored Observations}
+During typical Bayesian optimization, when we make an observation at a point $\bx$, we obtain an associated objective value $f(\bx) = y$. 
+For a right-censored observation, when we observe at the point $\bx$, we instead only learn that $y$ was greater than some threshold $\tau$. In our application, right-censored observations represent query timeouts: If a query $\bx$ is observed to execute for $\tau$ seconds before timing out, then we know that the true latency of $q$ is \emph{at least} $\tau$: $f(\bx) \geq \tau$. 
+
+%Conventional BO techniques assume that evaluations of $f$ correspond to the true value of the observation with additive noise. 
+In the query optimization setting, using right-censored observations is particularly important. Obtaining true values for arbitrary plans in the space of possible plans can be infeasible, as bad plans may take days or even weeks. Thus, it is more efficient if we can \emph{time out} plans that perform poorly and update the surrogate model with knowledge that the running time of $x$ is ``at least as bad as $y$''. Intuitively, for regions of $X$ that contain truly awful  plans, for the purposes of finding optimal plans, it is not necessary to know exactly how bad a particular plan is---it suffices to know that plans like it should be avoided. 
+
+BO in the presence of censored observations was first explored by Hutter et al. ~\cite{DBLP:journals/corr/HutterHL13}, where an EM-like algorithm was used to impute the value of censored responses.
+%They applied this to algorithm configuration, and terminated runs longer than a constant factor longer than the best running time observed so far.
+They applied this method to algorithm configuration, terminating any runs that exceeded a constant factor of the shortest running time observed so far. Building on this, Eggensperger et al. ~\cite{eggensperger2020neural} trained a neural network surrogate on a likelihood based on the Tobit model to directly model right-censored observations:
+%
+\begin{equation}
+\begin{aligned}
+\label{eq: tobit}
+p(\mathbf{y}|\mathbf{f}) &= \phi(\mathbf{z})^{1-\mathbf{I}}(1-\Phi(\mathbf{z}))^\mathbf{I} \\
+\mathbf{z} &= \frac{\mathbf{f}-\mathbf{\mu}}{\mathbf{\sigma}^2}\\ 
+I&= \begin{cases}
+       0, & \text{if } \mathbf{y} \text{ is uncensored} \\
+       1, & \text{if } \mathbf{y} \text{ is censored}
+    \end{cases}
+\end{aligned}
+\end{equation}
+%
+
+\noindent where $\phi$ and $\Phi$ denote the Gaussian density and cumulative density function respectively. In~\cite{eggensperger2020neural}, timeout thresholds were chosen as a fixed percentile of existing observations.
+
+\sparagraph{Approximate Gaussian Processes}  
+Because the space of query plans is large, we anticipate needing to test a large number of query plans. As a result, we must select a surrogate model that (1) allows for \emph{probabilistic inference}, that is, gives a probability distribution at each point instead of a simple point estimate, and (2) can scale to a large number of observations. Thus, we select an \emph{approximate} Gaussian Process (GP) model.
+
+Approximate GP models, such as the popular Scalable Variational Gaussian Process (SVGP)~\cite{svgp}, use inducing point methods in combination with variational inference to allow approximate GP inference on large data sets~\cite{hensman2013gaussian,titsias2009variational}. The standard evidence lower bound (ELBO) on the log-likelihood used to train a SVGP model is the following:
+% 
+\begin{align}
+\label{eq: svgp}
+\log p(\by) & \geq  \mathbb{E}_{q(\bfn)}[\log p(\by \mid \bfn)] - \textrm{KL}(q(\bu)\,||\,p(\bu)) 
+\end{align}
+%
+% Because of the large number of total query plans we will execute over the course of optimization and the need for approximate inference due to the non-Gaussian likelihood \autoref{eq: tobit}, we adapt SVGP \citep{svgp} models to this purpose.
+
+
+
+\subsubsection{Bayesian Optimization with Censored Observations} \label{sec:censored_observations}
+
+While previous work on Bayesian optimization with censored observations (censored BO) did not use approximate SVGP~\cite{svgp} models, \edit{we contribute a straightforward extension} of SVGP~\cite{svgp} models to the censored BO setting. 
+Starting from \Cref{eq: svgp} and using the Tobit likelihood given in~\Cref{eq: tobit}, we derive the new ELBO:
+%
+\begin{equation*}
+\centering
+% Im just doing this so it fits for now
+\begin{aligned}
+& \log p(\by) \geq  \mathbb{E}_{q(\bfn)}[\log p(\by \mid \bfn)] - \textrm{KL}(q(\bu)\,||\,p(\bu)) \\
+			& = \mathbb{E}_{q(\bfn)}[\log \phi(\mathbf{Z})^{1-\mathbf{I}}(1-\Phi(\mathbf{Z}))^\mathbf{I}] - \textrm{KL}(q(\bu)\,||\,p(\bu)) \\
+			& = \mathbb{E}_{q(\bfn)}[\log \phi(\mathbf{Z})^{1-\mathbf{I}} + \log(1-\Phi(\mathbf{Z}))^\mathbf{I}] - \textrm{KL}(q(\bu)\,||\,p(\bu)) \\
+            & = \mathbb{E}_{q(\bfn)}[\log \phi(\mathbf{Z_u})] + \mathbb{E}_{q(\bfn)}[\log(1-\Phi(\mathbf{Z_c}))] - \textrm{KL}(q(\bu)\,||\,p(\bu)) 
+\end{aligned}
+\end{equation*}
+%
+Here, $\mathbf{Z}_{u}$ correspond to $\frac{\mathbf{f} - \mu}{\sigma^2}$ values for uncensored observations, and $\mathbf{Z}_{c}$ correspond to censored observations. The first term
+%, $\mathbb{E}_{q(\bfn)}[\log \phi(\mathbf{Z_u})]$, 
+can be computed analytically as in standard SVGP models. The second term, $\mathbb{E}_{q(\bfn)}[\log(1-\Phi(\mathbf{Z_c}))]$, can be computed using one dimensional numerical techniques like Gauss-Hermite quadrature.  
+
+During optimization, we select a threshold $\tau$ for each executed query plan $\bx$, and cut off execution once the running time exceeds $\tau$. This results in right-censored observations. 
+Selecting the timeout for any given observation is crucial: selecting too low of a timeout deprives BO of important knowledge about the space of plans, whereas selecting too high of a timeout wastes time executing bad plans. Previous work in BO uses a constant multiplier over the best observation seen so far~\cite{hutter2013_bocensored}, or a fixed percentile across all observations~\cite{eggensperger2020_censored}. Balsa~\cite{balsa} also uses a fixed multiplier  in order to bound the impact of executing bad plans. 
+\edit{We use an uncertainty-based method for selecting timeouts that, compared to prior work, ensures that the surrogate model will be sufficiently confident that a particular point is suboptimal before timing out.}
+
+% We cannot just treat the timeout as true values. Example: $P_1$ would've taken an hour, but times out after 5m. $P_2$ would've taken 30 minutes, but times out after 5m. $P_2$ is twice as good as $P_1$, but they look "the same" to the BO algo. Tricks like multipling the timeout by some constant require adhoc tuning (like balsa).
+
+Before evaluating a new candidate query plan $x_t$ during step $t$ of optimization, we dynamically set a new timeout threshold $\tau_t$. 
+We select thresholds so that, after conditioning on the right-censored observation $(\bx_{t}, \tau_{t})$, we are \textit{confident} that the best query plan observed so far, $\bx^{*}_{t}$, is still a better design than the candidate plan $\bx_{t}$. 
+Because we do not want to waste additional running time evaluating $f(\bx_{t})$, we ideally want the \textit{smallest} such $\tau_{t}$. 
+
+\paragraph{Selecting $\tau_{t}$.} The above discussion leads to the following optimization problem, where we find the smallest threshold $\tau$ so that our incumbent is confidently better than $\bx_{t}$ \textit{after conditioning on $(\bx_{t}, \tau)$}:
+%
+\begin{align*}
+    \tau_{t}^{*} &= \argmin \tau \\
+    & \textrm{s.t.}\;\; y^{*}_{t} \leq \mu'_{t}(\tau) - \kappa \sigma'_{t}(\tau)
+\end{align*}
+%
+
+
+On \edit{its} surface, this optimization problem is challenging, as evaluating our constraint for a given $\tau$ involves updating the Gaussian process surrogate model with that value $\tau$ as the observed timeout. This is similar to other acquisition functions in the Bayesian optimization literature that use fantasization to do lookahead, e.g., knowledge gradient~\cite{frazier2009knowledge}.
+
+Because we use variational GPs, there are several inexpensive strategies that we can use to evaluate the constraint. For example, \citet{maddox2021conditioning} recently proposed an efficient routine for online updating sparse variational GPs, both with conjugate and non-conjugate likelihoods. Alternatively, a few additional iterations of SGD can be used to update the model in a less sophisticated way.
+
+Finally, we note that the value of $\mu'_{t}(\tau) - \kappa \sigma'_{t}(\tau)$ should generally be monotonic in $\tau$---fantasizing that $\bx_{t}$ cut off with a larger threshold should strictly increase the gap between our belief about $y_{t}$ and $y^{*}_{t}$. Therefore, given a routine to cheaply evaluate the constraint, the constrained minimization problem over $\tau$ can be solved e.g. with binary search.
+
+
+\subsection{Initialization Strategies} \label{sec:initialization_strategies}
+The initial step of BO for a given query typically involves selecting points within the latent space using the acquisition function. As the surrogate is initialized with a random prior, this amounts to selecting random points within the latent space. Theoretically, given sufficient time for BO execution, this approach would yield optimal results. However, to improve the practicality of BO within high dimensional spaces, it is helpful to initialize the process with a small number of precomputed $(x, f(x))$ pairs representing high-quality plans. We explore multiple methods of generating these initialization points.
+
+% \jeff{cut? goes against story about information/time tradeoff} A common theme across all of these initialization techniques is that in the interest of saving computation time, not all proposed plans are executed to completion. Since our system can accommodate censored observations, as described in the previous section, execution of any particular plan is cut off at the runtime of the best plan seen so far. As the runtime of the best found plan improves, these strategies search through subsequent proposed plans more quickly as the timeout is lower.
+
+% Regardless of the strategy we use to generate initial data points (plans), we execute the plans proposed by these strategies serially, seeking to minimize the total computation time spent. For faster wall clock time, it is possible to execute proposed plans in parallel batches, but computing the latency of the initialization points is usually not a significant computational cost (we verify this experimentally in Section~\ref{sec:eval}).
+
+\sparagraph{Hinted plans (Bao)} We can leverage an existing traditional query optimizer that accepts hints, such as PostgreSQL, to generate the initialization points. We exhaust all of the combinations of join and scan hints (as in the hint sets used by Marcus et al.'s Bao~\cite{bao} optimizer) to produce 49 initialization points for each query. These 49 initialization points are \emph{guaranteed} to contain the best plan that could have possibly been chosen by Bao. We note that it is not important \emph{which} of the queries in the initialization set is optimal, merely that the initialization set contains some queries that represent a promising starting point for optimization. Thus, it is not necessary to ``prune'' hint sets from Bao, as is recommended in~\cite{bao}.
+
+\sparagraph{The default optimizer plan} A simpler strategy would be to generate a single optimization point by using the DBMS' underlying optimizer. This approach has the advantage of simplicity, since the underlying DBMS almost surely has an optimizer. Unfortunately, we found that this approach does not work well in practice, mostly because initializing BO with a single initialization point seems to be suboptimal~\cite{lolbo}.
+
+\sparagraph{LLM} Inspired by previous work demonstrating the effectiveness of large language models (LLMs) in optimizing program runtimes \cite{pie}, we explore the use of fine-tuned LLMs for generating initialization points. We collected trajectories from 606 \sysname runs, selecting the top-1 and top-5 query plans for each query to construct a fine-tuning dataset. Using this dataset, we fine-tuned GPT4o-mini for one epoch. For each new query, we use the fine-tuned model to sample 50 initialization points. This approach leverages the model's ability to learn patterns from previous optimization runs, potentially producing high-quality plans that outperform those generated by traditional query optimizers. Our evaluation (\cref{sec:eval-llm}) demonstrates that this LLM-based strategy can often produce the best query plan among all initialization strategies considered here.
+
+\sparagraph{Extensibility} \sysname simply admits sets of initialization pairs $(x, f(x))$, so any strategy can be used to generate these pairs. As such, our approach can incorporate future improvements in traditional or learned query optimization techniques.
+
+% tradeoffs around size of initialization set (bigger = more budget spent on executing the initial set, smaller = not enough information)
+
+\subsection{Random plans} \label{sec:random}
+Though not related to BO, we implement random plan search, which can be thought of as a completely exploration-based algorithm. The intuition behind this method is that joins are commutative but that cross-joins are generally bad for performance. This strategy samples random plans from the space of all plans that do not contain any cross joins.
+
+% Given a particular query over a set of table aliases $T'$, we can construct the alias-$k$ reference graph $G_Q = (V_Q, E_Q)$ containing only the table aliases referenced in the query:
+
+% \begin{gather*}
+%     V_Q = T' \\
+%     E_Q = \left \{ (t_1, t_2) \mid  t_1, t_2 \in T'; (t_1, t_2) \in E^k \right \}
+% \end{gather*}
+
+\edit{Given a particular query over a set of table aliases, we construct the subgraph of the schema's alias-$k$ reference graph containing only the table aliases referenced in the query.}
+From this query graph, we can construct a random join tree by constructing a spanning tree. Whenever an edge is added to the spanning tree, we add the join between the two newly connected components to the join tree. Physical join operators are selected uniformly randomly.
+
+One potential benefit of utilizing this strategy is that its viability implies that it may be possible to perform offline optimization in the absence of a traditional query optimizer. As we show in \Cref{sec:eval}, this strategy can be used on its own to perform offline optimization.
+
+
+
+
+
+
+
+

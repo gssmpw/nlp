@@ -1,0 +1,242 @@
+\section{\methodname~}
+%~\hangliang {thinking about a name of the algorithm}
+%\dacheng{TODO: Draw a method figure for multi-step illusratation.}
+
+%\dacheng{For simplicity, 
+%1. main diagonal is the biggest
+%2. locality: to prove there is variant @HL.
+%3. For simplicity, key frame selection and whether key frame attend all is not important. 
+%} \hangliang{updated. @DL 2. locality is not very clear. need some explanation.}
+%\dacheng{3.0: Deep Dive on statistics in Attention Tile; add 2 more small exps.}
+\methodname~is a framework that takes in a 3D full attention DiT model $T$, and outputs a DiT that runs efficiently during inference $T_{\text{Fast}}$. \methodname~consists of three stages. The first stage (\S\ref{sec:method_cm}) performs a multi-step consistency distillation and outputs $T_{\text{MCM}}$, following the method developed in image diffusion models~\citep{xie2024mlcm}. The second stage (\S\ref{sec:method_layerwise}) takes in $T_{\text{MCM}}$, performs a one-time search to decide the optimal sparse attention mask for each layer, and outputs a model $T_{\text{Sparse}}$ with the optimal sparse attention mask. The last step(\S\ref{sec:method_distill}) performs a knowledge distillation to preserve the model performance, using $T_{\text{MCM}}$ as the teacher and $T_{\text{Sparse}}$ as the student, following the distillation design in~\citep{gu2024minillm, jiao2019tinybert}. 
+
+In this section, we first introduce the characteristics of~\patternname~that motivate the design of the sparse patterns in Section~\ref{sec:char}. Then, we will introduce the framework~\methodname~by stages.
+
+% Our distillation process consists of two main steps. First, we use Consistent Model (CM) to shorten the diffusion steps from a sampling perspective without altering the model. Then, we employ attention distillation to enable sparse attention modules within the model.
+
+\subsection{Preliminary: Characteristics of~\patternname~}
+\label{sec:char}
+In~\S\ref{sec:intro}, we briefly describe that the attention map consists of repetitive tile blocks. In this section, we dive into three characteristics that lead to our design and usage of a family of sparse attention masks.
+%There are three characteristics that lead to our design on the sparse pattern class in use.
+
+%\begin{wrapfigure}{r}{0.35\textwidth}
+
+%\vspace{-5mm}
+%\end{wrapfigure}
+\textbf{Large Diagonals} Tile blocks on the main diagonals has higher attention scores than off-diagonal ones. In Figure~\ref{fig:main_combined}(b), we plot the attention scores at the main diagonal tile blocks, compared to attention scores at the off-diagonal blocks, on Open-Sora-Plan-1.2 model~\citep{pku_yuan_lab_and_tuzhan_ai_etc_2024_10948109}. We find that on average the main diagonal blocks contain values $2.80\times$ higher than the off-diagonal ones. This suggests a separate treatment of tile blocks on and off the main diagonals.
+
+
+\textbf{Locality} Off-diagonal tile blocks are similar, but the similarity decreases with further distance. In Figure~\ref{fig:main_combined}(c), we plot the relative differences between the first latent frame and subsequent latent frames. We find that the differences increase monotonically. This indicates a need to retain the computation of several tile blocks (i.e. more than one) to accommodate information in distant tile blocks.
+%means that we need to increase the number of attention scores when we increase the number of frames. 
+% For simplicity, we compute all the attention scores for the key frames, since it already achieves a linear complexity with respect to the number of frames.
+
+\textbf{Data Independent} The structure of the tile is relatively stable across different inputs. We plot the overlap of indices for largest attention scores for different prompts. We observe that roughly 90\% of them coincide. This suggests reusing a fixed set of attention masks during inference for different inputs. 
+% We find that the attention mask is relatively stable across different inputs (Figure~\ref{fig:data_indepdendent}). This means that we can simply design a fixed pattern, without needing to search adaptively given the input data in inference time.
+
+Motivated by the above characteristics, we develop a family of sparse attention masks where we keep the attention computation in the main diagonal and the attention with a constant number of global reference latent frames. Figure~\ref{fig:our_attention_pattern} visualizes one instance of the attention mask. The formulation will be introduce formally in $\S~\ref{sec:method_layerwise}$.
+
+\begin{figure}[t]
+%\vspace{-5mm}
+\centering
+\includegraphics[width=0.3\textwidth]{figures/Our_pattern.pdf}
+\caption{Exemplar attention mask ($2:6$). It maintains the attention in the main diagonals and against 2 global reference latent frames. Tile blocks in white are not computed.}%Visualization of our attention (k=2). It consists of (1) Main diagonal: to address the large diagonal pattern, and (2) Key frames, to address the locality pattern.}
+%\vspace{-12mm}
+\label{fig:our_attention_pattern}
+\end{figure}
+
+%\subsection{Video Consistent Model}
+\subsection{Stage 1: Multi-Step Consistency Distillation}
+\label{sec:method_cm}
+% \dacheng{Multi-step, single-step comparison.}
+% To reduce the distill cost and learning curves for CM, 
+We follow~\citep{xie2024mlcm} to perform a multi-step latent consistency distillation(MLCD) procedure to obtain $T_{\text{MCM}}$ as classic CM map from an arbitrary ODE trajectory state to the endpoint. MLCD generalize CM by dividing the entire ODE trajectory in latent space into $S$ segments and carrying out consistency distillation for each segment independently which reduce the difficulty for training dramatically. MLCD obtains a set of milestone states marked as $\{t^s_{\text{step}}\}^S_{s=0}$. The loss for MLCD is:
+
+%\[
+%\mathcal{L}_{\text{MLCD}} = \left\lVert \text{DDIM}\left( z_{t_m}, f_{\theta}(z_{t_m}, t_m), t_m, t^s_{\text{step}} \right) - \text{nograd}\left( \text{DDIM}\left( z_{t_n}, f_{\theta}(z_{t_n}, t_n), t_n, t^s_{\text{step}} \right) \right) \right\rVert_2^2
+%\]
+
+\vspace{-5mm}
+\begin{equation}
+\begin{aligned}
+\mathcal{L}_{\text{MLCD}} = \biggl\lVert 
+  &\text{DDIM}\bigl( z_{t_m}, f_{\theta}(z_{t_m}, t_m), t_m, t^s_{\text{step}} \bigr) \\
+  - \text{nograd}\Bigl( &\text{DDIM}\bigl( z_{t_n}, f_{\theta}(z_{t_n}, t_n), t_n, t^s_{\text{step}} \bigr) \Bigr) 
+\biggr\rVert_2^2
+\end{aligned}
+\end{equation}
+\vspace{-5mm}
+
+where $s$ is uniformly sampled from $\{0, \dots, S\}$, $t_m$ is uniformly sampled from $[t^s_{\text{step}}, t^{s+1}_{\text{step}}]$, $t_n$ is uniformly sampled from $[t^s_{\text{step}}, t_m]$, $\text{DDIM}(z_{t_m}, f_{\theta}(z_{t_m}, t_m), t_m, t^s_{\text{step}})$ means one-step DDIM transformation from state $z_{t_m}$ at timestep $t_m$ to timestep $t^s_{\text{step}}$ with the estimated denoised image $f_{\theta}(z_{t_m}, t_m)$ and $\text{nograd}$ refers to one-step diffusion without guidance scale. 
+%\dacheng{@RL: (1) Loss, written in math, see the original MCM paper for reference, do not copy their equation directly. (2) Describe the multi-step procedure, and use a hyper-parameter s to denote it.}
+%\textbf{Extending CM to Video:} We follow the method described in the CM paper and expand CM from image to video through engineering modifications. Our training function is defined as ..., and our loss function is designed as .... Since CM requires hyperparameter tuning, our CM model is trained in two stages. We found that adding further stages did not lead to improved results. More insights and details about the training parameters can be found in the Appendix.
+
+%~\hangliang{@runlong: add details}
+
+\subsection{Stage 2: Layer-wise Search for optimal Sparse attention mask}
+% \subsection{Attention Distillation}
+\label{sec:method_layerwise}
+%\begin{wrapfigure}{r}{0.35\textwidth}
+
+\textbf{Sparse Attention Masks} Following our analysis in~\S\ref{sec:char}, a desired sparse attention mask should separately treat on and off diagonal tile blocks, leverages the repetitive pattern in off-diagonal tile blocks while considering locality. In this paper, we aim on a family of masks that achieve linear compute complexity while prioritizing simplicity and implementation efficiency. Specifically, we simply keep tile blocks in the main diagonals(marked as golden color in Figure~\ref{fig:our_attention_pattern}). For off-diagonal tile blocks, we keep a constant number of $k$ latent frames, and only retain attention between against these ``global reference frames" (mark as blue color in Figure~\ref{fig:our_attention_pattern}).
+%the attention map can be broken down into main-diagonal and off-diagonal ones.
+%We thus
+%Since the blocks in the main diagonal are significantly larger, we simply keep these blocks as it is (marked as golden color in Figure~\ref{fig:our_attention_pattern}). 
+%To capture off-diagonals, since they have smaller values and similar contents, we keep a constant number $k$ of blocks as "global-reference frame" that compute attention with every other frames (mark as blue color in Figure~\ref{fig:our_attention_pattern}). 
+Since $k$ is constant, the overall complexity of the attention is linear with respect to the number of latent frames. For simplicity, we choose these $k$ reference frames uniformly from all $F$ latent frames. For clarity, we denote a mask with two numbers - $k: F-k$. For example, the example figure~\ref{fig:our_attention_pattern} shows an attention mask of $2:6$.
+
+\begin{algorithm}[t]
+\caption{Searching for the optimal set of sparse attention masks}%Adaptive Searching Pattern (Layerwise with Timesteps Sampling)} 
+\label{alg:search}
+\begin{algorithmic}[1] 
+
+\Require Available mask list from dense to sparse [$\text{Mask}_1, \text{Mask}_2, ..., \text{Mask}_n$], teacher model $M_T$, student model $M$, loss function $\mathcal{L}$, number of timestep samples $m$.
+\Require Forward function \texttt{FORWARD}, threshold $r$, which is the maximum tolerance for $\mathcal{L}$.
+\Require 
+\For{each layer $l$ in model layers}
+    \State Initialize $\text{best\_mask} \gets \text{None}$ 
+    \For{$i$ from $1$ to $n$} \textcolor{blue}{\Comment{%Iterate over masks 
+    From dense to sparse}}
+        \State Apply $\text{Mask}_i$ to the current layer $M^{(l)}$
+        \State Initialize $\mathcal{L}_i^{\max} \gets -\infty$ \textcolor{blue}{
+        %\Comment{Initialize max loss for this mask}
+        }
+        \For{each timestep $t$ sampled $m$ times from $\text{Uniform}(0, 1)$}
+            \State $\hat{y} \gets$ \texttt{FORWARD}($M_{T}^{(l)}$, $\text{Mask}_i$, $t$)
+            \State Compute $\mathcal{L}_i(t) \gets \mathcal{L}(y, \hat{y})$
+            \State Update $\mathcal{L}_i^{\max} \gets \max(\mathcal{L}_i^{\max}, \mathcal{L}_i(t))$ \textcolor{blue}{
+            %\Comment{Update the maximum loss}
+            }
+        \EndFor
+        \If{$\mathcal{L}_i^{\max} < r$} 
+            \State $\text{best\_mask} \gets \text{Mask}_i$ \textcolor{blue}{
+            \Comment{Update the best mask within threshold}
+            }
+        \Else 
+            \State \textbf{break}
+        \EndIf
+    \EndFor
+    \State Assign $\text{best\_mask}$ to the current layer $M^{(l)}$
+    
+\EndFor
+\end{algorithmic} 
+\end{algorithm}
+
+
+% In full 3D attention, frames either attends to itself or other frames. The phenomenon~\patternname~implies that there exists a great redundancy in the latter part. Thus, we design a class of attention mask, where frames only attend to itself or $k$ other frames. Since the $k$ is a constant, the attention computation has linear complexity to the sequence length.
+
+%\dacheng{TODO: Draw a small wrap figure, abstract the ratio out to show what the mask looks like.} \hangliang{@Dacheng show differrent pattern 1d1, 1d2, 1d3, 1d5, 1d7 in appendix (like .drawio).}
+
+%We propose a new attention sparse pattern called the Key-Diff pattern, as shown in Figure \texttt{fig:key\_diff}. After processing through 3D-VAE, we treat the first frame of several consecutive frames in the attention map as \textbf{key frame}, while the following frames are treated as \textbf{diff frames}. Our main idea is that within a key-diff pair, full attention is performed, as key frames and diff frames within the pair need to communicate information. However, outside of the key-diff pairs, attention is performed only between different key frames, ignoring the diff frames. We believe this approach is complete and possesses the ability to generate videos.
+
+\begin{comment}
+\begin{figure}[htbp]
+    \centering
+    % Diagonal subplot
+    \begin{subfigure}[t]{0.32\textwidth}
+        \centering
+        \includegraphics[width=\linewidth]{figures/average_diagonal.pdf}
+        \caption{Average attention weights along the diagonal blocks.}
+        \label{fig:diagonal}
+    \end{subfigure}
+    \hfill
+    % Locality subplot
+    \begin{subfigure}[t]{0.32\textwidth}
+        \centering
+        \includegraphics[width=\linewidth]{figures/average_locality_layer.pdf}
+        \caption{Average differences between attention weights based on distance $|i - j|$.}
+        \label{fig:locality}
+    \end{subfigure}
+    % Data indepdendent subplot
+    \begin{subfigure}[t]{0.32\textwidth}
+        \centering
+        \includegraphics[width=\linewidth]{figures/average_locality_layer.pdf}
+        \caption{Average differences between xxx}
+        \label{fig:data_indepdendent}
+    \end{subfigure}
+
+    \caption{Comparison of attention weights: (a) Diagonal blocks and (b) Locality differences, (c) data} % ~\hangliang{change color. Done.}
+    \label{fig:attention_comparison}
+\end{figure}
+\end{comment}
+
+%\begin{figure}[t]
+%\centering
+%\includegraphics[width=\textwidth]{figures/average_diagonal.pdf}
+%\caption{\small It presents the average attention weights for diagonal and other blocks across layers. The values were computed from the attention weight matrix, highlighting ...}
+%\label{fig:exp_layerwise}
+%\end{figure}
+
+\begin{figure}[ht]
+\centering
+\includegraphics[width=0.46\textwidth]{figures/layerwise_plot/29x_greedy_reverse.pdf}
+\caption{\small %Additional results can be found in Appendix, which illustrates different sparsity selection strategies by enumerating various thresholds.
+Search results for Open-Sora-Plan v1.2 model (29 frames). We verify that different layers have different sparsity in 3D video DiTs.}
+%We find that each layer has different sparsity ratio. Darker colors indicate the use of denser masks. Once a threshold is fixed, a specific sparsity mask strategy can be determined.}
+\label{fig:exp_layerwise}
+\vspace{-3mm}
+%\end{wrapfigure}
+\end{figure}
+\textbf{Layer-wise Searching For Attention Masks} Previous studies has suggested that different layers exhibit different amount of sparsity~\citep{wang2023cuttlefish, ge2023model, yang2024pyramidinfer}. Using the MSE difference of the final hidden states %$\text{MSE}(X_{\text{teacher}}, X_{\text{student}})$ 
+as a guidance, %where $X$ is the final output of diffusion process
+we develop a searching method to find the best combinations of attention masks across layers (Algorithm \ref{alg:search}). Intuitively, we first perform a profiling process on $T_{MCM}$. %In each step of the profiling, it changes one layer of $T_{CM}$ to another $k$, and calculate the output difference of the final DiT layer between the full model. If the difference is beyond a pre-defined threshold $r$, we disregard this $k$. Otherwise
+%Before training, each layer undergoes a profiling process. 
+The profiling step loops over layers, and greedily selects the largest $k$ %for the current layer. We set this $k$ as the maximal value, 
+which does not incur a higher MSE difference than a predefined threshold $r$.
+%output difference between it and $T_{MCM}$ does not exceed a predefined threshold $r$. 
+A dynamic programming based alternative is also described in Appendix \ref{appendix:search}, where given a runtime constraint, the minimum possible maximum loss difference is computed. In the experiment section (~\S~\ref{sec:exp}), we show evidence that this is a key to maintaining video quality. For simplicity, we apply the greedy version of the search throughout the main paper. Fig.~\ref{fig:exp_layerwise} shows an exemplar algorithm output.
+
+
+%During our experiments in Figure \ref{fig:exp_layerwise}, we find that different layer has different sparse level and each layer may benefit from a different $k$.
+%The challenge lies in selecting the sparsity of the attention map. There is a trade-off: as the attention map becomes sparser (i.e., more diff frames are followed by a single key), the quality of the generated video degrades. 
+%We believe there is varying sparsity between different layers, as shown in Figure xxx. Therefore, we need to adaptively adjust the sparsity according to each layer. 
+%Thus, we develop a profiling-based search algorithm to search for the optimal $k$ for each layer. The algorithm is adapted from a search algorithm based on LLMs~\dacheng{cite} and detailed in Algorithm \ref{alg:search}. Intuitively, we first perform a profiling process on $T_{CM}$. %In each step of the profiling, it changes one layer of $T_{CM}$ to another $k$, and calculate the output difference of the final DiT layer between the full model. If the difference is beyond a pre-defined threshold $r$, we disregard this $k$. Otherwise
+%Before training, each layer undergoes a profiling process. 
+%The profiling step loops over the layers, where each step greedily select the best $k$ for the current layer. This $k$ is set to be the maximal value, whose output difference between it and $T_{CM}$ does not exceed a predefined threshold $r$. A dynamic programming profiling process is also described in Appendix C, where given a runtime constraint, the minimum possible maximum loss difference is computed. ~\hangliang{@Dacheng:combined this 2 paragraph}
+
+%\textbf{Layerwise sparsity selection}: We observe that different layers exhibit varying sensitivity to sparsity as shown in Figure \cref{fig:exp_layerwise}. For the Open-Sora-Plan 29x720p CM model, the top layers typically have a larger loss, indicating that they are more sensitive to adjustments in sparsity. Therefore, a fixed sparsity ratio is unlikely to be optimal, as it may fail to eliminate redundancy in the bottom layers or compromise final accuracy due to excessive compression of model weights. \methodname~considers selecting different thresholds to achieve varied profile results for different layers; for the Open-Sora-Plan 29x720p CM model, the mask profile results are shown in Figure \cref{fig:exp_layerwise}. ~\hangliang{@Dacheng:combined this 2 paragraph}
+%In each profiling step, we alter the $k$ for only the current layer while the other layers use the full model. 
+%For each sparse mask, we calculate the difference between the output of the final layer and the actual output, uniformly sampling timesteps and finding the maximum difference. A threshold is predefined, and our greedy approach seeks the sparsest pattern that does not exceed the given threshold difference. We consider this pattern as the result of the profile with the specified threshold and use it for subsequent training. A dynamic programming profiling process is also described in Appendix C, where given a runtime constraint, the minimum possible maximum loss difference is computed.
+
+
+
+\subsection{Stage 3: Knowledge Distillation with $T_{TCM}$}
+\label{sec:method_distill}
+Stage 2 introduces performance drop since we significantly modify the attention mask. In Stage 3, we apply the method of knowledge distillation, using the model with full attention $T_{MCM}$ as the teacher, and the model with sparse attention $T_{Sparse}$ as the student~\citep{hinton2015distilling}. We follow a similar design as knowledge distillation methods in Transformer models for Languages~\citep{gu2024minillm, jiao2019tinybert}, which combines the loss from attention output and hidden states output, over $L$ total layers.
+%textbf{Loss Function Design:}
+%Our overall training loss $\mathcal{L}_{\text{total}}$ combines the losses from attention, MLP, and diffusion components, structured as follows:
+\begin{equation}
+\mathcal{L}_{\text{total}} = \frac{1}{L} \left( \sum_{i=1}^{L} \left( \mathcal{L}_{\text{attention}}^{(i)} + \mathcal{L}_{\text{mlp}}^{(i)} \right) \right) + \lambda \mathcal{L}_{\text{diffusion}},
+\end{equation}
+
+\noindent where each term is defined as follows:
+
+\textbf{Attention Loss} $\mathcal{L}_{\text{attention}}$: To calculate $\mathcal{L}_{\text{attention}}^{(i)}$, we apply the MSE loss between the output of the student’s self-attention layer $\hat{O}_{\text{attn}}^{(i)}$ and the teacher’s self-attention layer output $\tilde{O}_{\text{attn}}^{(i)}$:
+
+\begin{equation}
+\mathcal{L}_{\text{attention}}^{(i)} = \text{MSE}(\hat{O}_{\text{attn}}^{(i)}, \tilde{O}_{\text{attn}}^{(i)}).
+\end{equation}
+
+\textbf{MLP Loss} $\mathcal{L}_{\text{mlp}}$: We calculate $\mathcal{L}_{\text{mlp}}^{(i)}$ as the MSE between the outputs of the student's MLP layer $\hat{O}_{\text{mlp}}^{(i)}$ and the teacher's MLP layer output $\tilde{O}_{\text{mlp}}^{(i)}$:
+
+\begin{equation}
+\mathcal{L}_{\text{mlp}}^{(i)} = \text{MSE}(\hat{O}_{\text{mlp}}^{(i)}, \tilde{O}_{\text{mlp}}^{(i)}).
+\end{equation}
+
+%\textbf{Diffusion Loss} $\mathcal{L}_{\text{diffusion}}$: This loss minimizes the error between the final output of the diffusion process and the original target image $X$. We compute:
+
+%\begin{equation}
+%\mathcal{L}_{\text{diffusion}} = \text{MSE}(\hat{X}_{\text{diffusion}}, X),
+%\end{equation}
+
+%\noindent where $\hat{X}_{\text{diffusion}}$ is the output of the entire diffusion process. 
+In addition, we keep the diffusion loss $\mathcal{L}_{\text{diffusion}}$ for the student model. In practice, we observed that the diffusion loss tends to be an order of magnitude smaller compared to other losses. To balance the contribution of the diffusion loss during the training process, we scale it by a factor \( \lambda \), ensuring it has a comparable impact on the overall loss function.
+
+
+%\end{figure}
+%\end{wrapfigure}
+%~\hangliang{put it into main text or appendix?}
+%\dacheng{Main text, keep it in a single paragraph, and list equaltions. don't highlight, just say following JSD paper. Also now is not mse, is kld.}
+
+
+
+

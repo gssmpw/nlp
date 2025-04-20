@@ -1,0 +1,151 @@
+\begin{figure*}
+    \centering
+    \includegraphics[width=0.85\textwidth]{figures/pipeline.pdf}
+    \caption{\textbf{Method Overview.} (1) \ourmethod~first collects a synthetic dataset in a self-supervised manner in simulation to train the state-based teacher constraint policy. The teacher constraint policy outputs an end-effector pose for the right arm, given the privileged information available in the simulation. (2) The weights of the trained teacher constraint policy are frozen, and a teacher grasping policy, $\pi_{teacher}$, is trained using RL from privileged information in simulation. To maximise the performance, we propose value function-guided policy coordination that refines the output of the constraint policy using gradients propagated from the value function that is jointly trained with the grasping policy by maximising its value. (3) The teacher grasping policy and the teacher constraint policy are distilled into vision-based student policies that leverage point cloud observations, robot proprioceptive states, and, optionally, a desired grasp pose to address bimanual occluded grasping tasks in real-world environments.}
+    \label{fig:pipeline}
+    \vspace{-0.5cm}
+\end{figure*}
+
+\section{Approach}
+In this section we present \ourmethod, a system designed to solve challenging bimanual occluded grasping tasks.
+Bimanual occluded grasping refers to scenarios where a desired grasp pose is initially occluded and in collision with external environments such as a table.
+COMBO-Grasp utilises two coordinated policies: a constraint policy trained on a dataset collected without human supervision within a simulation to stabilise the target object using one arm, and a grasping policy trained using RL to control the other arm and reorient the object for successful grasping.
+
+This section first introduces a novel self-supervised data collection method (Section~\ref{sec:data_collection}) that creates the data in simulation to train the teacher constraint policy (Section~\ref{sec:pretraining}). 
+The training procedure for the teacher grasping policy is then described in Section~\ref{sec:teacher_training}. 
+Value function-guided policy coordination that refines the generated constraint pose during RL training for the teacher grasping policy is described in Section~\ref{sec:teacher_training}. Finally, the process of teacher-student distillation for real-world deployment is detailed in Section~\ref{sec:distillation}.
+
+
+    
+
+
+\subsection{Self-Supervised Data Collection for Constraint Policy}
+\label{sec:data_collection}
+
+Rather than relying on costly expert demonstrations for training, this work introduces a novel self-supervised data collection approach that uses force-closure as a signal in simulation to train the constraint policy across a diverse set of objects (see Figure~\ref{fig:pipeline} (1)).
+Firstly, target occluded grasp pose annotations for objects are generated using antipodal sampling~\cite{eppner2019billion}.
+The desired grasp poses are collected for $48$ objects selected from the Google Scanned Objects dataset~\cite{downs2022googlescannedobjectshighquality} (see Figure~\ref{fig:training_objects} in Appendix~\ref{appendix:teacher}).
+These desired grasp poses are also used during RL training for a grasping policy (see Section~\ref{sec:teacher_training}).
+
+End-effector poses for the right arm are randomly sampled near the target object placed on a table, while the left arm remains fixed in its initial position.
+A force of $25N \times \text{mass}$ along the approach vector of a desired grasp pose is applied to the object.
+To assess force closure, the object's velocity is used as an approximation, as accurately evaluating force closure is often challenging, particularly in scenarios involving multiple contacts.
+Instead, force closure is considered successful if, after applying force, the object's velocity remains below a predefined threshold, given the specific grasp and constraint poses.
+The sampled end-effector pose, the corresponding desired grasp pose, and the object pose are then added to the dataset. 
+By iterating this process in the simulation, $3K$ constraint poses per object are collected.
+With $48$ objects, this results in a total of $144K$ samples.
+By leveraging the object's motion as a proxy measure for the success of a constraint pose, we can generate a rich set of training data to train the constraint policy.
+
+
+\subsection{Teacher Constraint Policy Training }
+\label{sec:pretraining}
+One of the central contributions of this work lies in value function-guided policy coordination that integrates classifier guidance in diffusion models to refine the generated constraint pose during the training of the state-based teacher grasping policy. 
+This is achieved by employing a diffusion model for the state-based teacher constraint policy, denoted as $\pi^{teacher}_{const}$, trained from the privileged information in the dataset (see Section~\ref{sec:data_collection}).
+This approach leverages gradients from the value function to steer the teacher constraint policy's output, optimising the stabilising poses to align with the grasping policy's objectives to improve task performance and sample efficiency.
+
+
+The teacher constraint policy uses a diffusion model formulated as a Denoising Diffusion Probabilistic Model (DDPM)~\cite{ho2020denoising}.
+DDPMs are a class of generative models where the output generation is modelled as a denoising process.
+Starting from $x^{K}$ sampled from Gaussian noise, the DDPM performs $K$ denoising iterations to generate a series of intermediate samples with decreasing levels of noise, $x^{k}, x^{k-1},...x^{0}$.
+This process is formulated as
+\begin{equation}
+    \mathbf{x}^{k-1} = \alpha(\mathbf{x}^{k} - \gamma \epsilon_{\theta}(\mathbf{x}^{k}, k) + \mathcal{N}(0, \sigma^2I))
+\end{equation}
+where $\epsilon_{\theta}$ is a noise prediction network parameterised by $\theta$.
+The choice of $\alpha, \gamma, \sigma$ is determined by a noise scheduler.
+To train the constraint policy, a forward diffusion process is applied to add noise to an unmodified sample, $x^{0}$, from the dataset by randomly sampling a denoising iteration $k$ and random noise $\epsilon^{k}$.
+The noise prediction model $\epsilon_{\theta}$ is then trained to estimate the noise added to a sample during the forward diffusion process.
+Thus, the training loss is formulated as
+\begin{equation}
+    \mathcal{L}_{constraint} = \textit{MSE}(\epsilon^{k}, \epsilon_{\theta}(\mathbf{x}^{0}_{const} + \epsilon^{k}, k))
+\end{equation}
+where $\mathbf{x}_{const}$ is the constraint pose for the right arm.
+In this work, we employ an MLP-based denoising model as the backbone for the diffusion policy (see Appendix~\ref{appendix:teacher_const} for further details of the architecture).
+
+The constraint policy takes as input an object pose, a desired grasp pose, and object IDs.
+For the Object IDs, we train an autoencoder~\cite{rumelhart1986} by reconstructing point clouds of objects using the Chamfer distance to learn compact representations similar to prior work~\cite{wan2023unidexgraspimprovingdexterousgrasping}.
+Then, we use the learnt compact latent representation as the Object ID rather than using a one-hot vector, as this reduces the dimensionality of the observation space, especially when considering greater numbers of objects.
+
+
+The state-based teacher constraint policy is used exclusively during the teacher grasping policy training phase, as described in Section~\ref{sec:teacher_training}. 
+At a later stage, the teacher constraint policy is distilled into a vision-based student constraint policy for sim-to-real transfer, ensuring robust performance across deployment scenarios.
+
+\subsection{Teacher Grasping Policy}
+\label{sec:teacher_training}
+After the constraint policy is trained, a teacher grasping policy $\pi^{teacher}_{grasp}$ is trained using Proximal Policy Optimisation (PPO)~\cite{schulman2017proximalpolicyoptimizationalgorithms} for diverse objects from privileged information in simulation.
+To train a robust teacher grasping policy capable of performing in real-world environments, we employ domain randomisation, incorporating additive Gaussian noise into low-dimensional observations, as well as randomising the physics parameters of the target object and the controller parameters during policy training. For further information about the domain randomisation, see Appendix~\ref{appendix:sim_training}.
+The teacher grasping policy receives as input the robot's proprioceptive states, object pose, object velocity, desired grasp poses, object IDs (see Section~\ref{sec:pretraining}), object's mass and friction parameters, and the PID gains for the OSC controller.
+
+At the beginning of each training episode, the teacher constraint policy $\pi^{teacher}_{const}$ generates a constraint end-effector pose $\mathbf{x}_{const}$ for the right arm.
+Given the constraint end-effector pose, the joint positions of the right arm are computed using an inverse kinematics solver in CuRobo~\cite{sundaralingam2023curobo}.
+Then, the right arm moves to the computed desired constraint joint positions.
+Once the right arm is positioned, the grasping policy controls the left arm to attempt the occluded grasping task.
+
+
+In this work, we design a reward function using six components: (1) distance reward between a left end-effector position and a desired grasp position, (2) distance reward between the left end-effector orientation and the desired grasp orientation, (3) action penalty to penalise the prediction of large actions by the grasping policy, (4) collision penalty including both self-collision and collision between robot arms and the table, (5) lift reward for incentivising the left arm to reorient the target object to expose the occluded target grasp pose, and (6) a sparse grasp success reward. 
+The collision penalty term is computed using the sign distance field provided by CuRobo.
+The final reward $r$ is
+\begin{equation}
+    \begin{split}
+    r = \alpha_{1} r_{dist\_pos} &+ 
+    \alpha_{2} r_{dist\_ori} - \alpha_{3} r_{collision} \\
+    & - \alpha_{4} r_{action} + \alpha_{5} r_{lift} + \alpha_{6} r_{success}        
+    \end{split}
+\end{equation}
+where $\alpha_{i}$ is a coefficient for each reward term.
+For more details on teacher policy training, domain randomisation, and each reward term with the coefficient value, see Appendix~\ref{appendix:teacher}.
+
+
+\subsection{Value Function-guided Policy Coordination}
+\label{sec:steering}
+A key aspect of \ourmethod~is to induce effective bimanual coordination using the trained constraint policy, thereby improving task performance and enhancing the sample efficiency of RL policy training. 
+Since the teacher constraint policy is initially trained on datasets collected using force closure as a signal, it does not inherently guarantee the generation of an optimal constraint for the grasping policy. 
+To address this limitation, \ourmethod~draws inspiration from classifier guidance in diffusion models and propose value function-guided policy coordination that refines the generated constraint pose using gradients from a value function $V(\mathbf{x}_{t})$, which is trained alongside the grasping policy using RL.
+The value function of the grasping policy acts as a classifier in the classifier guidance framework, and the gradients for guidance are obtained by maximising the estimated value.
+This approach effectively refines the generated constraint poses to align more closely with the grasping policy's requirements, leading to improved overall performance and sample efficiency.
+
+By incorporating gradients from the value function by maximisation, the denoising process for the constraint policy is formulated as
+
+\begin{equation}
+\label{eq:guidance}
+    \mathbf{x}^{k-1}_{const} = \alpha(\mathbf{x}^{k}_{const} - \gamma \epsilon_{\theta}(\mathbf{x}^{k}_{const}, k) - w\nabla V(\mathbf{x}) + \mathcal{N}(0, \sigma^2I))
+\end{equation}
+where $w$ is a scaling parameter, $\mathbf{x}$ is low-dimensional observation used as input to the value function $V(\cdot)$, and the constraint pose $\mathbf{x}_{const}$ is a subset of the input state $\mathbf{x}$ for the value function (\ie $\mathbf{x}_{const} \in \mathbf{x}$).
+For further details on value function-guided policy coordination, see Appendix~\ref{appendix:teacher}.
+
+
+
+
+
+
+
+
+
+\subsection{Policy Distillation for Sim-to-Real Transfer}
+\label{sec:distillation}
+
+\begin{figure}
+    \centering
+    \includegraphics[width=0.85\linewidth]{figures/student_policy.pdf}
+    \caption{\textbf{Student policy architecture.} We utilize DP3~\cite{ze20243d} as the backbone for the grasping policy. The DP3 encoder processes the scene point cloud, and its output is concatenated with a state feature vector obtained by a multi-layer perceptron (MLP). The resulting concatenated vector serves as the conditioning input for the diffusion-based policy. Similarly, the constraint student policy employs the DP3 encoder and an MLP, but it takes a desired grasp pose as input. Unlike the grasping policy, the constraint student policy employs a Gaussian Mixture Model (GMM)-based policy.}
+    \label{fig:student_arch}
+    \vspace{-0.3cm}
+\end{figure}
+
+To deploy a policy in real-world environments and grasp unseen objects, it is essential to leverage visual observations as an input modality to the policy. 
+To achieve this, teacher-student policy distillation~\cite{yamada2024twist, brosseit2021distilled} is used to transfer knowledge from the learnt teacher constraint and grasping policies to student policies. 
+These student policies are designed to process point cloud observations and state observations, such as proprioceptive information and, optionally, a desired grasp pose. 
+While the inclusion of the desired grasp pose slightly improves performance by biasing the arm's movements toward the target, omitting them still enables effective execution, albeit with a minor performance drop.
+In \ourmethod, we employ a diffusion policy as the student grasping policy, similar to that used in the prior work~\cite{ze20243d}.
+The student policy consists of DP3~\cite{ze20243d} and MLP encoders to process point cloud and state observations, as shown in Figure~\ref{fig:student_arch}.
+The resulting vectors from these encoders are concatenated and used as the conditioning input for the diffusion policy.
+In contrast to the student grasping policy, the student constraint policy uses a Gaussian Mixture Model (GMM)-based policy for its simplicity. 
+Since the student constraint policy does not require output steering like the teacher policy, the GMM approach is both effective and straightforward.
+
+To distil the teacher to the student policy, we rollout the teacher policy in the simulation and collect expert demonstrations.
+The expert demonstrations include visual observations.
+We collect $10K$ expert demonstrations for use in the distillation process.
+During distillation, we apply a small perturbation to point cloud observations to simulate noise seen in real-world scenes.
+For further details on the student policy training, see Appendix~\ref{appendix:student}.
+
+

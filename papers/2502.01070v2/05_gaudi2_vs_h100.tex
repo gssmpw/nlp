@@ -1,0 +1,151 @@
+\section{LLM inference comparison}\label{sec:g2_vs_h100}
+
+\subsection{LLM inference phases}
+
+Generative LLM inference comprises two distinct phases: a compute-bound prefill phase and a memory-bound decode phase \citep{splitwise, distserve_ZhongLCHZL0024}. Figure  \ref{fig:decode_diagram} illustrates the key differences between these phases.
+% We include a diagram highlighting the differences between the two phases in Figure \ref{fig:decode_diagram}.
+
+During the prefill phase, the LLM generates the first token based on the provided input prompt. 
+Throughout this process, key-value (KV) pairs are stored in the KV cache for reuse in subsequent token generations.
+% The key-value pairs are stored in the KV cache for reuse during the generation of subsequent tokens. 
+The prefill phase processes the entire input in parallel, utilizing matrix-matrix operations that are typically compute-bound. This high degree of parallelism allows for effective hardware utilization, enabling efficient input processing.
+
+Once the first token is generated, the process transitions to the decode phase, where output tokens are generated sequentially in an autoregressive manner based on the previous tokens. 
+Unlike the prefill phase, the decode phase is constrained by memory bandwidth, as it involves GEMV operations, which inherently limit hardware utilization compared to the more parallelizable GEMMs in the prefill phase.
+% The decode phase involves GEMV operations, inherently limiting hardware utilization compared to the compute-bound GEMMs in the prefill phase.
+
+Modern inference frameworks such as vLLM \citep{kwon2023efficient} and TensorRT-LLM \citep{TensorRT_LLM} partially remedy this issue by batching multiple decoding requests, improving the computational intensity of the linear layers. However, the batch size is limited by the memory capacity as each sequence in a batch requires its own KV cache. Furthermore, the computational intensity of the attention operation during decoding is unaffected by batch size, instead requiring a GEMV for each sequence. Grouped query attention (GQA) \citep{ainslie2023gqa} converts the operation into a thin GEMM, but it remains memory-bound. This slowdown becomes more evident at longer sequence lengths, where the attention FLOPs continue to increase in proportion to sequence length while the FLOPs required for linear layers remain constant.
+
+\subsection{Calculating inference FLOPs}
+
+While previous works \citep{splitwise} have evaluated inference performance using time to first token (TTFT) and time per output token (TPOT), these metrics do not facilitate comparisons across different inference stages, model sizes, or sequence lengths. To ensure a consistent comparison, we directly compute model FLOPs.
+Following the approach of \citet{pytorch2, megatron_lm}, we calculate only the FLOPs associated with matrix multiplication, as these dominate LLM computations. However, unlike previous works, we exclude FLOPs related to autoregressive attention masking, which can be skipped \citep{dao2024flashattention}. This approach aligns more closely with how the KV cache is leveraged when generating new tokens.
+
+Using this method, the FLOPs required for a forward pass of a Llama model with $l$ transformer blocks, hidden size $h$, intermediate size $ah$, head size $d$,  head count $H=h/d$, GQA group size $g$, vocabulary size $v$, and input sequence of length $s$ can be calculated as follows:
+
+\begin{equation}
+  f_{llama}(s)=2sh^2l(3a+2+\frac{2}{g})+2s^2hl+2vsh
+\label{eq:model_flops}
+\end{equation}
+
+By denoting $A=(3a+2+\frac{2}{g})$ as a constant for each model, the equation can be simplified to the following:
+
+\begin{equation}
+  f_{llama}(s)=2s(Ah^2l+vh)+2s^2hl
+\label{eq:model_flops_simple}
+\end{equation}
+
+When the model generates $t$ tokens in a single decoding iteration where $t \ll s$, we can calculate Equation \ref{eq:model_flops} using $s'=s+t$ and obtain the approximation:
+
+\begin{equation}
+\begin{aligned}
+  f_{llama}(s+t)-f_{llama}(s) \\
+  \approx 2t(Ah^2l+vh)+4sthl
+\label{eq:model_flops_delta}
+\end{aligned}
+\end{equation}
+
+From Equation \ref{eq:model_flops_delta}, we observe that linear layer computations, including those in the LM head, remain independent of the previous sequence length $s$. However, attention computations scale proportionally with $s$.
+In the autoregressive case where $t=1$ and considering a batch of sequences with batch size $b$ and sequence lengths $s_1, ..., s_b$, the FLOPs per decoding step can be approximated as follows:
+
+\begin{equation}
+\begin{aligned}
+    2b(Ah^2l+vh)+4hl\sum_{i=1}^{b}s_i
+\label{eq:model_flops_delta_batch}
+\end{aligned}
+\end{equation}
+
+One challenge in interpreting these results is that only the $2bAh^2l$ term, representing linear layers except the LM head, is computed in FP8, whereas the $2bvh$ term for the LM head and the $4hl\sum_{i=1}^{b}s_i$ term for attention are computed in BF16.
+Another is that online KV cache dequantization would add non-trivial overhead to Equation \ref{eq:model_flops_delta_batch}. However, such overheads do not constitute additional model FLOPs as per the definition of MFU in \citet{palm}.
+
+A more significant limitation is that each FLOP cannot be executed at full efficiency due to hardware utilization constraints. For example, the Gaudi 2 has a peak HBM bandwidth of 2.4 TB/s and a peak FP8 GEMM throughput of 865 TFLOPS, requiring a FLOP/byte ratio (computational intensity, CI) of at least 360 for optimal FP8 execution.
+However, in the decoding phase, a thin GEMM of  $(b \times h)\times (h \times ah)$, where $b \ll h$ and $a \ge 1$, results in a CI of approximately $2b$ for FP8 and $b$ for BF16, far below the required intensity for peak throughput on realistic batch sizes $b$.
+Additionally, matrix multiplication units operate with fixed block sizes, meaning that full utilization is only achieved when input dimensions align with hardware-friendly shapes such as multiples of 128 \citep{lee2024debunkingcudamythgpubased}.
+
+Furthermore, KV cache computations present a unique bottleneck. Increasing batch size does not improve the CI since each sequence in a batch maintains a separate KV cache.
+For a BF16 KV cache using GQA with $g$ groups, the CI is thus limited to $g$ FLOPs/byte. 
+Consequently, even with a perfectly optimized kernel, the theoretical throughput of applying the query to the KV cache is capped by the memory bandwidth multiplied by the CI. For Llama v3 models with $g=8$ on a Gaudi 2 with a peak 2.4 TB/s HBM, this theoretical ceiling is 19.2 TFLOPS, a small fraction of peak GEMM throughput. As attention computations are both inherently memory-bound and scale linearly with sequence length, decoding at longer sequence lengths ultimately converges to the attention throughput, as demonstrated in Figure \ref{fig:decode_efficiency}.
+
+By distinguishing these phases and understanding their computational characteristics, optimization strategies can be tailored to enhance the efficiency of LLM inference, especially during the resource-intensive decode phase.
+
+\subsection{Prefill phase}
+
+\begin{figure}[]
+    \centering
+    \includegraphics[width=0.48\textwidth]{figures/prefill_roofline_3.png}
+    \vspace{-1.6em}
+    \caption{Roofline diagram during the prefill phase for batch size 1. Throughput improves with longer sequence length until it begins to decline as the proportion of attention computations, which are slower than GEMMs, take up a greater share of the computation. We use static FP8 scaling for both the H100 and the Gaudi 2 as optimized dynamic FP8 scaling is unavailable for the Gaudi.}
+    \label{fig:prefill_roofline}
+    \vskip -0.1in
+\end{figure}
+
+
+
+
+We first conducted an analysis of the operational characteristics of the two accelerators in the prefill phase.
+Figure \ref{fig:prefill_roofline} compares the prefill TFLOPS achieved for three models across varying sequence lengths, using a roofline diagram for the H100 and Gaudi 2 accelerators.
+The results demonstrate that the H100 achieves significantly higher throughput during the prefill phase than the Gaudi 2. For Llama 8B, the H100 achieves double the throughput of the Gaudi 2.
+
+During the prefill phase, attention layers process long input sequences, enabling large matrix computations to be executed in a single step. This maximizes compute engine utilization, leading to high efficiency. As a result, performance in this phase is primarily dictated by GEMM throughput, rather than utilization or memory bandwidth constraints.
+
+As model sizes increase, matrix dimensions grow proportionally with hidden dimensions, making computations more compute-bound. This leads to a clear trend of increasing prefill throughput with larger models, underscoring the importance of compute performance in the prefill phase. A similar pattern is observed for longer sequence lengths, where utilization improves until reaching saturation.
+
+
+\begin{figure}[]
+    \centering
+    \includegraphics[width=0.48\textwidth]{figures/static_dynamic_2.png}
+    \vspace{-1.6em}
+    \caption{Decode throughput comparison between BF16 and FP8 on Llama v3.1 8B Instruct using a batch size of 64 using static FP8 scaling on the Gaudi 2 (left); static and dynamic FP8 scaling on the H100 (right). Throughput differences between FP8 and BF16 in the Gaudi 2 are 50\% or greater, whereas they are under 25\% for the H100. Dynamic scaling has higher throughput despite its greater overhead because row-wise GEMM is faster than per-tensor GEMM for small matrices on the H100 (see Table \ref{tab:h100_fp8_tflops}).}
+    \label{fig:static_dynamic}
+\end{figure}
+
+\subsection{Decode phase}
+
+In Figure \ref{fig:decode_efficiency}, we compare decode throughputs between the Gaudi 2 and H100. Surprisingly, the Gaudi 2 not only demonstrates superior power efficiency across all sequence lengths but also achieves higher absolute throughput for short sequences below 4K tokens. At longer sequence lengths, however, memory bandwidth becomes the primary bottleneck. Our measurements show HBM bandwidths of 2.0 TB/s for the Gaudi 2 and 2.6 TB/s for the H100, giving the latter an advantage as the KV cache size increases.
+
+We also compare decode throughputs for BF16, dynamic FP8 scaling, and static FP8 scaling on the H100 in Figure \ref{fig:static_dynamic} and find that the throughput gain from FP8 is below 25\%. In contrast, the gain for the Gaudi 2 approaches 50\%.
+
+
+
+
+
+
+To investigate the lack of performance gains in the H100, we analyze its throughput on thin matrices, identifying it as the primary bottleneck. Table \ref{tab:thin_gemm} shows that while FP8 GEMM throughput on the Gaudi 2 is nearly twice that of BF16 GEMM, there is minimal improvement on the H100. As shown in Equation \ref{eq:model_flops_delta_batch}, the decoding stage at short sequence lengths ($s < h$) is dominated by linear operations, making thin GEMM performance critical.
+
+\begin{table}[]
+\small
+\centering
+\caption{Thin GEMM throughputs in TFLOPS for the Gaudi 2 and H100 measuring $(M \times K)\times(K \times N)$ GEMMs, where $M$ corresponds to typical batch sizes encountered during inference and $K,N$ represent hidden dimension sizes. Row-wise scaling is used for FP8 GEMMs.
+Throughput scales linearly with $M$ on both devices, but the Gaudi 2 consistently outperforms the H100, even for BF16. These results highlight the superior efficiency of the Gaudi 2 for thin GEMMs, crucial for LLM decoding.
+}
+\vskip 0.15in
+% We used 1,024 GEMMs per function call to hide function calling overhead.
+\begin{tabular}{@{}rrrrrrr@{}}
+\toprule
+GEMM TFLOPS & \multicolumn{2}{c}{Gaudi 2} & \multicolumn{2}{c}{H100} \\ 
+\multicolumn{1}{c}{Shape: (M,K,N)} & BF16 & FP8 & BF16 & FP8 \\ \midrule
+(\enspace 8, 1024, 1024) &   3.3 &   3.8 &   1.7 &   1.7 \\
+(16, 1024, 1024) &   6.5 &  11.4 &   3.4 &   3.9 \\
+(32, 1024, 1024) &  12.8 &  23.8 &   6.5 &   7.0 \\
+(64, 1024, 1024) &  26.7 &  54.0 &  12.6 &  14.9 \\ \midrule
+(\enspace 8, 2048, 2048) &  12.4 &  26.1 &   6.7 &   7.5 \\
+(16, 2048, 2048) &  20.6 &  48.6 &  12.9 &  15.0 \\
+(32, 2048, 2048) &  48.0 &  87.6 &  27.1 &  28.2 \\
+(64, 2048, 2048) &  91.3 & 163.2 &  52.3 &  60.5 \\ \midrule
+(\enspace 8, 4096, 4096) &  18.8 &  35.4 &  14.4 &  16.8 \\
+(16, 4096, 4096) &  37.4 &  67.9 &  28.6 &  33.5 \\
+(32, 4096, 4096) &  73.6 & 132.0 &  68.3 &  68.1 \\
+(64, 4096, 4096) & 144.5 & 253.4 & 133.3 & 133.9 \\ \bottomrule
+\end{tabular}
+\vskip -0.1in
+\label{tab:thin_gemm}
+\end{table}
+
+\begin{figure}[]
+    \centering
+    \includegraphics[width=0.48\textwidth]{figures/GEMV_MFU_4.png}
+    \vspace{-1.6em}
+    \caption{Thin GEMM MFU comparison between the Gaudi 2 and H100 for both BF16 and FP8. The Gaudi 2 maintains a similar MFU for BF16 and FP8 of similar shapes while there is a noticeable drop for the H100. The MFU differences at the same shapes are enough to provide superior TFLOPS for the Gaudi 2 over the H100 as shown in Table \ref{tab:thin_gemm}.}
+    \label{fig:Decode_efficiency}
+    \vskip -0.1in
+\end{figure}

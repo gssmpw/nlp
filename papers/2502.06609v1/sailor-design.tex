@@ -1,0 +1,164 @@
+\subsection{Scanner} 
+
+The Scanner automatically extracts insights from the ISA specifications written in machine-readable Sail code. 
+
+\subsubsection{Primer on Sail}
+
+\input{sail-flow}
+
+\autoref{fig:sail-riscv} shows the block diagram for the instruction fetch till execute loop in the RISC-V Sail implementation \cite{sail-riscv}. 
+Each instruction is first fetched, decoded and then dispatched. Before the instruction semantics are executed, two things are checked: 
+(i) if any interrupts are pending, which might be serviced before executing the instruction, and 
+(ii) if the privilege level in the current architectural context allows executing the instruction.
+
+Each instruction (or sometimes group of the same type of instructions, depending on the Sail model implementation) has an independent definition specified in the Sail model implementation. 
+This definition of the instruction is then executed, which may involve accessing memory (and corresponding memory translations and checks), performing arithmetic operations, or modifying the processor state (registers). 
+The execution may also lead to exceptions, in which case the appropriate handler must be called. 
+Once the execution is complete, the performance monitoring unit (PMU) and the PC are updated, and the procedure is repeated for the next instruction. 
+
+We will now deep dive into a small Sail snippet to understand how instruction specifications are implemented in Sail. 
+The following text is taken from the RISC-V privileged ISA specification manual \cite{riscv-isa}, which describes the \texttt{mret} instruction.  
+
+\textit{"An MRET or SRET instruction is used to return from a trap in M-mode or S-mode respectively. 
+When executing an xRET instruction, supposing xPP holds the value y, xIE is set to xPIE; the privilege mode is
+changed to y; xPIE is set to 1; and xPP is set to the least-privileged supported mode (U if U-mode is
+implemented, else M). 
+If y$\neq{}$M, xRET also sets MPRV=0."} 
+
+\lstinputlisting[language=sail,caption={Sail implementation of \texttt{mret} in RISC-V.},captionpos=b,label={lst:mret}]{mret.sail}
+
+\autoref{lst:mret} shows the corresponding Sail implementation of the \texttt{mret} instruction. 
+The instruction definition is implemented using the "function clause execute <name>()", which we see on the left side of the figure. 
+The instruction execution is allowed only if the privilege mode in the current architecture context is set to machine mode (M-mode). 
+The exception handler is then called to execute the "CTL\_MRET" case (depicted on the right side of the figure). 
+Here, we can see the translation of the prose-style specification listed above into machine-readable specification in Sail.
+For instance, \texttt{MIE} (machine interrupt enable) is set to \texttt{MPIE} (machine previous interrupt enable) and the privilege level is set to the value in \texttt{MPP} (Machine previous privilege level) in the \texttt{mstatus} register. 
+
+The Sail implementation thus describes, in machine-readable format, every single effect on the architectural context of executing an instruction, given the access rights of a particular privilege mode.
+
+\subsubsection{Capturing ISA-level insights}
+\label{sec:scanner-insights}
+We formulate specific questions that help extract ISA-level insights, specifically about the access rights of different privilege modes over the ISA-state and the side-effects of executing instructions on the ISA-state. 
+The Scanner answers the following questions about the ISA. 
+
+\textbf{1. Does a privilege mode have explicit access rights to read or write a particular ISA-state?} 
+The simplest method to establish a side-channel or a covert-channel is through shared ISA-state. 
+For example, on RISC-V, confidential VMs that execute in VS-mode have the permission to explicitly write the \texttt{vsscratch} CSR; and
+hypervisors that execute in HS-mode have the permission to explicitly read the \texttt{vsscratch} CSR. 
+Thus, if a security monitor does not clear the \texttt{vsscratch} CSR during a context switch, it can be leveraged to leak the confidential VM's security-sensitive information. 
+In other words, this question checks whether a privilege mode can execute explicit ISA-state read/write instructions (\eg{} \texttt{csrrs} and \texttt{csrrw} in RISC-V from the Zicsr extension).
+The answer to this question gives us insights that the Analyzer uses to determine whether a direct communication channel can be established between two different security domains. 
+
+\textbf{2. What is the ISA-state footprint of an instruction?} 
+We define the ISA-state that could be read or written as a side-effect of the execution of an instruction as the \textit{ISA-state footprint} of an instruction. 
+For example, as shown in \autoref{lst:mret}, executing the \texttt{mret} instruction has several side-effects on the ISA-state, \eg{} updating the \texttt{MIE} field with the \texttt{MPIE} field's value in the \texttt{mstatus} CSR. 
+This implies that, the \texttt{mret} instruction implicitly depends on the value of \texttt{MPIE} and updates the value of \texttt{MIE}. 
+This information is crucial as instructions implicitly (or indirectly) update ISA-state.
+When the context switch implementation does not clear such ISA-state, a security domain can infer information about the execution in another security domain. 
+For example an adversary can infer whether the victim uses the floating point unit and whether any (and which) exceptions occur during execution~\cite{dtrap-fpu}.
+We also include the interrupt handling, PMU and PC updates in the footprint (as shown in Figure \ref{fig:sail-riscv}). 
+Prior work has shown that security vulnerabilities like interrupt hijacking can stem from overlooking a even a few bits of a register in the context switch implementation\cite{intel-tdx-sec}. 
+Thus, it is crucial to consider security-sensitive ISA-state that changes as a side-effect of instruction execution during the context switch implementation. 
+
+\textbf{3. Does a privilege mode have the access rights to execute a particular instruction?} 
+If a privilege mode does not have the access rights to execute an instruction (\eg{} only M-mode can execute the \texttt{mret} instruction) and ultimately never indirectly reads or writes certain ISA-state, then that helps reduce the amount of ISA-state that needs to be swapped to perform a secure context switch.
+We already cover direct reads or writes of ISA state in the first question.
+This information can be critical, especially performance-wise, as context switches are known to be expensive~\cite{context-switch-cost, context-switch-cost-hotos}.
+
+\autoref{lst:mret-sailor} shows the ISA-level insights that Sailor generates for the \texttt{mret} instruction. 
+This includes per privilege mode access to 
+executing the instruction as well as a fine-grained ISA-state footprint. 
+The ISA-state footprint includes the registers that have side-effects on the instruction execution as well as the particular fields of the register the instruction execution reads (is dependent on) and writes (updates). 
+
+As \autoref{lst:mret-sailor} shows, Sailor also captures the footprint of the \texttt{sret} and \texttt{uret} instructions in addition to the footprint of exception handling on RISC-V. 
+This is an artifact of the Sail model implementation. 
+In the Sail model, there is a single \texttt{exception\_handler} function which is called by the instruction definitions of \texttt{mret}, \texttt{sret} and \texttt{uret}, as well as for other exception handling, with a switch case ladder that determines what code to execute in each of the case. 
+
+\lstinputlisting[language=sailor-output,caption={ISA-insights captured by Sailor for \texttt{mret}.},captionpos=b,label={lst:mret-sailor}]{mret-sailor.txt}
+
+The code block in \autoref{lst:mret} shows only the code for \texttt{mret} for simplicity, whereas in the model, the \texttt{exception\_handler} function is called in the else block of the code. 
+In this particular case, using a single function does not help reducing redundant code, but rather reduces the modularity of the implementation. 
+Further, the Scanner doesn't evaluate branches. 
+So the Scanner captures a union of the footprint of all possible executions of an instruction. 
+Thus, the Scanner over-estimates the ISA-state that can be influenced by an instruction. 
+The benefit of the over-estimation is that the Scanner captures all the ISA-state that could be read/written by an instruction in any instance of the instruction's execution.
+The drawback, which is a result of the way the Sail model is implemented, is that this over-estimation might include ISA-state that would never be read/written during any instance of the instruction execution. 
+If there were different functions implemented for each \texttt{mret}, \texttt{sret} and \texttt{uret}, the footprint captured by the Scanner would be cleaner. 
+
+Once we have the output from the Scanner, we provide it as input to the next component of the  tool, \ie{} the Analyzer. 
+
+
+\subsection{Analyzer} 
+\label{sec:analyzer}
+
+\input{analyzer-algorithm}
+
+\autoref{fig:algo} shows the \textit{Classifier algorithm} we introduce to determine which ISA-state is security-sensitive. 
+This analysis must be repeated for each pair of privilege modes in order to determine the exact ISA-state required to be swapped on a security domain switch. 
+In \autoref{fig:algo}, the term \textit{Source} refers to the privilege mode in which the previous security domain had been executing, and \textit{Target} refers to the privilege mode in which the next security domain will be executing. 
+
+The algorithm's goal is to identify any channels in the ISA-state that (i) allow the Source to affect the results of execution in the Target (adversarial Source), (ii) leak information of the Source to the Target (adversarial Target), or (iii) enable establishing communication (adversarial Source and Target). 
+The analysis excludes GPRs since they can be written and read by any privilege mode and an adversary can easily leak data of another security domain through the GPRs (forming side-channels, covert-channels or computational integrity attacks), so they are considered security-sensitive by default. 
+The analysis is repeated for each ISA-state (\eg{} a CSR). 
+
+To identify (i), the algorithm checks whether the ISA-state is explicitly or implicitly writable by the Source mode. 
+Here, explicit access refers to the first question in \autoref{sec:scanner-insights} (\eg{} \textit{csrw mstatus, in\_reg} instruction in RISC-V). 
+Whereas, implicit access refers to the side-effects captured in the ISA-state footprint of an instruction (\eg{} the \texttt{fmadd} instruction in RISC-V execution can update the \texttt{mstatus.FS} bits to Dirty). 
+If a privilege mode has the rights to execute any instruction that can write the ISA-state as a side-effect of execution, it is considered to have implicit write access to the ISA-state. 
+The algorithm further checks whether the execution in Target mode depends on the ISA-state (via explicit or implicit reads). 
+This ISA-state is considered as security-sensitive because if it is not appropriately swapped during the context switch, it can constitute \textbf{computational integrity} attacks on the Target security domain, breaching its integrity guarantees. 
+For example, the Source can maliciously modify the rounding mode of computations, or disable extensions used by the Target.
+
+Similarly, to identify (ii) and (iii), the algorithm checks whether the Source mode can implicitly or explicitly write the ISA-state and whether the Target mode can implicitly or explicitly read that ISA state. 
+If the criteria is satisfied, then the ISA-state is considered as security sensitive because either the Target domain can breach the confidentiality of the Source domain by reading security-sensitive data of the Source domain or inferring details about execution in the Source domain. 
+That would constitute \textbf{side-channel} attacks on the Source domain. 
+Further, this ISA-state can also be used to breach the isolation guarantees in the system, enabling two-way communication between the Source and Target (\ie{} \textbf{covert-channel}). 
+
+The algorithm performs one further check to identify (ii), \ie{} whether the ISA-state contains sensitive data of the Source that it depends on (implicitly reads) during execution (\eg{} \texttt{satp} CSR in RISC-V which holds the page table root address and is used implicitly during execution of load/store instructions).
+If the Target can read this ISA-state, it can again constitute side-channel attacks on the Source domain.
+
+If no such channels are identified, the algorithm considers the particular ISA-state as not security-sensitive and moves on to analyze another ISA-state. 
+
+Despite the apparent simplicity of the questions that the algorithm asks to identify the potential information flow channels in the ISA-state, when combined with the fine-grained ISA-level insights that the Scanner generates, the Analyzer can help catch bugs that can constitute different classes of security vulnerabilities (such as computational integrity, side-channels, covert-channels).  
+
+Once we have information regarding which ISA-state is security sensitive and which isn't, we can validate the existing context switch implementations against that information. 
+We analyse the context switch implementations in existing security monitors to check whether they swap all the security-sensitive ISA-state.
+
+We found three different classes of mishandled ISA-state across four different security monitors (Section \ref{sec:vuln-det}). 
+
+
+
+\subsection{Validator} 
+
+\autoref{fig:validator} shows the third component of our tool, the Validator. 
+
+\input{validator} 
+
+The Validator's goal is to ensure that the Scanner captures all ISA-level insights from Sail using an existing tool Isla.
+This is important as the goal of our tool is to help prevent any oversights on ISA-state in the context switch implementations.
+Isla~\cite{isla} is a symbolic execution engine for Sail. It includes a footprint generator that produces instruction execution traces in the SMT-LIB2 format~\cite{smtlib2}.
+Isla prunes exploration paths by assuming concrete values for the ISA-state.
+Given an instruction and ISA-state constraints (e.g., privilege mode or CSR values), Isla generates traces capturing the instruction's dependencies, including the ISA-state that the instruction reads or writes.
+
+
+
+\lstinputlisting[language=smtlib, caption={The SMT-LIB2 trace generated by Isla for the MRET instruction executed in M-mode.}, captionpos=b, label={lst:mret-isla}]{mret-isla-trace.txt}
+
+
+\autoref{lst:mret-isla} shows the trace generated by Isla for the execution of the \texttt{mret} instruction in M-mode. 
+Along with the SMT-LIB2 semantics, there are additional annotations in the trace to describe the events meaningfully \eg{} \texttt{read-reg} or \texttt{write-reg} for a register read or write. 
+We parse the trace and capture all the \texttt{read-reg} and \texttt{write-reg} events to generate the architectural footprint of the instruction. 
+Then the Validator essentially checks the footprint generated from the Scanner against the one from Isla, as shown in Figure \ref{fig:validator}. 
+
+The traces from Isla also capture if a trap occurs during the execution. 
+For example,~\autoref{lst:mret-sup-isla} shows the execution of the \texttt{mret} instruction in S-mode, which is illegal according to the specification (~\autoref{lst:mret}). 
+As shown in the trace, after reading that the \texttt{cur\_privilege} is S-mode (line 5 in the trace), the exception delegating register on RISC-V (\texttt{medeleg}) is read, the \texttt{mcause} register is written with the value 2 (line 9) which denotes an illegal instruction trap. 
+More trap information is saved in the \texttt{mepc} and the \texttt{mtval} registers, and \texttt{cur\_privilege} is updated to M-mode so the trap can be handled in M-mode. 
+In this way, we use Isla to also check which privilege modes are allowed to execute which instructions and directly read or write which CSRs. 
+We compare the Scanner's output with Isla's for this information as well. 
+Section \ref{isla-vs-sailor} discusses the comparison between Isla and Scanner. 
+
+
+\lstinputlisting[language=smtlib, caption={The SMT-LIB2 trace generated by Isla for the MRET instruction executed in S-mode.}, captionpos=b, label={lst:mret-sup-isla}]{mret-sup-isla-trace.txt}
+
+

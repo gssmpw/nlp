@@ -1,0 +1,226 @@
+\input{text/figure/4-method/block_sparse}
+\section{\system: Long-sequence Serving with Unified Sparse Attention}
+\label{sect:method}
+
+\input{text/figure/1-intro/overview}
+
+
+We introduce \textbf{\system}, an efficient long-sequence LLM serving system featuring sparse attention. In \system, diverse sparse attention patterns are unified within a block-sparse formulation (Figure \ref{fig:method:blocksparse}), and are flexibly supported through fused CUDA kernels. \system also supports weight, activation and KV quantization, which significantly improves generation throughput at shorter context lengths. 
+
+\subsection{Unified Block Sparse Attention}
+\label{sect:method:blocksparse_overview}
+
+
+
+
+
+
+
+
+
+
+As shown in Figure~\ref{fig:motivation:attention_flow}, skipping computations in the attention kernel by blockwise processing accelerates execution by shortening the sequential loop.
+Building on this, we introduce a \textit{unified block sparse attention} pattern for both the prefilling and decoding stages: each thread block computes a $T_Q \times T_K$ tile (and $T_K \times T_V$) in parallel. Here, $T_Q > 1$ in the prefilling stage and $T_Q = 1$ in the decoding stage, with $T_K$ (or $T_V$) corresponding to the page size in PagedAttention~\cite{kwon2023efficient}.
+
+We define \textit{block sparsity} in \system as follows: for each $T_Q \times T_K$ tile in the attention calculation, it is either fully skipped (Figure~\ref{fig:method:blocksparse}(b), light gray blocks) or retained as in standard causal attention (Figure~\ref{fig:method:blocksparse}(b), blue blocks). Given that each GPU streaming multiprocessor can execute only a limited number of thread blocks simultaneously, the attention kernel execution time can be approximated by the total count of $T_Q \times T_K$ (and $T_K \times T_V$) blocks. With a block sparsity of $r$, where $rN$ of the $N$ total blocks are empty, the theoretical speedup from block sparse attention is $1 / (1 - r)$. For example in Figure~\ref{fig:method:blocksparse}(b), 10 out of $N$=21 blocks are non-empty. Thus, the theoretical speedup ratio is 2.1$\times$. 
+
+Figure~\ref{fig:method:blocksparse}(c)(d) shows two sparsity patterns used in \system. The first is streaming attention (Figure~\ref{fig:method:blocksparse}(c)), a specialized form of block-sparse attention where each token only attends to its immediate neighbors and initial tokens, known as attention sinks~\cite{xiao2023efficient}. Unlike dense attention, where computation for each row scales with the token index, streaming attention keeps the computation for each token \textit{constant}—in this case, only two local blocks and one sink block, as shown in Figure~\ref{fig:method:blocksparse}(c). This pattern is nearly cost-free in applications with extremely long contexts. Because streaming attention follows a fixed pattern, we designate which heads use it in \textit{offline}, and make it \textit{static} for different input sequences in both prefilling and decoding.
+
+The second type of sparsity, illustrated in Figure~\ref{fig:method:blocksparse}(d), is page sparsity, which is specifically designed for the decoding stage where $T_Q=1$ applies to both skipped and selected pages. Unlike streaming attention, page sparsity in \system is \textit{dynamic}, allowing different query tokens to attend to different KV pages. As noted in Deja Vu~\cite{liu2023deja}, dynamic sparsity results in higher compression ratios than static sparsity. Our observations indicate that static sparsity offers up to a 2$\times$ efficiency gain, whereas dynamic sparsity bounds the decoding complexity to a \textit{constant}, with each query attending only to a fixed number of KV tokens.
+
+\subsection{\system System Overview}
+\vspace{2pt}
+
+We present an overview of \system in Figure~\ref{fig:intro:overview}. Built on QServe, which natively supports quantized LLMs, \system enhances the baseline system by introducing sparsity into both prefilling and decoding dataflows. The \textit{two-way paged KV cache} serves as the bridge between these two stages. 
+
+As discussed in Section~\ref{sect:method:blocksparse_overview}, we statically partition the attention heads of a pretrained LLM into two groups: dense heads and streaming heads. Unlike conventional LLM serving systems, which maintain a single KV cache, we utilize \textit{separate} KV caches for the dense and streaming heads. The KV cache for the streaming heads is organized similarly to the pages in QServe, with scaling factors and zero points stored immediately after the token features. Additionally, the KV cache for the dense heads includes \textit{key statistics} that facilitate critical page selection during the decoding stage.
+
+In the prefilling stage, the key differences between \system and conventional dense-attention LLM serving systems are twofold: (1) we replace the dense attention kernel with our unified block sparse attention kernel, and (2) we write back quantized KV features using two distinct kernels. 
+
+In the decoding stage, our system incorporates dynamic attention sparsity. Rather than developing an entirely new dynamic sparse attention kernel, we decompose the problem into two components: (1) dynamic \textit{page selection} and (2) a \textit{dense} attention kernel with \textit{shorter page tables}, where the shorter page tables are provided by the page selector. Notably, our page selector employs hierarchical paging and reusable page selection, enhancing both long-context accuracy and page selection efficiency.
+\input{text/figure/6-analysis/naive_larger_page}
+
+
+\subsection{Prefilling Stage: Sparsity Determination}
+
+We adopt the approach from DuoAttention~\cite{xiao2024duoattention} to classify each attention head as either a retrieval head or a streaming head. Using DuoAttention's optimization-based identification method, we obtain a gating value $\alpha \in [0, 1]$ for each head, where values closer to 1 signify a retrieval head, and values closer to 0 indicate a streaming head. To classify a head as a retrieval head, we compare $\alpha$ to a threshold $\tau$, determined by a sparsity quantile. For instance, with a target sparsity of 50$\%$ across attention heads, $\tau$ equals the median of all gate values, thereby designating half of the heads as retrieval heads.
+
+\subsection{Prefilling Stage: Kernel Implementation}
+
+To effectively translate sparsity into performance gains, it is essential to avoid iterating over a complete sequential loop and relying on conditional statements to determine data loading and computation requirements. This method is inefficient for GPU computation patterns, which thrive on minimizing branching within loops. Instead, we should focus on iterating only over the necessary blocks by accurately calculating offsets to load data and assess whether a block should be processed.
+
+To facilitate this, we introduce an iterator-based abstraction that standardizes indexing operations. This allows us to loop exclusively over the blocks requiring computation, with data offsets easily computed using 
+$\text{offset} = \text{iter}(i + 1) - \text{iter}(i)$. This abstraction efficiently skips unnecessary blocks with minimal overhead and necessitates few changes to the kernel function, thus enhancing maintainability. Take the streaming heads as an example, the iterators are determined outside the attention kernel since streaming heads are configured offline and the attention pattern is fixed. Once the attention on sink tokens is complete, the iterator automatically updates the memory pointer to the first local token in the KV cache with minimal overhead. Additionally, our iterator-based formulation unifies the more general block sparse pattern (see Figure~\ref{fig:method:blocksparse}).
+
+
+
+
+\subsection{Decoding Stage: Sparsity Determination}
+\label{sect:method:decoding_sparsity_determination}
+
+
+
+
+To further enhance the long-context LLM decoding throughput, we introduce dynamic sparsity upon the input-agnostic static sparsity in Sec.~\ref{sect:method:blocksparse_overview}. 
+
+\subsubsection{Challenge: the Page Size Dilemma} 
+
+\input{text/table/6-analysis/page_size_speed}
+
+
+In the decoding stage, the attention operation is memory-bound, so state-of-the-art systems typically implement KV cache quantization to reduce device memory usage and enhance throughput. However, this quantization introduces challenges for further optimization. Specifically, reducing the bit-width of KV tokens necessitates larger page sizes to maintain GPU memory bandwidth utilization. Failure to do so can lead to significant throughput loss (Table~\ref{tab:ana:page_size_speed}). Yet, larger KV page sizes complicate the sparsification process; for example, Quest~\cite{tang2024quest}, which estimates token criticality using page-wise statistics, fails when page sizes increase (Figure~\ref{fig:ana:naive-larger-page}). This observation poses challenges to balance between accuracy and efficiency. 
+
+
+
+
+
+\input{text/figure/4-method/page_selector}
+\input{text/figure/4-method/reusable_selector}
+
+\subsubsection{Hierarchical Paging: Mitigating the accuracy-efficiency tradeoff} 
+\label{sect:method:decoding:hierarchical_page}
+
+
+We observe that the failure of query-aware KV cache selection paradigm (Figure~\ref{fig:ana:naive-larger-page}) is not due to the coarser granularity of sparse attention (i.e., larger page size). Rather, the underlying cause lies in that page-wise statistical indicators become homogenized and less representative especially when there are excessive tokens within a single page.
+To address this issue, we design a simple-yet-effective hierarchical paging system that introduces an abstract layer of virtual \textit{logical page} for estimating token criticality, while preserving the original memory layout of KV cache in (\textit{physical pages}).
+As illustrated in Figure~\ref{fig:method:page_selector}, our hierarchical paging groups $N_L$ tokens into a logical page and $N_P$ tokens into a physical page ($N_P = g\cdot N_L, g\in \mathbb{Z}$), that is, a physical page contains $g$ logical pages. 
+Tokens within the same logical page will collectively contribute to the same criticality estimator. In \system, we utilize the channel-wise minimum and maximum values of keys in the same logical page as its representative vectors, which has been proven to be an effective metric~\cite{tang2024quest} for page importance estimation with a moderate page size ($\leq 16$).
+The current query will attend to representative vectors of each logical page to calculate the corresponding importance score as follows:
+
+\vspace{-14pt}
+\begin{equation}
+\small
+S^{j} = \sum_i^D \max{\left(q[i]*k^j_{max}[i], \hspace{3pt} q[i]*k^j_{min}[i] \right)}
+\label{eqn:method:estimator}
+\end{equation}
+\vspace{-14pt}
+
+where $S$ is the importance score of logical page, $j\in\{a,b,...\}$ is the index of logical page, $i$ is the channel index, and $D$ refers to the head dimension.
+
+The importance of each physical page is determined by the max-reduction over the importance scores of its corresponding logical pages. Finally, \system selects the top-K physical pages (based on the predefined token budget) with highest importance scores as the input of sparse attention kernel.
+
+
+
+
+\subsubsection{Reducing sparse attention overheads with locality}
+\label{sect:method:decoding:locality}
+
+
+One remaining question is: as physical page size increases, will the hierarchical paging require a higher token budget for sparse attention to retain accuracy?
+
+Given a generation step, assume the most important history tokens are distributed in a logical page set $\mathcal{P}=\{P(i,j)\}$, where $i\in\{1,2,...\}, j\in\{a,b,,...\}$ are the physical and logical index of a page accordingly. If these important tokens are randomly and sparsely distributed in the context, chances are that all logical pages in $\mathcal{P}$ are scattered in different physical pages, that is, for any $P_1, P_2 \in \mathcal{P}$, $i_1 \neq i_2$. In this case, all $|\mathcal{P}|$ physical pages ($|\mathcal{P}|\cdot N_P$ tokens) are selected to avoid losing important information. However, the \naive paging only needs to keep $|\mathcal{P}|\cdot N_L$ tokens since it directly shrinks page sizes to a smaller granularity (e.g., $N_L$). Consequently, our hierarchical paging may suffer from a decrease in attention sparsity by $N_P/N_L$.
+
+
+Fortunately, the semantic continuity of natural language endows the attention operation with intrinsic locality, allowing \system to maintain a consistent sparse attention token budget for larger physical page sizes.
+During the decoding stage, the coherence of contextual tokens makes the current query token incline to attend to consecutive pages in the KV cache. As a result, logical pages with highest importance scores tend to cluster within similar physical pages. This kind of \textit{spatial locality} effectively alleviates the need for a increased token budget, thereby reducing the overhead caused by the contradiction between quantization and sparse attention. Experimental results in Figure~\ref{fig:ana:our_larger_page} further affirm that our hierarchical paging well preserves the model accuracy even with the same token budget as the vanilla page selector with smaller page sizes.
+
+
+Moreover, the attention mechanism in decoding stage also exhibits the \textit{temporal locality}: adjacent query tokens also heavily attend to similar historical pages. And there is no need for queries at consecutive decoding steps to select salient pages independently. Instead, the page selection decision can be shared across queries, aligning with the block-sparse attention formulation illustrated in Figure~\ref{fig:method:blocksparse}(d).
+
+To this end, we present \textit{Reusable Page Selection} in \system. As in Figure~\ref{fig:method:reusable_selector}, we activate the page selector only at the very beginning of pre-defined chunks. For the consecutive tokens within the same chunk, we reuse the page selection results from the first token of the chunk.
+Utilizing the temporal sparsity of attention, reusable page selection substantially improves the long-context generation speed by a great margin without sacrificing accuracy. As demonstrated in Figure~\ref{fig:ana:selector_overhead}, even though dynamic sparse attention effectively restrict the complexity of decoding attention, the latency of page selector increases linearly with regard to the sequence length. When the number of history tokens surpasses 64K, the \naive page selector becomes the bottleneck to system efficiency, whereas our reusable page selector significantly alleviates this problem.
+
+
+
+
+
+
+
+
+\subsection{Decoding Stage: Kernel Implementation}
+
+During the decoding stage, attention heads are processed in parallel on GPU, enabling different sparsity patterns to be applied independently on each head. This flexibility enables some heads to operate with page-level sparsity while others follow the streaming computation pattern. 
+
+To leverage this, we employ a two-level indexing hierarchy to unify the operations for streaming heads and dense heads with dynamic sparsity. Specifically, the low-level (physical) index corresponds to the iteration step of current GPU thread, which executes in a consecutive manner as in dense attention, while logical index denotes the actual position of the target token within the entire KV cache. For each dense head, the page selector provides an index table to map physical index to logical index. Streaming heads are treated as dynamic sparse heads with index table only containing the sink and local pages. 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

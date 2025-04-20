@@ -1,0 +1,69 @@
+\begin{figure*}[t!]
+    \centering
+    \includegraphics[width=0.8\textwidth]{figures/arch_v1.jpg}
+    \caption{Architecture of \sys framework. Client requests are received at the global router. IW requests are routed to and served by instances at various regions. NIW requests are held by the queue manager and introduced into the router selectively. The forecasting module runs the optimization to scale instances. %\textcolor{blue}{AP: revisit this figure before Arxiv submission.}
+    }
+    \label{fig:arch}
+\end{figure*}
+
+\section{Architecture of \sys}
+\label{sec:arch}
+We next describe the approach and design of our proposed \sys framework solves the proposed problem.
+\subsection{Overview}
+
+\autoref{fig:arch} shows the \sys LLM serving architecture operating across regions. At the frontend, \sys provides serving APIs similar to other LLM serving platforms. For IW requests, it uses a real-time streaming API that returns outputs once each token is
+generated~\cite{streamAPI,aoai-stream}. For NIW requests, it adopts an interface similar to Batch APIs~\cite{BatchAPI,aoai-batch} which takes requests and returns responses asynchronously. The global router receives a request and routes it to the relevant region hosting the LLM instances which can service the request ($\S$ \ref{sec:instancerouter}). Other components orchestrate the forecasting and optimization logic ($\S $ \ref{sec:forecast}), scaling logic ($\S$ \ref{sec:scaling} and NIW queue manager ($\S$ \ref{sec:queuemanager}). These are discussed next. 
+
+\subsection{Routing Logic}\label{sec:instancerouter}
+The routing module includes the routing to regions by the global router, routing to endpoints within a region, and routing locally among the instances of an endpoint.
+
+\para{Global routing for IW requests}
+When IW requests are received at the global router, the region routing logic checks the effective memory utilization of all the available regions hosting the model and routes the request to the region with memory utilization less than the desired threshold (70\%).
+If multiple regions match, we can specify an order of preference, e.g., based on network proximity.
+The effective memory utilization is calculated as the ratio of the sum of the effective memory utilized to the effective memory available across all instances for a model in a region. The effective available memory for a model instance is obtained by subtracting model weights from the total VM memory. If none of the preferred regions has memory utilization less than the threshold, then the region with the least memory utilization among the choices is selected.
+
+\para{Global routing for NIW requests}
+NIW requests are sent by the global router to a Queue manager that holds these requests (\autoref{fig:arch}). Each model endpoint at the regions periodically send a signal to the Queue manager when their effective utilization falls below a specific threshold (60\%, in our experiments). Then, the NIW requests waiting in the queue for that region and model are incrementally removed by the Queue Manager and routed to that available endpoint, as described in Section~\ref{sec:queuemanager}.
+
+\para{Routing logic at region endpoint}  For both IW and NIW requests, we route requests arriving at a region to the least loaded deployment endpoint for that model, based on the effective memory utilized. Requests are sent to the instance with the minimum remaining tokens to proces, based the Join The Shortest Queue Logic~\cite{gupta2007analysis}.
+
+\para{Scheduler at the model instance} A local queue is maintained at the instance as well. IW requests arriving at an instance are assigned priority 0 and available immediately for inference. The scheduler at the model instance selects requests and batches them for inference in a first-come, first-served manner. 
+NIW requests may also arrive with a priority 0, as set by the Queue Manager, and are considered on par with IW requests. NIW requests with the default priority 1 are selected for inference if there are no priority 0 requests waiting at the instance queue. NIW requests are incrementally added to the queue.
+
+
+%%-----------------------------------------------------------------------%%%%%%%%
+\subsection{Queue Manager for NIW} \label{sec:queuemanager}
+The Queue Manager take care of asynchrnously routing NIW requests to a specific region and endpoint. Upon receiving a signal from an model endpoint on its capacity availability, an asynchronous feedback logic initiates several steps. It pulls the requests that are queued at the Queue Manager for that model type and routes them to the region from which the signal was received. All NIW requests whose age is less than 10 hours are given a priority of 1, while requests that have an age greater than 10 hours are given a priority 0, similar to IW requests. If the signal received indicates that the effective memory at the regional endpoint is less than 60\%, one request is removed from the Queue Manager added sent to the endpoint; if it is less than 50\%, two requests are sent.
+% \ysnote{later, consider the size of the NIW workload, unless we're already splitting the NIW into smaller batches and sending them}
+% \kjnote{We are considering batch size 1 only in our experiments. Should mention that.}
+
+%%-----------------------------------------------------------------------%%%%%%%%
+\subsection{Forecast Logic and Optimization Module}\label{sec:forecast}
+For IW requests, we forecast the rate of token generation requests that will be received per region per model type using an ARIMA model~\cite{shumway2017arima}, which we find to be accurate enough to predict the diurnal load for each model from a region. From the forecasting module, we take the maximum TPS expected in the next hour to estimate the TPS capacity requred for an IW model. We add a buffer of $\beta$ to this forecasted TPS to handle transient bursty workloads and to offer capacity to serve NIW requests. We calculate the buffer as $\beta=10\%$ of the NIW load we received in the past hour. The output of the forecast module is passed to the optimization module, uses an Integer Linear Programming (ILP) solver to solve the optimization problem in Section~\ref{sec:optimization}.
+This returns $\delta_{i,j,k}$, which is the change in the number of instances assigned to model $i$ at region $j$ running on GPU VM of type $k$. The forecast and optimization module is invoked every hour.
+
+
+%%-----------------------------------------------------------------------%%%%%%%%
+\subsection{Scaling Logic} \label{sec:scaling}
+
+The long-term scaling logic uses the hourly output from the forecasting module, which solves the optimization problem using ILP. If the recommendation, $\delta_{i,j,k}$, for a specific region, model type and GPU VM type is positive, we need to scale out the instances; and if the prediction is negative, we need to scale in. For scale out, we first reclaim spot instances of the identical model type which are faster to acquire, and if none are available, we reclaim spot instances from other model types which can be slower to provision. Similarly, for scaling down, we donate the instances to the spot instances of the same model type.
+
+\subsubsection{When to initiate scaling?}\label{sec:lt-scaling-when}
+\para{Immediate (LT-I)}
+One naive approach is to immediately scale instantly to the instance count recommended by the long-term scaler every hour. We term this as Immediate (LT-I). 
+However, the recommendation is based on the peak load that will occur in the next 1~hour. So scaling out immediately can cause transient over-provisioning, well before the peak load actually arrives.
+
+We introduce two additional systematic scaling strategies to pace the rate at which the deployment state catches up with the forecasted load. 
+These approaches help improve the utilization of VMs and utility serving requests, making spare capacity available to other models that may require it in the same region. 
+
+\para{Instance Utilization (LT-U)}
+If the scaler suggests scaling out the instances, we do so only when the effective memory utilization actually starts increasing and goes over the threshold of 70\% used in out experiments. We keep increasing the instance count as long as this threshold is breached and until we achieve the instances count suggested by the optimization model. Similarly, if the scaling logic suggests downscaling, we do so when the utilization goes below the 30\% threshold, again until we have reduced to the suggested number of instances. The region endpoint provides the effective memory usage every time it receives a new request.
+
+
+\noindent \textbf{Instance utilization and ARIMA gap (LT-UA)}: 
+Our optimization model can make erroneous recommendations if the ARIMA predictions are inaccurate, which is bound happen if bursty requests occur often. As before for LT-U, we defer the scale out or in based on the memory usage thresholds actually being breached in either direction. 
+However, we do not strictly stop the scale out or in if the instance count reaches the target count. Instead, during the last 20 minutes of the hour, if we have reached the scale out instance count and the observed TPS load is $\geq 5\times$ of what ARIMA predicted, then we continue to scale up the instance count. On the other hand, if the TPS load received is $\leq 0.5\times$ of what the ARIMA prediction, we continue scaling down. Here, we switch from a memory-based strategy to a traffic-based strategy during the last 20 minutes of the decision window if the memory-based strategy has reached its goal.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% \clearpage

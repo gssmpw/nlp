@@ -1,0 +1,196 @@
+\section{Method}\label{sec:method}
+
+We train our models following a three-stage strategy:
+
+\begin{itemize}
+    \item \textbf{Image-only Pre-training (P1).} We pretrain on a large-scale human-centric dataset with image conditioning.
+    \item \textbf{Multiview Mid-training (M2).} We train models at a low-resolution of \resone to denoise $48$ target views with coarse camera control (no pixel-aligned spatial control).
+    \item \textbf{Multiview Post-training (P3).} We train at a high-resolution of \resfour to denoise $1-3$ target views with spatial control injected via ControlMLP layers. 
+\end{itemize}
+
+\noindent We denote the training stage and resolution of any given model as \{stage\}@\{resolution\}. For instance, M2@128 represents a mid-trained model at 128 resolution.
+
+\subsection{Base Model} \label{ssec:base_model}
+
+\heading{Architecture.} We adopt a DiT-like~\cite{peebles2023scalable} architecture with scale, shift, and gate modulation for timestep 
+conditioning inspired by Stable Diffusion 3~\cite{esser2024scaling} and Flux~\cite{flux}.
+We simplify the architecture by employing MLP and attention in parallel~\cite{zhai2022scaling}, and removing second LayerNorm after 
+attention layers.
+We use 
+VAE for training in latent space with $8$x spatial compression, and patchify latent images via a linear layer and patch size of $2$. We use fixed sinusoidal positional encoding during training. We provide more details in~\cref{app_sec:dit}, and the exact design of our DiT block in~\cref{fig:dit_block}. 
+
+\heading{Image-only Pre-training.} During pre-training, the model learns to 
+denoise an image conditioned on its corresponding image embedding from 
+DINOv2~\cite{darcet2023vitneedreg,oquab2023dinov2},
+this is similar in principle to the image decoder of DALL-E 2~\cite{DALLE-2}.
+We project both embeddings to the model dimension using with a linear layer 
+to create a joint conditioning. Importantly, our pretraining setup does not require any 
+annotations or captions for the images, and is well-aligned with our downstream 
+objective of generating consistent multiview images given a single reference image as 
+input.
+
+Formally, given an image $\mathbf{y} \in \mathbb R^{H \times W \times C}$, and the joint conditioning as $\mathbf{e}^{\text{img}} \in \mathbb R^{N \times D}$. We pre-train our diffusion model $\epsilon_\theta$ with the following objective: 
+\begin{equation}\label{eq:dm_loss}
+    \mathcal{L}_{\mathrm{DM}} = ||\noise^t - \dmmodel(\mathbf{y}^{t}, \mathbf{e}^{\text{img}},  t)||^2
+\end{equation}
+
+\noindent Where $t \in \mathbb [0,T]$ is diffusion timestep, $\noise^t \sim \mathcal{N}(\bm{0}, \bm{I})$ is the noise added at the given timestep.  We use the DDPM~\citep{DDPM,FirstDiffusionModel} formulation to define discrete timesteps and set $T=1000$. We first pretrain our model at \restwo and then at \resthree on a large corpus of human-centric images. Exact training details can be found in~\cref{app_sec:diffusion}.
+
+\subsection{Multiview Model} \label{ssec:multiview_model}
+
+Our goal is to generate many high resolution and unseen novel viewpoints of a human subject (akin to a studio capture) given a single input image.
+
+\vspace{1mm}
+\heading{Input Reference.} We denote the input image as $\mathbf{x}^{\text{ref}}$ and corresponding face crop as $\mathbf{x}^{\text{face}}$. The face crop is obtained using FaceNet~\cite{schroff2015facenet} and resized to the same size as input image, such that: $\mathbf{x}^{\text{face}}, \mathbf{x}^{\text{ref}} \in \mathbb R^{H \times W \times C}$. 
+
+\vspace{1mm}
+\heading{Target Cameras.} We denote the target viewpoints to be synthesized using distinct cameras (intrinsics and extrinsics), represented as $\mathbf{c}_{1:N}$. Each camera
+is used to generate its \plucker coordinates $\mathbf{P}_i \in \mathbb R^{H \times W \times 6}$.
+
+
+\vspace{1mm}
+\heading{Target \spatialanchor.} In addition to target cameras, we provide an oriented 3D point denoted as $\mathbf{a}_i=[\mathbf{R}_{i}|\mathbf{t}_{i}]$, which roughly defines the center of the subject's head, as well as their gaze direction. We show an example of our \spatialanchor in~\cref{fig:pipeline} in the studio on the left. This anchor is color-coded and projected into a 2D image, which is used as conditioning for our target view generations.  During inference, the \spatialanchor can be placed at any given point that lies within the field-of-view of the target cameras.
+
+\vspace{1mm}
+\heading{Multiview Diffusion Model.} Given the above inputs, we train a multiview diffusion model $\epsilon_\theta$ to \emph{jointly} denoise all the target views $\mathbf{y}_{1:N} \in \mathbb R^{N \times H \times W \times C}$ with the objective: 
+\begin{equation}\label{eq:dm_loss2}
+    \mathcal{L}_{\mathrm{DM}} = ||\noise^t - \dmmodel(\mathbf{y}^{t}_{1:N}, \mathbf{c}_{1:N}, \mathbf{x}^{\text{ref}}, \mathbf{x}^{\text{face}},  t)||^2
+\end{equation}
+
+\noindent where 
+$\mathbf{y}^{t}_{1:N}$ are noisy target images. We condition the base model on the provided reference image and its face crop by concatenating their patchified latent tokens with the noisy input latent tokens to the model. This is shown in ~\cref{fig:pipeline}
+
+\input{fig/model}
+
+\vspace{1mm}
+\heading{\midtraining.} In mid-training stage, we want to train a strong multiview model that can denoise several images together, and absorb the dataset quickly at a lower resolution. During this phase, we do not use any pixel-aligned spatial control such as \plucker or \spatialanchor. We use an MLP to encode the flattened $16$-dimensional target camera intrinsics and extrinsics into a single token 
+. We fuse this camera token into each noisy latent token (for the corresponding view) as positional encoding, which makes our multiview model 3D-aware of the target viewpoints. 
+We mid-train our model at \resone resolution to jointly denoise 24 views.
+
+\vspace{1mm}
+\heading{\posttraining.} In the post-training stage, our objective is to create a high-resolution model which is 3D-consistent starting with a low-resolution and a 3D-aware (but not consistent) model. For this, we design a lightweight ControlNet~\cite{zhang2023adding}-inspired module, which takes as input the pixel-aligned \plucker and \spatialanchor controls, and the denoising timestep to create a separate modulation signal for the multiview model. We name this module ControlMLP, as it uses a single MLP to generate scale-and-shift modulated control for each multiview-DiT block as shown in ~\cref{fig:dit_block}. Each layer of ControlMLP is zero-initialized at the start. We find that the Post-training phase is crucial in reducing flicker and 3D inconsistencies in generations. We post-train models at \resthree and \resfour resolutions to jointly denoise 10 and 2 views respectively. Increasing the number of views further lead to GPU out-of-memory issues. 
+
+
+
+\vspace{1mm}
+\heading{Encoding \plucker and \spatialanchor.} We notice that the relative differences between neighboring pixels in \plucker coordinates are tiny. To amplify these differences better, we use a SIREN~\cite{SIREN} layer to first process the $6$D grid into a $32$D feature grid. Then, we downsample it by $8$x to match the size of latent tokens and feed it as input to the ControlMLP. In addition, use the \spatialanchor to fix the position and orientation of the subject's head in 3D. We only use the \spatialanchor for generations, and not for the input reference view. We encode the \spatialanchor image into the latent space of our model via VAE, and concatenate it with \plucker input and pass it through an MLP to create the modulation signal at each layer. 
+
+
+\subsection{Understanding and Improving Spatial Control}\label{ssec:spatial_control}
+
+\noindent This section presents our design choices and examines alternative approaches for injecting pixel-aligned spatial controls during \posttraining stage. We demonstrate the effectiveness of spatial control through a focused overfitting experiment with quantitative evaluations in ~\cref{tab:3deval}.
+
+\vspace{1mm}
+\heading{Scene Overfitting Task.} We use $160$ frames from a fixed 3D scene of a given subject and timestamp, split into $100$ training and $60$ validation views. We overfit our mid-trained model to the training views while testing various spatial control methods, training only the control modules while keeping other weights frozen. After overfitting for $10$K iterations, we evaluate the model on validation views for novel view synthesis.  Strong generalization to validation viewpoints indicates effective spatial control and appropriate camera viewpoint sensitivity. Through this task, we evaluate different spatial control injection methods in~\cref{tab:3deval}, starting with simple to advanced modulation designs.
+
+\input{tab/3deval}
+
+\begin{itemize}
+    \item \textbf{No overfitting (Row 1).} The Mid-trained model without scene-specific overfitting achieves comparable PSNR of 19.2 and 19.7 on train and validation views respectively. We treat this setup as baseline to improve over. 
+
+    \item \textbf{Encoding Camera with MLP (Row 2).} We encode camera using an MLP similar to prior works~\cite{zero1to3, MVDream} and our \midtraining stage (\cref{ssec:multiview_model}). After overfitting, the model achieves slightly better PSNR on training views as expected, however the validation PSNR drops by 1.28 points to 17.95. This suggests that an MLP does not provide enough modulation for camera control. 
+    
+    \item \textbf{\plucker as Positional Encoding (Row 3).} In this setup, we use downsampled and patchified \plucker coordinates processed through MLP to create positional encoding, which is added to the noisy latent tokens. This setup is inspired from  prior works~\cite{RayConditioningGAN,LFNs,kant2024spad,he2024cameractrl,bahmani2024vd3d}, and it further improves the validation PSNR compared to MLP at 18.89, but lags behind the non-overfitted baseline.
+
+    \item \textbf{\plucker with ControlMLP and SIREN (Row 4, 5).} Here, we use our ControlMLP module to inject spatial control at each multiview-DiT block output. Moreover, encoding \plucker coordinate with a SIREN~\cite{SIREN} amplifies the relative differences between neighboring pixels (\cref{ssec:multiview_model}). This setup achieves PSNR of 20.13 with an improvement of 0.9 over baseline.
+
+    \item \textbf{Adding \spatialanchor (Row 6).} Finally using the \spatialanchor gives validation PSNR of 22.6 (gain of 3.3 points over baseline) and enables strong spatial control. Thus, we adopt this configuration for \posttraining stage.
+\end{itemize}
+
+\subsection{Handling Varying Number of Views at Inference}\label{ssec:scaling_views}
+
+As discussed in~\cref{ssec:multiview_model}, during training we jointly denoise a fixed number of views. Specifically, 24 views for mid-training at \resone, and 2 or 12 views for post-training at resolutions \resthree and \resfour respectively. This choice is largely motivated to avoid GPU out-of-memory errors during training. However, during inference, we wish to scale the number of views much further to generate smooth turnaround videos. This is feasible because we can run inference at half precision (using bfloat16) and do not need the backprop computation graph to be stored. 
+
+We find that simply scaling the number of views (or tokens) during inference beyond 2\texttt{x} of the number of views during training leads to blurry and degraded generations. We find these degradations to be most significant in regions unspecified in the input, for example, the back of the head or ears as shown in~\cref{fig:qual_entropy}. We investigate this issue next, and introduce Attention Biasing to remedy it. 
+
+\input{fig/entropy}
+\heading{Attention Biasing.} Let $\textbf{X} \in \mathbb{R}^{N \times d}$ denote the sequence of tokens denoised jointly, where $N, d$ represent number of tokens and the token dimension, respectively. In \ourmodel the total number of tokens in the sequence is proportional to number of views since the VAE and Patchify jointly compress the image by 16\texttt{x} in height and width. Within each DiT block, we compute the $\textrm{Attention}(\textbf{Q}, \textbf{K}, \textbf{V}) = \textbf{A}\textbf{V}$, where  $\textbf{Q},\textbf{K},\textbf{V}$ are query, key, value matrices and $\textbf{A}$ are attention scores computed via taking a row-wise softmax as follows:
+\begin{equation}
+    \textbf{A}_{i, j} = \frac{e ^{\lambda \textbf{Q}_{i}\textbf{K}_{j}^{\top}}}{\sum_{j' = 1}^{N} e ^{\lambda \textbf{Q}_{i}\textbf{K}_{j'}^{\top}}}, \label{attention map}
+\end{equation}
+Where the scaling factor $\lambda$ was proposed to be set to $1 / \sqrt{d}$ by the original work~\cite{vaswani2017attention} to stabilize the softmax operation as $d$ increases and avoiding biased (sharp) softmax distributions. We can quantify the sharpness of the attention by computing its entropy. Following previous works in NLP~\cite{ghader2017does,attanasio2022,zhang2024attention}, and in vision~\cite{jin2023training} we define entropy of attention as:
+\begin{equation}
+    \textrm{Ent}(\textbf{A}_{i}) = -\sum_{j=1}^{N} \textbf{A}_{i, j} \log (\textbf{A}_{i, j}), \label{entropy}
+\end{equation}
+By substituting the equation ~\eqref{attention map} in equation~\eqref{entropy}, authors of prior work~\cite{jin2023training} meticulously derive that entropy of attention grows logarithmically with number of tokens as follows: \(\textrm{Ent}(\textbf{A}_{i}) \propto \log N\). Furthermore, the authors show that this growth in entropy can be offset during inference by growing the scaling factor $\lambda$ as follows: 
+\begin{equation}
+    \begin{aligned}
+    \lambda = \sqrt{\frac{1}{d}} \cdot \sqrt{\frac{\log N_i}{\log N_t}}
+    \end{aligned}
+\end{equation}
+Where $N_t, N_i$ denote the number of tokens during training and inference respectively. For more details, please refer to Sections 3.1 and 3.2 of the original work~\cite{jin2023training}. Empirically, we find that having a slightly faster growing $\lambda$ alleviates the degradation better. Hence, we propose a hyperparameter $\gamma$ (growth factor) that is tuned between the range $[1.0,2.0]$ to control the growth of $\lambda$ as follows: 
+\begin{equation}
+    \begin{aligned}
+    \lambda_\texttt{ours} = \sqrt{\frac{1}{d}} \cdot \sqrt{\frac{\gamma \cdot \log N_i}{\log N_t}}
+    \end{aligned}
+    \label{attn_bias}
+\end{equation}
+We follow the above Equation~\eqref{attn_bias} with our growth factor hyperparameter $\gamma$. In~\cref{fig:entropy}, we plot the entropy (Y-axis) during an inference pass of \ourmodel across varying number of views (tokens) being denoised and demonstrate the corresponding growth in entropy. Furthermore, we also show the attenuation in the entropy under increasing growth factors $\gamma$ (X-axis). 
+
+We put generated visuals before and after using the suggested attention biasing in~\cref{fig:qual_entropy}. We put visuals sweeping over more values of the growth factor in Appendix~\cref{fig:qual_entropy_full}. Similar techniques have been explored in LLMs for handling and generating text at longer contexts~\cite{peng2023yarn,veličković2024softmax}, where the scaling factor $\lambda$ mentioned above is analogous to the inverse of the temperature scale. 
+
+Additionally, we also found that using a bump function instead of constant Classifier-free Guidance during generation leads to fewer artifacts. We discuss this trick further in~\cref{app_sec:diffusion}.
+
+\input{fig/qual_entropy}
+
+ 
+
+
+
+
+\subsection{Enhanced 3D Consistency Metric}
+\label{ssec:consistencymetric}
+
+
+
+Traditionally, the 3D consistency of multiview generation models is evaluated using 2D image metrics such as PSNR, LPIPS, and SSIM against a fixed set of ground truth images. However, this approach unfairly penalizes models that generate plausible and 3D-consistent novel content deviating from the fixed ground truth images.
+Some works try to address this by measuring SfM~\cite{SFM,fridman2024scenescape} or epipolar error~\cite{muller2024multidiff,TrainNVSDM3}, but these methods solve for pose or are not robust since they measure against the entire epipolar line. To address these limiations, we use our GT camera poses as input and compute \reprojectionerror (RE) given our known camera poses and predicted correspondences.
+
+
+
+
+Our computation of RE involves the following steps:
+\begin{enumerate}
+    \item \textbf{Landmarks and Correspondence estimation.} We use SuperPoint~\cite{detone2018superpoint} to detect landmarks in the generated images and employ SuperGlue~\cite{sarlin2020superglue} to establish pairwise correspondences between landmarks across images.
+    \item \textbf{Triangulation.} Given the correspondences and camera parameters, we apply Triangulation based on Direct Linear Transformation (DLT)~\cite{Hartley2004} to obtain the corresponding 3D points for each landmark.
+    \item \textbf{Reprojection and Error calculation.} We reproject these 3D points onto each image and compute the RE as the L2 distance between the original landmark and the reprojected 3D point normalized by image resolution, and average error across all images. 
+\end{enumerate}
+This approach evaluates multiview generation models by focusing on their ability to produce 3D-consistent results rather than adhering to a fixed ground truth. 
+The \reprojectionerror provides a valuable basis for comparison across different methods. Furthermore, by computing RE on a set of real-world images that are independent of our generated images, we can establish a baseline that quantifies the error due to the noisy predictions from SuperGlue and SuperPoint rather than the quality of our generated images.
+
+\heading{Naming Convention (RE@SG).} Please note that the use of SuperPoint~\cite{detone2018superpoint} and SuperGlue~\cite{sarlin2020superglue} estimation modules is a particular instantiation of our metric, and these could be replaced in the future with stronger counterparts such as MAST3R~\cite{dust3r_cvpr24,mast3r_arxiv24} or domain-specific keypoint detectors such as Sapiens~\cite{khirodkar2025sapiens}. Thus we use the naming convention of RE@SG to denote the Reprojection Error (RE) under SuperGlue (SG) estimation, which could be modified accordingly in the future for different estimators. 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    
+    
+    
+
+
+    
+
+    
+    
+    
+

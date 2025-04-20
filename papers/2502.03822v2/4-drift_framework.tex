@@ -1,0 +1,121 @@
+\section{DRIFT Framework}
+\label{sec:drift_framework}
+
+\subsection{Overview}
+The DRIFT framework is designed to dynamically adjust trainable ranks in a diffusion policy, allowing the number of trainable parameters to change throughout the training process. This flexibility enables efficient training from scratch by leveraging the intrinsic low-rank structure of overparameterized models. As covered in \S\ref{sec:problem_statement}, the rank adjustment process must ensure training stability and avoid introducing additional computational overhead. These considerations are critical for training from scratch but are often overlooked by existing methods like LoRA \cite{hu_lora}, which are primarily designed for fine-tuning. Applying methods like LoRA for dynamic rank adjustment during training from scratch can result in higher computational time for forward pass and instability due to the need for merging and re-injecting newly initialized low-rank adapters, which disrupts the training process.
+
+To achieve dynamic trainable rank adjustment while maintaining training stability, we propose \textit{rank modulation}. Rank modulation uses the Singular Value Decomposition (SVD) \cite{strang2022introduction} to partition ranks into trainable and frozen sections. This approach avoids introducing new parameters, ensures that computational costs for the backward pass decrease as the trainable ranks are reduced, and maintains a constant computational cost for the forward pass.
+
+In addition to rank modulation, the framework can incorporate a \textit{rank scheduler} to coordinate the dynamic adjustment of trainable ranks. While rank modulation facilitates the adjustment itself, the rank scheduler determines how the trainable ranks may automatically evolve during training. The rank scheduler uses a decay function that calculates the current number of trainable ranks based on the training epoch, the maximum rank, and the desired terminal rank of the policy.
+
+% In summary, the DRIFT framework primarily contains two components:
+% \begin{itemize}
+    % \item \textbf{Rank Modulation}: Adjusts trainable ranks without destabilizing training or introducing additional computational overhead.
+    % \item \textbf{Rank Scheduler}: Governs the dynamic adjustment of trainable ranks as training progresses.
+% \end{itemize}
+
+The rank modulation and rank scheduler components can work together to enable efficient training of diffusion policies by dynamically balancing representational power and computational efficiency.  
+
+% We cover both components in the next sections.
+
+\subsection{Rank Modulation}
+\label{sec:rank_modulation}
+
+Rank modulation takes inspiration from LoRA \cite{hu_lora}, which employs an adapter with small trainable ranks during fine-tuning. LoRA achieves this by injecting additional low-rank weight matrices into the network layers, allowing only these matrices to be updated during backpropagation. For the one-dimensional convolution blocks in a U-Net architecture used by diffusion models, LoRA would replace the original convolutional layer with:
+\[
+\text{Conv}_{\text{LoRA}}(x) = W_{\text{conv}} \circledast x + \alpha((W_{\text{up}} \times W_{\text{down}}) \circledast x),
+\]
+where $\circledast$ denotes convolution, $W_{\text{conv}}$ is the original convolution weight tensor of shape $(C_{\text{out}}, C_{\text{in}}, k)$, with $C_{\text{out}}$ and $C_{\text{in}}$ denoting the output and input channels, and $k$ is the kernel size. Two low-rank matrices, $W_{\text{down}} \in \mathbb{R}^{r \times C_{\text{in}} \times k}$ and $W_{\text{up}} \in \mathbb{R}^{C_{\text{out}} \times r \times k}$, are introduced, where $r \ll C_{\text{in}}$. A scaling factor $\alpha$ further controls the magnitude of the low-rank update. During backpropagation, gradients are computed only for $W_{\text{down}}$ and $W_{\text{up}}$, thus lowering the number of trainable ranks.
+
+Despite these benefits, LoRA has several limitations when applied to IL that trained from scratch. Since LoRA is essentially an approximation of the full-rank weight, it relies on the main weight $W_{\text{conv}}$ being thoroughly pre-trained. Otherwise, the low-rank approximation may limit the representational power of the model and prevent it from fully benefiting from overparameterization. Furthermore, injecting LoRA blocks adds complexity to the forward pass. Due to the merging of $W_{\text{up}}$ and $W_{\text{down}}$, the additional convolution with LoRA blocks results in a time complexity of $O(C_{\text{out}} \times C_{\text{in}} \times r \times k)$, which increases computational overhead proportional to the rank $r$ compared to the time complexity of the original convolution $O(C_{\text{out}} \times C_{\text{in}} \times k)$. While this computational overhead is often negligible when fine-tuning a pre-trained model with a rank of less than 4 \cite{hu_lora}, training a model from scratch requires low-rank adapters with significantly higher number of trainable ranks to effectively leverage both overparameterization and low-rank structure (as we will demonstrate in \S\ref{sec:abl_tr}). This increase in trainable ranks amplifies the computational cost associated with $r$, making it a critical consideration in such scenarios.
+
+Finally, if LoRA is used with a dynamic rank scheduler (discussed in \S\ref{sec:rank_scheduler}), new LoRA blocks must be injected each time the rank changes, introducing freshly initialized parameters and destabilizing training. Consequently, repeatedly merging and reinjecting LoRA blocks is inefficient when the trainable rank is adjusted on the fly. 
+
+% motivating our alternative solution via rank modulation.
+
+% In our scenario of imitation learning (IL) trained from scratch, it is ideal to maintain the same forward pass time while progressively reducing the number of trainable ranks to decrease the time required for backpropagation. Additionally, to ensure stable training, we should avoid initializing new parameters during the training process when the number of trainable ranks changes. 
+
+To address these limitations, we propose rank modulation, which leverages SVD to decompose weight matrices into components designated as either frozen or trainable ranks. More specifically, consider a weight matrix 
+$
+  W \in \mathbb{R}^{n \times m}
+$
+that can be created from a corresponding weight tensor \( W_{\text{conv}} \in \mathbb{R}^{C_{\text{out}} \times C_{\text{in}} \times k}\) for a one-dimensional convolutional layer by reshaping, e.g., $C_{\text{out}} * k$ becomes $n$ and $C_{\text{in}}$ becomes $m$ (as covered in \S\ref{sec:ranks_in_diffusion_models}).  Using this matrix, we first apply the SVD:
+$$
+   W = U\,\Sigma\,V^T,
+$$
+where 
+$
+  U \in \mathbb{R}^{n \times n},\,
+  \Sigma \in \mathbb{R}^{n \times m},\,
+  V \in \mathbb{R}^{m \times m}.
+$ 
+$U$ and $V$ are orthonormal matrices that represent rotations or reflections, while $\Sigma$ is a diagonal matrix containing scaling factors along the principal components of the weight matrix.
+Next, we split $U, \Sigma,$ and $V$ at a specified rank $r$ to partition trainable and frozen part of each matrix:
+\begin{align*}
+U &= 
+\bigl[\,
+   U_{\text{train}}\ \ U_{\text{frozen}}
+\bigr],
+\\
+\Sigma &= 
+\begin{bmatrix}
+  \Sigma_{\text{train}} & 0_{r \times (m - r)} \\
+  0_{(n - r) \times r} & \Sigma_{\text{frozen}}
+\end{bmatrix},
+\\
+V &= 
+\bigl[\,
+   V_{\text{train}}\ \ V_{\text{frozen}}
+\bigr].
+\end{align*}
+Accordingly, we represent trainable weight $W_{\text{train}}$ and frozen weight $W_{\text{frozen}}$ as:
+\begin{align*}
+W_{\text{train}} &= U_{\text{train}} \,\Sigma_{\text{train}}\,V_{\text{train}}^T, \\
+W_{\text{frozen}} &= U_{\text{frozen}} \,\Sigma_{\text{frozen}}\,V_{\text{frozen}}^T. 
+\end{align*}
+During training, \(\{U_{\text{train}}, \Sigma_{\text{train}}, V_{\text{train}}\}\) are the only parameters that receive gradient updates (rank-\(r\) subspace), while \(\{U_{\text{frozen}}, \Sigma_{\text{frozen}}, V_{\text{frozen}}\}\) remain fixed. Unlike LoRA, rank modulation performs a single convolution using the full \(W = W_{\text{train}} + W_{\text{frozen}}\) via another simple view transformation in memory:
+$$
+W_{\text{conv}} = \texttt{reshape}(W, (C_{\text{out}}, C_{\text{in}}, k)). 
+$$
+Hence, the forward time complexity remains the same as a standard convolution. Because no additional new parameter is introduced during the training process, rank modulation can also preserve stable update even when the number of trainable ranks changes.
+
+\subsection{Rank Scheduler}
+
+Building on rank modulation, which dynamically adjusts the number of trainable ranks while maintaining stable training, we introduce a rank scheduler to further exploit the low-rank structure. The rank scheduler, inspired by the noise scheduler in diffusion models that dynamically adjusts the added noise \cite{ho2020denoising}, is designed to improve training efficiency without compromising performance.
+
+The rank scheduler uses a decay function to compute the current number of trainable ranks $r_i$ based on the current training epoch index $i$, and the maximum and minimum trainable ranks, $r_{\text{max}}$ and $r_{\text{min}}$. Once $r_i$ is determined, the trainable ranks are adjusted depending on the low-rank adapters. For instance, with LoRA, this process involves merging the current LoRA blocks and reinstantiating new blocks with the updated trainable ranks. In the case of rank modulation, this process repartitions $W_{\text{train}}$ and $W_{\text{frozen}}$.
+
+In this work, we implement and evaluate four decay functions, which are linear, cosine, sigmoid, and exponential:
+$$
+r_{\text{linear}} = \left\lfloor r_{\text{max}} - (r_{\text{max}} - r_{\text{min}}) \times \left(\frac{i}{T}\right) \right\rfloor
+$$
+$$
+r_{\text{cosine}} = \left\lfloor r_{\text{min}} + 0.5 \times (r_{\text{max}} - r_{\text{min}}) \times \left(1 + \cos\left(\pi \times \frac{i}{T}\right)\right) \right\rfloor
+$$
+$$
+r_{\text{sig}} = \left\lfloor r_{\text{max}} - \frac{(r_{\text{max}} - r_{\text{min}})}{1 + e^{-\tau \times (i - t_{m})}} \right\rfloor 
+$$
+$$
+r_{\text{exp}} = \left\lfloor r_{\text{min}} + (r_{\text{max}} - r_{\text{min}}) \times e^{-\tau \times i} \right\rfloor
+$$
+where $i$, $T$, and $t_m$ are the current, total, and midpoint of the number of training epochs, respectively, $\tau$ denotes steepness, and $\lfloor\cdot\rfloor$ is the floor function. 
+
+% Exploring additional decay functions and strategies is left for future work.
+\label{sec:rank_scheduler}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

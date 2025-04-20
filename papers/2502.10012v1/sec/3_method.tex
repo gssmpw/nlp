@@ -1,0 +1,172 @@
+\section{Method}
+\label{sec: method}
+
+\begin{figure}[t]
+    \centering
+    % \vspace{-11pt}
+    \includegraphics[width=1.00\columnwidth]{figures/setups_v2-cropped.pdf}
+    \captionsetup{belowskip=-0.35cm, aboveskip=0.2cm}
+    \caption{\textbf{Detailed APG and AWM task formulations.} Black dots are states, \textcolor{blue}{blue} arrows are actions, \textcolor{red}{red} arrows are gradients. Correspondence to sections is as follows: optimal control -- Sec. \ref{subsection: apg}; state planning -- Sec. \ref{subsection: optimal_planners}; relative odometry -- Sec. \ref{subsection: dynamics}; inverse state estimation -- Sec. \ref{subsection: inverse_state_estimation}.}
+    \label{fig: diffenv_diagrams}
+\end{figure}
+
+In this section we introduce different task setups showcasing the usage of a differentiable simulator and the benefits it offers. Subsequently, in Sec. \ref{subsection: architecture} and \ref{subsection: planning}, we introduce the agent architecture and the planning at test time. 
+
+\textbf{Notation.} In all that follows we represent the current simulator state with $\mathbf{s}_t$, the current action with $\mathbf{a}_t$, the log (expert) state with $\hat{\mathbf{s}}_t$, the log action with $\hat{\mathbf{a}}_t$. The simulator is a function $\text{Sim}: \mathcal{S} \times \mathcal{A} \rightarrow \mathcal{S}$, with $\text{Sim}(\mathbf{s}_t, \mathbf{a}_t) \mapsto \mathbf{s}_{t + 1}$, where the set of all states is $\mathcal{S}$ and that of the actions $\mathcal{A}$.
+
+\subsection{Preliminaries -- APG}
+\label{subsection: apg}
+
+It is shown in \cite{nachkov2024autonomous} that a differentiable simulator can turn the search problem of optimal policy learning into a supervised one. Here the policy $\pi_\theta$ produces an action $\mathbf{a}_t$ from the current state, which is executed in the environment to obtain the next state $\mathbf{s}_{t+1}$. Comparing it to the log-trajectory $\hat{\mathbf{s}}_{t+1}$ produces a loss, whose gradient is backpropagated through the simulator and back to the policy:
+\begin{equation} \label{eq:apg}
+\begin{aligned}
+\min_\theta {\Big\lVert \text{Sim} \big(\mathbf{s}_t, \pi_\theta (\mathbf{s}_t) \big) - \hat{\mathbf{s}}_{t+1} \Big\rVert}_2^2.
+\end{aligned}
+\end{equation}
+
+
+The key gradient here is that of the next state with respect to the current agent actions $\frac{\partial \mathbf{s}_{t+1}}{\mathbf{a}_t}$. The loss is minimized whenever the policy outputs an action equal to the inverse kinematics $\text{InvKin}(\mathbf{s}_t , \hat{\mathbf{s}}_{t+1})$. To obtain similar supervision without access to a differentiable simulator, one would need to supervise the policy with the inverse kinematic actions, which are unavailable if the environment is considered a black box. Hence, this is an example of an inverse dynamics problem that is not efficiently solvable without access to a known environment, in this case to provide inverse kinematics.
+
+\subsection{Relative odometry}
+\label{subsection: dynamics}
+
+In this simple setting a world model $f_\theta : \mathcal{S} \times \mathcal{A} \rightarrow \mathcal{S}$ predicts the next state $\mathbf{s}_{t+1}$ from the current state-action pair $(\mathbf{s}_t, \mathbf{a}_t)$. Here, a differentiable simulator is not needed to learn a good predictor. One can obtain $(\mathbf{s}_t, \mathbf{a}_t, \mathbf{s}_{t+1})$ tuples simply by rolling out a random policy and then supervising the predictions with the next state $\mathbf{s}_{t+1}$. Nonetheless, we provide a formulation for bringing the simulator into the training loop of this task:
+\begin{equation} \label{eq:world_model_with_inverse}
+\begin{aligned}
+\min_\theta {\Big\lVert \text{Sim}^{-1} \big(f_\theta(\mathbf{s}_t, \mathbf{a}_t), \mathbf{a}_t \big) - \mathbf{s}_{t} \Big\rVert}_2^2.
+\end{aligned}
+\end{equation}
+
+Here, the world model $f_\theta$ takes $(\mathbf{s}_{t}, \mathbf{a}_t)$ and returns a next-state estimate $\tilde{\mathbf{s}}_{t+1}$. We then feed it into an inverse simulator $\text{Sim}^{-1}$ which is a function with the property that $\text{Sim}^{-1}( \text{Sim}(\mathbf{s}_t, \mathbf{a}_t), \mathbf{a}_t) = \mathbf{s}_t$. This output is compared with the current $\mathbf{s}_t$. The loss is minimized when $f_\theta$ predicts exactly $\mathbf{s}_{t+1}$, thus becoming a predictor of the next state.
+
+We implement the inverse simulator for the bicycle dynamics in Waymax \cite{gulino2024waymax}, however observe that it is problematic in the following sense. The velocities $v_x$ and $v_y$ are tied to the yaw angle of the agent through the relationship $v_x = v \cos \phi$ and $v_y = v \sin \phi$, where $\phi$ is the yaw angle and $v$ is the current speed. However, at the first simulation step, due to the WOM dataset \cite{ettinger2021large} being collected with noisy estimates of the agent state parameters, the relationships between $v_x$, $v_y$, and $\phi$ do not hold. Thus, the inverse simulator produces incorrect results for the first timestep.
+
+For this reason, we provide another formulation for the problem that only requires access to a forward simulator:
+\begin{equation} \label{eq:world_model_without_inverse}
+\begin{aligned}
+\min_\theta {\Big\lVert \text{Sim} \big(\mathbf{s}_{t+1} - f_\theta(\mathbf{s}_t, \mathbf{a}_t), \mathbf{a}_t \big) - \mathbf{s}_{t + 1} \Big\rVert}_2^2.
+\end{aligned}
+\end{equation}
+Here, $f_\theta$ predicts the relative state difference that executing $\mathbf{a}_t$ will bring to the agent. One can verify that the loss is minimized if and only if the prediction is equal to $\mathbf{s}_{t+1} - \mathbf{s}_t$. This can still be interpreted as a world model where $f_\theta$ learns to estimate how an action would change its relative state. Since the time-varying elements of the agent state consist of $(x, y, v_x, v_y, \phi)$, this world model has a clear relative odometric interpretation. Learning such a predictor without a differentiable simulator will prevent the gradients of the environment dynamics from mixing with those of the network.
+
+\textbf{Inverse dynamics and inverse kinematics}. Given a tuple $(\mathbf{s}_t, \mathbf{a}_t, \mathbf{s}_{t + 1})$, one can learn inverse dynamics $(\mathbf{s}_{t+1}, \mathbf{a}_t) \mapsto \mathbf{s}_t$ and inverse kinematics $(\mathbf{s}_{t}, \mathbf{s}_{t+1}) \mapsto \mathbf{a}_t$ without a differentiable simulator, which is useful for exploration \cite{pathak2017curiosity}. Formulations that involve the simulator are also possible. We do not list them here because they are similar to Eqn.~\ref{eq:world_model_without_inverse}.
+
+\subsection{Optimal planners}
+\label{subsection: optimal_planners}
+
+We call the network $f_\theta: \mathcal{S} \rightarrow \mathcal{S}$ with $\mathbf{s}_t \mapsto \mathbf{s}_{t+1}$ a planner because it plans out the next state to visit from the current one. Unlike a policy, which selects an action without explicitly knowing the next state, the planner does not execute any actions. Hence, until an action is executed, its output is inconsequential. We consider the problem of learning an optimal planner. With a differentiable simulator, as long as we have access to the inverse kinematics, we can formulate the optimisation as:
+\begin{equation} \label{eq:optimal_planner}
+\begin{aligned}
+\min_\theta {\Big\lVert \text{Sim} \Big(\mathbf{s}_t, \text{InvKin}\big(\mathbf{s}_t, \mathbf{s}_t + f_\theta(\mathbf{s}_t) \big) \Big) - \hat{\mathbf{s}}_{t + 1} \Big\rVert}_2^2.
+\end{aligned}
+\end{equation}
+
+Here, $f_\theta$ predicts the next state to visit as an offset to the current one. The action that reaches it is obtained using the inverse kinematics. After executing the action we directly supervise with the optimal next state. The gradient of the loss goes through the simulator, then through the inverse kinematics, and finally through the state planner network. Note that with a black box environment we can still supervise the planner directly with $\hat{\mathbf{s}}_{t+1}$, but a black box does not provide any inverse kinematics, hence there is no way to perform trajectory rollouts, unless with a separate behavioral policy.
+
+\subsection{Inverse optimal state estimation}
+\label{subsection: inverse_state_estimation}
+
+We now consider the following task \emph{"Given $(\mathbf{s}_t, \mathbf{a}_t)$, find an alternative state for the current timestep $t$ where taking action $\mathbf{a}_t$ will lead to an optimal next state $\hat{\mathbf{s}}_{t+1}$"}. We formulate the problem as
+\begin{equation} \label{eq:inverse_state_estimation}
+\begin{aligned}
+\min_\theta {\Big\lVert \text{Sim} \big(\mathbf{s}_t + f_\theta(\mathbf{s}_t, \mathbf{a}_t), \mathbf{a}_t \big) - \hat{\mathbf{s}}_{t + 1} \Big\rVert}_2^2.
+\end{aligned}
+\end{equation}
+
+Here $f_\theta$ needs to estimate the effect of the action $\mathbf{a}_t$ and predict a new state $\tilde{\mathbf{s}}_t$, relatively to the current state $\mathbf{s}_t$, such that after executing $\mathbf{a}_t$ in it, the agent reaches $\hat{\mathbf{s}}_{t + 1}$. The loss is minimized if $f_\theta$ predicts $\tilde{\mathbf{s}}_t - \mathbf{s}_t$. The key gradient, as in Eqns.~\ref{eq:world_model_with_inverse}, \ref{eq:world_model_without_inverse}, and \ref{eq:optimal_planner}, is that of the next state with respect to the current state. Given the design of the Waymax simulator \cite{gulino2024waymax}, these gradients are readily-available.
+
+Consider solving this task with a black box environment. To do so, one would need to supervise the prediction  $f_\theta(\mathbf{s}_t, \mathbf{a}_t)$ with the state $\tilde{\mathbf{s}}_t - \mathbf{s}_t$, with $\tilde{\mathbf{s}}_t$ being unknown. By definition $\tilde{\mathbf{s}}_t = \text{Sim}^{-1}(\hat{\mathbf{s}}_{t+1}, \mathbf{a}_t)$, which is unobtainable since under a black box environment assumption, $\text{Sim}^{-1}$ is unavailable. Hence, this is another inverse problem which is not solvable unless we are given more information about the environment, here specifically its inverse function.
+
+The utility of this task is in providing a ``confidence" measure to an action. If the prediction of $f_\theta$ is close to $\mathbf{0}$, then the agent is relatively certain that the action $\mathbf{a}_t$ is close to optimal. Likewise, a large prediction from $f_\theta$ indicates that the action $\mathbf{a}_t$ is believed to be optimal for a different state. The prediction units are also directly interpretable.
+
+\subsection{Architecture}
+\label{subsection: architecture}
+Having described the world modeling tasks, we now present the architecture that implements predictors for them.
+
+\textbf{Networks.} Figure \ref{fig: model_high_level} shows our setup. We follow \cite{nachkov2024autonomous} and extract observations for each modality -- roadgraph, agent locations, traffic lights, and any form of route conditioning -- and process them into a unified world state representing the current situation around the ego-vehicle. To capture temporal information, we use an RNN to evolve a hidden state according to the observed features. A world model with multiple heads predict the next unified world state, a reward, and the estimates for the three tasks introduced previously -- relative odometry, state planning, and inverse state estimation.
+
+\begin{figure}[t]
+    \centering
+    % \vspace{-11pt}
+    \includegraphics[width=\columnwidth]{figures/model_schematic_v2.pdf}
+    \captionsetup{belowskip=-0.35cm, aboveskip=0.1cm}
+    \caption{\textbf{Model architecture.} We extract observations for the different modalities (roadgraph $\text{rg}_t$, agent locations $\text{d}_t$, and traffic lights $\text{tr}_t$), process them, and fuse them into a unified latent world state. An RNN evolves the hidden state according to each timestep and selects actions. The world model predicts semantic quantities of interest (purple), allowing for latent imagination and planning. Gradients from the environment dynamics, shown in red, flow through the action execution -- we only show for the control task, but in fact similar gradients flow backward also from the world modeling tasks.}
+    \label{fig: model_high_level}
+\end{figure}
+
+\textbf{Losses.} We use four main losses -- one for the control task, which drives the behavioral policy, and three additional losses for the relative odometry, state planning, and inverse state tasks. Each of these leverages the differentiability of the environment. The inputs to the world model are detached (denoted with sg[$\cdot$]) so the world modeling losses do not impact the behavioral policy. This greatly improves policy stability and makes it so one does not need to weigh the modeling losses relative to the control loss.
+
+For extended functionality, our agent requires three additional auxiliary losses. The first trains the world model to predict the next world state in latent space, which is needed to be able to predict autoregressively arbitrarily long future sequences $\mathbf{z}_t, \mathbf{z}_{t+1}, ...$. It also allows us to use the AWM task heads on those imagined trajectories, similar to \cite{hafner2019dream, wu2023daydreamer}. The second is a reward loss so the world model can predict rewards. We use a standard reward defined as $r_t = -{\lVert \mathbf{s}_{t+1} - \hat{\mathbf{s}}_{t+1} \rVert}_2$. The third loss is an object collision loss, which is sparse and penalizes the ego-vehicle from colliding with other agents. It is described in Sec. \ref{subsection: additional_improvements}
+
+\begin{figure}[t!]
+    \centering
+    % \vspace{-11pt}
+    \includegraphics[width=0.8\columnwidth]{figures/mpc_style_planning-cropped.pdf}
+    \captionsetup{belowskip=-0.35cm, aboveskip=0.2cm}
+    \caption{\textbf{Planning.} In each step, planning consists of simulating a few trajectories using the world model (shown here as light orange, purple and green lines), evaluating them (shown as the numbers attached to them), and selecting an aggregated action from the best ones. The actual executed trajectory is shown in dashed black points. }
+    \label{fig: planning_high_level}
+\end{figure}
+
+\subsection{Planning at test time}
+\label{subsection: planning}
+
+Compared to the APG method in \cite{nachkov2024autonomous}, our world modeling predictors enable planning at test time. The relevant workflow is shown in Fig. \ref{fig: planning_high_level}. Specifically, we adopt a model-predictive control (MPC) algorithm where we first repeatedly compose the world models and the policy to simulate $N$ future trajectories branching out from the current state $\mathbf{s}_t$. Subsequently, the reward model evaluates them and the rewards along each one are summed to yield a single scalar, representing the value of this trajectory. Finally, we select the top-$k$ trajectories in terms of value, and average their first actions. This aggregate action is the one to be executed by the agent at the current step. The planning loop is repeated at every timestep, leading to adaptive, closed loop behavior. 
+
+Since the architecture relies on a recurrent model to process the incoming observations, we adapt the planning algorithm to evolve the RNN hidden state within the imagined trajectories. The pseudocode is shown in Algorithm \ref{planning pseudocode}.
+
+\begin{algorithm}
+\caption{RNN-based MPC planning}
+\textbf{Given:} $\mathbf{s}_t$, $\mathbf{h}_{t-1}$, Nsim
+\begin{algorithmic}[1]
+\label{planning pseudocode}
+\STATE Initialize trajectory buffer $\mathcal{B}$
+\STATE Observe $\mathbf{o}_t$ from $\mathbf{s}_t$
+\STATE $\mathbf{g}_t = \text{FeatureExtractor}(\mathbf{o}_t)$
+\STATE $\mathbf{h}_t = \text{RNN}(\mathbf{g}_t, \mathbf{h}_{t-1})$
+\FOR{$i < \text{Nsim}$}
+\STATE $\tilde{\mathbf{g}}_\tau, \tilde{\mathbf{h}}_{\tau} = \mathbf{g}_t, \mathbf{h}_t$
+
+\WHILE{simulate with timestep $\tau=\{0, 1, ... \}$, }
+    \STATE $\tilde{\mathbf{a}}_\tau^i \sim \text{Actor}(\tilde{\mathbf{g}}_\tau, \tilde{\mathbf{h}}_{\tau})$
+    \STATE $\tilde{r}_\tau^i, \tilde{\mathbf{g}}_{\tau+1} = \text{WorldModel}(\tilde{\mathbf{g}}_\tau, \tilde{\mathbf{a}}_{\tau}^i)$
+    \STATE $\tilde{\mathbf{h}}_{\tau+1} = \text{RNN}(\tilde{\mathbf{g}}_{\tau+1}, \tilde{\mathbf{h}}_\tau)$
+    \STATE Store $(\tilde{\mathbf{a}}_\tau^i, \tilde{r}_\tau^i)$ in $\mathcal{B}$
+    % \STATE $\tilde{\mathbf{h}}_{\tau}, \tilde{\mathbf{g}}_{\tau} := \tilde{\mathbf{h}}_{\tau+1}, \tilde{\mathbf{g}}_{\tau+1}$
+\ENDWHILE
+\ENDFOR
+\STATE Best trajectory $k = \text{argmax}_i \sum_{\tau} \tilde{r}_\tau^i$
+\STATE Select $\tilde{\mathbf{a}}_0^k$ for execution 
+\end{algorithmic}
+\end{algorithm}
+\captionsetup{justification=raggedright}
+\vspace{-0.4cm}
+\noindent
+\textbf{Aux. notation:} $\mathbf{h}_t$ = RNN state, $\mathbf{g}_t$ = latent sensory features 
+
+\subsection{Additional improvements}
+\label{subsection: additional_improvements}
+
+We have now explained the world modeling tasks, the agent architecture, and the planning. Here we focus on additional practical improvements relevant to our experiments.
+
+\textbf{Policy generalization.} Compared to the APG model in \cite{nachkov2024autonomous}, our strategy is to improve the generalization capability of the agent by increasing the diversity of the sampled trajectories. To that end, we first limit the number of training epochs to reduce any possible overfitting, and second, we explicitly add entropy regularization on the actions sampled from the policy \cite{haarnoja2018soft}. Since the distribution of the actions -- steering and acceleration -- is modeled as a Gaussian mixture (GM), this regularization is added only for the mixing distribution, which is categorical. To prevent the individual Gaussian distributions from degenerating into deterministic values, we clip their variances to a minimal value.
+
+\textbf{Differentiable overlap.} Being able to detect collisions in Waymax \cite{gulino2024waymax} is of crucial importance. The default algorithm there is based on the separation axis theorem and only tells us \emph{whether} two objects overlap, without telling us \emph{how much} they overlap. We are interested in obtaining a differentiable approximation for the overlap between two rotated 2D boxes, so that we can differentiate not only through the dynamics, but also through the scene configuration itself.
+
+We approximate box overlap as the overlap of 2D Gaussians. Specifically, from a vehicle pose $(x, y, \theta, w, h)$, we build a 2D Gaussian with parameters $\boldsymbol{\mu}$ and $\boldsymbol{\Sigma}$ given by:
+~
+\begin{align}
+\boldsymbol{\mu} &= \begin{bmatrix} x & y \end{bmatrix}^\mathsf{T} \\
+\boldsymbol{\Sigma} &=  \boldsymbol{R} \begin{bmatrix}
+    w^2/25 & 0 \\ 0 & h^2/25
+\end{bmatrix} \boldsymbol{R}^\mathsf{T}\\
+\boldsymbol{R} &= \begin{bmatrix}
+    \cos \theta & -\sin \theta \\ \sin\theta & \cos \theta
+\end{bmatrix}.
+\end{align}
+~
+The division by $25$ ensures that the density of the Gaussian covers the box relatively well. Then, the overlap between two boxes $\mathcal{N}(\boldsymbol{\mu}_1, \boldsymbol{\Sigma}_1)$ and $\mathcal{N}(\boldsymbol{\mu}_2, \boldsymbol{\Sigma}_2)$ is computed in closed form as another Gaussian density:
+\begin{equation} 
+\frac{1}{2 \pi \sqrt{\det(\boldsymbol{\Sigma}_1 + \boldsymbol{\Sigma}_2)}}e^{-\frac{1}{2} (\boldsymbol{\mu}_1 - \boldsymbol{\mu}_2)^\mathsf{T} (\boldsymbol{\Sigma}_1 + \boldsymbol{\Sigma}_2)^{-1} (\boldsymbol{\mu}_1 - \boldsymbol{\mu}_2)}.
+\end{equation}
+
+This overlap provides a very sparse training signal, as the ego-vehicle does not collide all the time. Yet, we include it to make the setup complete in terms of differentiating through both the dynamics and the agent interactions.

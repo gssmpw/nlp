@@ -1,0 +1,586 @@
+\section{Experiment}
+\label{sec:exp}
+% \dacheng{add PAB, seq parallel and data parallel discussion}
+We first present our experiment settings and evaluation metrics in \S\ref{sec::setting}. We then discuss system performance in \S\ref{sec:system_performance}, demonstrating the effectiveness on a single GPU and applicable to multiple GPUs. % parallelism techniques, specifically sequence parallelism. 
+In \S\ref{sec:performance_result}, we compare the video quality with and without variants of our methods with VBench and CD-FVD~\citep{huang2024vbench, cdfvd}. Finally, we show visualization results in \S\ref{sec:visual} of the generation quality for the original model, the MLCD model, and the final model.
+
+\subsection{Experiment setup}
+\label{sec::setting}
+
+\textbf{Models.} We use the 29 and 93 frames models of the popular 3D DiT based Open-Sora-Plan family~\citep{pku_yuan_lab_and_tuzhan_ai_etc_2024_10948109}.  %, which is currently the most popular open-source 3D-DiT model. 
+The model uses VAE inherits weights from the SD2.1 VAE~\citep{Rombach_2022_CVPR}, with a compression ratio of 4x8x8 (temporal, height and width). For the text encoder, it uses mt5-XXL as the language model, and it incorporates RoPE as the positional encoding~\citep{xue2020mt5, su2024roformer}. In addition to the VAE encoder, videos are further processed by a patch embedding layer that downsamples the spatial dimensions by a factor of 2. The videos tokens are finally flattened into a one-dimensional sequence across the frame, width, and height dimensions.
+
+\textbf{Metrics.} We evaluate video quality using VBench and Content-Debiased Frechet Video Distance (CD-FVD)~\citep{huang2024vbench, cdfvd}. VBench assesses the quality of video generation by aligning closely with human perception % We identified several dimensions of VBench that required further clarification, and thus, we isolated them for individual analysis. %The reasons for isolating these dimensions are discussed in detail in Section \ref{dimension_analysis}. 
+%We compare the generated videos from the original model (used as the baseline) with those produced by the accelerated model. 
+, computed for each frame of the video and then averaged across all frames, providing a comprehensive assessment. CD-FVD measures the distance between the distributions of generated and real videos toward per-frame quality over temporal realism. % \hangliang{@dacheng, discuss metric pick up here or in 4.2?}
+
+\textbf{Baselines.} We consider two models as the major baselines: the original Open-Sora-Plan model and the model after consistency distillation. Following the default settings of Open-Sora-Plan models~\cite{pku_yuan_lab_and_tuzhan_ai_etc_2024_10948109}, we use 100 DDIM steps for the original model, which is consistent across all experiments and training in the paper. For the MLCD model, we select the checkpoint with 20 inference steps as we empirically find that it achieves the best qualitative result.
+
+% There are several factors to consider when selecting baselines. The first is the number of diffusion steps. Following the default settings of both Open-Sora-Plan~\cite{pku_yuan_lab_and_tuzhan_ai_etc_2024_10948109} and Open-Sora~\cite{opensora}, 100 diffusion steps are typically required to achieve good results. Therefore, we use the original model sampled with 100 steps as one baseline. The second factor to consider is the decrease in performance after each stage of the process. Thus, the second baseline is the model after applying CM (Compression Methods) but without attention distillation. This helps in understanding the impact of each stage on the final model performance.
+
+\textbf{Implementation details.} %All training runs are carried out on NVIDIA 4xA100-SXM 80GB GPUs. 
+We use FlexAttention from PyTorch 2.5.0 \citep{pytorch} as the attention backend. We provide a more detailed description on how to leverage FlexAttention to implement our method in Appendix \ref{appendix:flex_attention}. We generate videos based on the VBench standard prompt list for VBench evaluation. To avoid potential data contamination in CD-FVD evaluation, we use a set of 2000 samples from the Panda-70M \citep{chen2024panda70m} test set to build our real-world data comparison. As we use the CD-FVD score between real-world data and generated videos to evaluate the capacity of DiT models, the prompt style needs to align with the real-world data clip samples. Therefore, we randomly select prompts from the Panda-70M test set caption list for video generation by the models.
+
+\textbf{Training details.} All models are trained using the first 2000 samples from the Open-Sora-Plan's mixkit dataset.%, with training performed on top of the corresponding baseline model. 
+The global batch size is set to 2, and training is conducted for a total of 10000 steps, equivalent to 10 epochs of dataset. The learning rate is 1e-5, and the gradient accumulation steps is set to 1. The diffusion scale factor $\lambda$ is 100. The MLCD model is trained with 100 DDIM steps of the original model. The final model is trained with a 20-step MLCD model checkpoint.
+
+\subsection{System Performance}
+\label{sec:system_performance}
+The major target of~\methodname~accelerates inference in a single GPU by using multi-step consistency distillation and sparse attention. In~\S\ref{sec:system_kernel}, we demonstrate the system speedup with various settings. In addition, we demonstrate an advantage of our method that it can be seaminglessly integrate with advanced parallel method, i.e. sequence parallelism, in~\S\ref{sec:system_parallel}.
+
+%In this section, we first evaluate our major system performance on 1 GPU (\S\ref{sec:system_kernel}). As an ablation study, we then evaluate our system when combined with parallelism methods to demonstrate its potential to integrate with parallel methods (\S\ref{sec:system_parallel}).
+
+\subsubsection{~\methodname~speedup on a single GPU}
+\label{sec:system_kernel}
+We test our approach on a single A100-SXM 80GB GPU. Table \ref{tab:kernel_time} shows the computation time for a single sparse attention kernel, while Table \ref{tab:main_result} presents the average execution time of all layers after layerwise search in Algorithm \ref{alg:search}. `2:6' refers to 2 global reference frames in Fig.\ref{fig:our_attention_pattern}. Sparsity refers to the proportion of elements in the kernel that can be skipped. During testing, we consider only the attention operation, where the inputs are query, key, value, and mask, and the output is the attention output. We do not account for the time of VAE, T5, or embedding layers. The measurement method involves 25 warmup iterations, followed by 100 runs. The median of the 20th to 80th percentile performance is used as the final result.
+
+In Table \ref{tab:kernel_time}, we observe that as the sparsity increases, the computation time decreases significantly. For instance, with a 2:6 attention mask, corresponding to a sparsity level of 45.47\%, the execution time reduces to 31.35 ms, resulting in a 1.86$\times$ speedup compared to the full mask. In Table \ref{tab:main_result}, the effect of increasing threshold $r$ on speedup is evident. As $r$ increases, the sparsity grows, leading to a greater reduction in computation time and a corresponding increase in speedup. For example, with $r=0.050$, the sparsity reaches 37.78\%, achieving a speedup of 1.64$\times$. When $r$ is further increased to 0.400, the sparsity level rises to 55.07\%, and the speedup improves to 2.25$\times$. This positive correlation between $r$, sparsity, and speedup highlights the efficiency gains that can be achieved by leveraging higher sparsity levels.
+
+%\begin{comment}
+
+\begin{table}[t]
+\centering
+\caption{Speedup with different masks.}
+\resizebox{0.9\columnwidth}{!}{\begin{tabular}{cccccc}
+    \toprule
+    \textbf{Frames} & \textbf{Mask} & \textbf{Sparsity (\%)} & \textbf{Time(ms)} & \textbf{Speedup} \\ 
+    \midrule
+    \multirow{5}{*}{29} & full & 0.00 & 58.36 & 1.00$\times$ \\
+     & 4:4 & 17.60 & 46.52 & 1.25$\times$ \\
+     & 3:5 & 29.88 & 40.08 & 1.46$\times$ \\
+     & 2:6 & 45.47 & 31.35 & 1.86$\times$ \\
+     & 1:7 & 64.38 & 20.65 & 2.83$\times$ \\
+    \midrule
+    \multirow{6}{*}{93} & full & 0.00 & 523.61 & 1.00$\times$ \\
+     & 12:12 & 21.51 & 397.72 & 1.32$\times$ \\
+     & 8:16 & 40.30 & 303.90 & 1.72$\times$ \\
+     & 6:18 & 51.88 & 244.13 & 2.14$\times$ \\
+     & 4:20 & 64.98 & 179.74 & 2.91$\times$ \\
+     & 3:21 & 72.05 & 142.77 & 3.67$\times$ \\
+    \bottomrule
+\end{tabular}}
+\label{tab:kernel_time}
+\end{table}
+
+\begin{comment}
+\begin{table}[h]
+\centering
+\caption{Speedup with different threshold $r$.}
+\resizebox{\columnwidth}{!}{\begin{tabular}{cccccc}
+    \toprule
+    \textbf{Frames} & \textbf{$r$} & \textbf{Sparsity (\%)} & \textbf{Time(ms)} & \textbf{Speedup} \\ 
+    \midrule
+     \multirow{6}{*}{29} & full & 0.00 & 58.36 & 1.00$\times$ \\
+     & 0.025 &  23.51 & 43.50 & 1.34$\times$ \\
+     & 0.050 & 37.78 & 35.58 & 1.64$\times$ \\
+     & 0.100 & 45.08 & 31.54 & 1.85$\times$ \\
+     & 0.200 & 51.55 & 27.91 & 2.09$\times$ \\
+     & 0.400 & 55.07 & 25.96 & 2.25$\times$ \\
+    \midrule
+    \multirow{2}{*}{93} & full & 0.00 & 523.61 & 1.00$\times$ \\
+     & 0.150 & 38.02 & 317.56 & 1.65$\times$ \\
+    \bottomrule
+\end{tabular}}
+\label{tab:main_result}
+\end{table}    
+\end{comment}
+
+\begin{table*}[t]
+\scriptsize \centering
+\caption{Open-Sora-Plan with 29 frames and 720p resolution results on VBench, CD-FVD metrics and kernel speedup evalutation. 
+`$r$=0.1' indicates that this checkpoint is trained using the layerwise search strategy described in Algorithm \ref{alg:search}, with a threshold of $r$=0.1. We selects some dimensions for analysis, with the remaining dimensions provide in the Table \ref{tab::all_vbench}. We also shows kernel different speedup with threshold $r$. } 
+\label{tab:main_result}
+\setlength{\tabcolsep}{4pt}
+
+\begin{tabular}{ccccccccccccc}
+\toprule 
+\textbf{Model} & \makecell{\textbf{Final} \\ \textbf{Score}} $\uparrow$&  \makecell{\textbf{Aesthetic} \\ \textbf{Quality}} & \makecell{\textbf{Motion} \\ \textbf{Smoothness}} & \makecell{\textbf{Temporal} \\ \textbf{Flickering}} & \makecell{\textbf{Object} \\ \textbf{Class}} & \makecell{\textbf{Subject} \\ \textbf{Consistency}} & \textbf{CD-FVD} $\downarrow$ & \textbf{Sparsity (\%)} & \makecell{\textbf{Kernel} \\ \textbf{Time(ms)}} & \makecell{\textbf{Kernel} \\ \textbf{Speedup}} & \textbf{Speedup} \\
+ 
+\midrule
+Base & 76.12\% & 58.34\% & 99.43\% & 99.28\% & 64.72\% & 98.45\% & 172.64 & 0.00 & 58.36 & 1.00$\times$& 1.00$\times$ \\ 
+MLCD & 76.81\% & 58.92\% & 99.41\% & 99.42\% & 63.37\% & 98.37\% & 190.50 & 0.00 & 58.36 & 1.00$\times$& 5.00$\times$ \\ 
+\midrule
+$\text{Ours}_{r\text{=0.025}}$& \textbf{76.14\%} & 57.21\% & \textbf{99.37\%} & 99.49\% & \textbf{60.36\%} & \textbf{98.26\%} & \textbf{186.84} & 23.51 & 43.50 & 1.34$\times$& 5.85$\times$ \\ 
+$\text{Ours}_{r\text{=0.050}}$& 76.01\% &  \textbf{57.57\%} & 99.15\% &\textbf{99.56\%} & 58.70\% & 97.58\% & 195.55 & 37.78 & 35.58 & 1.64$\times$ & 6.60$\times$ \\ 
+$\text{Ours}_{r\text{=0.100}}$ & 76.00\% & 56.59\% & 99.13\% & 99.54\% & 57.12\% & 97.73\% & 204.13 & 45.08 & 31.54 & 1.85$\times$ & 7.05$\times$ \\ 
+$\text{Ours}_{r\text{=0.200}}$ & 75.02\% & 55.71\% & 99.03\% & 99.50\% & 55.22\% & 97.28\% & 223.75 & 51.55 & 27.91 & 2.09$\times$ & 7.50$\times$ \\ 
+$\text{Ours}_{r\text{=0.400}}$& 75.30\% & 55.79\% & 98.93\% & 99.46\% & 54.98\% & 97.71\% & 231.68 & \textbf{55.07} & \textbf{25.96} & \textbf{2.25$\times$} & \textbf{7.80$\times$} \\ 
+\midrule
+\end{tabular}
+\end{table*}
+
+
+
+%\end{comment}
+\begin{comment}
+\begin{figure}[h]
+    \centering
+    \begin{minipage}[b]{0.45\textwidth} % Adjusting to 45% width
+    \centering
+    \caption{Speedup with different masks.}
+    \resizebox{0.95\columnwidth}{!}{\large \begin{tabular}{cccccc}
+        \toprule
+        \textbf{Frames} & \textbf{Mask} & \textbf{Sparsity (\%)} & \textbf{Time(ms)} & \textbf{Speedup} \\ 
+        \midrule
+        \multirow{10}{*}{29} & full & 0.00 & 58.36 & 1.00$\times$ \\
+         & 4:4 & 17.60 & 46.52 & 1.25$\times$ \\
+         & 3:5 & 29.88 & 40.08 & 1.46$\times$ \\
+         & 2:6 & 45.47 & 31.35 & 1.86$\times$ \\
+         & 1:7 & 64.38 & 20.65 & 2.83$\times$ \\
+         \midrule
+         & 0.025 &  23.51 & 43.50 & 1.34$\times$ \\
+         & 0.050 & 37.78 & 35.58 & 1.64$\times$ \\
+         & 0.100 & 45.08 & 31.54 & 1.85$\times$ \\
+         & 0.200 & 51.55 & 27.91 & 2.09$\times$ \\
+         & 0.400 & 55.07 & 25.96 & 2.25$\times$ \\
+        \midrule
+        \multirow{6}{*}{93} & full & 0.00 & 523.61 & 1.00$\times$ \\
+         & 12:12 & 21.51 & 397.72 & 1.32$\times$ \\
+         & 8:16 & 40.30 & 303.90 & 1.72$\times$ \\
+         & 6:18 & 51.88 & 244.13 & 2.14$\times$ \\
+         & 4:20 & 64.98 & 179.74 & 2.91$\times$ \\
+         & 3:21 & 72.05 & 142.77 & 3.67$\times$ \\
+         \midrule
+         & 0.150 & 38.02 & 317.56 & 1.65$\times$ \\
+        \bottomrule
+    \end{tabular}}
+    \label{tab:kernel_time}
+    \end{minipage}
+     \begin{minipage}[b]{0.495\textwidth} % Adjusting to 49.5% width
+    \centering
+    %\vspace{-3mm}
+    \includegraphics[width=1.0\textwidth]{figures/layerwise_plot/29x_greedy.pdf}
+    \caption{\small Search results for Open-Sora-Plan v1.2 model (29 frames). We verify that different layers have different sparsity in 3D video DiTs.}
+    %\vspace{-12mm}
+    \label{fig:layerwise_plot}
+\end{minipage}
+
+    \hfill
+\end{figure}
+
+\end{comment}
+\begin{comment}
+\begin{wraptable}{l}{0.3\textwidth}
+%\vspace{-5mm}
+\caption{Speedup with different masks.}
+\begin{tabular}{cccccc}
+        \toprule
+        \textbf{Frames} & \textbf{Mask} & \textbf{Sparsity (\%)} & \textbf{Time(ms)} & \textbf{Speedup} \\ 
+        \midrule
+        \multirow{10}{*}{29} & full & 0.00 & 58.36 & 1.00$\times$ \\
+         & 4:4 & 17.60 & 46.52 & 1.25$\times$ \\
+         & 3:5 & 29.88 & 40.08 & 1.46$\times$ \\
+         & 2:6 & 45.47 & 31.35 & 1.86$\times$ \\
+         & 1:7 & 64.38 & 20.65 & 2.83$\times$ \\
+         \midrule
+         & 0.025 &  23.51 & 43.50 & 1.34$\times$ \\
+         & 0.050 & 37.78 & 35.58 & 1.64$\times$ \\
+         & 0.100 & 45.08 & 31.54 & 1.85$\times$ \\
+         & 0.200 & 51.55 & 27.91 & 2.09$\times$ \\
+         & 0.400 & 55.07 & 25.96 & 2.25$\times$ \\
+        \midrule
+        \multirow{6}{*}{93} & full & 0.00 & 523.61 & 1.00$\times$ \\
+         & 12:12 & 21.51 & 397.72 & 1.32$\times$ \\
+         & 8:16 & 40.30 & 303.90 & 1.72$\times$ \\
+         & 6:18 & 51.88 & 244.13 & 2.14$\times$ \\
+         & 4:20 & 64.98 & 179.74 & 2.91$\times$ \\
+         & 3:21 & 72.05 & 142.77 & 3.67$\times$ \\
+         \midrule
+         & 0.150 & 38.02 & 317.56 & 1.65$\times$ \\
+        \bottomrule
+    \end{tabular}
+    
+\end{wraptable}
+\begin{wrapfigure}{r}{0.35\textwidth}
+%\begin{figure}[t]
+\centering
+\vspace{-3mm}
+\includegraphics[width=0.35\textwidth]{figures/layerwise_plot/29x_greedy.pdf}
+\caption{\small %Additional results can be found in Appendix, which illustrates different sparsity selection strategies by enumerating various thresholds.
+Search results for Open-Sora-Plan v1.2 model (29 frames). We verify that different layers have different sparsity in 3D video DiTs.}
+%We find that each layer has different sparsity ratio. Darker colors indicate the use of denser masks. Once a threshold is fixed, a specific sparsity mask strategy can be determined.}
+\vspace{-12mm}
+\end{wrapfigure}
+
+\end{comment}
+
+\subsubsection{~\methodname~speedup in distributed setting}
+\label{sec:system_parallel}
+\methodname~utilize sparse attention and consistency distillation to achieve speedup. These methods are orthogonal to the recent advances in distributed systems, mainly sequence parallelism based solution in LLMs~\citep{liu2023ring, li2024distflashattn, jacobs2023deepspeed} and model parallelism (or with hybrid sequence parallelism) based solution in diffusion Transformers~\citep{li2024distrifusion, wang2024pipefusion, chen2024asyncdiff}. We consider sequence parallelism in this section for is simplicity and empirical lower overhead~\citep{li2024distflashattn, li2024distrifusion, xue2024longvila}.
+
+% Our method is compatible with various parallel approaches, including data parallelism, tensor parallelism, pipeline parallelism, and, most importantly, sequence parallelism. Sequence parallelism can reduce memory consumption during training and improve the speed of generating a single video during inference.
+
+
+% \begin{tabular}{ccccccccccc}
+% \toprule 
+% \textbf{Model} & \makecell{\textbf{Multiple} \\ \textbf{Objects}} &  \makecell{\textbf{Human} \\ \textbf{Action}} & \textbf{Color}  & \makecell{\textbf{Spatial} \\ \textbf{Relationship}} & \textbf{Scene} & \makecell{\textbf{Appearance} \\ \textbf{Style}} & \makecell{\textbf{Temporal} \\ \textbf{Style}} & \makecell{\textbf{Overall} \\ \textbf{Consistency}} & \makecell{\textbf{Background} \\ \textbf{Consistency}} \\
+% \midrule
+% Base & 23.25\% & 54.00\% & 94.47\% & 43.49\% & 18.60\% & 19.88\% & 18.45\% & 19.69\% & 97.64\% \\ 
+% MLCD & 19.21\% & 56.00\% & 94.12\% & 40.57\% & 22.67\% & 20.46\% & 18.21\% & 19.77\% & 97.98\%\\ 
+% \midrule
+% %\cmidrule{2-10}
+% $\text{Ours}_{r\text{=0.025}}$ & 18.83\% & 55.00\% & \textbf{96.25\%} & \textbf{46.02\%} & 12.35\% & \textbf{20.31\%} & 18.17\% & 19.11\% & 97.70\%\\ 
+% $\text{Ours}_{r\text{=0.050}}$ & 11.74\% &  \textbf{58.00\%} & 92.11\% & 39.81\% & \textbf{22.31\%} & 20.25\% & 17.71\% & \textbf{19.45\%} & \textbf{97.71\%}\\ 
+% $\text{Ours}_{r\text{=0.100}}$ & \textbf{18.98\%} & 56.00\% & 93.65\% & 43.88\% & 15.77\% & 20.20\% & 17.98\% & 19.29\% & 97.55\%\\ 
+% $\text{Ours}_{r\text{=0.200}}$ & 17.99\% & 53.00\% & 51.82\% & 36.14\% & 13.88\% & 20.29\% & 17.97\% & 18.97\% & 97.62\%\\ 
+% $\text{Ours}_{r\text{=0.400}}$ & 15.32\% & 54.00\% & 92.64\% & 37.05\% & 12.06\% & 20.24\% & \textbf{18.19\%} & 19.22\% & 97.66\% \\ 
+% \bottomrule
+% \end{tabular}
+
+
+% \begin{tabular}{ccccccccccc}
+% \toprule 
+% \textbf{Model} & \makecell{\textbf{Final} \\ \textbf{Score}} $\uparrow$&  \makecell{\textbf{Aesthetic} \\ \textbf{Quality}} & \makecell{\textbf{Dynamic} \\ \textbf{Degree}}  & \makecell{\textbf{Motion} \\ \textbf{Smoothness}} & \makecell{\textbf{Temporal} \\ \textbf{Flickering}} & \makecell{\textbf{Object} \\ \textbf{Class}} & \makecell{\textbf{Subject} \\ \textbf{Consistency}} & \makecell{\textbf{Imaging} \\ \textbf{Quality}} & \textbf{FVD} $\downarrow$ & \textbf{Speedup} \\
+ 
+% \midrule
+% Base & 76.12\% & 58.34\% & 34.72\% & 99.43\% & 99.28\% & 64.72\% & 98.45\% & 64.75\% & 381.12 & 1.00$\times$ \\ 
+% $\text{Base}_{4:4}$& 76.57\% & 58.64\% & 43.06\% & 99.38\% & 99.20\% & 66.38\% & 98.26\% & 63.56\% & 360.22 & 1.16$\times$ \\ 
+% $\text{Base}_{3:5}$ & 75.53\% & 55.47\% & 58.33\% & 99.01\% & 98.96\% & 62.26\% & 97.42\% & 59.67\% & 359.81 & 1.26$\times$ \\ 
+% $\text{Base}_{2:6}$& 76.33\% & 57.14\% & 56.94\% & 99.06\% & 99.02\% & 56.17\% & 97.58\% & 61.10\% & 382.26 & 1.45$\times$ \\ 
+% $\text{Base}_{1:7}$ & 77.15\% & 57.53\% & 75.00\% & 98.67\% & 98.66\% & 60.68\% & 96.96\% & 61.91\% & 432.47 & 1.77$\times$ \\ 
+% %\cmidrule{1-10}
+% \midrule
+% MLCD & 76.81\% & 58.92\% & 41.67\% & 99.41\% & 99.42\% & 63.37\% & 98.37\% & 65.55\%& 438.13 & 5.00$\times$ \\ 
+% $\text{MLCD}_{4:4}$ & 75.90\% & 57.84\% & 50.00\% & 99.38\% & 99.50\% & 63.03\% & 98.21\% & 58.47\%& 343.52 & 5.80$\times$ \\ 
+% $\text{MLCD}_{3:5}$  & 75.41\% & 57.19\% & 43.06\% & 99.36\% & 99.50\% & 57.04\% & 98.12\% & 58.84\%& 386.58 & 6.30$\times$ \\ 
+% $\text{MLCD}_{2:6}$  & 75.23\% & 57.45\% & 44.44\% & 99.29\% & 99.48\% & 54.59\% & 98.37\% & 57.35\%& 407.09 & 7.25$\times$ \\ 
+% $\text{MLCD}_{1:7}$  & 75.84\% & 56.83\% & 63.89\% & 98.99\% & 99.23\% & 52.77\% & 97.54\% & 56.42\%& 425.82 & 8.85$\times$ \\ 
+% \midrule
+% %\cmidrule{2-10}
+% $\text{Ours}_{r\text{=0.025}}$& 76.14\% & 57.21\% & 52.78\% & 99.37\% & 99.49\% & 60.36\% & 98.26\% & 58.90\%& 351.62 & 5.85$\times$ \\ 
+% $\text{Ours}_{r\text{=0.050}}$& 76.01\% &  57.57\% & 58.33\% & 99.15\% & 99.56\% & 58.70\% & 97.58\% & 56.86\%& 357.36 & 6.60$\times$ \\ 
+% $\text{Ours}_{r\text{=0.100}}$ & 76.00\% & 56.59\% & 63.89\% & 99.13\% & 99.54\% & 57.12\% & 97.73\% & 54.88\%& 345.60 & 7.05$\times$ \\ 
+% $\text{Ours}_{r\text{=0.200}}$ & 75.02\% & 55.71\% & 59.72\% & 99.03\% & 99.50\% & 55.22\% & 97.28\% & 54.07\%& 356.88 & 7.50$\times$ \\ 
+% $\text{Ours}_{r\text{=0.400}}$& 75.30\% & 55.79\% & 65.28\% & 98.93\% & 99.46\% & 54.98\% & 97.71\% & 54.36\%& 380.23 & 7.80$\times$ \\ 
+% \bottomrule
+% \end{tabular}
+
+
+% \begin{tabular}{ccccccccccc}
+% \toprule 
+% \textbf{Model} & \makecell{\textbf{Multiple} \\ \textbf{Objects}} &  \makecell{\textbf{Human} \\ \textbf{Action}} & \textbf{Color}  & \makecell{\textbf{Spatial} \\ \textbf{Relationship}} & \textbf{Scene} & \makecell{\textbf{Appearance} \\ \textbf{Style}} & \makecell{\textbf{Temporal} \\ \textbf{Style}} & \makecell{\textbf{Overall} \\ \textbf{Consistency}} & \makecell{\textbf{Background} \\ \textbf{Consistency}} \\
+% \midrule
+% Base & 23.25\% & 54.00\% & 94.47\% & 43.49\% & 18.60\% & 19.88\% & 18.45\% & 19.69\% & 97.64\% \\ 
+% $\text{Base}_{4:4}$ & 32.01\% & 55.00\% & 90.94\% & 45.42\% & 17.30\% & 20.21\% & 18.41\% & 19.48\% & 97.17\% \\ 
+% $\text{Base}_{3:5}$ & 15.85\% & 53.00\% & 88.88\% & 44.38\% & 14.53\% & 20.13\% & 17.46\% & 18.43\% & 97.28\% \\ 
+% $\text{Base}_{2:6}$ & 21.65\% & 56.00\% & 93.27\% & 49.90\% & 18.31\% & 19.87\% & 18.23\% & 18.94\% & 97.27\%\\ 
+% $\text{Base}_{1:7}$& 17.76\% & 54.00\% & 93.02\% & 44.75\% & 19.99\% & 19.95\% & 18.25\% & 19.41\% & 97.30\% \\ 
+% %\cmidrule{1-10}
+% \midrule
+% MLCD & 19.21\% & 56.00\% & 94.12\% & 40.57\% & 22.67\% & 20.46\% & 18.21\% & 19.77\% & 97.98\%\\ 
+% $\text{MLCD}_{4:4}$ & 22.79\% & 53.00\% & 92.69\% & 39.80\% & 17.51\% & 19.89\% & 18.32\% & 19.06\% & 97.30\%\\ 
+% $\text{MLCD}_{3:5}$ & 22.10\% & 50.00\% & 90.82\% & 43.48\% & 21.44\% & 19.97\% & 17.68\% & 19.75\% & 97.47\%\\ 
+% $\text{MLCD}_{2:6}$ & 18.60\% & 53.00\% & 92.52\% & 43.36\% & 16.21\% & 19.89\% & 17.84\% & 20.12\% & 97.70\% \\ 
+% $\text{MLCD}_{1:7}$ & 16.92\% & 53.00\% & 91.92\% & 43.27\% & 17.22\% & 19.94\% & 18.56\% & 19.85\% & 97.45\%\\ 
+% \midrule
+% %\cmidrule{2-10}
+% $\text{Ours}_{r\text{=0.025}}$ & 18.83\% & 55.00\% & 96.25\% & 46.02\% & 12.35\% & 20.31\% & 18.17\% & 19.11\% & 97.70\%\\ 
+% $\text{Ours}_{r\text{=0.050}}$ & 11.74\% &  58.00\% & 92.11\% & 39.81\% & 22.31\% & 20.25\% & 17.71\% & 19.45\% & 97.71\%\\ 
+% $\text{Ours}_{r\text{=0.100}}$ & 18.98\% & 56.00\% & 93.65\% & 43.88\% & 15.77\% & 20.20\% & 17.98\% & 19.29\% & 97.55\%\\ 
+% $\text{Ours}_{r\text{=0.200}}$ & 17.99\% & 53.00\% & 51.82\% & 36.14\% & 13.88\% & 20.29\% & 17.97\% & 18.97\% & 97.62\%\\ 
+% $\text{Ours}_{r\text{=0.400}}$ & 15.32\% & 54.00\% & 92.64\% & 37.05\% & 12.06\% & 20.24\% & 18.19\% & 19.22\% & 97.66\% \\ 
+% \bottomrule
+% \end{tabular}
+
+% \begin{tabular}{cccccccc}
+% \toprule
+% \textbf{CM} & \textbf{Mask} & \textbf{Motion} $\uparrow$ & \textbf{Temporal} $\uparrow$  & \textbf{Per-Step(s)} & \textbf{Speedup} & \textbf{End-to-End(s)} & \textbf{End-to-End Speedup} \\
+% \midrule
+% before & full & 99.15\% & 98.76\% & 39.06 & - & Pending & - \\ 
+% % \cmidrule{1-9}
+% after & full & 99.30\% & 99.22\% & Pending & 39.06 & Pending & - \\ 
+% & $r$=0.15 & 99.08\% & 99.31\% & Pending & 0 & Pending & - \\ 
+% \bottomrule
+% \end{tabular}
+%     %\vspace{-5pt}
+% \hangliang{@Runlong add \textbf{testbf} to some numbers. add vbench results.}
+
+    %~\hangliang{@Dacheng: is it too large?} ~\hangliang{@Runlong: fill it with the data from exp.}
+    %\dacheng{Too big, consider reducing the number of characters in headers etc. And don't change font size.}
+    %\vspace{-10pt}
+
+\textbf{Implementation} We utilize the All-to-All communication primitives to implement sequence parallelism ~\citep{jacobs2023deepspeed}. In the attention computation, the system partitions the operations along the head dimension while keeping the entire sequence intact on each GPU, allowing a simple implementation of~\methodname~by applying the same attention mask as in the one GPU setting~\footnote{The difference is that the attention mask is applied to fewer number of attention heads.}. As a result,~\methodname~is natively compatible with All-to-All sequence parallelism.
+%During training, sequence parallelism is crucial when dealing with longer sequences and higher frame counts as it helps conserve memory and prevent out-of-memory (OOM) errors. This is because each GPU only needs to store a shard of the hidden states. In inference, sequence parallelism plays a key role when processing longer sequences and higher frame counts, significantly reducing latency for single-video generation. This method enables more efficient GPU utilization. 
+
+
+
+We conduct a scaling experiment with sequence parallelism on 4x A100-SXM 80GB GPUs, interconnected with NVLink. We observe a speedup of $3.68\times$ - $3.91\times$ for 29 and 93 frames generation on 4 GPUs, which is close to a theoretical speedup of $4\times$ (Table~\ref{tab:flexattention_scaling}).  If reported 29 frames generation on multi-GPUs, $\text{Ours}_{r\text{=0.100}}$  can achieve 25.8x speedup on 4 GPUs and 13.0x speedup on 2 GPUs.
+% For the 29 frames model, we achieve $3.68\times$ speedup compared to a single GPU implementation. For the 93 frames model, we achieve $3.91\times$ speedup compared to a single GPU imp
+
+%Scaling Performance with Sequence Parallelism on 4x A100-SXM 80GB GPUs. We use model after CM in Table \ref{tab:main_result} for this evalutation.
+
+%For example, in a scenario with four GPUs, we reduced the 3D-DiT per-step time from 39.06 to 10.02 seconds, achieving a 3.91x speedup (as shown in Table \label{tab:flexattention_scaling}). Furthermore, this approach scales efficiently with additional GPUs, accelerating video generation further and enabling the processing of longer sequences and higher-resolution videos.
+
+\begin{table}[h]
+\centering
+\caption{\methodname~ with sequence parallelism on Open-Sora-Plan model. Time as wall-clock-time per step.}
+\resizebox{0.7\columnwidth}{!}{
+\begin{tabular}{cccc}
+    \toprule
+    \textbf{Frames} & \textbf{\# GPUs} & \textbf{Time (s)} & \textbf{Speedup} \\ 
+    \midrule
+    \multirow{3}{*}{29} & 1 & 5.56 & $1.00\times$ \\
+    & 2 & 2.98 & 1.87$\times$  \\
+    & 4 & 1.52 & 3.68$\times$ \\
+    \midrule
+    \multirow{3}{*}{93} & 1 & 39.06 & $1.00\times$ \\
+    & 2 & 20.00 & 1.95$\times$ \\
+    & 4 & 10.02 & 3.91$\times$  \\
+    \bottomrule
+\end{tabular}}
+\label{tab:flexattention_scaling}
+\end{table}
+
+\subsection{Video Quality benchmark}
+\label{sec:performance_result}
+
+% We compare with PAB, and pure CM-based method, on both speedup and ML accuracy. Metric: VBench, FVD.
+In this section, we first evaluate~\methodname~with layerwise searching on CD-FVD and VBench~\citep{huang2024vbench, cdfvd}. We compare with the baseline of the original Open-Sora-Plan 1.2 model, and the model we obtain only using the MLCD method. We then conduct two ablation experiments to understand the effectiveness of the MLCD method, and our layerwise searching algorithm.
+
+% tests on VBench and FVD using the Open-Sora-Plan with 29 frames and 720p resolution, comparing the Base model, MLCD model, and models after layerwise search. Vbench contains two category of 16 dimensions of sub-metrics into video quality metrics and semantic metrics. The Vbench final score is a weighted average for all sub-metrics with official metric weights from vbench.
+
+Table \ref{tab:main_result} demonstrates the main result of the 29 frames model. In VBench, We find that the results of all our search models are within 1\% final score against the Base model with no noticeable drop in several key dimensions. %with no noticeable drop in critical dimensions such as aesthetic quality, motion smoothness, and subject consistency. 
+%For instance, Ours$_{r=0.025}$ performs similarly to the Base model in key aspects like aesthetic quality, motion smoothness, and subject consistency. 
+At higher acceleration ratios, such as Ours$_{r=0.400}$, the model maintains stable performance, with minimal deviations from the Base model, demonstrating the robustness of our approach while achieving significant speedups. However, we note that the imaging quality and subject class are lower than those of the base model. The reason why the VBench score remains within 1\% difference is that our model improves the dynamic degree. With more sparsity, our pipeline has the characteristics of being able to capture richer motions between frames, but trading off some degrees of aesthetic quality and subject class accuracy.
+
+In CD-FVD, our models with smaller acceleration ratios achieve better scores than MLCD model. For example, Ours$_{r=0.025}$ achieves a score of 186.84 with a speedup of 5.85$\times$, outperforming the MLCD model. As the acceleration ratio increases, the score degrades as expected. Ours$_{r=0.400}$ reaches a score of 231.68 with a speedup of 7.80$\times$, showing a trade-off between acceleration and performance.
+Our models maintain performance with minimal performance drop and achieve a significant speedup. %In table~\ref{tab:open_sora_results}, we show the effectiveness of~\methodname~in a subset of VBench for 93 frames. We observe a similar conclusion that we achieve $7.4\times$ speedup.% with less than 1\% performance drop in motion smootheness and temporal flickering.
+
+% \begin{table*}[h]
+% \scriptsize \centering
+% \begin{tabular}{cccc}
+% \toprule
+% \textbf{Model} & \textbf{Motion} $\uparrow$ & \textbf{Temporal} $\uparrow$  & \textbf{Speedup}  \\
+% \midrule
+% Base & 99.15\% & 98.76\%  & -  \\ 
+% % \cmidrule{1-9}
+% MLCD & 99.30\% & 99.22\%  & Pending  \\ 
+% \midrule
+% $\text{Ours}_{r\text{=0.150}}$ & 99.08\% & 99.31\%  & Pending   \\ 
+% \bottomrule
+% \end{tabular}
+%     %\vspace{-5pt}
+% \hangliang{@Runlong add \textbf{testbf} to some numbers. add vbench results.}
+% \end{table*}
+\begin{comment}
+\begin{wraptable}{r}{0.5\textwidth}
+%\vspace{-5mm}
+\scriptsize \centering
+\caption{Results on Open-Sora-Plan with 93 frames and 720p resolution. We select key measure of motion smoothness and temporal flickering that are crucial for sparse attention methods.}
+\begin{tabular}{cccc}
+\toprule
+\textbf{Model} & \makecell{\textbf{Motion} \\ \textbf{Smoothness}} & \makecell{\textbf{Temporal} \\ \textbf{Flickering}}  & \textbf{Speedup}  \\
+\midrule
+Base & 99.15\% & 98.76\%  & 1.00$\times$  \\ 
+% \cmidrule{1-9}
+MLCD & 99.30\% & 99.22\%  & 5.00$\times$  \\ 
+\midrule
+$\text{Ours}_{r\text{=0.150}}$ & 99.08\% & 99.31\%  & 7.40$\times$   \\ 
+\bottomrule
+\end{tabular}
+    %\vspace{-5pt}
+\end{wraptable}
+
+\end{comment}
+
+\textbf{Extension to MM-DiT architecture} We demonstrate our method's generalizability by applying it to CogVideoX-5B~\cite{yang2024cogvideox}, which is based on the MM-DiT architecture that differs from Open-Sora-Plan's cross attention module, where its attention module concatenates text tokens with video token. For MM-DiT, we only apply sparse mask to the video-video part considering that the text tokens length are very small compared to video tokens. Our approach achieves comparable performance, maintaining the final VBench score within 1\% of the baseline as shown in Table~\ref{tab:cog_vbench1}. Detailed analysis and additional results can be found in Appendix~\ref{appendix:cogvideo}.
+
+%\textbf{Extension to MM-DiT.} We demonstrate our method's generalizability by applying it to CogVideoX-5B~\cite{yang2024cogvideox}, which is based on the MM-DiT architecture that differs from Open-Sora-Plan's cross attention module, which shows our method 可扩展性. For MM-DiT, we only apply sparse mask to the video-video part considering the text length are very small compared to video. Our approach achieves comparable performance, maintaining the final VBench score within 1\% of the baseline as shown in Table~\ref{tab:cog_vbench1}. Detailed analysis and additional results can be found in Appendix~\ref{appendix:cogvideo}.
+
+\begin{table}[ht]
+\scriptsize \centering
+\setlength{\tabcolsep}{4pt}
+\caption{CogVideoX-5B with 49 frames and 480p resolution results on VBench.}
+\begin{tabular}{cccccc}
+\toprule 
+\textbf{Model} & \makecell{\textbf{Final} \\ \textbf{Score}} $\uparrow$ & \makecell{\textbf{Aesthetic} \\ \textbf{Quality}} & \makecell{\textbf{Motion} \\ \textbf{Smoothness}} & \makecell{\textbf{Temporal} \\ \textbf{Flickering}} & \textbf{Speedup} \\
+\midrule
+Base & 77.91\% & 57.91\% & 97.83\% & 97.34\% & 1.00$\times$ \\
+$\text{Ours}_{r\text{=5}}$ & 77.15\% & 51.18\% & 96.67\% & 97.18\% & 1.34$\times$ \\
+\bottomrule
+\end{tabular}
+\label{tab:cog_vbench1}
+\end{table}
+
+\textbf{Order of MLCD and KD} We claim that knowledge distillation and consistency distillation are orthogonal processes. To verify this, we conducted an ablation experiment on the distillation order. We first applied attention distillation based on the original model, then used this model to perform multi-step latent consistency distillation (MLCD). The results in Table \ref{tab:ablation_order1} support our hypothesis, showing minimal differences in VBench and CD-FVD scores regardless of the distillation sequence. We also show qualitative samples in Appendix Fig.~\ref{fig:vbench_abl}~to illustrate the video quality.
+
+\begin{table}[ht]
+\scriptsize \centering
+\setlength{\tabcolsep}{4pt}
+\caption{Quantitative evaluation on distillation order for MLCD and layerwise knowledge distillation.}
+\begin{tabular}{cccccc}
+\toprule 
+\textbf{Model} & \makecell{\textbf{Final} \\ \textbf{Score}} $\uparrow$ & \makecell{\textbf{Aesthetic} \\ \textbf{Quality}} & \makecell{\textbf{Motion} \\ \textbf{Smoothness}} & \makecell{\textbf{Temporal} \\ \textbf{Flickering}} & \textbf{CD-FVD} $\downarrow$ \\
+\midrule
+MLCD + KD & 76.00\% & 56.59\% & 99.13\% & 99.54\% & 204.13 \\
+KD + MLCD & 75.50\% & 56.38\% & 99.12\% & 99.40\% & 203.52 \\
+\bottomrule
+\end{tabular}
+\label{tab:ablation_order1}
+\end{table}
+
+%\subsubsection{Ablation study}
+
+\textbf{Separate Effect of MLCD and Layerwise Search.} We evaluate the effectiveness of MLCD and our layerwise search strategy separately. MLCD achieves comparable or better performance across most VBench metrics (76.81\% overall score) with a 5.00$\times$ speedup, maintaining consistent performance after knowledge distillation. For layerwise search, compared to uniform masking patterns (e.g., 4:4, 3:5 splits), our approach with various thresholds ($r$ = 0.025, 0.050, 0.100) achieves better VBench scores (>76.00\%) and speedup (7.05$\times$ vs. 5.80$\times$), while maintaining CD-FVD scores below 250. Detailed analysis and additional results can be found in Appendix~\ref{appendix:abl}.
+
+% \begin{tabular}{ccccccccccc}
+% \toprule 
+% \textbf{Model} & \makecell{\textbf{Multiple} \\ \textbf{Objects}} &  \makecell{\textbf{Human} \\ \textbf{Action}} & \textbf{Color}  & \makecell{\textbf{Spatial} \\ \textbf{Relationship}} & \textbf{Scene} & \makecell{\textbf{Appearance} \\ \textbf{Style}} & \makecell{\textbf{Temporal} \\ \textbf{Style}} & \makecell{\textbf{Overall} \\ \textbf{Consistency}} & \makecell{\textbf{Background} \\ \textbf{Consistency}} \\
+% \midrule
+% MLCD & 19.21\% & 56.00\% & 94.12\% & 40.57\% & 22.67\% & 20.46\% & 18.21\% & 19.77\% & 97.98\%\\ 
+% $\text{MLCD}_{4:4}$ & 22.79\% & 53.00\% & 92.69\% & 39.80\% & 17.51\% & 19.89\% & 18.32\% & 19.06\% & 97.30\%\\ 
+% $\text{MLCD}_{3:5}$ & 22.10\% & 50.00\% & 90.82\% & 43.48\% & 21.44\% & 19.97\% & 17.68\% & 19.75\% & 97.47\%\\ 
+% $\text{MLCD}_{2:6}$ & 18.60\% & 53.00\% & 92.52\% & 43.36\% & 16.21\% & 19.89\% & 17.84\% & 20.12\% & 97.70\% \\ 
+% $\text{MLCD}_{1:7}$ & 16.92\% & 53.00\% & 91.92\% & 43.27\% & 17.22\% & 19.94\% & 18.56\% & 19.85\% & 97.45\%\\ 
+% \midrule
+% %\cmidrule{2-10}
+% $\text{Ours}_{r\text{=0.025}}$ & 18.83\% & 55.00\% & 96.25\% & 46.02\% & 12.35\% & 20.31\% & 18.17\% & 19.11\% & 97.70\%\\ 
+% $\text{Ours}_{r\text{=0.050}}$ & 11.74\% &  58.00\% & 92.11\% & 39.81\% & 22.31\% & 20.25\% & 17.71\% & 19.45\% & 97.71\%\\ 
+% $\text{Ours}_{r\text{=0.100}}$ & 18.98\% & 56.00\% & 93.65\% & 43.88\% & 15.77\% & 20.20\% & 17.98\% & 19.29\% & 97.55\%\\ 
+% $\text{Ours}_{r\text{=0.200}}$ & 17.99\% & 53.00\% & 51.82\% & 36.14\% & 13.88\% & 20.29\% & 17.97\% & 18.97\% & 97.62\%\\ 
+% $\text{Ours}_{r\text{=0.400}}$ & 15.32\% & 54.00\% & 92.64\% & 37.05\% & 12.06\% & 20.24\% & 18.19\% & 19.22\% & 97.66\% \\ 
+% \bottomrule
+% \end{tabular}
+% \vspace{-4mm}
+%\vspace{-4mm}
+%\subsubsection{Evaluation on VBench and FVD} 
+
+\begin{comment}
+\begin{wraptable}{r}{0.5\textwidth}
+\vspace{-3mm}
+    \centering
+    \caption{\methodname~with sequence parallelism. Time as wall-clock-time per step.}
+    \vspace{-1mm}
+    \resizebox{0.4\columnwidth}{!}{\begin{tabular}{cccc}
+        \toprule
+        \textbf{Frames} & \textbf{\# GPUs} & \textbf{Time (s)} & \textbf{Speedup} \\ 
+        \midrule
+        \multirow{3}{*}{29} & 1 & 5.56 & $1.00\times$ \\
+         & 2 & 2.98 & 1.87$\times$  \\
+         & 4 & 1.52 & 3.68$\times$ \\
+        \midrule
+        \multirow{3}{*}{93} & 1 & 39.06 & $1.00\times$ \\
+         & 2 & 20.00 & 1.95$\times$ \\
+         & 4 & 10.02 & 3.91$\times$  \\
+        \bottomrule
+    \end{tabular}}
+    \vspace{+5pt}
+    \label{tab:flexattention_scaling}
+\end{wraptable}
+   
+\end{comment}
+
+% \textbf{Analysis of evaluation dimensions} With the attention distillation method, instead of using full attention, only key frames in the hidden space are considered. This approach increases the locality of the generated videos but leads to a monotone color style and temporal inconsistencies. VBench's aesthetic quality score reflects the color and background harmony of the videos, allowing us to assess how the key frame attention method impacts scene quality. Meanwhile, dynamic degree, motion smoothness, and temporal flickering metrics reflect the temporal inconsistencies caused by this distillation method. The Frechet Video Distance (FVD) score highlights the stylistic differences between real-world and generated videos under the same prompt, offering an overall benchmark for the realism of the generated videos.
+ 
+
+%\dacheng{Objective roadmap}
+%\begin{enumerate}
+%    \item ICLR submittable main result: CM + fixed Sparse pattern (A curve with different Sparsity Level), OSP-1.2 (93 frames).
+%    \item ICLR submittable ablation: (1) Different Sparsity Level. (2) Performance Loss of CM stage, Performance Loss of subsequent Sparse pattern. 
+%    \item Level 2 improvement: Adaptive sparsity.
+%    \item Level 3 improvement: CogVideox series: 2B/5B result, applied on the best recipe.
+%    \item Level 4 improvement: better data mixture.
+    %\item Level 5 Improvement: Change Attention map to Mamba.
+%    \item Good-to-have ablation: (1) Effect of different loss objective (2) Hyper-parameter. (3) Effect of CM and attention order.
+%\end{enumerate}
+%TODO: write scripts to launch.
+%\dacheng{Experiments roadmap}
+%\begin{enumerate}
+%    \item Sept 7: Setting: OSP v1.2, 29 frame, first CM then attention, mixkit data, fixed sparse pattern.
+%        \begin{enumerate}
+%            \item Different Sparsity level: Full, 1:1, 2:3:3 1:3, 1:7 (lr = 1e-5)
+%            \item + CM - Different Sparsity level: Full, 1:1, 2:3:3 1:3, 1:7 (lr = 1e-5)
+%        \end{enumerate}
+%    \item Next 1: Setting: OSP v1.2, 93 frame, first CM then attention, mixkit data. fixed sparse pattern.
+%        \begin{enumerate}
+%            \item Different Sparsity level: Full, 1:1, 1:2, 1:3, 1:5, 1:11, 1:23 (lr = 1e-5)
+%            \item + CM - Different Sparsity level: Full, 1:1, 2:3:3 1:3, 1:7
+%        \end{enumerate}
+%    \item Next 2: Setting: OSP v1.2, 93 frame, first CM then attention, mixkit data. Adapative sparse pattern.
+%        \begin{enumerate}
+%            \item Threshold: 0.1, 0.3, 0.5, 0.7, 0.9.
+%        \end{enumerate}
+%    \item Next 3: Setting: OSP v1.2, 93 frame, first CM then attention, full Data mixture. Adapative sparse pattern.
+%    \item Next 4: (1) CogVideoX-2B. (2) CogVideoX-5B.
+%\end{enumerate}
+%\begin{table*}[!ht]
+%\centering
+%\caption{Inference latency speedup comparison between sparse and full kernel.}
+%\label{tab:speedup}
+%\begin{tabular}{|c|c|c|c|c|c|c|}
+%\hline
+%\textbf{frames} & \textbf{length} & \textbf{sparsity} & \textbf{kernel sparse(s)} & \textbf{kernel speedup} & \textbf{end-2-end sparse(s)} & \textbf{end-2-end speedup} \\ 
+%\hline
+%\multirow{3}{*}{29x} & \multirow{3}{*}{28800} & Full & & & & \\
+%\cline{3-7}
+%                     &                       & 1:1  & & & & \\
+%\cline{3-7}
+%                     &                       & 1:3  & 62.5807 & 1.86 & 84s & 1.44 \\ 
+%\hline
+%\multirow{4}{*}{93x} & \multirow{4}{*}{86400} & Full & & & & \\
+%\cline{3-7}
+%                     &                       & 1:1  & & & & \\
+%\cline{3-7}
+%                     &                       & 1:3  & & & & \\
+%\cline{3-7}
+%                     &                       & 1:5  & & & & \\
+%\hline
+%\end{tabular}
+%\end{table*}
+
+%\subsection{ML performance}
+%Following runs on 2B model. We will use the best Recipe to train a 5B model:
+%\begin{enumerate}
+%    \item Model: 2B
+%    \item Frames number: 29, 93
+%    \item Recipe: (1) First CM, then Attention; (2) First Attention then CM, (3) Joint CM and Attention distillation.
+%    \item Sparsity Level: 1:1, 1:3, 1:5 
+%\end{enumerate}
+
+
+
+%\subsection{Ablation study}
+
+%\subsubsection{Comparison with different CM stages}
+
+%The purpose of this experiment is to evaluate the performance drop of models using the Compression Model (CM) across multiple stages. Since CM models generally lose some information during compression, resulting in a performance decrease, we aim to observe how different stages of CM models (e.g., CM stage1 and CM stage2) affect key metrics such as Aesthetic quality, Dynamic degree, Motion smoothness, and Temporal consistency. The focus of this experiment is to quantify the extent of performance degradation as the CM model is applied in multiple stages.
+
+
+%    \begin{table*}[h]
+%        \centering
+%        \begin{tabular}{ccccccc}
+%            \toprule
+%            \textbf{Frame} & \textbf{Model} & \textbf{Aesthetic $\uparrow$} & \textbf{Dynamic $\uparrow$} & \textbf{Motion $\uparrow$} & \textbf{Temporal $\uparrow$} & \textbf{FVD} \\ 
+%            \midrule
+%            & original & 0 & 0 & 0 & 0 & 5.56 \\ 
+%            29x & CM stage1 & 0 & 0 & 0 & 0 & 4.81 \\ 
+%            & CM stage2 & 0 & 0 & 0 & 0 & 4.40 \\ \midrule
+%            & original & 0 & 0 & 0 & 0 & 5.56 \\ 
+%            93x & CM stage1 & 0 & 0 & 0 & 0 & 4.81 \\ 
+%            & CM stage2 & 0 & 0 & 0 & 0 & 4.40 \\ 
+%            \bottomrule
+%        \end{tabular}
+%        \vspace{-5pt}
+%        \caption{Comparison of FVD scores and VBench metrics across different models.}
+%        \vspace{-10pt}
+%        \label{tab:main_result}
+%    \end{table*}
+
+% \dacheng{first use last layer loss to decide, future make ablation on the loss}
+
+\subsection{Qualitative result}
+\label{sec:visual}
+As illustrated in Fig.\ref{fig:vis}, we compare the video results generated by three methods: the original model, after applying MLCD, and after knowledge distillation. The generation settings are consistent with those in Table \ref{tab:main_result}, demonstrating that both the MLCD and knowledge distillation methods maintain the original quality and details. More qualitvative samples are listed in Appendix \ref{appendix:sample}.
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[page=1,width=\linewidth]{figures/prompt_sample/ICMLpics.pdf}
+  \vskip 5pt
+  \includegraphics[page=2,width=\linewidth]{figures/prompt_sample/ICMLpics.pdf}
+  %\vspace{-5pt}
+  \caption{Qualitative samples of our models. We compare the generation quality between the base model, MLCD model, and after knowledge distillation. Frames shown are equally spaced samples from the generated video. \methodname~is shortened as `E-vdit' for simplicity. More samples can be found in Appendix \ref{appendix:sample}.}
+  % \hangliang {@runlong, update qualitative results}
+  % \hangliang {@runlong, make it tight}
+  \label{fig:vis}
+  \vspace{-5mm}
+\end{figure}

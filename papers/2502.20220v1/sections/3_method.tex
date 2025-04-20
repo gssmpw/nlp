@@ -1,0 +1,82 @@
+\input{figures/03_method_figure}
+
+\section{Method}
+
+The goal of {\OURS} is to predict a high-quality 3D Gaussian representation of a human head from just a few posed input images while simultaneously animating the 3D head to match a desired facial expression:
+
+\begin{align}
+    \mathcal{G} = \textsc{Avat3r}(I, \pi, z_{exp})
+\end{align}
+
+
+where $I = \{I_1, ..., I_V\}$ are the $V$ input images, $\pi$ their corresponding camera parameters, and $z_{exp}$ a code describing the desired facial expression. In our experiments, $V = 4$. Note that the images $I$ do not necessarily have to stem from multi-view camera systems or synthetic multi-view renderings of objects as it is common for large reconstruction models. Instead, the input images may show the scene at different instances in time, making the model amenable for training and inference on frames from monocular videos. \\
+Under the hood, {\OURS} employs a Vision Transformer backbone~\cite{dosovitskiy2020vit} to predict 3D Gaussian primitives for each pixel in the input images. \cref{fig:03_method_figure} depicts the model architecture. In the following, we introduce the different components of our pipeline. 
+
+\subsection{Pre-trained Foundation Models}
+We simplify the task by employing two foundation models: DUSt3R~\cite{wang2024dust3r}, and Sapiens~\cite{khirodkar2025sapiens}. DUSt3R predicts dense position maps for a set of input images and globally aligns them with the known camera parameters $\pi$. These position maps will be beneficial for placing the 3D Gaussians. The Sapiens backbone predicts a rich low-resolution feature map for each image. The semantic nature of the extracted features will simplify the view matching task that has to be performed by the subsequent Transformer. 
+\begin{align}
+    I^{pos}, I^{conf} &= \textsc{Dust3r}(I, \pi) \\
+    I^{feat} &= \textsc{Sapiens}(I)
+\end{align}
+where $I^{pos}, I^{conf}$ are position and confidence maps predicted by DUSt3R, and $I^{feat}$ are the Sapiens feature maps.
+
+\subsection{Animatable Large 3D Reconstruction Model}
+We adopt a Vision Transformer architecture following GRM~\cite{xu2024grm} by first patchifying the input maps $I, I^{pos}, I^{pluck} \in \mathbb{R}^{V \times H \times W \times C}$ with a convolutional layer: 
+\begin{align}
+    h &= \textsc{Conv}\left([I, I^{pos}, I^{pluck}]\right)
+\end{align}
+where $I^{pluck}$ are the per-ray plucker coordinates stored for each pixel and $h \in \mathbb{R}^{V \times H_p \times W_p \times D}$ will be the low-resolution intermediate feature maps for each input view.\\
+Next, we incorporate the pre-computed per-image feature maps $I^{feat} \in \mathbb{R}^{V \times H_f \times W_f \times C_f}$:
+\begin{align}
+    h^{feat} &= \textsc{GridSample}\left(I^{feat}\right) \\
+    h &\leftarrow \textsc{Linear}([h, h^{feat}])
+\end{align}
+where the grid sampling step is necessary to transform the Sapiens features maps $I^{feat}$ to the same $H_p \times W_p$ resolution as the intermediate feature maps $h$. The subsequent linear layer then squashes the concatenated feature maps back to dimension $D$ to avoid excessive compute increase in the following transformer layers. \\
+The core of the Vision Transformer consists of several self-attention layers that perform cross-view matching between all $V\times H_p \times W_p$ tokens to infer 3D information from the given input images:
+\begin{align}
+    h \leftarrow \textsc{SelfAtt}(h, h)
+\end{align} 
+To make {\OURS} animatable, we employ several cross-attention layers that allow each image token to attend to a sequence of expression tokens following~\cite{kirschstein2024diffusionavatars, ye2023ipadapter}:
+\begin{align}
+    f_{exp} &= \textsc{MLP}(z_{exp}) \\
+    h &\leftarrow \textsc{CrossAtt}(h, f_{exp})
+\end{align}
+where the \textsc{MLP} projects a single descriptive expression code $z_{exp} \in \mathbb{R}^{C_{exp}}$ to the expression code sequence $f_{exp} \in \mathbb{R}^{S \times D}$. In our case, $S = 4$. Surprisingly, by simply enriching each image token in $h$ with expression-dependent information, {\OURS} is already capable of modeling complex facial animations in 3D.  \\
+We upsample the image tokens again to the original input resolution using the transformer-based upsampler from GRM~\cite{xu2024grm}:
+\begin{align}
+    M = \textsc{Upsample}(h)
+\end{align}
+where $M \in \mathbb{R}^{V \times H \times W \times C_{G}}$ denote the Gaussian attribute maps consisting of per-pixel Gaussian positions, scales, rotations, colors, and opacities. After upsampling, we add two skip connections for positions and colors:
+\begin{align}
+    M^{pos} &\leftarrow M^{pos} + I^{pos} \\
+    M^{rgb} &\leftarrow M^{rgb} + I
+\end{align}
+which incorporate the inductive bias that a pixel should primarily spawn a 3D Gaussian that models the pixel's corresponding 3D geometry. \\
+Finally, we make use of DUSt3R's per-pixel confidence maps $I^{conf}$ to decide which pixel in the generated Gaussian attribute maps $M$ should actually spawn a 3D Gaussian:
+\begin{align}
+    \mathcal{G} = \{M[x, y] : I^{conf}[x, y] > \tau\}
+\end{align}
+where $\tau = 0.5$ is a threshold describing the minimal confidence needed to create a 3D Gaussian. This serves two purposes: First, it avoids artifacts that arise from incorrect 3D position initializations from DUSt3R. Second, it naturally adjusts the number of Gaussians to the person at hand. In that sense, the confidence mask acts much like a foreground segmentation: If the person had large voluminous hair, then more pixels will belong to the foreground and thus more Gaussians will be kept. \\
+The final set of 3D Gaussians $\mathcal{G}$ can then be rendered from any desired novel viewpoint $\pi^{nv}$ using the tile-based differentiable rasterizer $\mathcal{R}$~\cite{kerbl20233dgs}:
+\begin{align}
+    I^{nv} = \mathcal{R}(\mathcal{G}, \pi^{nv})
+\end{align}
+
+\subsection{Losses}
+
+{\OURS} can be trained with only photometric losses on novel viewpoints following the original 3D Gaussian Splatting work~\cite{kerbl20233dgs}:
+\begin{align}
+    \mathcal{L}_{l1} &= \Vert I^{nv} - I^{gt} \Vert_1 \\
+    \mathcal{L}_{ssim} &= \textsc{SSIM}(I^{nv}, I^{gt})
+\end{align}
+
+Furthermore, we incorporate perceptual losses~\cite{zhang2018lpips} to encourage the emergence of more high-frequency details:
+\begin{align}
+    \mathcal{L}_{lpips} &= \textsc{LPIPS}(I^{nv}, I^{gt})
+\end{align}
+
+The final loss term is comprised as follows:
+\begin{align}
+    \mathcal{L} = \lambda_{l1} \mathcal{L}_{l1} + \lambda_{ssim} \mathcal{L}_{ssim} + \lambda_{lpips} \mathcal{L}_{lpips}
+\end{align}
+with $\lambda_{l1} = 0.8, \lambda_{ssim} = 0.2$, and $\lambda_{lpips} = 0.01$.

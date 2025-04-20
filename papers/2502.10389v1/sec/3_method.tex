@@ -1,0 +1,96 @@
+\section{Methodology}
+\label{sec.method}
+
+\begin{table}[hbt]
+
+\centering
+\renewcommand\arraystretch{1.2}
+\label{tab.symbo}
+\scalebox{0.85}{\begin{tabular}{ll}
+\noalign{\hrule height 1pt}
+$t$    & The current timestep                                            \\
+$N$    & The noise output of the DiT model              \\
+$\widetilde{N}$    & The cached noise output from the previous timestep                                       \\
+$\hat{N}$    & The estimated full-length noise calculated with $N$ and $\widetilde{N}$\\
+$S$ & The unpatchified image sample \\
+$x$ & The patchified input of the DiT model \\
+$M$ & Mask generated to drop certain tokens in the input \\
+$D$ & The number of times the tokens in a patch being dropped \\
+\noalign{\hrule height 1pt}
+\end{tabular}
+}
+\caption{Meanings of the symbols that are used in this paper}
+\end{table}
+
+\subsection{Overview}
+In this section, we present the \ourmethod{} design and techniques to exploit inter-timestep token correlations and the regional token attention mechanism introduced in Section \ref{sec:intro}. (1) Based on the regional characteristics we observed in the DiT inference process, we propose an end-to-end pipeline that dynamically eliminates the computation through DiT of certain tokens at each timestep. (2) To leverage the continuity across consecutive timesteps, we propose a straightforward method to identify the fast-update regions that require refinement in upcoming timesteps, while ensuring that slow-update regions are not neglected due to insufficient diffusion steps. This approach effectively balances token focus without leading to starvation. (3) Building on our observations of continuous distribution patterns, we introduce several scheduling optimization techniques to further enhance the quality of generated content. 
+
+
+
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.48\textwidth]{pics/paper_code.pdf} 
+    \caption{Sample Step with \ourmethod{} in Python. Only two extra functions are needed to switch from the original scheduler to \ourmethod{}.}
+    \label{fig:code}
+\end{figure}
+
+\subsection{Region-Adaptive Sampling}
+
+\textbf{Region-Aware DiT Inference with \ourmethod{}.} Building on the insight that only certain regions are important at each timestep, we introduce the \ourmethod{} pipeline for DiT inference. In U-Net-based models such as SDXL \cite{podell2023sdxlimprovinglatentdiffusion}, tokens must remain in fixed positions to preserve positional information. However, given the structure of DiT, we can now mask and reorder elements within latent samples, as positional information is already embedded using techniques like RoPE \cite{su2024roformer}. This flexibility allows us to selectively determine which regions are processed by the model.
+To achieve this, some additional operations are required starting from the final step, as described in Figure \ref{fig:code}. At the end of each timestep, the current sample is updated by combining the fresh model output for the active tokens and the cached noise for the inactive tokens. Specifically, the noise for the entire sequence is restored by integrating both the model output and the cached noise from the previous step. This mechanism enables active, important tokens to move in the new direction determined at the current timestep, while the inactive tokens retain the trajectory from the previous timestep. The next step involves updating the unpatchified sample with the scaled noise. We then compute the metric $R$, which is used to identify the fast-update regions based on the noise, update the drop count $D$ to track the frequency with which each token has been excluded, and generate the mask $M$ accordingly.
+
+With the mask $M$, the noise for the slow-update regions is cached, while the sample for the current fast-update regions is patchified and passed through the DiT model. Since modules like Layernorm and MLP do not involve cross-token operations, the computation remains unaffected even when the sequence is incomplete. For the attention \cite{vaswani2017attention} module, the computation can still proceed with the query, key, and value tensors being pruned. Additionally, we introduce a caching mechanism to further enhance performance, which will be detailed later. In summary, \ourmethod{} dynamically detects regions of focus and reduces the overall computational load of DiT by at least the same proportion as the user-defined sampling ratio.
+
+\noindent \textbf{Region Identification.} The DiT model processes the current timestep embedding, latent sample, and prompt embedding to predict the noise that guides the current sample closer to the original image at each timestep. To quantify the refinement of tokens at each timestep, we use the model's output as a metric. Through observation, we found that the standard deviation of the noise strongly marks the regions in the images, with the main subject (fast-update regions) showing an obvious lower standard deviation than the background (slow-update region). This could be caused by the difference in the amount of information between the regions after mixing with the Gaussian noises. Utilizing the deviation as a metric achieves reasonable results of image qualities and notable differences between regions, as is shown in Figure \ref{fig:visualization}. 
+Also, considering the similarities between latent samples across adjacent timesteps, we hypothesize that tokens deemed important in the current timestep are likely to remain important in the next, while the less-focused tokens can be dropped with minimal impact. Before we reach the final formulation of the metric, we need to introduce another technique to prevent starvation.
+
+\noindent \textbf{Starvation Prevention.} During the diffusion process, the main subject regions typically require more refinement compared to the background. However, consistently dropping computations for background tokens can lead to excessive blurring or noise in the final generated image. To address this, we track how often a token is dropped and incorporate this count as a scaling factor in our metric for selecting tokens to cache or drop, ensuring less important tokens are still adequately processed.
+
+\noindent Additionally, since DiT patchifies the latent tokens before feeding them into the model, we compute our metric at the patch level by averaging the scores of the tokens within each patch. Combining all the factors mentioned above, our metric can be written as:
+\begin{equation}
+\label{equa:metric}
+    R_t = mean_{patch}(std(\hat{N}_t)) \cdot exp(k * D_{patch})
+\end{equation}
+where $\hat{N}_t$ is the current estimated noise, $D_{patch}$ is the count of how many times the tokens in a patch have been dropped, and k is a scale factor to control the difference of sample ratios between fast-update regions and slow-update regions.
+
+\noindent \begin{figure}[htbp]
+    \centering
+\vspace{-0.5cm}    \hspace{-0.2cm}\includegraphics[width=0.5\textwidth]{pics/token-skip-attn.pdf} 
+    \caption{A \ourmethod{} self-attention module using Attention Recovery to enhance generation quality. $X_a^{t,l}$, $Q_a^{t,l}$, $K_a^{t,l}$, $V_a^{t,l}$ and $O_a^{t,l}$ represent the input hidden states, query, key, value and attention output of active tokens on layer $l$ during step $t$, respectively. $K^{t,l}$ and $V^{t,l}$ denote the key and value caches. The scatter operation to partially upload the key and value caches are fused into the previous projection using a PIT GeMM kernel. The keys and values of the not-focused area 
+($K^{t,l}_i$ and $V^{t,l}_i$) are estimated with the cache from the last sampling step ($K^{t-1,l}$ and $V^{t-1,l}$).}
+    \label{fig:detail}
+\end{figure}
+
+\noindent \textbf{Key and Value Caching.} As we know, the attention mechanism works by using the query for each token to compute its attention score with each other tokens by querying the keys and values of the whole sequence, thus giving the relations between each two tokens. The attention of the active tokens in \ourmethod{} can be given as: 
+\begin{equation}
+    O_{a} = softmax(\frac{Q_{a}K_{a}^{T}}{\sqrt{d}})V_{a}
+\end{equation}
+where $a$ stands for currently active tokens.
+However, the metric \textbf{R} we introduce to identify the current fast and slow regions does not take their contribution to the attention score into consideration. Thereby, losing these tokens during attention can cause a huge change in the final output. Our solution here is also caching. During each step, the full keys and values are cached until they are partially updated with the current active tokens. As is described in Figure \ref{fig:detail}, this solution is also based on the similarity between each two sampling steps, and now we can estimate the original attention output by: 
+
+\begin{equation}
+    O_{a} = softmax(\frac{Q_{a}[K_{a}, \widetilde{K}_i ]^T}{\sqrt{d}})[V_{a}, \widetilde{V}_i ]
+\end{equation} 
+where $i$ stands for the inactive tokens.
+
+\begin{figure*}[htbp]
+    \centering
+    \includegraphics[width=\textwidth]{pics/visual.pdf} % Adjust the path to your image
+    \caption{Visualization of \ourmethod{} on Lumina-Next-T2I and Stable Diffusion 3.}
+    \label{fig:visualization}
+\end{figure*}
+
+\subsection{Scheduling Optimization}
+\textbf{Dynamic Sampling Ratio.} As illustrated in Figure \ref{fig:ndcg}, the correlation between the initial timesteps is lower compared to the latter stages, where the diffusion process exhibits greater stability. This trend is also evident in Figure \ref{fig:latents}. Consequently, the strategy previously introduced is not suitable for the early stages of the diffusion process, as it could negatively impact the foundational structure of the generated image. Furthermore, we have observed that the similarity gradually increases during the stable phase of diffusion. To address these observations, we propose a dynamic sampling ratios that maintains a 100\% ratio for the initial timesteps (e.g., the first 4 out of 28 steps) to mitigate any adverse effects on the outline of the generated image. Thereafter, the sampling ratio is progressively reduced during the stable phase. This approach ensures a balance between computational efficiency and the image quality, enabling effective sampling ratios while minimizing adverse impacts on the generated output.
+
+
+
+\noindent \textbf{Accumulated Error Resetting.} \ourmethod{} focuses on the model's regions of interest, which tend to be similar across adjacent sampling steps. However, regions that are not prioritized for multiple steps may accumulate stale denoising directions, resulting in significant error between the original latent sample and the one generated with \ourmethod{}. To mitigate this issue, we introduce dense steps into the \ourmethod{} diffusion process to periodically reset accumulated errors. For instance, in a 30-step diffusion process where \ourmethod{} is applied starting from step 4, we designate steps 12 and 20 as dense steps. During these dense steps, the entire image is processed by the model, allowing it to correct any drift that may have developed in unfocused areas. This approach ensures that the accumulated errors are reset, maintaining the denoising process in alignment with the correct direction.
+
+
+\subsection{Implementation}
+
+\textbf{Kernel Fusing.} As previously mentioned, we introduced key and value caching in the self-attention mechanism. In each attention block of the selective sampling steps, these caches are partially updated by active tokens and then used as key and value inputs for the attention functions. This partial updating operation is equivalent to a scatter operation with active token indices.
+
+In our scenario, the source data of the scatter operation comprises active keys and values outputted by the previous general matrix multiplication (GeMM) kernel in the linear projection module. The extra GPU memory read/store on active keys and values can be avoided by fusing the scatter operation into the GeMM kernel, rather than launching a separate scatter kernel. Fortunately, PIT \cite{zheng2023pit} demonstrates that all permutation invariant transformations, including one-dimensional scattering, can be performed in the I/O stage of GPU-efficient computation kernels (e.g. GeMM kernels) with minimal overhead. Using this method, we fused the scatter operation into the epilogue of the previous GeMM kernel.

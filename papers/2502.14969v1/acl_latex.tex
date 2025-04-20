@@ -1,0 +1,446 @@
+\pdfoutput=1
+\documentclass[11pt]{article}
+\usepackage[preprint]{acl}
+\usepackage{times}
+\usepackage{latexsym}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{microtype}
+\usepackage{inconsolata}
+\usepackage{graphicx}
+
+\usepackage{colortbl}
+\usepackage{subfig}
+\usepackage{hyperref}
+\usepackage{multirow}
+\usepackage{listings}
+\usepackage{array}
+\definecolor{lightgray}{gray}{0.95}
+\usepackage{xcolor}
+\definecolor{red}{HTML}{CD5C5C}
+\usepackage{tcolorbox}
+
+\title{Lost in Space: Optimizing Tokens for Grammar-Constrained Decoding}
+
+\author{Sil Hamilton \and David Mimno \\
+  Department of Information Science \\
+  Cornell University \\
+  \texttt{\{srh255,mimno\}@cornell.edu}}
+
+\begin{document}
+\maketitle
+\begin{abstract}
+General-purpose language models are trained to produce varied natural language outputs, but for some tasks like annotation or classification we need more specific output formats.
+LLM systems increasingly support structured output, sampling tokens according to a grammar, which enforces a format but which can also reduce performance.
+We ask whether there are systematic differences between grammars that appear semantically similar to humans.
+To answer this question, we test four popular model families with five token formats on four NLP benchmarks. 
+All models perform most accurately when instructed to classify with real numbers.
+Performance also improves by 5\%-10\% when models are instructed to return tokens incorporating leading whitespace, which we find can help models avoid structural deficiencies in subword token representations.
+Format-based differences are largest for smaller models that are often used for local laptop-scale inference.
+We present best practices for researchers using language models as zero-shot classifiers with structured output.
+\end{abstract}
+
+\section{Introduction}
+One of the most promising applications of LLMs is parsing natural language into structured data \citep{Radford_Wu_Child_Luan_Amodei_Sutskever_2018, Brown_et_al._2020}.
+LLMs are increasingly used to structure data by academics in fields as diverse as literary studies \citep{Bamman_Chang_Lucy_Zhou_2024}, legal studies \citep{Gray_Savelka_Oliver_Ashley_2023, Hamilton_2023}, finance \citep{Holter_Ell_2023}, and computational biology \citep{Hou_Ji_2024}. 
+It is likewise prevalent outside of academia, with \citet{Veselovsky_Ribeiro_West_2023} estimating up to 46\% of Mechanical Turk requests involve LLMs.
+
+\input{figures/firstfigure.tex}
+
+Users don't want to waste queries on useless or difficult-to-interpret output.
+Prior research has proposed competing methods for guaranteeing valid output, such as reinforcement learning from human feedback (RLHF) and instruction tuning  \citep{Ouyang_Wu_Jiang_Almeida_Wainwright_Mishkin_Zhang_Agarwal_Slama_Ray_et_al._2022}.
+These methods are time consuming and expensive to implement, and are impractical for the variable and rapid-turnaround scenarios typical of LLM usage.
+
+An increasingly popular method for ensuring output consistency without fine-tuning is selectively sampling tokens according to formal grammars \citep{Shin_Lin_Thomson_Chen_2021, Wang_Wang_Wang_Cao_Saurous_Kim_2023}.
+Structured output, or grammar-constrained decoding (GCD), has become a regular feature included with LLM server software \citep{Gerganov_2024, Microsoft_2024, Rickard_2024}.
+GCD works by modifying LLM inference algorithms to selectively mask certain tokens according to some formal grammar.
+Some servers allow users to specify grammars with regular languages \citep{Willard_Louf_2023, Microsoft_2024}, while others allow users to write context-free grammars in Backus–Naur form (BNF), a notation for conveniently expressing rewrite rules \citep{Chomsky_1956, Knuth_1964, Gerganov_2024}.
+But despite this popularity, using GCD appears to degrade task accuracy \citep{Willard_Louf_2023, Park_Wang_Berg_2024, Beurer-Kellner_Fischer_Vechev_2024, Geng_Josifoski_Peyrard_West_2023, Le_Chen_Ritter_Xu_2024}.
+We present an example of this degradation in \autoref{fig:llama}.
+Why is this the case, and how can we mitigate it?
+
+We investigate this phenomenon by comparing the performance achieved when using one of five distinct token sets across four different data labeling scenarios with four families of pre-trained language models \citep{Dubey_Jauhri_Pandey_et_al._2024}.
+We present three key contributions: first, we note all models perform best when guided to only emit numbers in the closed interval $[0,1]$.
+Second, we find most models benefit from returning tokens incorporating leading whitespace, a key finding building on recent research emphasizing the critical nature of tokens incorporating leading whitespace among other syntactic tokens \citep{Pimentel_Meister_2024, Oh_Schuler_2024}.
+We hypothesize ill-formed subword token representations are the basis of this preference for otherwise semantically identical tokens, and find supporting evidence in the embedding weights of our models of interest.
+We finally propose a set of strategies for selecting target tokens when specifying grammars for GCD libraries. 
+These strategies can help achieve better performance for structured outputs from general-purpose models, and are particularly valuable for users of smaller, less computationally intensive models.
+
+\section{Related Work}
+
+\paragraph{Grammar-constrained decoding failure modes.}
+Grammar-model misalignment is a recognized issue with grammar-constrained decoding algorithms.
+Existing approaches involve modifying the decoding system by adding additional constraints.
+\citet{Geng_Josifoski_Peyrard_West_2023} propose penalizing the model for emitting short strings, a solution unfortunately unlikely to extend to context-free grammars when desiring technically infinite token generation.
+\citet{Park_Wang_Berg_2024} make a similar observation and propose an adaptive algorithm wherein a beam search process discovers valid \emph{and} optimal token sequences according to the grammar.
+They report some success in generating valid sequences, but note accuracy is not improved in all respects.
+Finally, \citet{Beurer-Kellner_Fischer_Vechev_2024} propose ``DOMINO,'' a ``minimally invasive constrained decoding'' algorithm for solving the alignment problem by pre-computing allowed sequences of tokens before dynamically selecting certain paths according to probability mass.
+While all three approaches show promise, we note all propose non-arbitrary adjustments to GCD as is commonly presently implemented.
+This limits their downstream applicability and leaves open the question of whether there exists a generalizable set of token alignment strategies useful for common inference servers \emph{as are presently implemented}.
+In contrast, this paper evaluates strategies for selecting better grammars within existing systems.
+
+\paragraph{Non-exchangeable token embeddings.}
+Artifacts in LLM training can result in tokens that appear semantically similar to humans but whose latent representations differ to a great extent.
+Recent literature has drawn attention to how LLMs capture semantic similarity in the embedding space.
+\citet{Wen-Yi_Mimno_2023} explore trained token representations in the embedding weights of highly multilingual LLMs, observing significant variation in how models represent semantically similar tokens in the embedding space: worryingly, they find certain models \emph{fail} to represent shared semantics between otherwise closely related tokens.
+The authors leave open the question of whether asymmetric token embeddings negatively impact downstream performance.
+\citet{Zhang_Lu_Tran_Schuster_Metzler_Lin_2024} report similar behavior in  monolingual LLMs, noting asymmetries in token categories including pronouns, numbers, and nouns.
+They likewise do not measure the downstream impact of this behavior.
+
+\paragraph{Leading whitespace tokens.}
+Researchers are similarly investigating the downstream consequences of models whose tokenizers incorporate leading whitespace (henceforth LW) into word-leading subword tokens.
+Tokenizers descending from SentencePiece duplicate certain tokens: once with LW to capture instances where the token begins a word in languages making use of the space, and once without \citep{Kudo_Richardson_2018}.
+For example, the Llama 3.1 tokenizer can represent the word ``culture'' either as the token \verb.culture. (index key $70905$) or \verb._culture. (index key $7829$).
+These are two distinct tokens despite appearing identical to humans once decoded by the tokenizer.
+The goal of this duplication is efficiency, in that frequently issuing a dedicated space token when tokenizing regular English text can increase (in the worst case) token counts by a count of $2n-1$ where $n$ is the number of words in the sequence.
+There are other consequences. \citet{Pimentel_Meister_2024} note tokenizers making use of LW tokens can complicate computing token surprisal given model likelihoods are attributed on a per-subword basis.
+\citet{Oh_Schuler_2024} similarly find models trained with LW tokens are prone to an increased likelihood of failing to learn word boundaries given their tokenizers explicitly penalize the appearance of space tokens.
+Neither work estimates the impact LW tokens may have on downstream tasks, nor whether LW tokens can eventually semantically converge with non-LW tokens during pre-training.
+
+\section{Methods}
+To mitigate grammar-model misalignment on existing GCD implementations, we compare output formats.
+The phenomenon of non-exchangeable token embeddings suggests that two formats that appear identical to humans could have different performance.
+Can we dependably elicit these preferences by constructing grammars with particular sets of tokens?
+If so, we can avoid extending existing GCD-enabled inference servers as is commonly recommended by the literature \citep{Geng_Josifoski_Peyrard_West_2023, Park_Wang_Berg_2024, Beurer-Kellner_Fischer_Vechev_2024}.
+In this section we describe our method for systematically discovering these GCD-optimal token sets.
+
+\input{figures/labels.tex}
+\paragraph{Evaluation.} 
+\label{par:evaluation}
+We assess the viability of certain token sets against four benchmarks.
+Our first two benchmarks are the Semantic Textual Similarity Benchmark \citep{cerSemEval2017Task12017} and the MEN Test Collection \citep{Bruni_Tran_Baroni_2014}. 
+Both are \emph{semantic textual similarity} (STS) tasks asking annotators to capture the semantic similarity of two sentences on an interval scale uniform between two numbers.
+Our next two benchmarks are Quora Question Pairs \citep{DataCanary_hilfialkaff_Jiang_Risdal_Dandekar_tomtung_2017} and ToxicChat \citep{Lin_Wang_Tong_Wang_Guo_Wang_Shang_2023}. 
+Both are \emph{detection} tasks asking annotators to assess whether a given phenomenon is present; their annotation target is a binary. 
+We randomly sample $4,000$ problems from across all benchmarks with equal numbers from each.
+We then specify a task prompt template valid for problems sampled from all four datasets:
+
+{
+\begin{verbatim}
+<string 1>{word_1}</string 1>
+<string 2>{word_2}</string 2>
+Rate your agreement with the following
+statement: {statement}
+{constraint}
+\end{verbatim}
+}
+
+The template accepts four parameters.
+Two (\verb,word_1, and \verb,word_2,) are problem-specific, in that all benchmarks construct problems in the form of a pair-wise string comparison.
+\verb,statement, is benchmark-specific, in that the fundamental task posed by each benchmark is summarized in a single sentence (e.g. \emph{These strings are similar.}).
+Finally, \verb,constraint, contains a short instruction informing the model which token sets are permissible.
+We present example task prompts in \autoref{sec:appendix}.
+
+\paragraph{Baseline measures.}
+We contextualize our LLM results using two baseline measures.
+Since two of our four benchmarks target semantic similarity as a real number, we make use of \verb.BERTScore. to provide a baseline BERT-based cosine similarity score for every problem in all four benchmarks \citep{Zhang_Kishore_Wu_Weinberger_Artzi_2020}.
+This system is specifically tuned to perform semantic similarity scoring, and serves as an upper bound relative to zero-shot prompting strategies.
+We note the semantic similarity problems in \citet{Bruni_Tran_Baroni_2014} and \citet{cerSemEval2017Task12017} together with the duplicate questions in \citet{DataCanary_hilfialkaff_Jiang_Risdal_Dandekar_tomtung_2017} all appear lightly correlated with string edit distance, so we also use Levenshtein distance to provide a non-LLM lower bound for all problems across all benchmarks \citep{Levenshtein_1966}.
+We intend neither measure to be state-of-the-art.
+Rather, the BERTScore measures to represent the performance of a reasonable language model, while the edit distance of each problem is a simple method that is still expected to outperform random guessing.
+
+\paragraph{Model selection.}
+To validate whether differences between grammars are consistent or model-dependent, we evaluate on eight models of varying size belonging to four popular families of instruction-tuned LLMs: Llama 3.1 \verb.8b./\verb.70b., Qwen 2.5 \verb.7b./\verb.72b., Gemma 2 \verb.9b./\verb.24b. and Phi 3 \verb.3b./\verb.14b. \citep{Dubey_Jauhri_Pandey_et_al._2024, qwenQwen25TechnicalReport2025, teamGemma2Improving2024, abdinPhi3TechnicalReport2024}.
+All models were trained in the last two years and feature pre-training sets ranging between $3.3$ and $18$ trillion tokens.
+We select these model families for three reasons: their high performance relative to proprietary  models, their high compatibility with GCD-enabled inference servers, and their popularity with researchers for certain downstream tasks such as classification and annotation, e.g. \citet{Bamman_Chang_Lucy_Zhou_2024}.
+
+\paragraph{Model inference.}
+All models are run with default temperature and \verb.Top_p..
+Context lengths are set to $512$ tokens.
+We obtain models from their official repositories and quantize all models to \verb.q8_0. with scripts provided by \citet{Gerganov_2024} to maximize local inference speed.
+We follow prior research on quantized models suggesting that reducing weight precision to an average of no fewer than eight bits ensures performance remains comparable to unquantized models \citep{Dettmers_Lewis_Belkada_Zettlemoyer_2022}.
+We host the models with \verb,llama.cpp, (compiled with Cuda support) and run the server on a system equipped with two Nvidia RTX A6000 GPUs.
+We make use of use the GBNF GCD implementation included with \verb,llama.cpp, without modification.\footnote{Examples of GBNF grammars can be found in the \href{https://github.com/ggerganov/llama.cpp/blob/master/grammars/README.md}{llama.cpp docs}.}
+
+\paragraph{Token output formats.}
+\label{par:Target Label Ranges}
+In current GCD implementations, users specify output formats either with grammars or regular expressions.
+We can make arguments for several formats.
+A fine-grained floating point number may provide more flexibility in output, but a model could also do better with less flexibility and a coarser, more restricted output space like a binary or Likert scale.
+
+We consider five commonly used output formats, shown in \autoref{tab:target-labels}.
+These categories include integers between $1$ and $5$ inclusive, real numbers in the closed interval $[0,1]$, percentages, binaries, and $5$-point Likert scales.
+In addition to the output domain, we add three additional format variables:
+
+\begin{itemize}
+    \item \emph{With/without leading newline}. Chat templates for RLHF-tuned models can implicitly expect a new line following the beginning of the assistant turn.
+    \item \emph{With/without leading space}. Previous research has identified tokens incorporating a leading space character as being potentially preferred by models.
+    \item \emph{As digits/words}. All token categories can be represented in either numeric and English word tokens.
+\end{itemize}
+
+We vary across datasets, token families, model families, model sizes, treatments, and our baseline measures.
+These combinations result in $1,280,000$ total classifications.
+
+\section{Results}
+We first evaluate the effectiveness of different output formats by measuring the correlation between the numeric value of a model's output prediction and the human label.
+Because the model prediction formats and human labels do not necessarily map to real numbers (e.g. Likert), we report Spearman rank correlation. Pearson correlations, however, are typically within 0.01 from the Spearman values.
+
+\paragraph{Baseline correlations.}
+We first evaluate the two baseline measures (\verb.BERTScore. and Levenshtein distance) over all four benchmarks.
+As expected, \verb.BERTScore., a system specifically trained for semantic similarity, shows strong correlation on two semantic similarity benchmarks ($r\!=\!0.755$ and $r\!=\!0.839$). It performs less well on Quora Pairs  $r\!=\!0.540$ and near random on ToxicChat $r\!=\!-0.061$.
+These values serve as an indication of the capabilities and limitations of systems fine-tuned for particular tasks.
+On the other extreme, the Levenshtein distance baseline performs poorly in all cases, with mean correlation of $r\!=\!-0.094$.
+This result replicates \citet{Lin_Wang_Tong_Wang_Guo_Wang_Shang_2023}, whose task involves classifying the presence of toxic language in textual transcripts and is thus explicitly not measuring semantic similarity.
+This result indicates that the tasks are indeed hard and cannot be solved by na{\"i}ve algorithms. 
+
+\paragraph{Real numbers perform best.}
+\input{figures/results.tex}
+\autoref{tab:model-correlations} shows correlations between model output and human labels broken down by model and token set, but not adding any additional formatting such as newline after the beginning of the assistant turn or leading space before the classification token. Results are the mean of observations across all benchmarks.
+Real numbers perform best across all models, with a minimum Spearman rank correlation coefficient of $\rho\!=\!0.420$ and a maximum of $\rho\!=\!0.609$.
+Conversely, we find integers and binaries perform worst, particularly, $\rho\!=\!-0.160$ for integers on Llama 3.1 \verb.8b..
+Likert proves the least reliable, with the label range yielding a correlation of $\rho\!=\!-0.006$ with Gemma 2 \verb.27b. and $\rho\!=\!0.581$ using Qwen 2.5 \verb.72b..
+These results indicate that there are consistent, substantial differences between output formats, and that real-valued outputs are consistently the best format across all models.
+We offer further exploration in \autoref{par:tokens}.
+
+\paragraph{Format differences are strongest for smaller models.}
+Averaging over all formats, large models have higher correlation than small models, at $0.341 \pm 0.28$ and $0.316\pm0.39$ respectively.
+This trend is due mostly, however, to  the Llama and Qwen families.
+Phi 3 and Gemma 2 show little improvement or even reduction in performance. For Likert scores, Gemma goes \textit{down} from  $\rho\!=\!0.138$ to $\rho\!=\!-0.006$ between small and large models.
+We investigate this phenomenon more closely in \autoref{par:tokens}.
+The difference between the real-valued output format and the other formats is also less pronounced for large models than for small models.
+The global mean values likewise disguise variations in per-token set performance.
+While increasing parameter count improves correlation for most formats, we find integers exhibit a mean increase of less than 3.5\%.
+This intra-range variation is most pronounced in Gemma 2 \verb.27b., which yields lower mean correlation scores for the percent, binary, and Likert token sets.
+
+\paragraph{Whitespace matters.}
+\input{figures/treatment.tex}
+In addition to the size of the model and the output domain, we also vary several additional format variables, as shown in
+\autoref{tab:treatment-correlations}.
+Using digits rather than words \verb.as_word. reduces performance.
+We find all models exhibit strong preferences for digit tokens when completing tasks involving quantities and selection (e.g. assigning confidence or assessing similarity).
+Asking for numeric values as English words reduces correlation for all models: $\rho\!=\!-0.180$ for Llama, $\rho\!=\!-0.180$ for Gemma, $\rho\!=\!-0.410$ for Phi, and $\rho\!=\!-0.120$ for Qwen.
+Format likewise does not result in a significant change to performance when averaged over all observations.
+
+We see substantial improvement from increasing parameter count \verb.as_large., as expected.
+However, including an initial new line \verb.with_newline. (including leading whitespace in the token immediately prior), and \verb.with_space. (adding leading whitespace in the token itself).
+As previously described, increasing parameter count is a dependable method for increasing downstream performance.
+That \verb.with_newline. and \verb.with_space. reliably increase performance across the Llama, Gemma, and Qwen families is a more suggestive result: both involve adding whitespace.
+The first treatment, \verb.with_newline., involves adding a newline following the beginning of the assistant turn in most chat templates.
+The second, \verb.with_space., involves the use of tokens directly encoding leading whitespace.
+Both increase performance, but only one is necessary for the effect as we find the presence of \verb.with_newline. causes \verb.with_space. to lose statistical power.
+Moreover, we observe neither Phi 3 model respond to LW.
+We investigate this further in \autoref{par:LW}.
+
+\section{Analysis}
+We observe substantial and consistent variation between output formats. 
+In this section we attempt to explain why these formats are so different.
+
+\paragraph{Results differ by format.}
+\label{par:tokens}
+\input{figures/heatmap.tex}
+\input{figures/tsne.tex}
+Previously we presented the correlation between model outputs constrained by various output formats and human labels.
+\autoref{fig:heatmap} shows the correlations between these formatted outputs themselves for two model families, Llama and Phi.
+We collect observations produced with each token family twice: once for numerical values, and again for word values.
+Stable intra-token set correlations should yield a solid color in a correlation matrix.
+We instead find all correlation matrices exhibit poor intra-token set regularity.
+This indicates no model in our study has achieved stable token representations for the tasks and token sets tested.
+
+Neither do output formats belonging to \emph{the same token family} (from a human perspective) have correlated outputs, again indicating the models tested have not achieved token set stability.
+Comparing small and large models reveals increasing parameter count (and consequently training tokens) shows less differentiation between output formats for Llama, Gemma, and Qwen when increasing scale.
+This does not improve consistency for Phi 3.
+One possible explanation for this phenomenon is the large portion of synthetic data used in the Phi training data; synthetic data can amplify certain signals in noise, increasing the possibility of overfitting during pre-training.
+
+\paragraph{Whitespace in token embeddings.}
+\label{par:LW}
+We find that formats that start with a space have better zero-shot performance than otherwise identical formats that do not have that space.
+To explain this difference we ask, to what degree do tokens incorporating LW (henceforth LW tokens) differ from their non-LW twins in the embedding space?
+We obtain the tokenizers for each of our model families and extract all LW/non-LW token pairs from their corresponding vocabularies.
+All vocabularies contain token pairs.
+We find between $22\%$ and $32\%$ of tokens in the Phi, Llama and Qwen vocabularies participate in a pair, while $40\%$ of the Gemma vocabulary participates in a pair.
+Put another way, the lower bound observed has one in ten tokens having a twin — and the upper bound is every one in $2.5$.
+Do these pairs share semantic representations?
+To test this, we take the token index keys for each pair and obtain the corresponding columns of the Llama 3.1 \verb.8b. and \verb.70b. embedding matrices.
+Increasing model size slightly increases pair similarity.
+The cosine similarity of pairs is $0.369$ for \verb.8b. and $0.386$ for \verb.70b., with an effect size of $d\!=\!0.13$.
+To verify that this effect is not the result of \emph{all} token embeddings becoming more similar as we increase model size, we calculate cosine similarity between $20,000$ random pairs of token embeddings for \verb.8b. and \verb.70b..
+In fact, the average pair of vectors is \textit{less} similar in the larger model: pairs sourced from \verb.8b. have a mean similarity of $0.016$ versus $0.008$ for \verb.70b., with an effect size of $d\!=\!-0.38$.
+
+A t-SNE projection \citep{vandermaatenVisualizingDataUsing2008} of LW and non-LW token embeddings is shown in \autoref{fig:tsne} for small and large Llama models.
+Increasing model scale (and correspondingly training time assuming compute optimality) results in vectors that t-SNE is better able to distribute uniformly.
+Furthermore, we can observe LW/non-LW tokens co-occupy space to a greater degree as scale increases, suggesting our measured cosine similarities do in fact indicate more exchangeable representations.
+
+Our results indicate LW/non-LW token pairs are not wholly exchangeable on an embedding basis.
+We turn to the training data to investigate one potential cause for this phenomenon.
+
+\paragraph{Whitespace in training data.}
+Does the ratio of LW to non-LW tokens in pre-training data account for their variations in embedding space?
+The actual pre-training data for these models is not available to us, but we can approximate its distribution using the Dolma dataset \citep{soldainiDolmaOpenCorpus2024}.
+We use a sample of Dolma \verb,v1.6, containing 16GB of text taken from a variety of online sources.
+We then tokenize Dolma once for each of the respective tokenizers for the four model families.
+We first note our tokenizers differ in compression factor: the Llama, Gemma, and Qwen tokenizers converting Dolma into $\approx7.5*10^9$ tokens, while the smaller Phi vocabulary produces $\approx9.1*10^9$ tokens.
+
+Counting token occurrences furthermore reveals LW tokens are consistently more prevalent than their non-LW token duplicates with all tokenizers.
+We find the Llama, Gemma, and Qwen tokenizers emit LW tokens at rates from $2.5$ to $2.7$ time greater than non-LW tokens, indicating our models of interest were exposed to many more LW tokens than non-LW tokens during pre-training.
+Phi is again an outlier, with its tokenizer producing LW tokens at a rate $1.66$ times greater than non-LW tokens.
+Our results provide one possible explanation for why incorporating LW into grammars leads to increased classification performance: the LW tokens were observed at a greater frequency during pre-training.
+The Phi tokenizer producing fewer LW tokens relative to non-LW tokens supports this conclusion, given we also observe Phi showing limited response to newlines and leading whitespace.
+
+\section{Discussion}
+Conditioning LLM results on specific output formats is a promising and popular way to ensure valid annotation results, but can reduce performance.
+We systematically test a range of familiar formats that appear semantically similar to humans, along with a set of format options that users may not even be aware of.
+We find there are substantial differences between seemingly identical formats.
+By varying over tokens differentiated by syntactic -- but not semantic -- qualities, we show GCD-guided LLMs are sensitive to features like leading whitespace, numerical representation, and newlines.
+By better evaluating and surfacing these differences, we hope to close the gap in output-filtered performance without modifying existing decoding systems.
+
+We recommend using as many of the following strategies as possible:
+
+\paragraph{Evaluate multiple formats.}
+We find that there is substantial variation between output formats and that while there are some consistent results, the effect of formats may vary between model families. 
+As new models are released, developers and user communities should provide evidence-based guidance on models' preferred formats.
+
+\paragraph{Use leading whitespace.}
+Users may not notice that, when generating without structured output, models usually add leading whitespace.
+Unintentionally forcing models to \textit{not} use an initial newline or tokens with leading spaces may prevent models from accessing well-trained token ranges.
+The difference between an initial newline and space is less important, so long as whitespace is present.
+
+\paragraph{Prefer numeric outputs.}
+We recommend selecting token ranges matching the intended output format.
+For example, if the classification task at hand requires numerical values be selected, then it is important the corresponding grammar incorporate numerical tokens.
+Subword token representations in existing LLMs are not yet coherent enough to dependably exchange numerical tokens for their semantically-equivalent word tokens, or vice versa.
+While future models may one day reach representation parity, it is recommended to select context-appropriate patterns until then.
+
+\paragraph{Use less-restrictive patterns.}
+It is helpful to offer the model the greatest degree of choice if possible.
+Consider a grammar guiding models to emit a scalar value -- our results suggest it is beneficial to offer the model a choice from the closed interval $[0,100]$ rather than $[1,10]$.
+It is further helpful to represent this range with the fewest tokens possible to prevent errors propagating over multiple inferences.
+
+\paragraph{Use larger models}
+Finally, larger models, when available, are usually better.
+They are generally --- though not always --- more capable and are typically less influenced by differences in requested output formats.
+
+\section{Conclusion}
+
+Grammar-constrained decoding (GCD) has the potential to close the gap between the task-specificity of fine-tuned models and the rapid iteration of zero-shot models. 
+But users must not only write good prompts, they must also write effective output-grammar constraints.
+This work indicates that users may unintentionally knock models out of their ``comfort zone'' by inadvertently selecting patterns that are misaligned with pre-training or RLHF fine-tuning. We find that better understanding the effect of subtle format differences has significant benefits and opens new opportunities for research.
+
+Advances in quantization, software infrastructure, and model training have made powerful LLMs increasingly available on laptop-grade hardware.
+Of the eight LLMs studied in this work, six will load on computer systems containing 32GB of RAM.
+The remaining two, Llama \verb.70b. and Qwen \verb.72b., require a minimum 48GB assuming quantization is kept to a minimum of six bits per weight.
+We find smaller models are more liable to produce non-valid output, meaning GCD is especially valuable for researchers working in memory-constrained environments.
+We also find that smaller models show more sensitivity to GCD formats.
+The results of this work can help to ensure that the benefits of low-compute LLMs are fully realized.
+
+The increasing popularity of structured output indicates there is appetite for employing LLMs as pseudo-classifiers.
+GCD is critical for ensuring the success of structured output, and we see our current brute-force method as a promising initial step.
+Generating $1.28$ million generations on dual RTX A6000 is a time-consuming process. Future work should consider how else GCD optimality can be determined.
+One interesting pathway will be to further study how subword token representations impact downstream performance.
+Can modifications to the pre-training process ensure more efficient transfer of representation between visually identical tokens?
+
+\section*{Limitations}
+This work is limited in three respects.
+First, the task patterns considered in our study target single scalar values, meaning more complex annotation tasks are not considered.
+Second, we limit our study to so-called ``open-weight'' models whose weights are made freely available on the Internet with permissive licenses.
+While our study compares models of varying sizes, including sizes matching those of proprietary models such as ChatGPT and Google Gemini, we leave open the question of whether proprietary models are similarly impacted by format variations such as leading whitespace.
+Third, we do not provide conclusive evidence for a causal relationship between particular subword token representations and downstream classification performance.
+We instead provide evidence with the goal of motivating future research on the relationship between token embeddings and LLM behavior.
+
+\section*{Acknowledgments}
+We would like to thank Axel Bax, Federica Bologna, Rebecca Hicke, Kiara Liu, Andrea Wang, Matthew Wilkens, and Shengqi Zhu for their kind comments and suggestions.
+
+\bibliography{custom}
+
+\appendix
+
+\section{Example Task Prompts}
+\label{sec:appendix}
+
+We provide four example prompts, one from each of the benchmarks considered in this study.
+All prompts are instantiations of the template described in \autoref{par:evaluation}.
+
+\paragraph{STS Benchmark.}
+This task has raters determine whether two texts are semantically similar.
+Prompt:
+\begin{verbatim}
+<string 1>cooking</string 1>
+
+<string 2>rice</string 2>
+
+Rate your agreement with the following
+statement: These strings are similar.
+
+Respond only with a number between 0 and 1.
+\end{verbatim}
+
+Corresponding grammar:
+\begin{verbatim}
+root ::= response
+response ::= "0."[0-9][0-9]
+\end{verbatim}
+
+\paragraph{MEN Test Collection.}
+This task likewise has raters determine whether two texts are semantically similar.
+Prompt:
+\begin{verbatim}
+<string 1>Obama praises U.S.-Latin America
+trade ties</string 1>
+
+<string 2>Obama Secret Service agents sent
+home</string 2>
+
+Rate your agreement with the following
+    statement: These strings are similar.
+
+Respond only with a number between 1 and 
+5, where
+1 = Strongly disagree,
+2 = Disagree,
+3 = Neither agree nor disagree,
+4 = Agree,
+5 = Strongly agree
+\end{verbatim}
+
+Corresponding grammar:
+\begin{verbatim}
+root ::= response
+response ::= [1-5]
+\end{verbatim}
+
+\paragraph{Quora Duplicate Questions.}
+This task has raters assess whether two strings are duplicates.
+Prompt:
+\begin{verbatim}
+<string 1>Do ants die of old age?</string 1>
+
+<string 2>Could plants die of old
+age?</string 2> 
+
+Rate your agreement with the following 
+statement: These strings are duplicates. 
+
+Respond only with 'True' or 
+'False'.
+\end{verbatim}
+
+Corresponding grammar:
+\begin{verbatim}
+root ::= response
+response ::= "True" | "False"
+\end{verbatim}
+
+\paragraph{ToxicChat.}
+This task has raters assess whether there is toxic language present.
+Prompt:
+\begin{verbatim}
+<string 1>Hi, I need to write a  snippet 
+in javascript</string 1> 
+
+<string 2>Sure, what do you need help 
+with?</string 2>
+
+Rate your agreement with the following 
+statement: These strings contain toxic
+language.
+
+Respond only with a number 
+between 1 and 5.
+\end{verbatim}
+
+Corresponding grammar:
+\begin{verbatim}
+root ::= response
+response ::= [1-5]
+\end{verbatim}
+
+\end{document}

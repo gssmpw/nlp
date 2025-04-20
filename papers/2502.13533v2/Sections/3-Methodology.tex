@@ -1,0 +1,209 @@
+\section{Memory-Efficient LoRA Training --- \method}
+\subsection{Low-Rank Adaptation}
+Given a pre-trained weight matrix $\mathbf{W}_{0} \in \mathbb{R}^{m \times n}$, a typical full-parameter fine-tuning process adapts to new tasks by updating the entire full-rank matrix $\mathbf{W}_{0}$.
+Inspired by the insight that pre-trained weights of LLMs exhibit low ``intrinsic dimension" when adapting to specific tasks~\citep{ghajanyanGZ20}, LoRA~\citep{Edw:2022lora} further suggests that the updated weights 
+% also
+have a low ``intrinsic rank".
+Consequently, LoRA reparameterizes the model weights as $\mathbf{W}_0 + \mathbf{W}_{\Delta} = \mathbf{W}_0 + \mathbf{B}\mathbf{A}$, where $\mathbf{B} \in \mathbb{R}^{m \times r}$ and $\mathbf{A} \in \mathbb{R}^{r \times n}$, and $\mathbf{W}_{\Delta}=\mathbf{B}\mathbf{A}$ represents a low-rank decomposition matrix with the rank $r \ll \min(m, n)$.
+
+During training, as illustrated in~\cref{fig:overview} (a), the pre-trained weight matrix $\mathbf{W}_0$ is frozen to avoid gradient computation. Instead, the low-rank matrices $\mathbf{B}$ and $\mathbf{A}$ are updated to enable parameter-efficient fine-tuning, which defaults to standard supervised fine-tuning, 
+% \textcolor{blue}{
+with the objective function $\mathcal{L}_\mathtt{SFT}$ defined as the cross-entropy loss between the predicted logits and the ground-truth answers.
+% }
+Given an input feature vector $\mathbf{x}$ of length $m$, the forward pass of LoRA modifies the output activation from fully fine-tuning, represented by $\mathbf{h}=\mathbf{x}\mathbf{W}_0$ (of length $n$), to:
+\begin{equation}
+\mathbf{h}
+=\mathbf{x} \mathbf{W}_0+\mathbf{x}\mathbf{W}_{\Delta}
+=\mathbf{x} \mathbf{W}_0+\mathbf{x}\mathbf{BA}.
+\end{equation}
+
+ 
+Once low-rank matrices $\mathbf{B}^{\star}$ and $\mathbf{A}^{\star}$ are trained by minimizing the $\mathcal{L}_\mathtt{SFT}$, as shown in the~\cref{fig:overview} (c),
+the computation of activation $\mathbf{h}$ for $\mathbf{x}$ is reformulated to improve inference efficiency:
+\begin{equation}
+\mathbf{h}
+=\mathbf{x} (\mathbf{W}_0+\mathbf{W}_{\Delta}^{\star})
+=\mathbf{x} (\mathbf{W}_0+\mathbf{B}^{\star}\mathbf{A}^{\star}).
+\end{equation}
+
+\subsection{Memory-Efficient LoRA Training} 
+% LoRA substantially reduces memory usage during training by updating low-rank matrices $\mathbf{B}$ and $\mathbf{A}$ instead of the full-rank weight matrix $\mathbf{W}_0$. 
+% For example, 
+% Consider the LLaMA-2-13B, a model with approximately 13 billion parameters in $\mathbf{W}_0$.
+% By applying LoRA, we replace updates to $\mathbf{W}_0$ with updates to low-rank matrices $\mathbf{B}$ and $\mathbf{A}$ in several critical layers. Specifically, 
+Consider the LLaMA-2-13B model,
+% (13 billion parameters),
+we introduce 
+% decomposable
+low-rank matrices ($r=8$) for 
+the four projection matrices ($\mathbf{W}_\text{q}$, $\mathbf{W}_\text{k}$, $\mathbf{W}_\text{v}$, and $\mathbf{W}_\text{o}$) in the attention layer, the three projection matrices ($\mathbf{W}_\text{up}$, $\mathbf{W}_\text{gate}$, and $\mathbf{W}_\text{down}$) in the MLP layer, and the weight matrix $\mathbf{W}_\text{lm\_head}$ in output layer. 
+Despite the additional 32 million parameters, the number of trainable parameters is reduced by 406$\times$ compared to the full parameters.
+Many LoRA variats~\citep{zhou:2024loradrop,zhang2023lorafa,kopiczko2024vera,azizi2024lamda,wang2024prolora} aim to address the significant memory overhead associated with $\mathbf{W}_{\Delta}$ as $\mathbf{W}_0$ scales, but they still necessitate storing a complete copy of $\mathbf{W}_0$ in memory, which dominates training memory usage. Even with quantization methods designed for LoRA~\citep{Tim:2023qlora,Xu:2023QALoRA,li2024loftq,guo2024lqlora,OPTQ2023,chai2023int21}, training performance constraints often limit the representation of $\mathbf{W}_{0}$ to 4 bits. Consequently, for the LLaMA-2-13B, storage requirements are reduced from 26 GB in \texttt{FP16} to 6.5 GB in \texttt{NF4}. 
+%%TODO
+% \textcolor{blue}{
+However, this is still significantly higher than the memory required for $\mathbf{W}_{\Delta}$ in \texttt{BF16}, 
+which occupies only 64MB of storage and has a peak memory requirement of 576MB during training. Thus, the memory needed for the frozen quantized $\mathbf{W}_{0}$ is 11.5$\times$ greater than that required for learnable $\mathbf{W}_{\Delta}$.
+% which is only 64 MB. Thus, the memory needed for the quantized $\mathbf{W}_{0}$ is 104$\times$ greater than that required for $\mathbf{W}_{\Delta}$.
+% }
+
+To mitigate the memory overhead dominated by $\mathbf{W}_0$ while achieving inference performance gain, we propose a memory-efficient LoRA training called \method. 
+% This scheme separates the training and inference stages by using different models, 
+% \method prune updates the pruned low-rank matrices on the pruned model during training and performs inference on the original model with dimensionally recovered low-rank matrices. 
+% \textcolor{blue}{
+\method first prunes the model to a smaller size and performs LoRA fine-tuning on the pruned model. 
+After training, it recovers the LoRA weights, applies them to the original model, and then conducts inference.
+We now describe the various stages of \method.
+The complete algorithm of \method is presented in ~\cref{alg:loram}.
+% .}
+
+\begin{figure*}[t]
+% \vskip -0.5in
+\begin{center}
+\includegraphics[width=0.96\textwidth]{fig/overview.pdf}
+\vspace{-10pt} % Adjust
+\caption{
+Comparison of \method and LoRA: Training (subfigures a and b) and Inference (c and d). Key stages include the offline process of the frozen full-rank matrix $\mathbf{W}_{0}^{*}$ (subfigure e) and the online generation of the learnable low-rank matrix $\mathbf{W}_{\Delta}^{*}$ (f) during \method training (b) and inference (d).
+}
+\label{fig:overview}
+\end{center}
+\vskip -0.2in
+\end{figure*}
+
+\paragraph{Pruned Full-Rank Weight Generation.}
+% To reduce the dominant memory overhead associated with full-rank pre-trained weights during training, 
+% \textcolor{blue}{
+First, we employ a pruning algorithm $\mathtt{P}(\cdot)$ to derive the pruned weight matrix $\mathbf{W}_0^\mathtt{P}$ from the original weights $\mathbf{W}_0$. Specifically, $\mathbf{W}_0^\mathtt{P}$ is computed as:
+% }
+\begin{equation}
+\mathbf{W}_{0}^\mathtt{P} = \mathtt{P}(\mathbf{W}_0) = \mathbf{W}_0 \circ \mathbf{M}^\mathtt{P},
+\end{equation}
+where $\mathbf{M}^\mathtt{P} \in \{0, 1\}^{m \times n}$ is a binary mask matrix indicating retained parameters (`1') and pruned parameters (`0'), and $\circ$ denotes the Hadamard product. 
+
+\paragraph{Pruned Low-Rank Matrix Training.}
+After obtaining the pruned weight matrix $\mathbf{W}_0^\mathtt{P}$, we modify the standard LoRA training process. 
+Instead of updating the low-rank matrices $\mathbf{B}$ and $\mathbf{A}$ for the original $\mathbf{W}_0$, 
+we train the pruned low-rank decomposition matrix $\mathbf{W}_{\Delta}^\mathtt{P} = \mathbf{W}_{\Delta} \circ \mathbf{M}^\mathtt{P} = \mathbf{B}^\mathtt{P}\mathbf{A}^\mathtt{P}$, while keeping $\mathbf{W}_0^\mathtt{P}$ frozen as shown in~\cref{fig:overview} (b). 
+The output activation $\mathbf{h}$ for an input feature vector $\mathbf{x}$ is calculated as:
+
+\begin{equation}
+\mathbf{h} 
+= \mathbf{x} \mathbf{W}_0^\mathtt{P} + \mathbf{x} \mathbf{W}_{\Delta}^\mathtt{P}
+= \mathbf{x} \mathbf{W}_0^\mathtt{P} + \mathbf{x} (\mathbf{B}^\mathtt{P}\mathbf{A}^\mathtt{P}).
+\end{equation}
+
+\paragraph{Recovered Low-Rank Matrix Generation.}
+By optimizing the objective function $\mathcal{L}_\text{SFT}$, we obtain the trained pruned low-rank matrix $\mathbf{W}_{\Delta}^{\mathtt{P}^{\star}}$.
+% Using the pruning mask $\mathbf{M}^\mathtt{P}$
+% we introduce a recovery function $\mathtt{R}(\cdot)$  to recover the shape of trained pruned low-rank matrix $\mathbf{W}_{\Delta}^{\mathtt{P}^{\star}}$ by filling the pruned positions with zeros, resulting in $\mathbf{W}_{\Delta}^{\mathtt{R}^{\star}}$ as following:}
+% Using the pruning mask $\mathbf{M}^\mathtt{P}$, we recover the trained pruned low-rank matrix $\mathbf{W}_{\Delta}^{\mathtt{P}^{\star}}$ by filling the pruned positions with zeros, resulting in $\mathbf{W}_{\Delta}^{\mathtt{R}^{\star}}$ as following:
+% \textcolor{blue}{
+To fully leverage the original model weights for improved inference performance, we introduce a recovery function $\mathtt{R}(\cdot)$, guided by the pruning mask $\mathbf{M}^\mathtt{P}$.
+This function recovers the shape of the trained low-rank matrix by filling zeros at pruned positions, resulting in $\mathbf{W}_{\Delta}^{\mathtt{R}^{\star}}$ as follows:
+% }
+\begin{equation}
+\mathbf{W}_{\Delta}^{\mathtt{R}^{\star}} = 
+\mathbf{B}^{\mathtt{R}^{\star}}\mathbf{A}^{\mathtt{R}^{\star}} =
+\mathtt{R}(\mathbf{W}_{\Delta}^{\mathtt{P}^{\star}})=
+\mathbf{W}_{\Delta}^{\mathtt{P}^{\star}} \circ (1 - \mathbf{M}^\mathtt{P}).
+\end{equation}
+
+% \textcolor{blue}{
+This operation ensures that the recovered low-rank matrix $\mathbf{W}_{\Delta}^{\mathtt{R}^{\star}}$ can be seamlessly merged with the original pre-trained weights $\mathbf{W}_{0}$, forming $\mathbf{W}_{0} + \mathbf{W}_{\Delta}^{\mathtt{R}^{\star}}$ as follows:
+% }
+
+\begin{equation}
+(\mathbf{W}_{0} + \mathbf{W}_{\Delta}^{\mathtt{R}^{\star}})[i, j] = 
+\begin{cases}
+\mathbf{W}_{0}[i, j] & \text{if } \mathbf{M}^\mathtt{P}[i, j] = 1 \\
+\mathbf{W}_{0}[i, j] +\mathbf{W}_{\Delta}^{\mathtt{R}^{\star}}[i, j] & \text{if } \mathbf{M}^\mathtt{P}[i, j] = 0
+\end{cases}
+\end{equation}
+% \textcolor{blue}{
+This formula indicates that, for positions where the pruning mask $\mathbf{M}^\mathtt{P}$ is `1', the merged matrix $\mathbf{W}_{0} + \mathbf{W}_{\Delta}^{\mathtt{R}^{\star}}$ retains the original values from the pre-trained matrix $\mathbf{W}_{0}$. For positions where the mask is `0', the elements in the merged matrix are updated to be the sum of the corresponding values from $\mathbf{W}_{0}$ and the recovered low-rank matrix $\mathbf{W}_{\Delta}^{\mathtt{R}^{\star}}$.
+% }
+
+\paragraph{Recovered Low-Rank Matrix Inference.}
+Once we obtain the recovered low-rank matrix $\mathbf{W}_{\Delta}^{\mathtt{R}^{\star}}$, during inference, the forward pass output activation $\mathbf{h}$ for an input feature $\mathbf{x}$ is computed as follows:
+
+\begin{equation}
+\mathbf{h} 
+= \mathbf{x} (\mathbf{W}_0 + \mathbf{W}_{\Delta}^{\mathtt{R}^{\star}}) = \mathbf{x} (\mathbf{W}_0 + \mathbf{B}^{\mathtt{R}^{\star}}\mathbf{A}^{\mathtt{R}^{\star}}).
+\label{eq:recovered_infer}
+\end{equation}
+
+Our experiments (see~\cref{ssec:exp_convergence} and~\cref{ssec:exp_downstream}) show that \method maintains high performance across various pruning strategies $\mathtt{P}(\cdot)$, including structured~\citep{ma2023llmpruner} and non-structured pruning (semi-structured \& unstructured pruning)~\citep{FrantarA23spasegpt}. 
+The four stages outlined above summarize the core steps of \method. To avoid notational clutter, we have streamlined the algorithmic details. Nonetheless, three key considerations for deployment must be emphasized:
+
+\begin{itemize}[leftmargin=20pt]
+    \item[$\mathsf{C}_1$] \textbf{Pruned Full-Rank Weight Generation:} For non-structured pruning, the matrix dimension remains unchanged, with $\mathbf{W}_0^\mathtt{P}$ compressed into a sparse matrix populated by zeros. In structured pruning, weights are physically removed, yielding a compact, dense $\mathbf{W}_0^\mathtt{P}$.
+
+    \item[$\mathsf{C}_2$] \textbf{Recovered Low-Rank Matrix Generation:} For non-structured pruning, the weights in $\mathbf{W}_{\Delta}^\mathtt{P}$ corresponding to pruned positions in $\mathbf{M}^\mathtt{P}$ are excluded from backpropagation by setting their gradients to zero, ensuring that only the retained components are updated during training.
+
+    \item[$\mathsf{C}_3$] \textbf{Recovered Low-Rank Matrix Inference:} 
+    For non-structured pruning, the shapes of both the pre-trained and low-rank weights are identical (see $\mathsf{C}_1$), and the gradients of the pruned weights are blocked (see $\mathsf{C}_2$). 
+    Consequently, we can bypass the recovery phase, resulting in $\mathbf{W}_{\Delta}^{\mathtt{R}^{\star}} =\mathbf{B}^{\mathtt{R}^{\star}}\mathbf{A}^{\mathtt{R}^{\star}}=\mathbf{B}^{\mathtt{P}^{\star}}\mathbf{A}^{\mathtt{P}^{\star}}$. 
+    In the case of structured pruning, the shapes of the weight matrices vary significantly across different pruning strategies. 
+    To simplify the definitions, we standardize the recovery process using the pruning mask.
+\end{itemize}
+
+To clearly illustrate the evolution of weight matrix dimensions across these stages, we take LLM-Pruner~\citep{ma2023llmpruner} as an example in~\cref{sec:dimension_vis}, visualizing the transformation from $\mathbf{W}_{0} \Rightarrow \mathbf{W}_{0}^\mathtt{P}$, $\mathbf{W}_{\Delta} \Rightarrow \mathbf{W}_{\Delta}^\mathtt{P}$, and $\mathbf{W}_{\Delta}^{\mathtt{P}^{\star}}\Rightarrow \mathbf{W}_{\Delta}^{\mathtt{R}^{\star}}$ under \method with structured pruning. 
+% For \method variants employing non-structured pruning, the parameter dimensionality remains unchanged during training due to the use of a mask matrix; therefore, these visualizations are omitted.
+
+
+\paragraph{Pruned Full-Rank Weight Alignment.}
+Given the original pre-trained weights $\mathbf{W}_{0}$, the optimal low-rank matrix learned is $\mathbf{W}_{\Delta}^{\star}$. 
+Similarly, for pruned weights $\mathbf{W}_{0}^\mathtt{P}$, the optimal low-rank counterpart is $\mathbf{W}_{\Delta}^{\mathtt{P}^{\star}}$.
+If the knowledge encoded in $\mathbf{W}_{0}$ and $\mathbf{W}_{0}^\mathtt{P}$ is closely aligned, the knowledge embedded in $\mathbf{W}_{\Delta}^{\mathtt{P}^{\star}}$ should approximate that of $\mathbf{W}_{\Delta}^{\star}$. 
+Consequently, the recovered matrix $\mathbf{W}_{\Delta}^{\mathtt{R}^{\star}}$ should effectively pair with $\mathbf{W}_{0}$, yielding performance improvements similar to those from $\mathbf{W}_{\Delta}^{\star}$.
+However, the pruning function $\mathtt{P}(\cdot)$ disrupts some of the knowledge embedded in the original weights, leading to a mismatch between $\mathbf{W}_{0}$ and $\mathbf{W}_{0}^\mathtt{P}$. Such knowledge mismatch causes $\mathbf{W}_{\Delta}^{\mathtt{R}^{\star}}$, when paired with $\mathbf{W}_0$, to deliver suboptimal performance, particularly at higher pruning ratios.
+
+
+To address the knowledge mismatch, 
+% Thus,
+we propose an efficient alignment scheme, namely continual pre-training of pruned weights $\mathbf{W}_{0}^\mathtt{P}$ into $\mathbf{W}_0^\mathtt{P,A}$ on a small, general corpus $\mathcal{D}_\mathtt{A}$.
+% in a teacher-forcing manner~\citep{bachmann2024teacherforce}.
+Formally, we minimize the alignment loss $\mathcal{L}_{\mathtt{A}}$ defined as following: 
+\begin{equation}
+\mathcal{L}_{\mathtt{A}}=-\mathbb{E}_{\mathbf{s} \in \mathcal{D}_\mathtt{A}}\left[\sum_{t=1}^{|\mathbf{s}|} \log p \left(\mathbf{s}_{t+1} \mid \mathbf{s}_{<t};\mathbf{W}_{0}^\mathtt{P,A}\right)\right],
+\end{equation}
+where $p(\mathbf{s}_{t+1} \mid \mathbf{s}_{<t};\mathbf{W}_{0}^\mathtt{P,A})$ represents the model's predict likelihood of generating the next token $\mathbf{s}_{t+1}$ given the first $t$ tokens $\mathbf{s}_{<t}$ of input sequence $\mathbf{s}$ (token number is $|\mathbf{s}|$) and current parameter matrices $\mathbf{W}_{0}^\mathtt{P,A}$.
+This alignment process is a one-time, offline operation on a relatively small corpus (about 105 million tokens), making it a cost-effective solution for model publishers. Alongside the base model, they can release the aligned pruned model, enabling low-resource users to fine-tune the base model via \method for specific downstream tasks.
+
+% Additionally, incorporating an extra distillation loss (computed between the original and pruned models) could further enhance the alignment performance. However, this approach significantly increases training overhead due to the additional teacher model parameters. Thus, this loss is not adopted in our current implementation~\footnote{We also identified several potential improvements to the alignment strategy that could further mitigate knowledge inconsistencies in \method detailed in the Appendix. However, we found that the performance gains from these improvements were not significant, as the existing approach already proves sufficiently effective.}. Future work could explore enhancing training efficiency using acceleration techniques like DropBP, but this falls outside the scope of our current study.
+
+
+% Minimizing this loss ensures the knowledge encoded in the pruned weights is effectively transferred to the original model dimensions, maintaining the integrity and performance of the LLM. Each model release includes a pruned model that has undergone this alignment process, enabling users to perform efficient fine-tuning with \method.
+
+\paragraph{Pruned Full-Rank Weight Quantization.}
+The design of \method inherently supports the seamless integration of quantization techniques, further reducing memory consumption during training by applying quantization to pruned models. For example, by adapting the LoRA-specific quantization scheme QLoRA~\citep{Tim:2023qlora}, \method extends into \Qmethod,
+the pruned full-rank weight matrix is quantized into the \texttt{NF4} format, while the pruned low-rank matrices $\mathbf{B}^\mathtt{P}$ and $\mathbf{A}^\mathtt{P}$ remain in full or half precision, striking a balance between memory efficiency and fine-tuning quality.
+
+Formally, given a quantization function $\mathtt{Q}(\cdot)$, during training, the forward pass output activation vector $\mathbf{h}$ for an input feature vector $\mathbf{x}$ is computed as: 
+\begin{equation}
+\mathbf{h}
+=\mathbf{x} \mathtt{Q}(\mathbf{W}_{0}^\mathtt{P}) + \mathbf{x} \mathbf{B}^\mathtt{P} \mathbf{A}^\mathtt{P}
+=\mathbf{x} \mathbf{W}_{0}^\mathtt{P,Q} + \mathbf{x} \mathbf{B}^\mathtt{P} \mathbf{A}^\mathtt{P},
+\end{equation}
+where $\mathbf{W}_{0}^\mathtt{P,Q}$ represents the full-rank weight $\mathbf{W}_{0}$ after undergoing pruning via $\mathtt{P}(\cdot)$, followed by quantization using $\mathtt{Q}(\cdot)$. 
+We can also quantize the pruned full-rank weight after alignment to $\mathbf{W}_{0}^\mathtt{P,A,Q}$. 
+For inference, unless additional quantization is required, \Qmethod operates identically to \method, as shown in~\cref{fig:overview} (d). 
+It utilizes the original full-rank weights $\mathbf{W}_{0}$ alongside the recovered low-rank matrices $\mathbf{B}^{\mathtt{R}^{\star}}$ and $\mathbf{A}^{\mathtt{R}^{\star}}$ to perform the forward pass according to~~\cref{eq:recovered_infer}.
+In summary, for \method, as shown in~\cref{fig:overview} (e), the offline processing path of the frozen full-rank matrix $\mathbf{W}_{0}^{*}$, which minimizes 
+% video 
+{GPU}
+memory usage, is $\mathbf{W}_{0} 
+\stackrel{\mathtt{P}(\cdot)}{\longrightarrow} 
+\mathbf{W}_{0}^{\mathtt{P}} \stackrel{\mathcal{L}_{\mathtt{A}}}{\longrightarrow}
+\mathbf{W}_{0}^{\mathtt{P,A}}
+\stackrel{\mathtt{Q}(\cdot)}{\longrightarrow}
+\mathbf{W}_{0}^{\mathtt{P,A,Q}}
+$;
+\cref{fig:overview} (f) shows that
+the online generation path for the trained low-rank matrix $\mathbf{W}_{\Delta}^{*}$ is
+$\mathbf{W}_{\Delta} 
+\stackrel{\mathtt{P}(\cdot)}{\longrightarrow} 
+\mathbf{W}_{\Delta}^{\mathtt{P}} \stackrel{\mathcal{L}_{\mathtt{SFT}}}{\longrightarrow}
+\mathbf{W}_{\Delta}^{\mathtt{P}^{\star}}
+\stackrel{\mathtt{Q}(\cdot)}{\longrightarrow}
+\mathbf{W}_{\Delta}^{\mathtt{R}^{\star}}
+$.

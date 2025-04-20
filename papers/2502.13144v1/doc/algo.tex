@@ -1,0 +1,356 @@
+
+\section{\thename}
+\subsection{End-to-End Driving Policy}
+The overall framework of \thename{} is depicted in Fig.~\ref{fig:framework}. 
+\thename{} takes multi-view image sequences as input, transforms the sensor data into scene token embeddings, outputs the probabilistic distribution of actions, and samples an action to control the vehicle. 
+
+\boldparagraph{BEV Encoder.} 
+We first employ a BEV encoder~\cite{li2022bevformer} to transform multi-view image features from the perspective view to the Bird's Eye View (BEV), obtaining a feature map in the BEV space. This feature map is then used to learn instance-level map features and agent features.
+
+\boldparagraph{Map Head.} 
+Then we utilize a group of map tokens~\cite{maptrv2, liao2022maptr, lanegap} to learn the vectorized map elements of the driving scene from the BEV feature map, including lane centerlines, lane dividers, road boundaries, arrows, traffic signals, \etc.
+
+\boldparagraph{Agent Head.} 
+Besides, a group of agent tokens~\cite{jiang2022pip} is adopted to predict the motion information of other traffic participants, including location, orientation, size, speed, and multi-mode future trajectories.
+
+\boldparagraph{Image Encoder.} 
+Apart from the above instance-level map and agent tokens, we also use an individual image encoder~\cite{vit,he2016resnet} to transform the original images into image tokens. These image tokens provide dense and rich scene information for planning, complementary to the instance-level tokens.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.98\linewidth]{fig/post-training-2.pdf} 
+\caption{\textbf{Post-training.}  $N$  workers parallelly run. The generated rollout data $(s_t,a_t, r_{t+1},s_{t+1},...)$ are recorded in a rollout buffer. Rollout data and human driving demonstrations are used in RL- and IL-training steps to fine-tune the AD policy synergistically.
+}
+\label{fig:post-training}
+\end{figure}
+
+\boldparagraph{Action Space.} 
+To accelerate the convergence of RL training, we design a decoupled discrete action representation. 
+We divide the action into two independent components: lateral action and longitudinal action. 
+The action space is constructed over a short $0.5$-second time horizon, during which the vehicle's motion is approximated by assuming constant linear and angular velocities. 
+Under this assumption, the lateral action $a^x$ and longitudinal action $a^y$ can be directly computed based on the current linear and angular velocities.
+By combining decoupling with a limited temporal scope and simplified motion model, our approach effectively reduces the dimensionality of the action space, accelerating training convergence.
+
+
+\boldparagraph{Planning Head.} 
+We use $E_\text{scene}$ to denote the scene representation, which consists of map tokens, agent tokens, and image tokens. We initialize a planning embedding denoted as $E_\text{plan}$. A cascaded Transformer decoder $\phi$ takes the planning embedding $E_\text{plan}$ as the query and the scene representation $E_\text{scene}$ as both key and value.
+
+The output of the decoder $\phi$ is then combined with navigation information $E_\text{navi}$ and ego state $E_\text{state}$ to output the probabilistic distributions of the lateral action $a^x$ and the longitudinal action $a^y$:
+\begin{equation}
+\begin{aligned}
+     \pi(a^x\mid s) = & \text{softmax}(\text{MLP}(\phi(E_\text{plan}, E_\text{scene}) \\
+    & + E_\text{navi} + E_\text{state})), \\
+     \pi(a^y\mid s) = & \text{softmax}(\text{MLP}(\phi(E_\text{plan}, E_\text{scene}) \\
+     & + E_\text{navi} + E_\text{state})),
+\label{eq:action distribution}
+\end{aligned}
+\end{equation}
+where $E_\text{plan}$, $E_\text{navi}$, $E_\text{state}$, and the output of $\text{MLP}$ are all of the same dimension ($1 \times D$).
+
+The planning head also outputs the value functions $V_x(s)$ and $V_y(s)$, which estimate the expected cumulative rewards for the lateral and longitudinal actions, respectively: 
+\begin{equation}
+\begin{aligned}
+    & V_x(s) = \text{MLP}(\phi(E_\text{plan}, E_\text{scene}) + E_\text{navi} + E_\text{state}), \\
+    & V_y(s) = \text{MLP}(\phi(E_\text{plan}, E_\text{scene}) + E_\text{navi} + E_\text{state}).
+\end{aligned}
+\end{equation}
+The value functions are used in RL training (Sec.~\ref{sec:optimization}).
+
+\subsection{Training Paradigm}
+We adopt a three-stage training paradigm: perception pre-training, planning pre-training, and reinforced post-training, as shown in Fig.~\ref{fig:framework}.
+
+\boldparagraph{Perception Pre-Training.} 
+Information in the image is sparse and low-level. In the first stage,  
+the map head and the agent head explicitly output map elements and agent motion information, which are supervised with ground-truth labels. Consequently,  
+map tokens and agent tokens implicitly encode the corresponding high-level information.  
+In this stage, we only update the parameters of the BEV encoder, the map head, and the agent head.
+
+
+
+\boldparagraph{Planning Pre-Training.} 
+In the second stage, to prevent the unstable cold start of RL training, IL is first performed to initialize the probabilistic distribution of actions based on large-scale real-world driving demonstrations from expert drivers. In this stage, we only update the parameters of the image encoder and the planning head, while the parameters of the BEV encoder, map head, and agent head are frozen. The optimization objectives of perception tasks and planning tasks may conflict with each other. However, with the training stage and parameters decoupled, such conflicts are mostly avoided.
+
+\boldparagraph{Reinforced Post-Training.} 
+In the reinforced post-training, RL and IL synergistically fine-tune the distribution. RL aims to guide the policy to be sensitive to critical risky events and adaptive to out-of-distribution situations. IL serves as the regularization term to keep the policy's behavior similar to that of humans.
+
+We select a large amount of risky dense-traffic clips from collected driving demonstrations. For each clip, we train an independent 3DGS model that reconstructs the clip and serves as a digital driving environment.  
+As shown in Fig.~\ref{fig:post-training}, we set $N$ parallel workers.  
+Each worker randomly samples a 3DGS environment and begins rollout, i.e., the AD policy controls the ego vehicle to move and iteratively interacts with the 3DGS environment. After the rollout process of this 3DGS environment ends, the generated rollout data $(s_t,a_t, r_{t+1},s_{t+1},...)$ are recorded in a rollout buffer, and the worker will sample a new 3DGS environment for another round of rollout.
+
+As for policy optimization, we iteratively perform RL-training steps and IL-training steps. For RL-training steps, we sample data from the rollout buffer and follow the Proximal Policy Optimization (PPO) framework~\cite{PPO} to update the AD policy. For IL-training steps, we use real-world driving demonstrations to update the policy. After a fixed number of training steps, the updated AD policy is sent to every worker to replace the old one, to avoid a distribution shift between data collection and optimization.
+We only update the parameters of the image encoder and the planning head. The parameters of the BEV encoder, the map head, and the agent head are frozen.  
+The detailed RL design is presented below.
+
+\subsection{Interaction Mechanism between AD Policy and 3DGS Environment}
+In the 3DGS environment, the ego vehicle acts according to the AD policy. Other traffic participants act according to real-world data in a log-replay manner.  
+A simplified kinematic bicycle model is employed to iteratively update the ego vehicle's pose at every $\Delta t$ seconds as follows:  
+\begin{equation}
+\begin{aligned}
+x_{t+1}^{w} & = x_{t}^w + v_t \cos \left(\psi_{t}^w\right) \Delta t, \\
+y_{t+1}^{w} & = y_{t}^w + v_t \sin \left(\psi_{t}^w\right) \Delta t, \\
+\psi_{t+1}^{w} & = \psi_{t}^w + \frac{v_t}{L} \tan \left(\delta_t\right) \Delta t,
+\label{equation:kinematic_model}
+\end{aligned}
+\end{equation}  
+where $x_t^{w}$ and $y_t^{w}$ denote the position of the ego vehicle relative to the world coordinate; $\psi_t^w$ is the heading angle that defines the vehicle's orientation with respect to the world $x$-coordinate; $v_t$ is the linear velocity of the ego vehicle; $\delta_t$ is the steering angle of the front wheels; and $L$ is the wheelbase, i.e., the distance between the front and rear axles.
+
+During the rollout process, the AD policy outputs actions $(a_t^x, a_t^y)$ for a $0.5$-second time horizon at time step $t$. We derive the linear velocity $v_t$ and steering angle $\delta_t$ based on $(a_t^x, a_t^y)$.  
+Based on the kinematic model in Eq.~\ref{equation:kinematic_model},  
+the pose of the ego vehicle in the world coordinate system is updated from ${p}_t = (x_{t}^w, y_{t}^w, \psi_{t}^w)$ to ${p}_{t+1} = (x_{t+1}^{w}, y_{t+1}^{w}, \psi_{t+1}^{w})$.  
+
+Based on the updated ${p}_{t+1}$, the 3DGS environment computes the new ego vehicle's state $s_{t+1}$. The updated pose ${p}_{t+1}$ and state $s_{t+1}$ serve as the input for the next iteration of the inference process.
+
+The 3DGS environment also generates rewards $\mathcal{R}$ (Sec.~\ref{sec:reward}) according to multi-source information (including trajectories of other agents, map information, the expert trajectory of the ego vehicle, and the parameters of Gaussians), which are used to optimize the AD policy (Sec.~\ref{sec:optimization}).
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=1.0\linewidth]{fig/reward.pdf} 
+\caption{\textbf{Example diagram of four types of reward sources.}  (1): Collision with a dynamic obstacle ahead triggers a reward $r_{\text{dc}}$. (2): Hitting a static roadside obstacle incurs a reward $r_{\text{sc}}$. (3): Moving onto the curb exceeds the positional deviation threshold $d_{\text{max}}$, triggering a reward $r_{\text{pd}}$. (4): Drifting toward the adjacent lane exceeds the heading deviation threshold $\psi_{\text{max}}$, triggering a reward $r_{\text{hd}}$.
+}
+\label{fig: reward source}
+\end{figure}
+\subsection{Reward Modeling}
+\label{sec:reward}
+The reward is the source of the training signal, which determines the optimization direction of RL. The reward function is designed to guide the ego vehicle's behavior by penalizing unsafe actions and encouraging alignment with the expert trajectory. It is composed of four reward components: (1) collision with dynamic obstacles, (2) collision with static obstacles, (3) positional deviation from the expert trajectory, and (4) heading deviation from the expert trajectory:
+\begin{equation}
+\begin{aligned}
+\mathcal{R} = \{r_{\text{dc}}, r_{\text{sc}}, r_{\text{pd}}, r_{\text{hd}}  \}. 
+\end{aligned}
+\end{equation}
+
+As illustrated in Fig.~\ref{fig: reward source}, these reward components are triggered under specific conditions.  
+In the 3DGS environment, dynamic collision is detected if the ego vehicle's bounding box overlaps with the annotated bounding boxes of dynamic obstacles, triggering a negative reward $r_{\text{dc}}$. Similarly, static collision is identified when the ego vehicle's bounding box overlaps with the Gaussians of static obstacles, resulting in a negative reward $r_{\text{sc}}$.  
+Positional deviation is measured as the Euclidean distance between the ego vehicle's current position and the closest point on the expert trajectory. A deviation beyond a predefined threshold $d_{\text{max}}$ incurs a negative reward $r_{\text{pd}}$.  
+Heading deviation is calculated as the angular difference between the ego vehicle's current heading angle $ \psi_t $ and the expert trajectory's matched heading angle $\psi_{\text{expert}}$. A deviation beyond a threshold $ \psi_{\text{max}}$ results in a negative reward $r_{\text{hd}}$.
+
+Any of these events, including dynamic collision, static collision, excessive positional deviation, or excessive heading deviation, triggers immediate episode termination. Because after such events occur, the 3DGS environment typically generates noisy sensor data, which is detrimental to RL training.
+
+\subsection{Policy Optimization}
+\label{sec:optimization}
+In the closed-loop environment, the error in each single step accumulates over time. The aforementioned rewards are not only caused by the current action but also by the actions of the preceding steps.  
+The rewards are propagated forward with Generalized Advantage Estimation (GAE)~\cite{gae} to optimize the action distribution of the preceding steps.
+
+Specifically, for each time step $t$, we store the current state $s_t$, action $a_t$, reward $r_t$, and the estimate of the value $V(s_t)$.  
+Based on the decoupled action space, and considering that different rewards have different correlations to lateral and longitudinal actions, the reward $r_t$ is divided into lateral reward $r_t^x$ and longitudinal reward $r_t^y$:
+\begin{equation}
+\begin{aligned}
+r_t^x &= r_t^{\text{sc}} + r_t^{\text{pd}} + r_t^{\text{hd}}, \\
+r_t^y &= r_t^{\text{dc}}.
+\label{eq:reward-decouple}
+\end{aligned}
+\end{equation}
+Similarly, the value function $V(s_t)$ is decoupled into two components: $V_x(s_t)$ for the lateral dimension and $V_y(s_t)$ for the longitudinal dimension. These value functions estimate the expected cumulative rewards for the lateral and longitudinal actions, respectively. The advantage estimates $\hat{A}_t^x$ and $\hat{A}_t^y$ are then computed as follows:
+\begin{equation}
+\begin{aligned}
+\delta_t^x &= r_t^x + \gamma V_x(s_{t+1}) - V_x(s_t), \\
+\delta_t^y &= r_t^y + \gamma V_y(s_{t+1}) - V_y(s_t), \\
+\hat{A}_t^x &= \sum_{l=0}^{\infty}(\gamma \lambda)^l \delta_{t+l}^x, \\
+\hat{A}_t^y &= \sum_{l=0}^{\infty}(\gamma \lambda)^l \delta_{t+l}^y,
+\label{eq:advantage}
+\end{aligned}
+\end{equation}
+where $\delta_t^x$ and $\delta_t^y$ are the temporal difference errors for the lateral and longitudinal dimensions, $\gamma$ is the discount factor, and $\lambda$ is the GAE parameter that controls the trade-off between bias and variance.
+
+To further clarify the relationship between the advantage estimates and the reward components, we decompose $\hat{A}_t^x$ and $\hat{A}_t^y$ based on the reward decomposition in Eq.~\ref{eq:reward-decouple} and the advantage estimation in Eq.~\ref{eq:advantage}. Specifically, we derive the following decomposition:
+\begin{equation}
+\begin{aligned}
+\hat{A}_t^x &= \hat{A}_t^{\text{sc}} + \hat{A}_t^{\text{pd}} + \hat{A}_t^{\text{hd}}, \\
+\hat{A}_t^y &= \hat{A}_t^{\text{dc}},
+\end{aligned}
+\end{equation}
+where $\hat{A}_t^{\text{sc}}$ is the advantage estimate for avoiding static collisions, $\hat{A}_t^{\text{pd}}$ is the advantage estimate for minimizing positional deviations, $\hat{A}_t^{\text{hd}}$ is the advantage estimate for minimizing heading deviations, and $\hat{A}_t^{\text{dc}}$ is the advantage estimate for avoiding dynamic collisions.
+
+These advantage estimates are used to guide the update of the AD policy $\pi_{\theta}$, following the PPO framework~\cite{PPO}. By leveraging the decomposed advantage estimates $\hat{A}_t^x$ and $\hat{A}_t^y$, we can independently optimize the lateral and longitudinal dimensions of the policy. This is achieved by defining separate objective functions $\mathcal{L}_x^{\text{CLIP}}(\theta)$ and $\mathcal{L}_y^{\text{CLIP}}(\theta)$ for each dimension,  as follows:
+\begin{equation}
+\begin{aligned}
+\mathcal{L}_x^{\text{PPO}}(\theta) &= \mathbb{E}_t \left[ \min \left( \rho_t^x \hat{A}_t^x, \ \text{clip}(\rho_t^x, 1-\epsilon_x, 1+\epsilon_x) \hat{A}_t^x \right) \right], \\
+\mathcal{L}_y^{\text{PPO}}(\theta) &= \mathbb{E}_t \left[ \min \left( \rho_t^y \hat{A}_t^y, \ \text{clip}(\rho_t^y, 1-\epsilon_y, 1+\epsilon_y) \hat{A}_t^y \right) \right], \\
+\mathcal{L}^{\text{PPO}}(\theta) &= \mathcal{L}_x^{\text{PPO}}(\theta) + \mathcal{L}_y^{\text{PPO}}(\theta),
+\end{aligned}
+\end{equation}
+where $\rho_t^x = \frac{\pi_{\theta}(a_t^x \mid s_t)}{\pi_{\theta_{\text{old}}}(a_t^x \mid s_t)}$ is the importance sampling ratio for the lateral dimension, $\rho_t^y = \frac{\pi_{\theta}(a_t^y \mid s_t)}{\pi_{\theta_{\text{old}}}(a_t^y \mid s_t)}$ is the importance sampling ratio for the longitudinal dimension, $\epsilon_x$ and $\epsilon_y$ are small constants that control the clipping range for the lateral and longitudinal dimensions, ensuring stable policy updates.
+
+The clipped objective function $\mathcal{L}^{\text{PPO}}(\theta)$ prevents excessively large updates to the policy parameters $\theta$, thereby maintaining training stability.
+
+\begin{table*}[ht]
+    \centering
+{
+\begin{tabular}{lccccccccc}
+    \toprule
+    RL:IL & CR$\downarrow$ & DCR$\downarrow$ & SCR$\downarrow$ & DR$\downarrow$ & PDR$\downarrow$ & HDR$\downarrow$ &ADD$\downarrow$ & Long. Jerk$\downarrow$ & Lat. Jerk$\downarrow$ \\
+    \midrule
+     0:1  & 0.229 & 0.211 & 0.018 & 0.066 & 0.039 & 0.027  & 0.238 & 3.928 & 0.103\\
+     1:0  & 0.143 & 0.128 & 0.015 &0.080 &0.065 &0.015 &0.345 &4.204 &0.085\\
+     2:1 & 0.137 & 0.125 & 0.012 & 0.059 & 0.050 & 0.009  & 0.274 & 4.538 & 0.092\\
+     4:1 & 0.089 & 0.080 & 0.009 & 0.063 & 0.042 & 0.021  & 0.257 & 4.495 & 0.082 \\
+     8:1 & 0.125 & 0.116 & 0.009 & 0.084 & 0.045 & 0.039  & 0.323 & 5.285 & 0.115\\
+    \bottomrule
+\end{tabular}
+}
+    \caption{\textbf{Ablation on RL-to-IL step mixing ratios in the reinforced post-training stage.}}
+    \label{tab:ratio}
+\end{table*}
+
+\subsection{Auxiliary Objective}
+RL usually faces the challenge of sparse rewards, which makes the convergence process unstable and slow. To speed up convergence, we introduce auxiliary objectives that provide dense guidance to the entire action distribution.
+
+The auxiliary objectives are designed to penalize undesirable behaviors by incorporating specific reward sources, including dynamic collisions, static collisions, positional deviations, and heading deviations. These objectives are computed based on the actions \( a_t^{x, \text{old}} \) and \( a_t^{y, \text{old}} \) selected by the old AD policy \( \pi_{\theta_{\text{old}}} \) at time step \( t \). To facilitate the evaluation of these actions, we separate the probability distribution of the action into four parts:
+\begin{equation}
+\begin{aligned}
+\Delta \pi_y^{\text{dec}} &= \sum_{a_t^y < a_t^{y, \text{old}}} \pi_\theta(a_t^y \mid s_t), \\
+\Delta \pi_y^{\text{acc}} &= \sum_{a_t^y > a_t^{y, \text{old}}} \pi_\theta(a_t^y \mid s_t), \\
+\Delta \pi_x^{\text{left}} &= \sum_{a_t^x < a_t^{x, \text{old}}} \pi_\theta(a_t^x \mid s_t), \\
+\Delta \pi_x^{\text{right}} &= \sum_{a_t^x > a_t^{x, \text{old}}} \pi_\theta(a_t^x \mid s_t).
+\end{aligned}
+\end{equation}
+Here, \( \Delta \pi_y^{\text{dec}} \) represents the total probability of deceleration actions, \( \Delta \pi_y^{\text{acc}} \) represents the total probability of acceleration actions, \( \Delta \pi_x^{\text{left}} \) represents the total probability of leftward steering actions, and \( \Delta \pi_x^{\text{right}} \) represents the total probability of rightward steering actions.
+
+\boldparagraph{Dynamic Collision Auxiliary Objective.}  
+The dynamic collision auxiliary objective adjusts the longitudinal control action \(a_t^y\) based on the location of potential collisions relative to the ego vehicle. If a collision is detected ahead, the policy prioritizes deceleration actions (\(a_t^y < a_t^{y, \text{old}}\)); if a collision is detected behind, it encourages acceleration actions (\(a_t^y > a_t^{y, \text{old}}\)). To formalize this behavior, we define a directional factor \(f_\text{dc}\):
+\begin{equation}
+\begin{aligned}
+f_\text{dc} = \begin{cases} 
+1 & \text{if the collision is ahead}, \\
+-1 & \text{if the collision is behind}.
+\end{cases} 
+\end{aligned}
+\end{equation}
+
+The auxiliary objective for dynamic collision avoidance is defined as:
+\begin{equation}
+\begin{aligned}
+\mathcal{L}_\text{dc}(\theta_y) = \mathbb{E}_t \left[ 
+    \hat{A}_t^\text{dc} \cdot f_\text{dc} \cdot (\Delta \pi_y^{\text{dec}} - \Delta \pi_y^{\text{acc}})
+\right],
+\end{aligned}
+\end{equation}
+where \(\hat{A}_t^\text{dc}\) is the advantage estimate for dynamic collision avoidance.
+
+\boldparagraph{Static Collision Auxiliary Objective.}  
+The static collision auxiliary objective adjusts the steering control action $a_t^x$ based on the proximity to static obstacles. If the static obstacle is detected on the left side, the policy promotes rightward steering actions ($a_t^x > a_t^{x,\text{old}}$); if the static obstacle is detected on the right side, it promotes leftward steering actions ($a_t^x < a_t^{x,\text{old}}$). To formalize this behavior, we define a directional factor $f_\text{sc}$:  
+\begin{equation}
+\begin{aligned}
+f_\text{sc} = \begin{cases} 
+1 & \text{if static obstacle is on the left}, \\
+-1 & \text{if static obstacle is on the right}.
+\end{cases} 
+\end{aligned}
+\end{equation}
+
+The auxiliary objective for static collision avoidance is defined as:  
+\begin{equation}
+\begin{aligned}
+\mathcal{L}_\text{sc}(\theta_x) = \mathbb{E}_t \left[ 
+    \hat{A}_t^\text{sc} \cdot f_\text{sc} \cdot (\Delta \pi_x^{\text{right}} - \Delta \pi_x^{\text{left}})
+\right],
+\end{aligned}
+\end{equation}  
+where $\hat{A}_t^\text{sc}$ is the advantage estimate for static collision avoidance.  
+
+\boldparagraph{Positional Deviation Auxiliary Objective.}  
+The positional deviation auxiliary objective adjusts the steering control action $a_t^x$ based on the ego vehicle's lateral deviation from the expert trajectory. If the ego vehicle deviates leftward, the policy promotes rightward corrections ($a_t^x > a_t^{x,\text{old}}$); if it deviates rightward, it promotes leftward corrections ($a_t^x < a_t^{x,\text{old}}$). We formalize this with a directional factor $f_\text{pd}$:  
+\begin{equation}
+\begin{aligned}
+f_\text{pd} = \begin{cases} 
+1 & \text{if ego vehicle deviates leftward}, \\
+-1 & \text{if ego vehicle deviates rightward}.
+\end{cases} 
+\end{aligned}
+\end{equation}
+
+The auxiliary objective for positional deviation correction is:
+\begin{equation}
+\begin{aligned}
+\mathcal{L}_\text{pd}(\theta_x) = \mathbb{E}_t \left[ 
+    \hat{A}_t^\text{pd} \cdot f_\text{pd} \cdot (\Delta \pi_x^{\text{right}} - \Delta \pi_x^{\text{left}})
+\right],
+\end{aligned}
+\end{equation}  
+where $\hat{A}_t^\text{pd}$ estimates the advantage of trajectory alignment.
+
+\boldparagraph{Heading Deviation Auxiliary Objective.}  
+The heading deviation auxiliary objective adjusts the steering control action $a_t^x$ based on the angular difference between the ego vehicle’s current heading and the expert’s reference heading. If the ego vehicle deviates counterclockwise, the policy promotes clockwise corrections ($a_t^x > a_t^{x,\text{old}}$); if it deviates clockwise, it promotes counterclockwise corrections ($a_t^x < a_t^{x,\text{old}}$). To formalize this behavior, we define a directional factor $f_\text{hd}$:  
+\begin{equation}
+\begin{aligned}
+f_\text{hd} = \begin{cases} 
+1 & \text{if ego vehicle deviates clockwise}, \\
+-1 & \text{if ego vehicle deviates counterclockwise}.
+\end{cases} 
+\end{aligned}
+\end{equation}
+
+The auxiliary objective for heading deviation correction is then defined as:  
+\begin{equation}
+\begin{aligned}
+\mathcal{L}_\text{hd}(\theta_x) = \mathbb{E}_t \left[ 
+    \hat{A}_t^\text{hd} \cdot f_\text{hd} \cdot (\Delta \pi_x^{\text{right}} - \Delta \pi_x^{\text{left}})
+\right],
+\end{aligned}
+\end{equation}  
+where $\hat{A}_t^\text{hd}$ is the advantage estimate for heading alignment.  
+
+\begin{table*}[ht]
+\begin{center}
+\centering
+\resizebox{0.98\textwidth}{!}{
+\begin{tabular}{cccccccccccccc}
+\toprule
+\multirow{2}{*}{ID} & Dynamic & Static & Position & Heading & \multirow{2}{*}{CR$\downarrow$} &\multirow{2}{*}{DCR$\downarrow$} &\multirow{2}{*}{SCR$\downarrow$} &\multirow{2}{*}{DR$\downarrow$} &\multirow{2}{*}{PDR$\downarrow$} &\multirow{2}{*}{HDR$\downarrow$} &\multirow{2}{*}{ADD$\downarrow$} &\multirow{2}{*}{Long. Jerk$\downarrow$} &\multirow{2}{*}{Lat. Jerk$\downarrow$}\\
+& Collision & Collision & Deviation & Deviation & & & & & & & & & \\
+\midrule
+1 & \cmark  &  &  &  & 0.172 & 0.154 & 0.018 & 0.092 & 0.033 & 0.059  & 0.259 & 4.211 & 0.095 \\
+2 &  & \cmark & \cmark & \cmark & 0.238 & 0.217 & 0.021 & 0.090 & 0.045 & 0.045  & 0.241 & 3.937 & 0.098 \\
+3 & \cmark &  & \cmark & \cmark & 0.146 & 0.128 & 0.018 & 0.060 & 0.030 & 0.030  & 0.263 & 3.729 & 0.083\\
+4 & \cmark & \cmark &  & \cmark & 0.151 & 0.142 & 0.009 & 0.069 & 0.042 & 0.027 & 0.303 & 3.938 & 0.079\\
+5 & \cmark & \cmark & \cmark &  & 0.166 & 0.157 & 0.009 & 0.048 & 0.036 & 0.012 & 0.243 & 3.334 & 0.067\\
+6 & \cmark & \cmark & \cmark & \cmark & 0.089 & 0.080 & 0.009 & 0.063 & 0.042 & 0.021 & 0.257 & 4.495 & 0.082 \\
+\bottomrule
+\end{tabular}
+}
+\end{center}
+\vspace{-2mm}
+\caption{\textbf{Ablation on reward sources.} The table shows the impact of different reward components on performance.}
+\label{tab:reward_ablation}
+\end{table*}
+
+\begin{table*}[ht]
+\begin{center}
+\centering
+\resizebox{0.98\textwidth}{!}{
+\begin{tabular}{ccccccccccccccc}
+\toprule
+\multirow{2}{*}{ID} & \multirow{2}{*}{PPO Obj.}  & Dynamic Col. & Static Col. & Position Dev. & Heading Dev. & \multirow{2}{*}{CR$\downarrow$} & \multirow{2}{*}{DCR$\downarrow$}  & \multirow{2}{*}{SCR$\downarrow$} & \multirow{2}{*}{DR$\downarrow$} & \multirow{2}{*}{PDR$\downarrow$} & \multirow{2}{*}{HDR$\downarrow$} & \multirow{2}{*}{ADD$\downarrow$} & \multirow{2}{*}{Long. Jerk$\downarrow$} & \multirow{2}{*}{Lat. Jerk$\downarrow$} \\
+& & Auxiliary Obj. & Auxiliary Obj. & Auxiliary Obj. & Auxiliary Obj. & & & & & & & & & \\
+\midrule
+1 &\cmark&  &  &  &  & 0.249 & 0.223 & 0.026 & 0.077 & 0.047 & 0.030  & 0.266 & 4.209 & 0.104 \\
+2 &\cmark& \cmark &  &  &  & 0.178 & 0.163 & 0.015 & 0.151 & 0.101 & 0.050 & 0.301 & 3.906 & 0.085 \\
+3 &\cmark&  & \cmark & \cmark & \cmark & 0.137 & 0.125 & 0.012 & 0.157 & 0.145 & 0.012 & 0.296 & 3.419 & 0.071 \\
+4 &\cmark& \cmark &  & \cmark & \cmark & 0.169 & 0.151 & 0.018 & 0.075 & 0.042 & 0.033 & 0.254 & 4.450 & 0.098 \\
+5 &\cmark& \cmark & \cmark &  & \cmark & 0.149 & 0.134 & 0.015 & 0.063 & 0.057 & 0.006 & 0.324 & 3.980 & 0.086 \\
+6 &\cmark& \cmark & \cmark & \cmark & & 0.128 & 0.119  & 0.009 & 0.066 & 0.030 & 0.036  & 0.254 & 4.102 & 0.092 \\
+7 &&\cmark  &\cmark  &\cmark  &\cmark  & 0.187 &0.175  &0.012 &0.077 &0.056  &0.021  &0.309  &5.014  &0.112  \\
+8 &\cmark& \cmark & \cmark & \cmark & \cmark & 0.089 & 0.080 & 0.009 & 0.063 & 0.042 & 0.021  & 0.257 & 4.495 & 0.082 \\
+\bottomrule
+\end{tabular}
+}
+\end{center}
+\vspace{-2mm}
+\caption{\textbf{Ablation on auxiliary objectives.} The table shows the impact of different auxiliary objectives on performance.}
+\label{tab:auxiliary_ablation}
+\end{table*}
+
+\boldparagraph{Overall Auxiliary Objectives.}  
+The overall auxiliary objectives are a weighted sum of the individual objectives:
+\begin{equation}
+\begin{aligned}
+\mathcal{L}_\text{aux}(\theta) = &\lambda_1 \mathcal{L}_\text{dc}(\theta_y) + \lambda_2 \mathcal{L}_\text{sc}(\theta_x)  + \\ 
+&\lambda_3 \mathcal{L}_\text{pd}(\theta_x) +\lambda_4 \mathcal{L}_\text{hd}(\theta_x),
+\end{aligned}
+\end{equation}
+where $\lambda_1$, $\lambda_2$, $\lambda_3$, and $\lambda_4$ are weighting coefficients that balance the contributions of each auxiliary objective.
+
+\boldparagraph{Optimization Objective.}  
+The final optimization objective combines the clipped PPO objective with the auxiliary objective:
+\begin{equation}
+\mathcal{L}(\theta) = \mathcal{L}^{\text{PPO}}(\theta) + \mathcal{L}_\text{aux}(\theta).
+\end{equation}

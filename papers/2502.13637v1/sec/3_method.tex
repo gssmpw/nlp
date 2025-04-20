@@ -1,0 +1,139 @@
+\section{Method}
+\label{sec:method}
+
+Generating a semantically meaningful body pose of a non-existent person is challenging. Because, unlike a traditional pose estimation approach, an actual human is not present for supervision of the body joints, which forces the generator to depend exclusively on the scene context. However, directly using the spatial feature maps from one \cite{wang2017binge, do2018affordancenet, yao2023scene} or multiple \cite{chuang2018learning, wang2021scene, zhang2022inpaint} modalities does not provide a comprehensive encoding of the scene context, thereby limiting the sampling quality of the generator. Our key idea is a bidirectional cross-attention mechanism between feature spaces of two modalities for a modulated scene context representation. In particular, we use an ImageNet-pretrained \cite{deng2009imagenet} VGG-19 model \cite{simonyan2015very} to estimate the convolution feature maps from the scene image and the corresponding segmentation mask, followed by mutually cross-attending the two feature spaces. The proposed affordance generation pipeline consists of four stages. In the first stage, we use a conditional VAE to estimate a probable location within the scene where a person can be centered. In the second stage, a classifier predicts the most likely template pose for the estimated location from a set of existing human pose candidates. In the subsequent stages, we use two conditional VAEs to sample the scale and linear deformation parameters for the predicted template. Fig. \ref{fig:architecture} illustrates an overview of the proposed architecture.
+
+% --------------------------------------------------------------------------------
+\subsection{Context representation}
+\label{sec:method_context}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{fig/mcma_block.pdf}
+  \caption{Architecture of the \emph{Mutual Cross-Modal Attention} (\textbf{MCMA}) block.}
+  \label{fig:mcma_block}
+  \vspace{-1.0em}
+\end{figure}
+
+Conceptually, the attention mechanism \cite{vaswani2017attention} dynamically increases the receptive field in a network architecture \cite{wang2018non}. Unlike self-attention, which combines two similar embedding spaces, cross-attention asymmetrically combines two separate embedding spaces. More specifically, self-attention computes the attention maps from queries $Q$, keys $K$, and values $V$ projected from the same token space, while cross-attention uses $K$ and $V$ projected from a different token space as the contextual guidance. However, the underlying computation steps are identical in both cases and involve a similarity measure between $Q$ and $K$ to form an attention matrix $AM$, followed by weighing $V$ with $AM$ to obtain the updated query tokens.
+
+In the proposed cross-attention mechanism, we use an image $I$ and the corresponding semantic segmentation map $S$ as inputs from two different modalities for mutually attending to each other. The segmentation maps are estimated from respective images using OneFormer \cite{jain2023oneformer} with DiNAT-L \cite{hassani2022dilated} backbone pretrained on the ADE20K dataset \cite{zhou2019semantic}. We reduce the initial 150 semantic labels to 8 most significant categories to represent indoor scenes as grayscale semantic maps with the following values -- wall (36), floor (72), stairs (108), table (144), chair (180), bed (216), person (252), and background/everything else (0). Initially, we resize $I$ and $S$ with a rescaling function $f: \mathbb{R}^{h \times w \times 3} \rightarrow \mathbb{R}^{256 \times 256 \times 3}$. The resized images are passed through the convolutional backbone of an ImageNet-pretrained \cite{deng2009imagenet} frozen VGG-19 model \cite{simonyan2015very} to extract the respective spatial feature maps $F^{conv}_I$ and $F^{conv}_S$, $g: \mathbb{R}^{256 \times 256 \times 3} \rightarrow \mathbb{R}^{8 \times 8 \times 512}$. The resulting feature maps $F^{conv}_I$ and $F^{conv}_S$ are normalized with channel-wise root mean square layer normalization (RMSNorm) \cite{zhang2019root} to obtain the normalized feature maps $F^{norm}_I$ and $F^{norm}_S$. Mathematically, the normalization operation defines a function $\phi: \mathbb{R}^{8 \times 8 \times 512} \rightarrow \mathbb{R}^{8 \times 8 \times 512}$ as
+\[
+F^{norm} = \phi(F^{conv}) = \gamma \; \frac{F^{conv} \sqrt{N_c}}{max(\|F^{conv}\|_2, \epsilon)}
+\]
+where $N_c$ denotes the number of channels in feature map $F^{conv}$, $\epsilon \in \mathbb{R}^n$ is a very small constant $(\approx 1e^{-12})$ to provide numerical stability, and $\gamma \in \mathbb{R}^n$ is a learnable gain parameter set to 1 at the beginning.
+
+For computing the multi-head attention maps, we first define three projection functions $q$, $k$, and $v$ to map the normalized feature maps $F^{norm}$ into queries $Q$, keys $K$, and values $V$ as
+\[
+Q = q(F^{norm}): \mathbb{R}^{8 \times 8 \times 512} \rightarrow \mathbb{R}^{8 \times 8 \times N_{embed}}
+\]
+\[
+K = k(F^{norm}): \mathbb{R}^{8 \times 8 \times 512} \rightarrow \mathbb{R}^{8 \times 8 \times N_{embed}}
+\]
+\[
+V = v(F^{norm}): \mathbb{R}^{8 \times 8 \times 512} \rightarrow \mathbb{R}^{8 \times 8 \times N_{embed}}
+\]
+where the projection functions use point-wise convolution with $1 \times 1$ kernels and zero bias, and $N_{embed}$ is the length of the cumulative embedding space of all attention heads. In the proposed architecture, we use 8 attention heads of dimension 64 each, resulting $N_{embed} = 8 \times 64 = 512$. Next, we update the feature maps from both modalities $I$ and $S$ by computing the respective cross-attention matrices, taking $Q$ from one modality and $K$ \& $V$ from the other. Mathematically,
+\[
+F^{att}_I = softmax \left( \frac{Q_I K^T_S}{\sqrt{d}} \right) V_S
+\]
+\[
+F^{att}_S = softmax \left( \frac{Q_S K^T_I}{\sqrt{d}} \right) V_I
+\]
+where $d$ is a scaling parameter. In the proposed method, we take the attention head dimension as $d$.
+
+% \noindent
+The final updated cross-modal feature maps are estimated as $F^*_I = p(F^{att}_I)$ and $F^*_S = p(F^{att}_S)$, where the function $p: \mathbb{R}^{8 \times 8 \times N_{embed}} \rightarrow \mathbb{R}^{8 \times 8 \times 512}$ defines a projection that uses convolution with $1 \times 1$ kernels and zero bias.
+
+% \noindent
+Finally, we compute the mutual cross-modal feature maps as $F^{mutual} = t(c(F^*_I, F^*_S))$ by a channel-wise concatenation $c: \mathbb{R}^{8 \times 8 \times 512} \times \mathbb{R}^{8 \times 8 \times 512} \rightarrow \mathbb{R}^{8 \times 8 \times 1024}$ of $F^*_I$ and $F^*_S$, followed by a projection $t: \mathbb{R}^{8 \times 8 \times 1024} \rightarrow \mathbb{R}^{8 \times 8 \times 512}$ using convolution with $1 \times 1$ kernels and zero bias.
+
+The vectorized representation of the contextual embedding $F^{context} \in \mathbb{R}^{8192}$ is obtained by first downsampling the $8 \times 8$ feature maps of $F^{mutual}$ into a spatial resolution of $4 \times 4$ with strided convolution ($4 \times 4$ kernel, stride = 2, padding = 1, bias = 0), then following a set of sequential operations -- batch normalization, ReLU activation, $4 \times 4$ adaptive average pooling, and flattening. We use $F^{context}$ as the semantic condition in the proposed architecture. The architecture of the proposed \emph{mutual cross-modal attention} (\textbf{MCMA}) block is illustrated in Fig. \ref{fig:mcma_block}.
+
+% --------------------------------------------------------------------------------
+\subsection{Estimating locations of non-existent persons}
+\label{sec:method_location}
+Unlike the existing approaches, where the location of the target person is user-specified, we attempt to estimate the probable locations of non-existent persons automatically to minimize user intervention. However, the problem is challenging as potential human candidates may appear at several locations with varying scales and poses. Therefore, inferring a location directly from spatial feature space is difficult. In the proposed method, we use a VAE to sample a possible location by conditioning the network on the global context embedding $F^{context} \in \mathbb{R}^{2048}$, computed over the entire scene. The encoder and decoder in the VAE architecture use a shared feature space $F^{shared} \in \mathbb{R}^{128}$, obtained by projecting $F^{context}$ into a 128-dimensional vector with a fully connected (FC) layer and ReLU activation.
+
+In the encoder network, the 2D location coordinates $o(x, y) \in \mathbb{R}^2$ is first mapped into a 128-dimensional vector using two consecutive FC layers having ReLU activations, and the output is linearly concatenated with $F^{shared}$. We compute the mean $\mu \in \mathbb{R}^{32}$ and variance $\sigma \in \mathbb{R}^{32}$ of the latent distribution $P(\mu, \sigma)$ by projecting the concatenated feature vector through two separate FC layers. The latent embedding vector $z$ is obtained using the reparameterization technique \cite{kingma2013auto} as $z = \mu + \sigma \odot \epsilon$, where $z \in \mathbb{R}^{32}$ is sampled from the estimated distribution $P(z \; | \; \mu, \sigma)$ and $\epsilon \in \mathbb{R}^{32}$ is sampled from the normal distribution $\mathcal{N}(0, 1)$.
+
+In the decoder network, the latent embedding $z$ is projected into a 128-dimensional space using two consecutive FC-ReLU layers. The shared feature vector $F^{shared}$ also receives an additional projection into a 128-dimensional space through a single FC-ReLU layer. The two projected vectors are linearly concatenated and passed over another 128-dimensional FC-ReLU layer. Finally, we use one more FC layer to project the feature space into the predicted 2D location coordinates $\overline{o}(x, y) \in \mathbb{R}^2$.
+
+The optimization objective for the network consists of two loss components. To measure the spatial deviation, we compute the mean squared error ($\mathcal{L}_{MSE}$) between the 2D target and predicted locations $o(x, y)$ \& $\overline{o}(x, y)$ as follows.
+\[
+\mathcal{L}_{MSE} = \| \; \overline{o}(x, y) \; - \; o(x, y) \; \|_2
+\]
+To evaluate the statistical difference between the estimated probability distribution of the embedding space $P(z \; | \; \mu, \sigma)$ and the normal distribution $\mathcal{N}(0, 1)$, we compute the Kullback–Leibler divergence \cite{kullback1951information} ($\mathcal{L}_{KLD}$) between the two distributions as follows.
+\[
+\mathcal{L}_{KLD} = KL \left( P(z \; | \; \mu, \sigma) \; \| \; \mathcal{N}(0, 1) \right)
+\]
+
+We update the network parameters by minimizing the cumulative objective $\mathcal{L} = \mathcal{L}_{MSE} + \mathcal{L}_{KLD}$ using stochastic Adam optimizer \cite{kingma2015adam}, keeping a fixed learning rate of $1e^{-3}$ and $\beta$-coefficients at (0.5, 0.999). During inference, we estimate a probable center $o^*(x, y)$ for a non-existent person by using a random noise $\eta \in \mathbb{R}^{32}$, sampled from the normal distribution $\mathcal{N}(0, 1)$, and the shared scene context embedding $F^{shared} \in \mathbb{R}^{128}$ as inputs to the VAE decoder $\mathcal{D}^{vae}$. Formally, $o^*(x, y) = \mathcal{D}^{vae}(\eta, F^{shared})$, $\eta \sim \mathcal{N}(0, 1)$.
+
+% --------------------------------------------------------------------------------
+\subsection{Finding pose templates for non-existent persons}
+\label{sec:method_pose}
+Unlike the conventional human pose estimation techniques \cite{cao2017realtime, sun2019deep, xu2022vitpose, geng2023human}, directly inferring the valid pose of a non-existent person is difficult \cite{roy2022scene} due to the unavailability of an actual human body for supervision. Thus, after sampling a probable location $o^*(x, y)$ within the scene where a person can be centered, we select a potential candidate from an existing set of $m$ valid human poses as the initial guess (template) at that position. In the next stage, the template pose is scaled and deformed to estimate the target pose. The candidate pool is constructed using the K-medoids algorithm \cite{park2009simple} to select $m$ representative pose templates from all the available human poses in the training data. Each template class is represented as a $m$-dimensional one-hot embedding vector $y \in \mathbb{R}^m$. To estimate the class probabilities $\overline{y} \in \mathbb{R}^m$ for an expected pose, we use a multi-class classifier on the context embedding.
+
+The global cross-modal feature maps $F^{mutual} \in \mathbb{R}^{8 \times 8 \times 512}$ are estimated over the entire scene as discussed in Sec. \ref{sec:method_context}. In addition to the global features, we compute two local feature representations $F^{mutual}_A \in \mathbb{R}^{8 \times 8 \times 512}$ and $F^{mutual}_B \in \mathbb{R}^{8 \times 8 \times 512}$ over two square patches $A$ and $B$, centered at the initially sampled location $o^*(x, y)$. The size of patch $A$ is equal to the scene height, and the size of patch $B$ is half of the scene height. A channel-wise concatenation of the global and local feature maps represents the cumulative feature space $F^{mutual}_* \in \mathbb{R}^{8 \times 8 \times 1536}$. We derive the combined context embedding vector $F^{context}_* \in \mathbb{R}^{8192}$ by first downsampling $F^{mutual}_*$ into a spatial dimension of $\mathbb{R}^{4 \times 4 \times 512}$ with strided convolution ($4 \times 4$ kernel, stride = 2, padding = 1, bias = 0), then following a set of sequential operations similar to Sec. \ref{sec:method_context} -- batch normalization, ReLU activation, $4 \times 4$ adaptive average pooling, and flattening. Finally, the classifier predicts the multi-class probabilities by projecting the context embedding $F^{context}_*$ into a $m$-dimensional output vector $\overline{y} \in \mathbb{R}^m$ using an FC-layer, followed by $softmax$ activation.
+
+The optimization objective of the classifier is a multi-class (categorical) cross-entropy loss ($\mathcal{L}_{CCE}$), which is formally defined using the negative $log$-likelihood as follows.
+\[
+\mathcal{L}_{CCE} = - \sum_{i=1}^m y_i \; log(\overline{y}_i)
+\]
+where $y_i \in y$ and $\overline{y}_i \in \overline{y}$ denote the probabilities of $i$-th class, $i \in \{1, ..., m\}$, in the target ($y$) and predicted ($\overline{y}$) label vectors, respectively. We update the network parameters by minimizing $\mathcal{L}_{CCE}$ using stochastic Adam optimizer \cite{kingma2015adam}, keeping a fixed learning rate of $1e^{-3}$ and $\beta$-coefficients at (0.5, 0.999). During inference, we obtain the one-hot pose template class embedding $y^* \in \mathbb{R}^m$ by selecting the predicted class with the highest probability. Formally, $y^* = argmax(\overline{y})$.
+
+% --------------------------------------------------------------------------------
+\subsection{Scaling the selected pose template}
+\label{sec:method_scale}
+After inferring a probable location $o^*(x, y)$ and one-hot pose template class embedding $y^* \in \mathbb{R}^m$, we use a conditional VAE to sample the expected scaling factors (height and width) of the target person. The estimated parameters are used to rescale the normalized pose template of unit height and width into the target dimensions. The encoder and decoder networks of the VAE use a shared feature space $F^{shared}_* \in \mathbb{R}^{128}$ as the condition, which is derived from the cumulative context vector $F^{context}_* \in \mathbb{R}^{2048}$ and pose template class embedding $y^* \in \mathbb{R}^m$. As discussed in Sec. \ref{sec:method_pose}, $F^{context}_*$ encodes both global (over entire scene) and local (over localized patches) cross-modal scene context representations. To compute the shared feature space, we first project $y^*$ into a 128-dimensional vector by two consecutive FC-ReLU layers and then linearly concatenate the projected output with $F^{context}_*$. The concatenated vector is passed through another FC-ReLU layer to obtain the 128-dimensional shared feature representation $F^{shared}_* $.
+
+The encoder and decoder of the VAE adopt a similar architecture as the location estimator discussed in Sec. \ref{sec:method_location}. The encoder takes the scaling parameters $s(\Delta x, \Delta y) \in \mathbb{R}^2$ and shared feature vector $F^{shared}_* \in \mathbb{R}^{128}$ as inputs to predict the mean $\mu_s \in \mathbb{R}^{32}$ and variance $\sigma_s \in \mathbb{R}^{32}$ of the latent distribution $P_s(\mu_s, \sigma_s)$. The decoder takes the latent embedding $z_s \in \mathbb{R}^{32}$ and shared feature vector $F^{shared}_* \in \mathbb{R}^{128}$ as inputs to estimate the probable scaling parameters $\overline{s}(\Delta x, \Delta y) \in \mathbb{R}^2$, where $z_s$ is computed using the reparameterization technique as $z_s = \mu_s + \sigma_s \odot \epsilon$, $z_s \sim P_s(\mu_s, \sigma_s)$, and $\epsilon \sim \mathcal{N}(0, 1)$.
+
+The optimization objective for the network consists of two loss components. The first term measures the spatial deviation $\mathcal{L}_{MSE}$ between $s(\Delta x, \Delta y)$ and $\overline{s}(\Delta x, \Delta y)$ as the $L_2$ norm. The second term estimates the statistical difference $\mathcal{L}_{KLD}$ between $P_s(z_s \; | \;\mu_s, \sigma_s)$ and $\mathcal{N}(0, 1)$ as the KL divergence. Mathematically, the loss terms can be represented as follows.
+\[
+\mathcal{L}_{MSE} = \| \; \overline{s}(\Delta x, \Delta y) \; - \; s(\Delta x, \Delta y) \; \|_2
+\]
+\[
+\mathcal{L}_{KLD} = KL \left( P_s(z_s \; | \; \mu_s, \sigma_s) \; \| \; \mathcal{N}(0, 1) \right)
+\]
+
+We update the network parameters by minimizing the cumulative objective $\mathcal{L} = \mathcal{L}_{MSE} + \mathcal{L}_{KLD}$ using stochastic Adam optimizer, with a fixed learning rate of $1e^{-3}$ and $\beta$-coefficients of (0.5, 0.999). During inference, we estimate the probable scaling factors $s^*(\Delta x, \Delta y)$ for the selected pose template by using a random noise $\eta \in \mathbb{R}^{32}$, sampled from $\mathcal{N}(0, 1)$, and the shared scene context embedding $F^{shared}_* \in \mathbb{R}^{128}$ as inputs to the VAE decoder $\mathcal{D}^{vae}_s$. Formally, $s^*(\Delta x, \Delta y) = \mathcal{D}^{vae}_s(\eta, F^{shared}_*)$, $\eta \sim \mathcal{N}(0, 1)$.
+
+% --------------------------------------------------------------------------------
+\subsection{Deforming the selected pose template}
+\label{sec:method_deform}
+The potential human pose at the sampled location $o^*(x, y)$ is estimated by applying a linear deformation on the chosen pose template. A linear deformation vector $d$ is the set of distances between the cartesian coordinates of each body keypoint. Assuming a human pose is represented with $r$ keypoints, we define $d = \{dx_1, dy_1, ..., dx_r, dy_r\} \in \mathbb{R}^{2r}$, where ($dx_j, dy_j$) denotes the differences between the template and target coordinates along $x$ and $y$ axes for the $j$-th keypoint, $1 \leqslant j \leqslant r$. In the proposed method, we represent a human pose with 16 major body joints ($r = 16, d \in \mathbb{R}^{32}$), following the MPII \cite{andriluka142d} keypoint format.
+
+The deformation parameters are estimated using an identical VAE architecture as discussed in Sec. \ref{sec:method_scale}. The encoder takes the context embedding $F^{shared}_* \in \mathbb{R}^{512}$ and linear deformations $d \in \mathbb{R}^{32}$ as inputs to predict the mean $\mu_d \in \mathbb{R}^{32}$ and variance $\sigma_d \in \mathbb{R}^{32}$ of the latent distribution $P_d(\mu_d, \sigma_d)$. The decoder takes $F^{shared}_* \in \mathbb{R}^{512}$ and the latent vector $z_d \in \mathbb{R}^{32}$ as inputs to estimate the probable deformation parameters $\overline{d} \in \mathbb{R}^{32}$, where $z_d = \mu_d + \sigma_d \odot \epsilon$, $z_d \sim P_d(\mu_d, \sigma_d)$, and $\epsilon \sim \mathcal{N}(0, 1)$.
+
+The network parameters are optimized by minimizing the cumulative objective $\mathcal{L} = \mathcal{L}_{MSE} + \mathcal{L}_{KLD}$ using stochastic Adam optimizer, with a fixed learning rate of $1e^{-3}$ and $\beta$-coefficients of (0.5, 0.999). Mathematically,
+\[
+\mathcal{L}_{MSE} = \| \; \overline{d} \; - \; d \; \|_2
+\]
+\[
+\mathcal{L}_{KLD} = KL \left( P_d(z_d \; | \; \mu_d, \sigma_d) \; \| \; \mathcal{N}(0, 1) \right)
+\]
+
+The probable deformation parameters $d^* \in \mathbb{R}^{32}$ for the selected pose template is inferred by using a random noise $\eta \in \mathbb{R}^{32}$ and the shared scene context embedding $F^{shared}_* \in \mathbb{R}^{512}$ as inputs to the VAE decoder $\mathcal{D}^{vae}_d$. Formally, $d^* = \mathcal{D}^{vae}_d(\eta, F^{shared}_*)$, $\eta \sim \mathcal{N}(0, 1)$.
+
+% --------------------------------------------------------------------------------
+\subsection{Target transformation}
+\label{sec:method_transformation}
+
+Assuming a normalized human pose template of unit scale $h^*(x_1, y_1, ..., x_r, y_r)$ corresponding to the predicted pose template class $y^*$, we compute the target pose $\overline{h}(\overline{x}_1, \overline{y}_1, ..., \overline{x}_r, \overline{y}_r)$ from the estimated center $o^*(x_0, y_0)$, scaling factors $s^*(\Delta x, \Delta y)$, and linear deformations $d^*(dx_1, dx_2, ..., dx_r, dy_r)$ as follows.
+\[
+\overline{x}_i = \frac{w}{w_0} \left[ \left( x_i \Delta x + dx_i \right) + \left( x_0 - \frac{\Delta x}{2} \right) \right]
+\]
+\[
+\overline{y}_i = \frac{h}{h_0} \left[ \left( y_i \Delta y + dy_i \right) + \left( y_0 - \frac{\Delta y}{2} \right) \right]
+\]
+where $i \in \{1, 2, ..., r\}$, $(h_0, w_0)$ is the rescaled image patch size for network input, and $(h, w)$ is the size of the original scene. In the proposed method, we use $h_0 = w_0 = 256$.
+
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=\linewidth]{fig/architecture.pdf}
+  \caption{An illustration of the proposed architecture. The workflow is divided into four subnetworks to estimate the probable location $o^*$, pose template class $y^*$, scaling parameters $s^*$, and linear deformations $d^*$ of a potential target pose. Every subnetwork exclusively uses the proposed \emph{Mutual Cross-Modal Attention} (\textbf{MCMA}) block to encode global and local scene contexts as shown in Fig. \ref{fig:mcma_block}.}
+  \label{fig:architecture}
+\end{figure*}
+

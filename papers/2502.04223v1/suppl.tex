@@ -1,0 +1,182 @@
+\section{Architecture Details}
+
+The entire architecture has a total of 937M parameters. 
+
+\textbf{Vision Encoder}  Our vision encoder is initialized from the RADIO~\cite{radio} ViT-H /16 model (657M parameters). The inputs to the encoder are images of resolution $1280\times 1024$. We resize and pad the original image to this size, while maintaining the aspect ratio. This results in $80\times 64$ patches. 
+
+\textbf{Vision Neck} Following the observation in \cite{hu2024mplugdocowl15unifiedstructure} that text is more correlated within a line rather than across lines, we compress the sequence with a horizontal convolutional kernel of size $1\times 4$ and stride $1\times 4$. Given an input image of size $1280\times 1024$ which produces $5120$ patches, this reduces the sequence length to $1280$. %\KS{Maybe add why we do it? }
+
+\textbf{Decoder} We use an MBart~\cite{mbart} decoder with 10 layers (279M parameters) trained from scratch. The maximum sequence length for the decoder is set to 3584. 
+
+\section{Training \& Inference}
+We follow a two-step training strategy, similar to Nougat~\cite{Nougat}. We pre-train \eclair on the arXiv-5M dataset and fine-tune it further on all the training datasets. In both stages, we use the AdamW optimizer~\cite{loshchilov2017decoupled} and train for 130000 iterations with an effective batch size of 128. During pre-training, we use a constant learning rate of $2\times 10^{-5}$ with 5000 linear warmup steps. For fine-tuning, we employ a constant learning rate of $8\times 10^{-6}$ with 500 linear warmup steps. During inference, we use a greedy decoding strategy with a repetition penalty~\cite{keskar2019ctrl} of $1.1$. % \KS{Talk about modification to generate pipeline to get 2+ token inference. }
+
+\textbf{Inference Speed Comparison} To measure the speed of competing methods compared to \eclair and its multi-token variants, we utilize their publicly shared huggingface pipelines and pre-trained models. We report the speed of exclusively the model excluding any pre-processing, i.e., \textit{model.generate()} step. All models are evaluated with the provided pre-processing pipelines and the recommended parameters are used. We perform evaluation in bf16 for fair comparison. Additionally, since the speed of a model is affected by potential hallucinations that can lead to infinite loops bound by maximal sequence length, we also report the speed per 100 tokens. We can see that in this case speed of \eclair is almost identical to that of Nougat, as their decoder architecture is the same. At the same time, while \eclair has the most parameters out of competing methods, being front-heavy, it enjoys faster inference speed which is primarily dictated by the size of the decoder.
+For multi-token inference, we adopt a simple greedy decoding strategy (as opposed to more complex speculative strategies) for ensuring maximal throughput in batch mode during inference. Each linear layer has 1024 nodes.
+
+\section{Datasets}
+\subsection{Reading Order}
+
+The reading order for the bounding boxes in a page is the order in which the contents of these boxes would be visited if a person was reading the page out aloud. We only include relevant text-like semantic classes in this order, i.e., Text, Section-Header, List-Item, Title and Formula. See Figure~\ref{fig:reading-order}  for an illustration. Additionally, we reorder all Page-Header elements to be at the start of the page, and all Footnote, Page-Footer, Picture, Table and Caption elements to be at the end.
+
+\begin{figure*}[h]
+\centering
+\includegraphics[width=\textwidth]{images/reading_order_img.png}
+\vspace{-3mm}
+\caption{Illustrations of reading order over relevant text-like elements, i.e. Text, Section-header, List-item, Title and Formula. Other semantic classes (such as Picture, Footnote and Page-footer in the examples here) are not included in the reading order of the main body. (Note: We are not showing all the classes)}
+\label{fig:reading-order}
+\vspace{-4mm}
+\end{figure*}
+
+\subsection{Pre-processing steps for the training datasets }
+
+\textbf{SynthTabNet} The SynthTabNet dataset~\cite{nassar2022tableformer} consists of images of tabular data along with HTML annotations. We convert these HTML annotations to \LaTeX.
+
+\textbf{G1000} We obtain the annotations for G1000 using Tesseract~\cite{smith2007overview}.
+
+\textbf{README} We create a dataset of project documents by sampling README files from the Stack~\cite{Kocetkov2022TheStack}. To normalize the markdown source code, we convert it to HTML using Pandoc~\footnote{https://pandoc.org/} and render the converted HTML as PDF using wkhtmltopdf~\footnote{https://wkhtmltopdf.org/}. To obtain the ground truth for each page within the rendered PDFs, we first convert the HTML source back into our markup format and adopt Nougat's~\cite{Nougat} data processing pipeline\footnote{https://github.com/facebookresearch/nougat} to split and align the markdown with each page.
+
+\textbf{Table Auto-Labeling} The DocLayNet dataset and the human-annotated CommonCrawl samples do not contain {\LaTeX} annotations for tables and equation blocks. When we mask these elements out (both in the input image and the targets) in the fine-tuning stage owing to lack of ground truth, we observe that the model tends to mis-classify tables as pictures during inference. We hypothesize that this is caused by the lack of tables in the visually diverse subset of the training data, rendering such samples out-of-distribution (OOD) during inference. We address this by fine-tuning \eclair on table crops from SynthTabNet and arXiv-5m and using it to auto-label table crops from DocLayNet and the human-annotated samples. 
+
+\section{Post-processing: Hallucinations and Bad-box detection.}
+
+Similar to Nougat~\cite{Nougat}, we observe that \eclair sometimes degenerates into repetition loops wherein it repeats the same phrase, sentence or paragraph over and over again at the end of the prediction. Nougat \cite{Nougat} detect hallucinations by tracking a moving average of logits and flagging the outputs when a certain threshold is reached.
+
+For \eclair, we adopt a simple hallucination mitigation strategy to filter out such occurrences: the inference-time prompt is always set to the Maximal Informative Prompt (MIP) and we do a strict syntax check on the resulting predictions to reject non-compliant boxes. Some examples of hallucinations detected and filtered out using this strategy are shown in Figure~\ref{fig:hallucinations}. We also enforce the spatial and categorical validity of the remaining boxes by verifying that the bottom-right corner of each bounding box exceeds the top-left corner and that classes conform to a validated schema. By implementing this layered filtering strategy, we observe a substantial reduction in model hallucinations.
+
+\begin{figure*}[htbp]
+    \centering
+    \subfloat[]{\includegraphics[width=0.9\linewidth]{images/hallucination_1.png}} \\
+    \subfloat[]{\includegraphics[width=0.9\linewidth]{images/hallucination_2.png}}
+    \vspace{-3mm}
+    \caption{Examples of hallucinations in the \eclair predictions. The hallucinations (in this case, repetition loops), marked in red, are detected and filtered out by our hallucination-mitigation strategy.}
+    \vspace{-3mm}
+    \label{fig:hallucinations}
+\end{figure*}
+
+\section{Object detection}
+
+\subsection{mAP - Back to Simple Metrics}
+\label{sec:map}
+In line with previous works on autoregressive detection \cite{avetisyan2024scenescriptreconstructingscenesautoregressive}, we find mAP to be inherently unfavorable to end-to-end models like \eclair. Dedicated object detectors generally predict a set of bounding boxes of a fixed size as a raw output, where each bounding box is associated with a confidence score. Consequently, it is possible to control the recall-precision trade-off of the model by adjusting the confidence threshold by which the raw predictions are filtered. Naturally, this results in a possibility of achieving a high recall for the model, albeit at low precision. Instead, \eclair predicts a set of bounding boxes in line in the output stream of tokens, requiring no filtering or thresholding.
+
+An inherent problem with our end-to-end detector is the absence of a score for detected boxes that could be used to rank them. Using the likelihood/logits of the initial coordinate tokens is not ideal, as they indicate the distribution over potential starting points rather than an independent probability. Similarly, class-token logits only provide a distribution over class choices, not the probability of the box's existence. Considering text tokens is also impractical, as they represent the actual text rather than the existence of the surrounding box. Therefore, our predictor does not generate a box score. On one hand, as there is no over-prediction, no subsequent filtering or post-processing (such as non-maximum suppression) as well as no score is necessary. On the other hand, this makes comparison on the average precision metric challenging, as when considering all of the predicted bounding boxes jointly, only a single recall level exists for \eclair, making area calculation not meaningful. 
+
+Therefore, it can be seen that comparing \eclair against other works on the $mAP$ metric poses challenges:
+
+\begin{enumerate}
+    \item AP is the area under the PR-Curve, which degenerates to a single point without the possibility to rank predictions, making the calculation of the area not meaningful.
+    \item The COCO implementation assumes scores are unique. Identical scores (as in our case) lead to incorrect PR-Curves and inconsistent results. \footnote{See \url{https://github.com/MiXaiLL76/faster_coco_eval/issues/46} and \url{https://github.com/cocodataset/cocoapi/issues/678}}.
+    \item COCO mAP is computed per class independently (i.e. first separate classes, then match boxes). We propose to first match boxes over all classes and then compute the per-class precision/recall, which allows us to plot a confusion matrix, to better visualize problematic cases. Precision/recall and confusion matrix can still be averaged over multiple IoUs (0.5 to 0.95) like the COCO framework does. For an example of this on the DocLayNet evaluation dataset, see \cref{fig:eclair_conf_mat}.
+\end{enumerate}
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.45\textwidth]{images/None_confusion_matrix_avg.png}
+    \caption{Confusion matrix for \eclair boxes matched with ground truth on the DocLayNet evaluation dataset, averaged over thresholds of $IoU \geq \{0.5, 0.55, ..., 0.9, 0.95\}$.}
+    \label{fig:eclair_conf_mat}
+\end{figure}
+
+\Cref{fig:eclair_vs_swindoc_plot} shows PR-Curves of individual classes for $IoU \geq 0.5$ and 1001 recall-bins vs predictions from SwinDocSegmenter \cite{swindocsegmenter}. For \eclair, scores are taken from class-token logits, which apparently are not a good separator for true positives vs false positives, compared to SwinDocSegmenter's scores. \eclair does not predict additional low-score boxes, causing curves to drop to zero when all boxes are included. SwinDocSegmenter curves are smoother due to over-predicted boxes, allowing proper score thresholds for each class.
+
+The second part of \cref{fig:eclair_vs_swindoc_plot} shows averaged PR-Curve over all classes for $IoU \geq 0.5$ and 1001 recall-bins. Steps in the \eclair curve come from averaging over classes, cutting off at the mean precision (mP)/mean recall (mR) point. 
+
+In the main paper, we have shown \eclair to be competitive on mAP metric when using methods from the earlier autoregressive object detection literature \cite{pix2seq} such as sequence augmentation and top-k selection that are able to increase the recall of the model at the cost of the low precision. Still, we show \eclair to be a strong predictior without the necessity to introduce such augmentations in the next subsection.
+
+\subsection{Comparisons at corresponding precision/recall levels}
+We additionally present a comparison of \eclair to SwinDocSegmenter in a point-to-point manner. Given \eclair's precision and recall value of each class when considering all the predicted bounding boxes, we compare the recall and precision of SwinDocSegmenter at corresponding precision and recall levels (that is, considering equal recall, we want to evaluate which model achieves higher precision, and vice versa). We evaluate each class separately, and report the mean precision and mean recall for both methods. Here, we train a standard \eclair model without sequence augmentation and perform no filtering or post-processing on the predicted bounding boxes, reporting the mean precision and mean recall of the full prediction set. The results are summarized in \cref{tab:eclair_vs_swindoc_tab}. As can be seen, \eclair achieves higher precision at the same recall as SwinDocSegmenter, as well as higher recall at the same precision point, for the vast majority of the classes, as well as on average. 
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.45\textwidth]{images/PR_Curve_allcat_iou0.5.png}
+    \includegraphics[width=0.45\textwidth]{images/PR_Curve_catall_iou0.50_areaall_maxDet100.png}
+    \caption{PR-Curves for individual classes and averaged over all classes for $IoU \geq 0.5$ and 1001 recall-bins evaluated on the DocLayNet evaluation dataset. For \eclair, the scores are taken from the class-token logits. The mean precision and recall are taken from \cref{tab:eclair_vs_swindoc_tab}.}
+    \label{fig:eclair_vs_swindoc_plot}
+\end{figure}
+
+
+\begin{table}[h]
+    \centering
+    \footnotesize
+    \begin{tabular}{l|cc|cc}
+\multicolumn{5}{c}{$IoU\geq 0.5$} \\
+\multirow{2}{*}{Class} & \multicolumn{2}{c|}{\textbf{mP}} & \multicolumn{2}{c}{\textbf{mR}} \\
+                & \eclair & SDS* & \eclair & SDS* \\\hline
+Caption         & \textbf{89.2} & 83.2 & \textbf{91.2} & 89.1 \\
+Footnote        & \textbf{92.4} & 65.6 & \textbf{82.1} & 70.8 \\
+Formula         & \textbf{91.7} & 78.7 & \textbf{90.9} & 83.6 \\
+List-item       & \textbf{91.0} & 87.8 & \textbf{91.4} & 89.6 \\
+Page-footer     & \textbf{94.6} & 93.3 & \textbf{94.0} & 93.2 \\
+Page-header     & 93.4 & \textbf{96.7} & 86.8 & \textbf{91.1} \\
+Picture         & 86.9 & \textbf{92.8} & 85.2 & \textbf{90.9} \\
+Section-header  & \textbf{93.0} & 90.5 & \textbf{90.1} & 87.8 \\
+Table           & \textbf{88.4} & 87.8 & \textbf{85.2} & 84.8 \\
+Text            & \textbf{94.0} & 91.0 & \textbf{93.4} & 90.9 \\
+Title           & \textbf{87.8} & 44.2 & \textbf{87.0} & 56.6 \\\hline
+All             & \textbf{91.1} & 82.9 & \textbf{88.8} & 84.4 \\
+\end{tabular}
+\begin{tabular}{l|cc|cc}
+\multicolumn{5}{c}{\vspace{\baselineskip}} \\
+\multicolumn{5}{c}{$IoU\geq 0.5:0.95$} \\
+\multirow{2}{*}{Class} & \multicolumn{2}{c|}{\textbf{mP}} & \multicolumn{2}{c}{\textbf{mR}} \\
+                & \eclair & SDS* & \eclair & SDS* \\\hline
+Caption         & \textbf{82.8} & 72.1 & \textbf{84.7} & 79.5 \\
+Footnote        & \textbf{79.0} & 59.8 & \textbf{70.1} & 62.8 \\
+Formula         & \textbf{76.8} & 56.5 & \textbf{75.8} & 56.1 \\
+List-item       & \textbf{85.0} & 68.2 & \textbf{85.4} & 82.1 \\
+Page-footer     & \textbf{74.7} & 45.3 & \textbf{74.2} & 59.8 \\
+Page-header     & \textbf{78.6} & 64.0 & \textbf{73.0} & 68.4 \\
+Picture         & 80.7 & \textbf{88.6} & 79.1 & \textbf{85.3} \\
+Section-header  & \textbf{78.7} & 53.4 & \textbf{76.2} & 59.8 \\
+Table           & \textbf{84.9} & 84.3 & \textbf{81.8} & 81.5 \\
+Text            & \textbf{88.5} & 60.6 & \textbf{88.0} & 79.6 \\
+Title           & \textbf{83.2} & 20.6 & \textbf{82.3} & 49.7 \\\hline
+All             & \textbf{81.2} & 61.2 & \textbf{79.2} & 69.5 \\
+    \end{tabular}
+    \caption{The mean precision and mean recall of \eclair for each class and the corresponding mean recall and mean precision of SwinDocSegmenter for the respective recall/precision on the PR-curve evaluated on the DocLayNet evaluation dataset. Computed for $IoU \geq 0.5$ (corresponding to \cref{fig:eclair_vs_swindoc_plot}) and for averaged thresholds of $IoU \geq \{0.5, 0.55, ..., 0.9, 0.95\}$ (default for COCO metrics). *SDS: SwinDocSegmenter.}
+    \label{tab:eclair_vs_swindoc_tab}
+\end{table}
+
+
+\section{LLM Training}
+
+We train both models with a total of 300B tokens obtained from a combination of sources. We ensure that the models are trained for 3.3 epochs of the tokens  extracted using \eclair and PyMuPDF4LLM. These tokens are extracted from a common set of PDFs for both methods. The rest of the 300B training tokens come from various sources including CommonCrawl snapshots, Stack Exchange, OpenWebMath~\cite{paster2023openwebmath}, PubMed Abstracts, PubMed Central, bioRxiv, SEC filings, Wikipedia and ArXiv data. 
+
+\subsection{Postprocessing and Joining Pages}
+To join pages and handle the positioning of floating objects, we follow these steps:
+
+\begin{enumerate}
+    \item \textbf{Process Pages Individually:} Each page is processed separately. To manage paragraphs that span across pages, we need to carry open paragraphs over to next pages.
+    \item \textbf{Reassign Floating Objects:} Floating objects (e.g., images, tables, captions) are removed and captions are reassigned to their respective objects using Hungarian matching based on the Manhattan distance of the bounding boxes.
+    \item \textbf{Concatenate Pages:} Pages are concatenated while skipping sections like Table of Contents, Bibliography, and Indexes by detecting typical headings. Floating text blocks (e.g., Text and List-item) are merged based on specific rules, such as not ending with punctuation.
+    \item \textbf{Remove Markdown Formatting:} All markdown formatting is removed from the inner text to ensure consistency.
+    \item \textbf{Flush Floating Objects:} After processing each page, floating objects that are not part of the floating text are flushed to the output blocks.
+\end{enumerate}
+
+\section{Examples of predictions}
+
+In this section, we present examples of predictions from \eclair on samples from the Common Crawl dataset. Figure~\ref{fig:good-samples} contains samples with tables, formulae, pictures and a variety of other elements. 
+
+\begin{figure*}[htbp]
+    \centering
+    \begin{minipage}[c]{0.33\linewidth}
+        \centering
+        \includegraphics[width=\linewidth]{images/ex2.png}
+    \end{minipage} \hspace{0.5cm}
+    \begin{minipage}[c]{0.57\linewidth}
+        \centering
+        \includegraphics[width=\linewidth]{images/ex1.png}
+    \end{minipage} \\[0.5cm]  % Vertical space between rows
+    
+    % Second row
+    \begin{minipage}[c]{0.34\linewidth}
+        \centering
+        \includegraphics[width=\linewidth]{images/ex3.png}
+    \end{minipage} \hspace{0.5cm}
+    \begin{minipage}[c]{0.57\linewidth}
+        \centering
+        \includegraphics[width=\linewidth]{images/ex4.png}
+    \end{minipage}
+    \caption{Examples of pages with tables, formulae and pictures. On the left, predicted bounding boxes superimposed on the original sample image. On the right, the corresponding full predictions.}
+    \label{fig:good-samples}
+\end{figure*}

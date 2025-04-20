@@ -1,0 +1,144 @@
+\section{\solution}
+
+To solve this problem, we propose \solution, a system that unleashes the full efficiency of token filtering. \solution features two main design points: 1) \solution filters the activations in the backward computation to retain sufficient sparsity (\S\ref{sec:system:filter_activation}); 2) \solution transforms the sparse GEMM to dimension-reduced dense GEMM through automatically updating the backward computation graph to achieve maximum performance with existing hardware (\S\ref{sec:system:accelerate_sparse_gemm}).
+
+\subsection{Activations or Loss?} \label{sec:system:filter_activation}
+
+Although existing method~\cite{RHO} filters loss of inconsequential tokens at the output layer, they leave activations of filtered tokens unchanged which will subsequently participate in the backward computation and cause dense gradients. The backward computation starts at the last layer and propagates to the first layer. Essentially, the gradients passed from the $i$-th layer to the $i-1$-th layer are computed based on the input gradients and activations of the $i$-th layer. Existing works leave the activations unchanged, \ie, the dense activation of the filtered tokens are still stored in the memory and used for computing the gradients. Thus, even though the input gradients of the $i$-th layer are sparse, the activations are dense and the gradients passed to the $i-1$-th layer are also dense, leading to limited optimization opportunities. To solve this problem, \solution further filters the activations in the backward computation to retain suffcient sparsity.
+
+To understand how the activations impact the gradient computation, we first analyze the forward and backward computations of the attention block. \Cref{eq:sys:attn_full_forward} shows the forward computation of the self-attention, where $\mathbf{X}$ is the input, $\mathbf{W}_Q, \mathbf{W}_K$ are the model parameters, and $\mathbf{Q, K, V}$ are the query, key, and value matrices, and $\mathbf{X'}$ is the output. \Cref{eq:sys:attn_backward_activation} shows the backward computation of the attention block, where the underlined terms are the activations saved during the forward computation. We make the following observations:
+\begin{icompact}
+\item The activation of $softmax$ determines the sparsity of $\mathbf{V}$'s gradient. It also implicitly impacts the gradients of $\mathbf{Q}$ and $\mathbf{K}$ through $\mathbf{G}_A$ (\ie, $\mathbf{G}_A$ is also computed based on $softmax$~\cite{FlashAttention}). Thus, the activation of $softmax$ needs to be filtered to retain the sparsity. Specifically, we remove the data corresponding to the filtered tokens.
+\item The activations of linear transformation (\eg, $\mathbf{W}_{Q}$) only work on the hidden dimensions and do not impact the sequence dimension, thus having no impact on the sparsity of the gradients (\ie, filtering tokens will only bring sparsity in the sequence dimension). Similarly, the activations in the feedforward network (FFN) do not need to be filtered.
+\end{icompact}
+\begin{equation} \label{eq:sys:attn_full_forward}
+\left\{ 
+\begin{aligned}
+	\mathbf{Q} &= \mathbf{X} \times \mathbf{W}_Q,\ \mathbf{K} = \mathbf{X} \times \mathbf{W}_K,\ \mathbf{V} = \mathbf{X} \times \mathbf{W}_V\\
+	\mathbf{A} &= \mathbf{Q}\times\mathbf{K}^T / \sqrt{d} \\
+	\mathbf{X'} &= softmax(\mathbf{A}) \times \mathbf{V} \\
+\end{aligned}
+\right.
+\end{equation}
+\begin{equation} \label{eq:sys:attn_backward_activation}
+\left\{ 
+\begin{aligned}
+	\mathbf{G}_V &= \underline{softmax^T} \times \mathbf{G}_{X'} \\
+	\mathbf{G}_Q &= \mathbf{G}_A \times \underline{\mathbf{K}} \times \sqrt{d} \\
+	\mathbf{G}_K &= \mathbf{G}_A^T \times \underline{\mathbf{Q}}  \times \sqrt{d} \\
+	\mathbf{G}_{X} &= \mathbf{G}_Q \times \underline{\mathbf{W}_{Q}^T} \ | \ \mathbf{G}_K \times \underline{\mathbf{W}_{K}^T} \ | \ \mathbf{G}_V \times \underline{\mathbf{W}_{V}^T} \\
+\end{aligned}
+\right.
+\end{equation}
+\begin{figure}[t]
+	\centering
+	\includegraphics[scale=0.43]{figures/dv_filter.pdf}
+	\caption{By filtering the activations in the backward of attention block, we maintain the efficiency advantages of backward token filtering. Other activations (\eg, for backward on $\mathbf{Q}$ and $\mathbf{K}$) are also filtered simultaneously.} % \highlight{TODO: mark the dimension names}} 
+	\label{fig:dv_filter}
+    % \vspace{+2mm}
+\end{figure}
+\Cref{fig:dv_filter} illustrates filtering the $softmax$ activation when computing the gradients of $\mathbf{V}$ with the corresponding rows of $softmax^T$ set to zero. By filtering the activations, the gradients of $\mathbf{V,Q,K}$ and the gradients back-propagated to the front layers will still be sparse, which retains the sparsity and the opportunity to accelerate the end-to-end training efficiency. For implementations that do not explicitly store $softmax$ activation (\eg, FlashAttention~\cite{FlashAttention}), we can alternatively filter the $\mathbf{Q}$ and $\mathbf{K}$ which are used to compute the $softmax$. 
+
+\parab{Analyzing the correlation between filtering loss and activations.} 
+In causal language modeling, the hidden states of each token are constructed based on all preceding tokens. Although the loss associated with unimportant tokens is filtered, the loss of the remaining tokens still incorporates information from all prior tokens, including those that have been filtered. Consequently, gradients are propagated from the remaining tokens to the hidden states of the filtered tokens. We propose to filter the activations primarily by modifying the softmax function, which thus implicitly cuts off the connections from the remaining tokens to the filtered tokens. This approach effectively eliminates the gradients of the filtered tokens during the backward computation, thereby retaining sparsity.
+
+\subsection{Dimension-reduced Dense GEMM}\label{sec:system:accelerate_sparse_gemm}
+
+Filtering the activations in the backward computation retains sufficient sparsity to improve training performance. However, existing sparse GEMM implementations cannot effectively support token filtering. Our experiments show that existing sparse GEMM is effective only when the data is highly sparse (\eg, filtering 95\% tokens) (\S\ref{sec:efficiency_motivation}). However, the typical token filtering ratio is 30\% $\sim$ 40\% under which existing sparse GEMM implementations even have worse performance than dense GEMM. 
+
+To address this problem, we propose transforming sparse GEMM into dimension-reduced dense GEMM by leveraging the characteristics of sparsity in token filtering scenarios (\S\ref{sec:system:transfer_sparse_to_dense}). However, performing dimension reduction is challenging due to the dynamics of the computation graph, making static updating rules impractical (\S\ref{sec:system:challenges_of_updating_graph}). To this end, we introduce an automatic workflow that utilizes runtime stability to determine the graph nodes and employs special markers to finalize the node updating logic (\S\ref{sec:system:using_markers}).
+
+\subsubsection{Transforming Sparse GEMM to Dimension-reduced Dense GEMM} \label{sec:system:transfer_sparse_to_dense}
+
+To understand and optimize the computation after filtering, we first carefully analyze the characteristics of sparsed computation in the backward process. \Cref{fig:torch_node_template} shows the generalized backward process in the computation graph of existing machine learning libraries (\eg, PyTorch), where $\mathbf{G} \in \mathbb{R}^{bsz*seq \times d_1}$ is the gradients matrix, $bsz$ is the batch size, $seq$ is the sequence length, $d_1$ is the hidden size, $\mathbf{W} \in \mathbb{R}^{d_1 \times d_2}$ is the parameter matrix, and $\mathbf{X} \in \mathbb{R}^{bsz*seq \times d_2}$ is the input matrix. The gradients of the filtered tokens are set to zero (\ie, $\mathbf{G}$ is row-wise sparse).
+
+\begin{figure}[h!]
+	\centering
+	\includegraphics[scale=0.45]{figures/torch_node_template.pdf}
+	\caption{The generalized backward computation in existing machine learning libraries (\eg, PyTorch). Each node in the computation graph necessarily has the input gradients and output for the next nodes. The model weights and saved variables could be optional and vary in different nodes (\eg, transpose and slicing have no model weights).} 
+	\label{fig:torch_node_template}
+    \vspace{+2mm}
+\end{figure}
+
+We can categorize the sparse GEMM into two types: 1) Gradients for previous nodes: $\mathbf{G}_{sparse} \cdot \mathbf{W}$, $\mathbf{G}_{sparse} \odot \mathbf{g}$, which are sparse and passed to the next nodes. $\mathbf{g}$ is a scaler or vector that performs element-wise computation on the gradients; 2) And the gradients of model parameters: $\mathbf{G}^T_{spase} \cdot \mathbf{X}$, which will be dense and updated to the model weights. Based on these analyses, we have the following observations:
+
+\begin{icompact}
+\item The gradients passed to the next nodes inherit the sparsity of the input gradients and the sparsity follows the same pattern as the input gradients (\ie, the gradients of filtered tokens are zeros). Thus if we shrink the sequence dimension at the initial gradients (\ie, removing the zeros), all the afterward gradients will be automatically reduced.
+\item The sequence dimension vanishes in the gradients of model parameters, which is reasonable since the parameters are independent of the sequence length, and we can directly shrink the sequence dimension to reduce the computational cost.
+\end{icompact}
+
+Instead of directly optimizing the sparse matrix computations, we leverage the above observations and propose to globally reduce the sequence dimension of the gradients and the saved variable in the backward computation graph to accelerate the computation. \Cref{fig:shrink_dim} illustrates the computation before and after reducing the sequence dimension. By shrinking the sequence dimension, we can transform the sparse GEMM to dimension-reduced dense computations with optimized performance. Compared with directly optimizing the sparse GEMM, transforming to dense GEMM is more effective since the dense GEMM has been well optimized on existing hardware.
+
+\begin{figure}[h!]
+	\centering
+	\includegraphics[scale=0.42]{figures/shrink_dim.pdf}
+	\caption{Computations before and after reducing the sequence dimension. Instead of directly optimizing the sparse matrix computations, we leverage the characteristics of token filtering and globally reduce the sequence dimension.} 
+	\label{fig:shrink_dim}
+    % \vspace{+2mm}
+\end{figure}
+
+\subsubsection{Dynamic Graph Complicates the Transformation} \label{sec:system:challenges_of_updating_graph}
+
+Based on observations from backward computations, sparse matrix operations can be reformulated into dimension-reduced dense computations. To implement this proposed approach, it is crucial to first understand the functionality of existing automatic differentiation (autograd) libraries. For example, PyTorch, one of the most widely used frameworks, employs a dynamic computational graph that is constructed incrementally as operations are executed.
+Other machine learning libraries (\eg, TensorFlow~\cite{TensorFlow}) and systems (\eg, MegatronLM~\cite{MegatronLM} and DeepSpeed~\cite{deepspeed}) also use a similar graph-based approach or are mostly built on PyTorch.
+The backward graph is built during forward propagation and is utilized only once to compute gradients (\ie, discarded after the backward pass in each iteration).
+
+Backward token filtering occurs after the forward computation, at which point the computation graph has already been constructed. Therefore, we need to update the computation graph node by node (\eg, updating the sizes and variables) prior to performing the backward computation. However, modifying the computational graph poses significant challenges due to the following reasons:
+
+\begin{icompact}
+	\item Dynamic graph structure. The computational graph is dynamically built. Different implementations of the same algorithm can have significantly different backward computation graph. Even the input and output can impact the graph, \eg, FlashAttention~\cite{FlashAttention} only accept model weights in 16-bits and naive attention implementation is the only choice if we need to explicitly output the attention values. The dynamic graph structure makes it impractical to design static updating rules based on the model (\eg, designing static rules for updating self-attention and FFN layers).
+	\item Dynamic usage of the graph nodes. The same type of node can have different inputs and outputs in different models or even in the same model. For example, the same multiplication node has different outputs when multiplying with scalar, vector, or matrix. The dynamic usage of the graph nodes makes it impractical to use static updating rules based on the node types.
+	\item Numerous types of nodes. Different models typically have different computations and thus use different type of nodes. Different nodes require different updating logic. PyTorch, for instance, has over 300 node types, significantly increasing the complexity of system implementation.
+\end{icompact}
+
+In summary, effectively accelerating the token filtering requires us to transform the sparse GEMM to dimension-reduced dense GEMM that requires updating the computation graph, which is challenging due to the dynamic of graph structure, the dynamic usage of nodes, and the numerous types of nodes. 
+
+
+\subsubsection{Automatic Graph Updating Workflow} \label{sec:system:using_markers}
+
+To address this issue, we propose an automatic workflow to amend the computational graph. The key insight is that, even though the graph is highly dynamic, it still can be deterministic when using the same implementation and inputs. Particularly, the model implementation and inputs remain the same during the whole training (\ie, runtime stability). Thus, we can mimic the input and traverse the graph using the same implementation to dynamically determine the node information. 
+The automatic workflow contains two steps: 1) generating the skeleton code for processing each type of nodes and their attributes; 2) leveraging special markers to generate detailed node processing rules.
+
+Specifically, we first perform a coarse-grained graph traversing using synthetic data (\ie, mimicing the actual inputs) to collect all the node types and find the target attributes (\eg, sizes and variables) that need to be updated. \Cref{tab:attr} shows examples of the node attributes that need to be amended. We select the list of target attributes and corresponding data types based on Torchgen, which could be easily updated if more attributes needs to be processed. 
+We generate skeleton codes for processing attributes of all the nodes and the implementation detail is presented in \S\ref{sec:imple:offline}.
+
+\begin{table}[t!]
+	\centering
+	% \setlength{\tabcolsep}{0.2em}
+	\renewcommand\arraystretch{1}
+	\small
+	\begin{tabular}{c|c|c}
+		\hline
+		\tabincell{c}{Node Attributes} & \tabincell{c}{Data Type} & \tabincell{c}{Operations} \\
+		\hline
+		InputMetadata & \tabincell{c}{Int Array} & \tabincell{c}{Update size} \\
+		SavedVariables & \tabincell{c}{Tensor} & \tabincell{c}{Reduce Dimensions} \\
+		Matrix Sizes & \tabincell{c}{Int Array} & \tabincell{c}{Update size} \\
+		Matrix \# of elements & \tabincell{c}{Int} & \tabincell{c}{Update value} \\
+		\hline
+	\end{tabular}
+	\caption{Examples of the nodes' attributes that need to be updated during amending the graph.} 
+	\vspace{-2mm}
+	%between the servers or between the server and data contributors.}
+\label{tab:attr}
+\end{table}
+
+% \begin{figure}[t!]
+% 	\centering
+% 	\includegraphics[scale=0.19]{figures/gen_code.png}
+% 	\caption{Generated skeleton code for processing GEMM and FlashAttention nodes. The automatic code generation enables us to support various nodes with low implementation costs (\eg, PyTorch has more than 300 types of nodes).} 
+% 	\label{fig:gen_code}
+%     \vspace{+2mm}
+% \end{figure}
+
+After obtaining the skeleton code for updating the node attributes, we still need to determine the updating logic. Specifically, we need to determine which dimensions should be reduced and the sizes after the reduction. We only focus on the sequence dimension since we need to filter out unimportant tokens. However, the index of the sequence dimension varies among different nodes and may also be mixed with the batch size. Moreover, the same type of node can have different dimensions at different positions in the same graph, making it impractical to use static updating logic. To address this issue, we design a simple-but-effective method by marking the batch size and sequence length with special numbers to precisely find the shrinking dimensions of various nodes in the computational graph. \Cref{fig:marker_example} shows an example of marking the batch size and sequence length with prime numbers. 
+In the skeleton code, we use a greedy algorithm to find the batch size and sequence dimension. Directly using the greedy algorithm can produce wrong results as the batch size or sequence length may be identified with other dimensions (\eg, the sequence length and hidden dimension could be both 2048). The special markers avoid the ambiguity of the dimension and enable the greedy algorithm to precisely find the shrinking dimensions and determine the size after the reduction. The system will cache the output of greedy algorithm for online training (\S\ref{sec:imple:offline}).
+
+
+\begin{figure}[t!]
+	\centering
+	\includegraphics[scale=0.45]{figures/marker_example.pdf}
+	\caption{An example of marking batch size and sequence length with prime numbers. Leveraging the special marks is a simple-but-effective way to precisely find the shrinking dimensions of various nodes in the computational graph.} 
+	\label{fig:marker_example}
+    \vspace{+2mm}
+\end{figure}

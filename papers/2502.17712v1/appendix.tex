@@ -1,0 +1,176 @@
+\section{Implementation Details}
+\label{app:implementation_details}
+
+We discuss GPU-specific implementation details of our algorithm below.
+
+\paragraph*{Detecting Visible Triangles.} To identify all triangles which are visible, we first perform a depth pre-pass from the camera's view, filling the depth buffer. We then perform a second pseudo-rendering pass with conservative rasterization enabled, testing each triangle against the depth buffer using the {\em less than or equal} depth test condition. For any fragment that passes the depth test, we mark the triangle from which that fragment originated as visible in a {\em visible triangle buffer} (VT buffer) which contains an entry for each triangle in the scene. This buffer is initialized with all null values; once a triangle is determined to be visible we record its ID in the corresponding entry. This method of recording visibility is inspired by visibility buffers \cite{burns2013visibility} and the observation that efficient GPU occlusion testing can be performed using buffer objects \cite{kubisch2014opengl}.  
+
+\paragraph*{GPU Union Find.} We implement GPU union find using the {\em ECL-CC} method of Jaiganesh and Burtscher \shortcite{Jaiganesh:2018}, which implements the union-find algorithm on the GPU in three stages: initialization, a union-find algorithm based on pointer hooking, and finalization. As Jaiganesh and Burtscher's algorithm was originally designed for arbitrary graphs of high degree, we specialize it for our problem case as follows. First, their original paper initializes node component IDs (in our case, triangle IDs) by setting them to the value of their first connected neighbour with a lower value. For arbitrary graphs, this produces a good initialization while not visiting all edges, which is important for nodes of high degree. Since our highest degree is 3, we initialize the triangle component IDs directly using the visibility shader, and simply visit every edge subsequently during initialization. Second, they split their hooking step into two distinct kernels to account for vertices of high degree; as our highest degree is 3, we do not do this. We implement the entire algorithm as three separate GLSL compute shaders, synchronized with memory barriers to achieve synchronization between all threads and not just those in a given work group.
+
+
+\begin{figure*}
+\vspace{-10pt}
+\includegraphics[width=\linewidth]{fig_supp_unionfind_v2.pdf}
+\caption{GPU Union Find. Given each triangle labelled with its starting index, we first initialize by linking each triangle to its neighbor of lowest index (a) through the half-edge data structure. Triangles are then hooked together such that each has a path to the root triangle (b). We then initialize a mapping from vertices to triangle roots by writing to each vertex the minimum root of its connected triangles (c). Finally, we perform another connection step through the initialized vertex roots (d) and then flatten the entire data structure to point to the global root (e), which is then recorded as the root triangle for the newly formed chart.}
+\vspace{-10pt}
+\label{fig:union_find}
+\end{figure*}
+
+In order for chart IDs to be read by the vertex shader during shading and rasterization without changing the mesh topology in the triangle index buffer, we require each {\em vertex} to be mapped to a unique visible chart; this is made possible by our charts having seams at visible borders. We therefore run an additional compute pass which merges any two formed charts that share a common vertex at their boundary. The resulting set of charts then satisfies this requirement, and we generate a {\em vertex-to-chart map} to be used during shading and rasterization. Pseudocode is provided in Algorithm 1 in this document. An overview diagram is provided in Figure \ref{fig:union_find}.
+
+\paragraph{Discontinuity Processing at Chart Boundaries.} Our chartification method does not form visible seams on continuous surfaces, allowing us to effortlessly avoid artifacts such as those in Fig. 2c. However, like all standard shading approaches that use bilinear sampling, we must take care to avoid sampling artifacts along geometric discontinuities; in other words, even though our seams are invisible, any sample at the edge of a chart still must still have a plausible color for bilinear filtering to work correctly. Following Andersson et al. \cite{andersson2014adaptive}, we use a two-pass approach with conservative rasterization. We first render each triangle with conservative rasterization disabled; we then render each triangle again with depth compare set to {\em strictly less} and conservative rasterization enabled. This ensures that a bilinear tap occuring at the boundaries of a chart has shaded texels to read from, without the problems of image dilation methods.
+
+\paragraph{Alpha Tested Materials.} We handle alpha tested materials conservatively by not writing any triangle during the depth pre-pass that is not fully opaque (ie. has alpha=$1$ everywhere), and by testing triangle visibility for alpha-tested materials as though alpha testing was disabled. In effect, we never consider materials with alpha to be occluders, and we never test alpha value during rasterization. In practice, we found that this approach avoids numerous edge cases with little to no impact on rendering speed. 
+
+\paragraph*{Shading and Rasterization.}
+
+Our framework is compatible with all existing approaches for texture space shading, including forward shading, raytraced illumination, or deferred shading in texture space \cite{baker:2016}. For demonstration purposes, in the examples shown we implement a standard forward shading based rendering pipeline: we transform the vertices of our chart triangles within the vertex shader, clip these triangles using the standard GPU triangle setup engine, and finally shade the fragments within a dedicated fragment shader.  We implemented our method in the G3D Innovation Engine \cite{G3D17}, a commercial grade renderer which provides a suitable forward shading pipeline for texture-space shading. 
+
+To position our charts in the texture atlas for shading, we run a standard vertex shader on the vertices of each chart. Our shader first applies the standard camera and perspective transformation to all vertices for the current view; it then scales all charts by the scale factor $S$ and finally, for the vertices within each chart, it applies a per-chart rigid transformation that maps the chart's bounding box in post-perspective divide NDC space to its corresponding previously computed bounding box in the shading atlas. When shading into the atlas, we clip triangles using the GPU triangle setup engine: we compute the distance in homogenous clip space between each vertex and the homogenous clip planes of the original, screen-space projection in the vertex shader, and pass them to the GPU as user clip planes  to discard any fragment that needs to be clipped. 
+
+\paragraph*{Filtering Across Hard Edges.} To render the frame of interest as seen from the camera using a FastAtlas generated atlas, we use the same logic as used for shading, except that the chart UV coordinates are passed to the fragment shader verbatim post-division with no need to invoke the user clip planes. (Any fragment being rasterized where $w<0$ during rasterization is off-screen by definition, and will be culled as part of the normal culling pipeline.) When the input geometry contains sharp edges or discontinuities, our method will by default perform bilinear filtering across the boundary; however, some applications may prefer shading to be discontinuous across such edges. We propose a simple modification to the final rasterization pass to achieve this. For each fragment, we consider the 4 texels that would be addressed by a standard bilinear fetch. We determine whether each texel should contribute to the final fragment color with two simple tests: if it is in the same triangle as the current fragment; or if it is in a triangle adjacent to the current fragment, but the angle between the two faces is less than a user-defined threshold. We find empirically that a threshold of 75 degrees performs well, effectively preventing sampling across sharp edges and depth discontinuities within the same chart. To support these queries, we also render a 32-bit triangle ID texture when shading to the atlas.
+
+Our conditions may yield anywhere between 0 and 4 valid texels for each fragment. To reconstruct shading from a variable number of samples, we proceed case-by-case. If 0 texels are valid, we use the nearest texel, and if only 1 texel is valid, we use it. If 2 texels are valid, we linearly interpolate their values. If 3 texels are valid, we perform barycentric interpolation using the barycentric coordinate formula derived by Sen et al. \cite{Sen2004SilmapTex}. However, it is possible for the result to fall outside the range of the three input colors if the sample location is outside the triangle formed by the three valid texels, yielding shading that appears incorrect \cite{Sen2004SilmapTex}. Slightly modifying their proposed solution, we clamp the resulting color to the per-component minimum and maximum of the input colours. Finally, if all 4 texels are valid, we use standard bilinear interpolation. All results in the paper are generated with our modified sampling enabled.
+
+\input{union_find}
+
+\paragraph*{Data Structures.} Table \ref{tab:data_structures} provides a summary of all data structures and intermediate buffers used by our method, as well as their memory requirements.
+
+\input{data_structures}
+
+\section{Performance Measurement Details.}
+
+\paragraph*{Test Corpus.} Our test corpus includes detailed exterior (\textit{bistro exterior}, \textit{Greek Villa}, \textit{San Miguel}) and interior spaces (\textit{bistro interior, sibenik, robot lab, breakfast room, modern house}), with highly detailed geometry and high triangle counts (2.9 million triangles for \textit{bistro exterior}, over nine million triangles for {\em San Miguel}). The circular paths have 300 frames, and target 5 seconds of rendered footage at 60 frames per second. The spline paths have 1,320 frames.
+
+\paragraph*{Timing Methodology.} To ensure accurate and representative timings, the GPU and memory clocks were locked using the {\em nvidia-smi} tool prior to measurement. We first render one full flight path without taking measurements to ensure that caches are heated and all shaders required for the scene are compiled. We then render all frames again and report the measurements across all frames. To produce a representative measure of algorithm performance in real world scenarios we follow \cite{Neff2022MSA} and add extra lights to the scenes (specifically, we add 100 extra point lights using a loop in the shader). 
+
+\paragraph*{Implementation of Alternative Methods.} To compare our results with \cite{Neff2022MSA} we used the meshlet generation code provided to us by the authors, and re-implemented the rest of their pipeline, including their superblock packing scheme (they were unable to share the rest of the codebase but kindly advised us on implementation details). Our implementation of Shading Atlas Streaming \cite{mueller2018shading} is based on their paper, using the same superblock allocation code we use for \cite{Neff2022MSA}. We note that Hladky et al. \shortcite{hladky2022quadstream}, who had access to the original SAS codebase, report that SAS fails on some models on which our reimplementation of their method succeeds (most notably, {\em San Miguel}). We also note that both \cite{Neff2022MSA} and \cite{mueller2018shading} operate on refined and remeshed versions of the input scenes for their experiments. Our paper operates on the original scenes, taken from the Computer Graphics Archive \cite{McGuire2017Data}, without geometry refinement. Neff et al. originally used a dilation filter to handle bilinear sampling at chart boundaries, rather than conservative rasterization; we tried both approaches and found that conservative raster produced slightly reduced \FLIP error for both methods on our test scenes; therefore we use conservative raster for both their method and ours. For SAS, we handle bilinear filtering by following their methodology and dilating UVs inwards by $0.5$ texels; for 1-pixel charts, which SAS can produce, we simply disable it.
+
+The size of the superblock used for packing is a critical parameter for both of these methods: they can fail to produce atlases if the superblock size is too large and not enough superblocks can be fit into the atlas for a given frame. At the same time, using smaller superblocks requires scaling charts down, reducing sampling rate and thus visual quality. In their work, Neff et al. use $2048 \times 2048$ superblocks and a target atlas size of $16k \times 8k$. The original SAS paper ~\shortcite{mueller2018shading} uses superblock sizes of size $256 \times 256$ for their experiments with 8 and 16 megapixel atlases and $128 \times 128$ for 2 and 4 megapixel atlases. For a maximally fair comparison, we start with each method's largest reported superblock size for all test scenes; if packing fails, we rerun the entire scene using a superblock size that is half the previous size, and repeat until finding a superblock size that fits. We note that this would not be viable in a real-world application, as this comes with a significantly increased computational cost. Unlike our prefix-sum based approach, block allocation does not lend itself to parallelization across all candidate scales; to achieve high performance, block allocation is already parallelized efficiently across all charts \cite{mueller2018shading}, meaning that that the GPU is already fully utilized. (Furthermore, their three-phase allocation scheme would require keeping a full copy of the superblock data structure for each resolution being tested.) The alternative of picking a superblock size small enough to ensure that packing would never fail for any scene in our corpus would result in much more severe undersampling, significantly degrading both methods' outputs. 
+
+We attempted to compare against UV-based meshlet shading atlases (MSA-UV in \cite{Neff2022MSA}), which use offline LSCM-based UV computation for each meshlet rather than perspective projection, but found that in practice it was impossible to generate LSCM-parameterized meshlets with non-refined geometry without foldovers (Fig. ~\ref{fig:msa_uv_foldover_fail}). 
+
+\begin{figure}
+\includegraphics[width=\linewidth]{fig_supp_msa_uv_v1.pdf}
+\caption{Attempting to parameterize meshlets with LSCM parameterization on non-remeshed input geometry results in failure, as LSCM does not guarantee bijectivity for irregular atlases.}
+\label{fig:msa_uv_foldover_fail}
+\end{figure}
+
+\section{Additional Gallery.}
+
+We provide additional examples of FastAtlas renders generated using reduced shading rates and fixed-size atlases ($2K \times 2K$ and $4K \times 4K$) compared to alternatives in Figs. \ref{fig:supp_reduced_sr}, \ref{fig:supp_more_lowres}, \ref{fig:supp_more_lowres_sas}, and \ref{fig:supp_more_lowres_meshlet}.
+
+\begin{figure*}
+   \includegraphics[width=\linewidth]{fig_supp_reduced_sr_v6_robotLab.pdf}
+    \caption{Comparing FastAtlas to \cite{Neff2022MSA} and a forward upsampling baseline when targeting reduced shading rates. Here, all methods target a shading rate of 25\% ($0.25^2=0.0625$, or 6.5\% samples). The forward upsampling baseline (b) introduces jagged artifacts while \cite{Neff2022MSA} (c) exhibits undersampling (highlighted on zoomed images). FastAtlas (d) achieves the most similar results to ground truth forward rendering (a) and preserves important details even at a 25\% shading rate.}
+    \label{fig:supp_reduced_sr}
+\end{figure*}
+
+\begin{figure*}
+\includegraphics[width=\linewidth]{fig_supp_low_res_all_v2_sibenik.pdf}
+\caption{Additional comparisons with prior art ($2K \times 2K$ atlases). Left to right: reference forward render, static atlasing, SAS \cite{mueller2018shading}, MSA  \cite{Neff2022MSA}, FastAtlas. While all prior method outputs exhibit notable undersampling, our results remain visually close to forward rendering.}
+\label{fig:supp_more_lowres}
+\end{figure*}
+
+\begin{figure*}
+\includegraphics[width=\linewidth]{fig_supp_low_res_us_sas_v2_bistroInt.pdf}
+\caption{Additional comparisons with SAS \cite{mueller2018shading} using $2K \times 2K$ atlases. Left to right: reference forward render, SAS \cite{mueller2018shading}, FastAtlas. While SAS outputs exhibit notable undersampling, our results remain visually close to forward rendering.}
+\label{fig:supp_more_lowres_sas}
+\end{figure*}
+
+\begin{figure*}
+\includegraphics[width=\linewidth]{fig_supp_low_res_us_meshlet_v1_bistroExt.pdf}
+\caption{Additional comparisons with MSA \cite{Neff2022MSA} using $4K \times 4K$ atlases. Left to right: reference forward render, MSA-P \cite{Neff2022MSA}, FastAtlas. While MSA outputs exhibit notable undersampling and seam artifacts, our results remain visually close to forward rendering.}
+\label{fig:supp_more_lowres_meshlet}
+\end{figure*}
+
+\section{Additional Experiments.}
+
+\paragraph*{Temporal Reuse.}
+\label{sec:compare_temporal}
+\label{sec:temporal}
+\label{sec:reuse}
+
+To evaluate FastAtlas's suitability for temporal decoupling algorithms, we implement a basic temporal re-use algorithm on top of TSS atlases (Fig~\ref{fig:temporal_compare}), and report runtime, reuse, and quality relative to standard forward rendering. 
+In the first rendered frame, we chart and shade all visible triangles as discussed above. For subsequent frames, we generate a new atlas for each frame, but only shade triangles in this atlas if they are newly or partially visible (a triangle is \textit{partially visible} if it contains at least one vertex for which $\max(|x^p|, |y^p|) \geq w^p$). During rasterization, we test each fragment in a triangle to see if it was visible in the initial frame, by interpolating the triangle's homogenous clip-space coordinates from the original frame and applying the test above. Depending on if the fragment was visible in the initial frame or not, we read texture information from the appropriate atlas. At an adjustable interval, we re-shade the entire chart atlas from scratch. This approach gracefully handles both sudden camera movement and disocclusions.  On average, our FastAtlas-based temporal re-use method reduces shading time by 33\% across all scenes.
+
+\begin{figure}
+\includegraphics[width=\linewidth]{fig_supp_reuse_v2.pdf}
+\caption{Using FastAtlas for temporal re-use: (a) Frame $N$ rendered using FastAtlas; (b) Frame $N+9$ rendered using forward rendering. (c) Our reuse pattern in frame $N+9$ - reused areas greened out. (d) Frame $N+9$ rendered using FastAtlas.}
+\label{fig:temporal_compare}
+\end{figure}
+
+\begin{figure}
+\includegraphics[width=\linewidth]{fig_supp_temporal_v3_arrows.pdf}
+\caption{Examples of typical ghosting artifacts produced by reverse reprojection cacheing \cite{nehab2007accelerating}(b) and our ghost-free temporal reuse results (c); ground truth forward renders on the left (a).}
+\label{fig:ghosts}
+\end{figure}
+
+We compare our approach to the standard reverse reprojection caching method used for screen-space shading reuse (RRC)  \cite{nehab2007accelerating} (Fig. ~\ref{fig:temporal_compare}). We refresh both methods every ten frames, and exclude frames from reporting where both methods regenerate the entire shading cache or atlas from scratch.  
+For both methods we measure the minimum and mean percentages of fragments reused, and mean \FLIP error compared to forward rendering. Both methods achieve comparable fragment reuse on average (90\% for both RRC and FastAtlas) and in the worst case (RRC: 78\%; FastAtlas: 79\%).  We achieve both better average mean \FLIP (RRC: 0.05; FastAtlas: 0.04) and maximum (RRC: 0.07; FastAtlas: 0.05) error across all test scenes; our error with temporal re-use is in fact very close to our baseline TSS error without it (comparing our temporal re-use method to a forward renderer naturally means that \FLIP will measure some error on this test that is not due to temporal re-use, but due to signal aliasing differences between the forward and TSS renderers). While these metrics show moderate improvement, the key advantage of the simple reuse approach we propose is that, by construction, it removes ``ghosting'' artifacts which are prevalent 
+in RRC outputs, despite our efforts to tune its parameters for our scenes (Fig. ~\ref{fig:ghosts}). Visual inspection suggests that ghosting shows up in a large percentage of the RRC outputs (see supplementary gallery).
+
+\input{table_supp_bistro-exterior-simplified-2024-09-19}
+
+\paragraph*{Level of Detail Ablation.} To examine how well FastAtlas and other methods perform on coarser geometry that is optimized for reduced mesh size and vertex/triangle count, we simplified the {\em bistro exterior} scene (2.9M triangles), which has very regular mesh complexity, using the commercially available {\em RapidPipeline} level-of-detail software package. Tab. ~\ref{tab:bistro_ext_simplified} shows the results of our method, SAS, and MSA-P \cite{Neff2022MSA}, on this simplified model with a triangle count reduced by 50\%. Both SAS and MSA-P exhibit higher stretch on this coarser model, which in turn leads to notably lower \FLIP; this observation is supported by Neff's experimental methodology, in which they refine their input meshes before packing them, increasing triangle count in the process. Conversely, FastAtlas produces almost the same \FLIP errors on the unsimplified and simplified model, showcasing robustness.
+
+\input{table_supp_flip-ablation-summary-2024-09-18}
+\input{table_supp_stretch_ablation-summary-2024-09-30}
+\paragraph*{Packing vs Chartifiction Ablation.} To quantify what percentage of our improvement over prior art is due to seam avoidance versus better atlas packing, we perform two experiments. In the first experiment, we pack the meshlet charts of Neff et al. ~\cite{Neff2022MSA} using our packing method; in the second, we pack FastAtlas charts using Neff et al.'s method. We compare the results of these experiments to Neff et al. and standard FastAtlas in Tab.~\ref{tab:ablation}. Using our charts and their packing, the visual quality is notably worse than ours at all resolutions. At higher resolutions the error in this setting is similar to Neff et al., but at low resolutions this ablation notably outperforms their method. When packing meshlets using FastAtlas with 8K atlases the visual quality is nearly-identical to ours; however, as our fixed atlas size reduces to $2K$, we reduce perceptual error by 20.5\% compared to FastAtlas-packed Meshlet charts. These experiments confirm our hypotheses that packing is a key component of our method, that correct handling of seams is critical for good texture-space shading performance, and that the importance of seams increases as chart resolution decreases.
+
+\begin{figure}
+\includegraphics[width=\linewidth]{fig_supp_overshading_v4.pdf}
+\caption{Overshading using FastAtlas: (a) Forward render, (b) Forward rendering to a 3840 $\times$ 2160 display and then downsampled, (c) Same frame rendered using an $8K\times 8K$ FastAtlas with 200\% shading rate.}
+\label{fig:overshading}
+\end{figure}
+
+\paragraph*{Oversampling/Overshading. }
+FastAtlas supports oversampling, where multiple texels correspond to a single pixel. It had been suggested \cite{Baker2022} that oversampling can improve visual quality beyond that of standard forward rendering.  Fig~\ref{fig:overshading} shows an example where we shaded the atlas at 200\% shading rate (4 texels per pixel) by scaling all charts up by factor 2 in each direction. Notably in our experiments we can still successfully pack such charts in an $8K \times 8K$ atlas with only minimal downscaling for all frames of the Bistro Exterior scene; our average chosen scale factor out of 64 is 99.5\% of the target.
+
+\begin{figure*}
+\includegraphics[width=\linewidth]{fig_supp_highres_v1.pdf}
+\caption{On 4K displays (3840 $\times$ 2160), MSA \cite{Neff2022MSA} cannot faithfully preserve even large-scale details such as the floor (b); SAS \cite{mueller2018shading} exhibits severe texture stretch artifacts (c). FastAtlas successfully handles this challenging case (d). Please zoom in for 4K pictures.}
+\label{fig:high_res}
+\end{figure*}
+
+\paragraph*{High-resolution Displays.}  Fig~\ref{fig:high_res} compares FastAtlas, SAS \cite{mueller2018shading}, and MSA \cite{Neff2022MSA} outputs for high resolution displays.
+
+\input{table_supp_compression-2024-10-02}
+
+\paragraph*{Compression Ratios.} A key measure of spatiotemporal stability for streaming is measured using compression ratio under a fixed constant rate factor (CRF); this measures temporal coherency between atlas frames, which in turn determines how efficiently an atlas can be streamed over a network. Across our scenes, our average compression ratios are 0.48\% (CRF=5), 0.48\% (CRF=10), 0.45\% (CRF=25), and 0.23\% (CRF=35) with 4K atlases, and 2.00\% (CRF=5), 1.99\% (CRF=10), 1.11\% (CRF=25), and 0.40\% (CRF=35) with 2K atlases (Table \ref{tab:supp_compression}). We do not compare to our implementation of SAS or MSA, as we do not implement their temporal reuse scheme, which would result in an unfair-to-them comparison. However, we note that Hladky et al. ~\shortcite{hladky2021snakebinning}, who had access to the source code for \cite{mueller2018shading}, report CRF numbers for SAS. Our compression ratios are consistently better than their reported numbers, and at low CRF is an order of magnitude better than their reported results (SAS: CRF=5: 14.66\%; CRF=10: 12.12\%; CRF=25: 4.80\%; CRF=35: 2.71\%).
+
+\paragraph*{Effective Shading Rate.} We further evaluate the utility of FastAtlas for spatial decoupling by measuring the effective shading rate of our method. At 1920x1080 with fixed-size atlases, our mean effective shading rates are 104\%, 98\%, and 50\% for 8K, 4K, and 2K atlases respectively. For a 4K framebuffer, our mean effective shading rates are 0.96 (8K), 0.49 (4K), and 0.13 (2K). Using fixed reductions in chart scale, rates at 1920x1080 are 29.4\% (50\% scale factor; 25\% target shading rate); 9.1\% (25\% SF; 6.25\% target)/3.5\% (12.5\% SF; 1.5\% target); at 4K, 26.9\% (50\% SF; 25\% target), 7.6\% (25\% SF; 6.25\% target); 2.5\% (12.5\% SF; 1.5\% target). We attribute our slight overshading versus ideal effective shading rates as due to adding borders for bilinear sampling. Our method uniformly distributes samples (and error) across the screen due to uniform scaling and perspective projection, as confirmed by our texture stretch metric experiments. Table ~\ref{tab:supp_shading_rate} provides a breakdown of effective shading rate across all scenes and test conditions.
+
+\begin{figure}
+    \includegraphics[width=\linewidth]{fig_supp_figure12_new.pdf}
+    \caption{Comparison of our near-plane clipping strategy with Blinn's original bounds estimator. Note how Blinn's estimator can produce badly oriented charts with imprecise bounds (top left).
+    The addition of our near plane clipping provides more precise bounds, which allows our chart packing step to pick a larger scale factor, thus decreasing shading error.} 
+    \label{fig:bbox_clip_alt}
+\end{figure}
+
+\paragraph{Bounding Box Computation Alternatives.}
+\label{app:bbox_near_clip}
+Fig. ~\ref{fig:bbox_clip_alt} shows the impact of clipping the near clip plane versus Blinn's original formulation for computing chart bounding boxes. As shown in this example, when large triangles intersect the near clip plane, the original method produces large bounding boxes that overestimate the amount of space needed. By selectively clipping line segments that intersect the near clip plane if needed and then applying Blinn's formulation, we produce tighter boxes that occupy less space in the chart. 
+
+\paragraph*{Runtimes on Low-End Hardware.}
+While the G3D engine cannot load some of our more complex test scenes on older GPUs due to insufficient video memory, we can measure performance on the remaining scenes using an older graphics card (a 6-year old NVIDIA GeForce RTX2080). Reducing the number of scale factors, we achieve good atlasing runtime performance on this older graphics card. At 16 scales, our average total atlasing times are 1.76ms (8K), 1.49ms (4K), and 1.37ms (2K); at 32 scales, 2.17ms (8K), 1.89ms (4K), and 1.77ms (2K). We note that the number of scale factors is the primary bottleneck of our method, and can be adjusted to increase performance if desired.
+
+\input{table_supp_runtime-rtx2080-2024-10-02}
+
+\input{applications}
+
+\section{Additional Statistics.}
+
+The tables below provide detailed scene level statistics for the experiments we ran. We include tables containing a detailed breakdown of \FLIP error metrics across individual scenes for every scene and path combination we tested, both for fixed atlas sizes and for fixed shading rate reductions. We also include similar tables for $L^2$ and $L^{\infty}$ texture stretch metrics. For our packing experiment ablation, where we pack our charts into the superblock packing scheme of \cite{Neff2022MSA}, and pack their charts with our packing scheme, we include a full breakdown across all scenes tested. Finally, we report the number of reused fragments and \FLIP error across all scenes for our temporal reuse comparison to reverse reprojection caching \cite{nehab2007accelerating}, and a breakdown of per-scene effective shading rates for our method across different fixed atlas sizes.
+
+\input{table_supp_flip-vs-infinite-atlas-2024-09-18}
+\input{table_supp_flip-fixed-shading-rate-2024-09-18}
+\input{table_supp_stretch_fixed_shading_rate_2024_09_25}
+\input{table_supp_flip-fixed-atlas-2024-09-18}
+\input{table_supp_stretch_fixed_atlas_2024_09_25}
+\input{table_supp_flip-ablation-2024-09-18}
+\input{table_supp_stretch_ablation-2024-09-30}
+\input{table_supp_temporal-2024-09-23}
+\input{table_supp_shading-rate-2024-09-18}
+\input{table_supp_runtime-fixed-atlas-2024-09-30}
+\input{table_supp_runtime-fixed-shading-rate-2024-09-30}

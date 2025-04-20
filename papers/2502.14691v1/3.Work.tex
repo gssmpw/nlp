@@ -1,0 +1,79 @@
+\section{Parallelizing Accel-sim}\label{sec:work}
+
+\par
+This section describes how we have parallelized the Accel-sim framework simulator. 
+
+\par
+The principal components of the modeled GPUs in Accel-sim are shown in \autoref{fig:gpu_design_parallel}. The GPU has a dedicated main memory (VRAM), usually GDDR or HBM. There are several memory partitions, each with a channel to access the VRAM and the GPU's on-chip interconnect network. Memory partitions are divided into two sub-partitions, each with a slice of the L2 cache. Finally, there are a number of SMs (GPU cores) in charge of executing the user kernel instructions. 
+
+\begin{figure}[ht]
+  \centering
+  \includegraphics[trim={0.6cm 0.6cm 0.6cm 0.6cm},clip,width=8cm]{images/gpuWholeDesign.pdf}
+  \caption{GPU design.}
+  \label{fig:gpu_design_parallel}
+\end{figure}
+
+\par
+\autoref{fig:gpu_design_sm} shows the design of an SM. We can see that each core is divided into four sub-cores. They all have access to shared components such as an L1 instruction cache, the L1 Data Cache/Texture Cache/Shared memory, and shared execution units like FP64 for some architectures like Turing. Each sub-core is assigned a number of warps and executes them concurrently. The warp instruction fetcher requests one or several instructions from the L0 Instruction Cache every cycle. Once an instruction is received, it is decoded and stored in a buffer. An Issue Scheduler checks which warps have their oldest instruction ready and chooses one of them every cycle. Then, its operands are read from the register file, and finally, the instruction is usually executed in one of the different execution units of the sub-core (FP32, INT32, etc).
+
+\begin{figure}[ht]
+  \centering
+  \includegraphics[trim={0.0cm 0.0cm 0.0cm 0.0cm},clip,width=6.5cm]{images/SMGeneral.pdf}
+  \caption{SM design.}
+  \label{fig:gpu_design_sm}
+\end{figure}
+
+\par
+\hyperref[alg:simulator]{Algorithm~\ref*{alg:simulator}} shows the high-level structure of the simulator's code to model the above-described architectures. We can see that the main function calls the cycle function while the simulation is still ongoing. The cycle function has different tasks to do. The first one processes all the interconnection network work; as we can see, this task is split into different code regions, lines 8-11, 16, and 19. It also models the main memory (lines 12-14) and the accesses to the L2 cache (line 16). Then, it continues by executing the work in each GPU's SMs (lines 21-23), each with the different components found in \autoref{fig:gpu_design_sm}. Finally, the function increments the number of cycles that the GPU is active and tries to issue the remainder thread blocks to available SMs.
+
+\begin{algorithm}
+\begin{algorithmic}[1]
+\Function{main}{}
+    \While{\Not simulation.done()}
+        \State cycle()
+    \EndWhile
+\EndFunction
+\State
+\Function{Cycle}{}
+    \State doIcntToSm()
+    \ForEach{memSubpartition $\in$ GPU\_memSubpartition}
+        \State doMemSubpartitionToIcnt()
+    \EndForEach
+    \ForEach{memPartition $\in$ GPU\_Partition}
+        \State memPartition.DramCycle()
+    \EndForEach
+    \ForEach{memSubpartition $\in$ GPU\_memSubpartition}
+        \State doIcntToMemSubpartition()
+        \State memSubpartition.cacheCycle()
+    \EndForEach
+    \State doIcntScheduling()
+    \State
+    \ForEach{SM $\in$ GPU\_SMs}
+        \State SM.cycle()
+    \EndForEach
+    \State gpuCycle++
+    \State issueBlocksToSMs()
+\EndFunction
+\end{algorithmic}
+\caption{Simulator pseudo-code}\label{alg:simulator}
+\end{algorithm}
+
+\begin{figure}[ht]
+  \centering
+  \includegraphics[trim={0.0cm 0.0cm 0.0cm 0.0cm},clip,width=8cm]{images/gperftoolsGraph.pdf}
+  \caption{Profiler output.}
+  \label{fig:gperftools}
+\end{figure}
+
+\par
+To find out which parts of the simulator are the more time-consuming ones, we have configured the Google Performance Tools (Gperftools) \cite{gperftools} CPU profiler to be executed with the Accel-sim in a node with the specifications shown in \autoref{tab:node_specs}. The simulator models an NVIDIA RTX 3080 TI GPU (\autoref{tab:gpu_specs}) and simulates one of the benchmarks found in \autoref{tab:benchmarks} (concretely, \textit{hotspot}). \autoref{fig:gperftools} depicts the output of the Gperftools profiler, which shows that over $93\%$ of the execution time is spent executing the SM cycles. This makes sense due to two reasons. First, there are many more SMs than memory partitions. Second, an SM has many more components and details than memory partitions or DRAM. As a result, we have a clear target: parallelize the execution of all the SMs, which are circled in red in \autoref{fig:gpu_design_parallel}.
+
+\par
+We have parallelized the simulator using OpenMP because it requires minimal changes. First, we have added the \texttt{-fopenmp} flag to the simulator compilation. Then, we added the clause of OpenMP to parallelize for-loops in line 20
+(\texttt{\#pragma omp parallel for}) of \hyperref[alg:simulator]{algorithm~\ref*{alg:simulator}}.
+
+\par
+Moreover, we had to fix the data races that appeared due to parallelizing the SMs loop. Although the different hardware components modeled in the SM were previously properly isolated,  stats had data races. Most of the stats of the Accel-sim simulator are shared among all the SMs to report a unique stat for the GPU. Usually, stats are counters that are later used to compute percentages or ratios. Therefore, we have isolated all these stats to be calculated by SM instead of globally for the whole GPU. Once the kernel execution has finished, each of the stats reported by SM is gathered into a single GPU stat to report stats in the same way as the single-threaded simulator. Notice that this approach is much better than creating a critical section whenever we want to increase a stat counter because this kind of construct would damage performance due to frequent code serialization and lock management \cite{criticalSectionOpenMP}.
+
+\par
+Even though counters are the most common stat, sometimes stats are represented by hash tables or sets. For example, suppose we want to discover how many different memory addresses are accessed during simulation. In that case, we need a set (which does not contain duplicates) that tracks all the accessed addresses. However, maps or sets are not thread-safe structures in C++ \cite{stlThreadSafe}, meaning they undermine behavior and can lead to segmentation fault errors. Therefore, there are three possible solutions to this problem. The first one is to make this structure thread-safe by ourselves. The second one is to have one of these structures per SM and then compute the union of all SM data structures at the end. The third one is to find a place where the simulator is executed sequentially and handle that stat there (e.g. making the different insert/erase operations). It is clear that the last option is the best one. However, it may not always be possible, and the simulator user will have to choose between the first or the second option in those scenarios. The choice will depend on a trade-off between the performance drop of accessing a unique shared thread-safe structure shared by all SMs by employing critical sections or increasing memory consumption by having per-SM data structures.

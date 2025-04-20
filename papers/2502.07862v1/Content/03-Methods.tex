@@ -1,0 +1,137 @@
+\section{Methodology}
+
+
+\subsection{Problem Description}
+
+A typical multimodal system employing embedding-level fusion is illustrated on the left side of Figure~\ref{fig:admn_architecture}.
+It first utilizes independent, modality-specific backbones to extract informative embeddings for each modality.  
+These embeddings are fused via self-attention in a \emph{Transformer encoder}, which condenses all modality embeddings into a single joint embedding.  
+Finally, an output head converts the dense joint embedding into the desired final output specific to the target task. 
+In this work, \name accomplishes two objectives. First, it contains dynamic backbones robust to various dropped layers, thus enabling adaptation to different total layer budgets. Second, it allocates the layer budget optimally among modality backbones (i.e., transformer layers) according to the fluctuating input QoI, greatly outperforming static models with the same layer budget.
+
+
+\subsection{\name Architecture}
+Figure \ref{fig:admn_architecture} showcases the task-agnostic architecture of \name, which involves a two-stage training process.
+
+\textbf{Stage 1: LayerDrop Finetuning.}
+We initialize each backbone with a set of weights pretrained with LayerDrop~\cite{fan2019reducing}. Subsequently, the multimodal network is finetuned with LayerDrop on the desired task while freezing the majority of earlier backbone layers (shown in blue) to prevent overfitting. 
+Stage 1's objective is to adjust the learnable weights for the specific target task, while also training the Fusion and Output layers to accept diverse embeddings arising from various backbone layer configurations.
+
+
+\textbf{Stage 2: Controller Training.}
+We freeze all the Stage 1 network weights and train a controller that learns to allocate a fixed budget of $L$ layers. 
+The controller network accepts the multimodal inputs, and from the relative QoI, outputs a discrete sequence summing to $L$ outlining the selection of backbone layers. 
+Based on the task loss, the controller will readjust the layer allocation across the modalities. 
+
+
+
+\subsection{Stage 1: LayerDrop Finetuning}
+
+We adapt the LayerDrop \cite{fan2019reducing} work, originally designed for text input, to support non-text multimodal input, while also showcasing how LayerDrop can be integrated into modality pretraining. 
+
+
+\subsubsection{Vanilla LayerDrop}
+LayerDrop trained text transformers with layer-wise dropout, enabling on-demand depth reduction during test-time. During training, each layer of the transformer is dropped out with a certain probability, thereby forcing the network to function with only a subset of its layers. At inference time, they proposed a dropout strategy alternating layers starting from the middle to meet a particular compute requirement, referred to as the ``every-other'' strategy. We refer readers to the original work for greater detail.
+
+
+\subsubsection{Multimodal LayerDrop}
+We extend LayerDrop to Vision Transformers (ViTs) \cite{dosovitskiy2020image} by first integrating them into ImageNet-1K \cite{ILSVRC15} pretraining. Rather than performing supervised training on ImageNet, which suffers heavily from convergence issues, we employ Masked Autoencoder (MAE) pretraining \cite{he2022masked}. We use a LayerDrop rate of 0.2 in each ViT layer and do not drop any layers in the decoder. By employing LayerDrop in MAE pretraining, the model learns to reason about the image in the presence of missing layers. Then, the MAE pretrained weights are loaded into each of the ViT backbones of a multimodal (e.g., vision-depth) neural network to be finetuned on a downstream task. The majority of the backbone layers are frozen during finetuning, with the last few layers left tunable to adjust to the new task. A LayerDrop rate of 0.2 is maintained during the finetuning process in all the backbones, allowing the remaining learnable layers to adapt to the countless different combinations of missing layers. This process ultimately creates a task-specific multimodal network containing several ViT backbones with adaptable layer configurations at inference time. 
+
+
+\textbf{Full-Backbone LayerDrop:} 
+One unique challenge that surfaces when applying LayerDrop in a multimodal context is the need to subject a backbone to extreme dropout conditions. In the unimodal case, dropping all layers of a backbone is avoided because it would leave the input unprocessed. For a multimodal network, however, one may wish to drop all layers of a modality that suffers from extreme noise. The typical LayerDrop training ratio of 0.2 in a 12 layer ViT is unlikely to drop out all layers of a given modality, resulting in unpredictable behavior when all layers are missing at test-time. Increasing the dropout rate is an option, but can hurt the full-layer performance. To remedy this, we employ full-backbone dropout during training time, under which there is a 10\% chance all the layers of a given modality's backbone will be dropped out independently of the 0.2 LayerDrop rate. Through this procedure, the fusion network can observe embeddings that emerge when one backbone's layers are entirely bypassed, preventing them from potentially disrupting the self-attention process. 
+
+
+
+\subsection{Stage 2: Controller Training}
+
+The controller decides which backbone layers to activate within the frozen Stage 1 network depending on the relative input modality QoI, as shown in Figure \ref{fig:admn_architecture}. For instance, in a multimodal image and depth network with a layer budget $L$, the controller may choose to allocate all $L$ layers to the image backbone if it detects that depth is severely corrupted, and vice versa. The controller performs this adaptation on a \emph{per-sample} basis. In order to maximize the resources provided to the main network, the controller should also remain as lightweight as possible. 
+
+
+
+
+
+\subsubsection{Controller Architecture}
+
+Figure \ref{fig:admn_controller} reveals the structure of the controller. First, we downsample the multimodal inputs to $100\times100$ and pass them through a series of modality specific lightweight convolutional networks. The goal of these convolutional networks is to produce embeddings containing information solely regarding each modality's QoI, which can be accomplished from low-resolution data. With $M$ input modalities, the convolutional networks produce $M$ total noise embeddings, which are subsequently fused by a transformer encoder. The transformer encoder outputs a single embedding $e_{\mathrm{noise}}$ containing the noise signature of every input modality. From this joint noise embedding, we can obtain a set of raw logits
+\begin{equation}
+    \pi =\mathrm{MLP}(e_{\mathrm{noise}}) \: \mathrm{where} \: \pi \in \mathbb{R}^{C} ,\: C = \sum^{M}_{i=0}|b_i|
+\end{equation}
+and $|b_i|$ is the number of layers in the backbone of modality $m_i$. In essence, $\pi$ represents an allocation of $L$ available layers among $C$ total backbone layers, with values dependent on the noise characteristics of every input sample. 
+
+Ideally, the convolutional layers will automatically learn to extract each modality's noise signature. Failure to identify the modality QoI will result in high loss arising from improper layer allocation, which will be backpropagated to the convolution. In practice, however, we found that adding supervision by providing ground truth noise information greatly aided convergence. Thus, we introduce an additional MLP that predicts the noise standard deviation $\hat{\sigma}_{m_i}$ of every modality $m_i$ from $e_{\mathrm{noise}}$. 
+We optimize over the joint loss $\mathcal{L}_{total} = \mathcal{L}_{model} + \mathcal{L}_{noise}$ , where $\mathcal{L}_{noise} = \sum_{i=0}^{M} |\hat{\sigma}_{m_i} - \sigma_{m_i}|$
+
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.85\linewidth]{Figures/ADMN_Controller.png}
+        \vspace{-0.1in}
+    \caption{Detailed depiction of the \name controller.}
+    \vspace{-5pt}
+    \label{fig:admn_controller}
+        \vspace{-0.2in}
+\end{figure}
+
+
+\subsubsection{Differentiable Layer Selection}
+Although the logits $\pi$ provide information regarding which layers to select, activating a given layer is a discrete, binary decision. One simple method is to perform \emph{top-L masking} where the top-L largest logits are discretized to one and the rest are set to zero. The output of top-L masking is multiplied with the output of each backbone layer, zeroing out the contribution of dropped layers.
+While necessary for layer selection, the discretization process interrupts the flow of gradients during backpropagation. 
+Consequently, the gradients from the frozen main network carrying vital information on the success of a layer configuration will not propagate to the learnable parameters of the controller. 
+
+
+\textbf{Traditional Unimodal Discretization:}
+Gumbel-Softmax Sampling~\cite{maddison2016gumbel} propagates gradients over discretization by approximating a categorical distribution while retaining differentiability, where 
+\begin{equation}
+    G = -\mathrm{log}(-\mathrm{log}(u))\;  ;\;  u \sim U(0, 1) \\
+\end{equation}
+defines the Gumbel distribution, and
+\begin{equation}
+            y_i = \frac{\mathrm{exp}((\mathrm{log}(\pi_i) + g_i) / \tau)}{\sum_{j=1}^C \mathrm{exp}((\mathrm{log}(\pi_j) + g_j) / \tau)} 
+\end{equation}
+where $y$ is the result of Gumbel-Softmax Sampling with i.i.d samples $g_{0...C} \sim G$. As the value of temperature $\tau$ decreases, $y$ approximates a categorical distribution with a single $y_i = 1$ and the remaining $y_j = 0 ; j=0...C, j \neq i$.
+
+
+% End-to-end 
+Unimodal Early-Exit methods rely upon Gumbel-Softmax Sampling \cite{meng2022adavit}. 
+They employ decision networks at every layer of the model, outputting a single logit representing the likelihood of executing that particular layer, which then undergoes Gumbel-Softmax sampling. 
+
+
+
+
+\textbf{Multimodal Discretization:}
+Unfortunately, simply applying Gumbel-Softmax Sampling is insufficient for \name. 
+The key difference between \name and unimodal Early-Exit works is that \name predicts the entire layer configuration at the \emph{beginning of model execution, rather than forming a decision at every layer}. \name must decide the layer allocation by selecting $L$ total layers based off characteristics from all modalities, and utilizing decision networks at every layer of the unimodal backbones would omit crucial multimodal information. 
+Given this, emulating discretization solely through low-temperature Gumbel-Softmax sampling is a poor choice, as it approximates a categorical distribution in which \emph{only a single layer is selected}. 
+
+We devise a method for retaining gradients over top-L sampling. Initially, we perform standard Gumbel-Softmax sampling with a temperature of 1 instead of a low temperature. This allows multiple high-value logits to be represented in the resulting probability distribution, better accommodating the selection of $L$ layers. This is accomplished at the expense of the highly desirable near-discrete behavior of the low-temperature Gumbel-Softmax. We introduce a subsequent \emph{top-L discretization} stage to activate only $L$ layers, and maintain gradient flow through the \emph{straight-through estimator} \cite{bengio2013estimating}. Represented by
+$y + (\mathrm{discretize}(y) - y).\mathrm{detach}()$, the downstream layers receive the discretized value, while the gradients received are copied over to the continuous logits, allowing for gradient flow. Intuitively, standard Gumbel-Softmax sampling stochastically provides a probability distribution across layers, after which we sample the L-most likely layers via discretization, and copy the gradients across the discretization step. We provide justification in Appendix \ref{subsec:grad_justify}.
+
+
+\section{Implementation Details}
+
+
+\textbf{\name Application Domain:}
+To showcase the generality of \name, we evaluate it on two highly diverse tasks - regression and classification. We select distributed multimodal localization as the regression task and multimodal human activity recognition for classification.  
+For the task of distributed multimodal localization, we follow the approach in \cite{jeong2024gdtm}. 
+Assuming $S$ sensor nodes each containing $M$ modalities, we define $M$ modality-specific backbones that process each node's data, resulting in $S \times M$ backbone embeddings. The $S \times M$ embeddings are provided as input tokens into the transformer encoder for fusion, and the output head converts the fused embedding into a prediction of target location. For multimodal human activity recognition, we employ the popular \emph{space-time encoder} architecture \cite{woo2023towards}. Given $F$ frames of an activity from $M$ modalities, we define $M$ backbones that process each frame of data, resulting in $F \times M$ embeddings. Once again, a stack of transformer encoders fuses the embeddings, and the output head predicts the activity class. % Due to the need to perform large-scale pretraining with LayerDrop for every diverse modality, 
+In this work, we restrict the majority of our evaluations to image-like data (e.g., RGB, depth) that can utilize the same set of MAE ImageNet initializations. 
+However, we hope that our work inspires future models to be pretrained with LayerDrop, removing the heavy pretraining burden and allowing the user to proceed directly to Stage 1 Training. 
+
+
+
+\textbf{MAE Pretraining:} We pretrain Vision Transformers on the ImageNet-1K dataset with the Masked Autoencoders method. Additionally, we employ a LayerDrop probability of 0.2 in each layer of the encoder. We follow the standard pretraining process for a ViT-Base model with 12 layers and dimension 768. We refer to the original paper ~\cite{he2022masked} for further implementation details. 
+
+
+\textbf{Training Details:}
+To accomplish the goal of adjusting to variable modality QoI, \name must understand how to process noisy multimodal input. 
+In addition to employing LayerDrop, we also add varying amounts of noise to the multimodal inputs during Stage 1 Training. We simulate dynamic QoI by adding Gaussian Noise of different standard deviations to each modality, allowing the model to gain robustness to noisy inputs during finetuning. For each modality $m_i$ in a batch of input samples, we will draw $\sigma_{m_i} \sim [0, \sigma_{i_{max}}]$, and then add zero mean Gaussian Noise with standard deviation $\sigma_{m_i}$ (i.e., $\mathcal{N}(0, \sigma_{m_i})$) to modality $m_i$. This ensures the controller can properly perform QoI-aware layer allocation during Stage 2 Training. 
+Further details and hyperparameter settings are provided in Appendix~\ref{sec_appendix_training}.
+
+
+
+
+
+
+
+

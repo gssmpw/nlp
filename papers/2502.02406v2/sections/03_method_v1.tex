@@ -1,0 +1,92 @@
+\section{Method}
+TODO: a connecting paragraph
+\subsection{LV-XAttn: Distributed Cross Attention with Minimal Communication Overhead}
+\begin{algorithm}[tb]
+   \caption{LV-XAttn Forward Pass for Worker $i$}
+   \label{alg:lv-xattn}
+    \begin{algorithmic}
+       \STATE {\bfseries Input:} data $Q_i$, $K_i$, $V_i$
+       \FOR{$round=0$ {\bfseries to} $n-1$}
+            \STATE $j_{\text{prev}} \gets (i+round+1) \bmod n$
+            \STATE $j \gets (i+round) \bmod n$
+            \STATE $j_{\text{next}} \gets (i+round-1) \bmod n$
+            \STATE \textbf{do in parallel:}
+            \STATE \hspace{1em} Send $m_{j_{\text{prev}}}, l_{j_{\text{prev}}}, o_{j_{\text{prev}}}, Q_{j}$ to worker $(i+1) \bmod n$
+            \STATE \hspace{1em} Recv $m_{j}, l_{j}, o_{j}, Q_{j_{\text{next}}}$ from worker $(i-1) \bmod n$
+            \STATE \hspace{1em} $\Delta m, \Delta l, \Delta O \gets \text{FlashAttention}(Q_{j}, K_i, V_i)$
+            \STATE $m_{j}, l_{j}, O_{j} \gets \text{Rescale}(m_{j}, l_{j}, O_{j}, \Delta m, \Delta l, \Delta O)$
+       \ENDFOR
+    \end{algorithmic}
+\end{algorithm}
+Our primary observation is that in applications involving large visual inputs, the size of the query block is typically much smaller than that of the key-value blocks. For instance, in the widely-used video understanding benchmark, Video-MME~\cite{fu2024video-mme}, long videos have an average duration of 2386 seconds. Each frame is encoded by the visual encoder and projection layer in MLLM into multiple visual tokens. For example, mPLUGOwl-3 generates 729 visual tokens per frame. With a sampling rate of 1 frame per second, each video results in sequence length of $S_{KV} = 1739394$. In contrast, the average text prompt for long videos consists of $S_Q = 3128$ words, including the question, options, answer, and subtitles. As a result, distributed attention mechanisms that involves movement of key-value blocks incur substantial communication overhead.
+
+To address this, we propose LV-XAttn, which keeps the large key-value blocks locally on each worker, while smaller query blocks, attention blocks, and necessary softmax statistics are exchanged among workers in a ring-style fashion. During each round, worker $i$ computes attention using its local key-value blocks $K_i$ and $V_i$ and query blocks $Q_j$ received from peers. This computation generates partial attention blocks $\Delta O$ and partial softmax statistics $\Delta m$ and $\Delta l$. The worker then updates the received attention block $O_j$ and softmax statistics $m_j$ and $l_j$ by rescaling them using $\Delta O$, $\Delta m$, and $\Delta l$. The worker then sends $Q_j$, $O_j$, $m_j$, and $l_j$ to the next worker in the ring topology and receives $Q_{j-1}$, $O_{j-1}$, $m_{j-1}$, and $l_{j-1}$ from the previous worker. After $n$ rounds, the computed attention block $O_i$ and softmax statistics $m_i$ and $l_i$ returns to worker $i$.
+
+\textbf{Overlapping computation and communication} To further reduce communication overhead, we can overlap the attention computation with data transmission between workers. While performing attention computation with $Q_j$, $K_i$ and $V_i$, worker $i$ also does the following in parallel
+\begin{itemize}
+    \item Receive $m_j$, $l_j$ and $O_j$ from worker $i-1$, which are needed for rescaling in this round
+    \item Receive $Q_{j-1}$ from worker $i-1$, which is needed for attention computation in the next round
+    \item Send $m_{j+1}$, $l_{j+1}$, $O_{j+1}$ computed in the previous round to worker $i+1$
+    \item Send the already present $Q_j$ to worker $i+1$
+\end{itemize}
+After the reception of $m_j$, $l_j$ and $O_j$ and the computation of $\Delta m, \Delta l$ and $\Delta O$, rescale can be performed to update $m_j$, $l_j$ and $O_j$. This overlapping results in Algorithm~\ref{alg:lv-xattn}.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{figures/speedup.pdf}
+    \caption{The theoretical speedup of LV-XAttn over Ring Attention for cross-attention in mPLUG-Owl3-7b on a cluster with 4 nodes, each equipped with 4 A100 GPUs. The uncolored region indicates a speedup of less than 1, meaning LV-XAttn performs slower than Ring Attention. Top-left and bottom-left quadrant represents the typical use case of MLLM with large visual inputs: $S_{KV} \gg S_Q$.}
+    \label{fig:speedup}
+\end{figure}
+\begin{table}[tbp]
+    \centering
+    \begin{tabular}{l|c|c}
+        \hline
+         & Forward & Backward \\ \hline 
+        Ring Attention & $\frac{2\cdot\frac{S_{KV}}{n}\cdot h\cdot d}{\text{Net Bandwidth}}$ & $\frac{4\cdot\frac{S_{KV}}{n}\cdot h\cdot d}{\text{Net Bandwidth}}$ \\[7pt]
+        LV-XAttn & $\frac{4\cdot\frac{S_Q}{n}\cdot\frac{S_{KV}}{n}\cdot h\cdot d}{\text{GPU FLOPS}}$ & $\frac{10\cdot\frac{S_Q}{n}\cdot\frac{S_{KV}}{n}\cdot h\cdot d}{\text{GPU FLOPS}}$ \\[7pt]
+        Speedup & $\frac{1}{2\cdot\frac{S_Q}{n}}\frac{\text{GPU FLOPS}}{\text{Net Bandwidth}}$ & $\frac{2}{5\cdot\frac{S_Q}{n}}\cdot\frac{\text{GPU FLOPS}}{\text{Net Bandwidth}}$ \\ [7pt]\hline
+    \end{tabular}
+    \caption{Runtime analsys for Ring Attention and LV-XAttn.}
+    \label{tab:runtime-formula}
+\end{table}
+\begin{table}[tbp]
+    \centering
+    \begin{tabular}{l|c|c|c}
+        \hline
+         & Ring Attention & LV-XAttn & Speedup\\ \hline
+        Forward & $\frac{2\cdot\frac{S_{KV}}{n}\cdot h\cdot d}{\text{Network Bandwidth}}$ & $\frac{4\cdot\frac{S_Q}{n}\cdot\frac{S_{KV}}{n}\cdot h\cdot d}{\text{GPU FLOPS}}$ & $\frac{1}{2\cdot\frac{S_Q}{n}}\frac{\text{GPU FLOPS}}{\text{Network Bandwidth}}$ \\la
+        Backward & $\frac{4\cdot\frac{S_{KV}}{n}\cdot h\cdot d}{\text{Network Bandwidth}}$ & $\frac{10\cdot\frac{S_Q}{n}\cdot\frac{S_{KV}}{n}\cdot h\cdot d}{\text{GPU FLOPS}}$ & $\frac{2}{5\cdot\frac{S_Q}{n}}\cdot\frac{\text{GPU FLOPS}}{\text{Network Bandwidth}}$ \\
+    \end{tabular}
+    \caption{runtime analsyis}
+    \label{tab:runtime-formula}
+\end{table}
+\textbf{Runtime Analysis} Let $f(\text{query block size}, \text{key-value block size})$ represent the time required to perform the forward-pass attention computation, and let $comm(\text{tensor size})$ denote the time to transmit a tensor. In \text{LV-XAttn}, $Q_i, m_i, O_i \in \mathbb{R}^{\frac{S_Q}{n} \times d}$ and $l_i \in \mathbb{R}^{\frac{S_Q}{n}}$ are transmitted during each round. This results in a runtime of:
+\begin{equation}
+    \max\left(f(\frac{S_Qd}{n}, \frac{S_{KV}d}{n}), comm(3\cdot\frac{S_Qd}{n} + \frac{S_Q}{n})\right)
+\end{equation}
+In contrast, Ring Attention transmits key-value blocks $K_i$ and $V_i \in \mathbb{R}^{\frac{S_{KV}}{n} \times d}$ in each round, leading to a runtime of:
+\begin{equation}
+    \max\left(f(\frac{S_Qd}{n}, \frac{S_{KV}d}{n}), comm(2\cdot\frac{S_{KV}d}{n})\right)
+\end{equation}
+Figure~\ref{fig:speedup} shows the speedup of LV-XAttn over Ring Attention across different $S_Q$ and $S_{KV}$. For MLLM with large visual inputs, where $S_{KV} \gg S_Q$, and slow cross-node interconnect -- an unavoidable constraint for inputs exceeding single-node memory capacity -- \text{LV-XAttn} is compute-bound, while Ring Attention is communication-bound. Consequently, the runtime for \text{LV-XAttn} reduces to $f\left(\frac{S_Qd}{n}, \frac{S_{KV}d}{n}\right)$, while for Ring Attention it becomes $comm\left(2\cdot\frac{S_{KV}d}{n}\right)$. Given that the FLOPs of attention computation is calculated as $4\cdot\frac{S_Q}{n}\frac{S_{KV}}{n}d$~\cite{dao2023fa2}, the speedup of \text{LV-XAttn} over Ring Attention is 
+\begin{equation}
+\label{eqn:speedup}
+\frac{1}{\frac{2S_Q}{n}}\frac{\text{GPU FLOPS}}{\text{Network Bandwidth}}
+\end{equation}
+Intuitively, with a smaller per-device query block size, attention computation becomes less time-consuming, while the communication of key-value blocks remains constant. This leads to a more significant speedup of of \text{LV-XAttn} over Ring Attention.
+% (TODO: more on this)
+
+% TODO: talk about backward pass? Ring Attention becomes $comm\left(4\frac{S_{KV}d}{n}\right)$, while LV-XAttn is $b\left(\frac{S_Qd}{n}, \frac{S_{KV}d}{n}\right)$
+% TODO: Do we want a trace graph here?
+
+% Let $f(x, y)$ denote the time it takes to run forward pass attention computation with query block size $x$ and key-value block sizes $y$, and $comm(x)$ denote the time it takes to send tensor of size $x$. By transmitting $Q_j, m_j, O_j \in \mathbb{R}^{\frac{S_Q}{n} \times d}$ and $L_j \in \mathbb{R}^{\frac{S_Q}{n}}$, each round in \text{LV-XAttn} takes $\max\left(f(\frac{S_Qd}{n}, \frac{S_{KV}d}{n}), comm(3\frac{S_Qd}{n} + \frac{S_Q}{n})\right)$. On the other hand, Ring Attention transmits key value blocks $K_j, V_j \in \mathbb{R}^{\frac{S_{KV}}{n} \times d}$, resulting in each round taking $\max\left(f(\frac{S_Qd}{n}, \frac{S_{KV}d}{n}), comm(2\frac{S_{KV}d}{n})\right)$. With large visual inputs where $S_{Q} \ll S_{KV}$ and slow inter-connect between GPUs, which is typical in cross-node setup, LV-XAttn's communication can be easily overlapped by computation while Ring Attention's cannot, and thus the term reduces to $f(\frac{S_Qd}{n}, \frac{S_{KV}d}{n})$ and $comm(2\frac{S_{KV}d}{n})$, respectively.
+\subsection{Reducing Activation Memory} In standard attention implementation, during forward pass computation, input tensors $Q_i, K_i, V_i$ and output tensors $O_i$ and $L_i$ are saved for backward pass, where $L_i = m_i + \log{l_i}$. However, storing large key-value blocks $K_i$ and $V_i$ reduces the maximum amount of visual inputs that can be processed. For instance, in the case of mPLUG-Owl3-7b with a modest 128-frame video, storing $K_i$ and $V_i$ takes $1.25$GB per cross-attention layer.
+
+To address this, we observe that while language features $x$ differ across cross-attention layers because they pass through various LM blocks, the visual features $y$ remain unchanged throughout all cross-attention layers, as they are only fed into the cross-attention layers. Thus, instead of storing key-value blocks per cross-attention layer, we propose to keep a single copy of visual features $y$ that can be accessed by all cross-attention layers. During the backward pass, $y$ is projected to obtain key-value blocks $K_i$ and $V_i$. With $Q_i$ also being recomputed in backward pass, we only need to save $x$, $O_i$, and $L_i$ during each cross-attention forward pass.
+
+As demonstrated in the ablation study in Section~\ref{sec:eval/ablation}, this approach incurs an overhead of less than $8\%$ while enabling the system to handle $1.6\times$ more visual inputs.
+
+
+% \subsection{Support for arbitrary mask?}
+% \subsection{Generalize to longer Q?}
+

@@ -1,0 +1,87 @@
+\section{Methodology}
+
+\subsection{Problem Setting}
+For common downstream tasks, such as Open-Domain QA~\cite{DBLP:journals/corr/abs-2101-00774}, the training data typically consists of an input query $\mathbf{q}$ and the corresponding ground-truth answer $\mathbf{a}$. During the retrieval process, a set of candidate documents $\mathbf{d_1}, \dots, \mathbf{d_n}$ is retrieved based on $\mathbf{q}$. The reranker $\mathcal{R}$ is then applied to these candidate documents, generating a set of candidate scores. We retain only the top-\(k\) scored documents for further computation:
+\begin{equation}
+\begin{aligned}\label{eq: reranker forward pass}
+    w_i &= \mathcal{R}(\text{Concatenate}(\mathbf{q}, \mathbf{d}_i)), \quad \forall i \in [n] \\
+    \mathcal{I}_k &=\left\{ i \mid w_i \in \text{top-}k \left( \{ w_i \}_{i=1}^n \right) \right\}
+\end{aligned}
+\end{equation}
+where $[n] \triangleq \{1, 2, \dots, n\}$. The top-$k$ documents, $\mathcal{D}_k= \{\mathbf{d}_i \mid i \in \mathcal{I}_k \}$, are selected as input to the LLM, which then computes the corresponding logits and language loss $\mathcal{L}_{LM}$. In this work, we focus on training the reranker in the RAG system. A key challenge is that the candidate documents $\mathbf{d_1}, \dots, \mathbf{d_n}$ lack relevance annotations, making it infeasible to directly fine-tune the reranker. Additionally, although we have access to the language loss $\mathcal{L}_{LM}$, the top-$k$ operation in \autoref{eq: reranker forward pass} is non-differentiable, preventing gradient propagation to the reranker and thus hindering end-to-end training.
+
+\subsection{Viewing Reranker as Attention Mask}\label{sec: Viewing Reranker as Attention Mask}
+We reinterpret the reranking process from the perspective of attention masks. Let $K_{i,t}$ and $V_{i,t}$ denote the key and value embeddings of the $t$-th token in the $i$-th candidate document, respectively. And let $Q_m$ denote the query embedding for the $m$-th token in the decoding phase of LLM, the standard attention computation is defined as:
+
+\begin{equation}\label{eq: original attn}
+    \mathcal{A}(Q_m, K_{i,t}) = \frac{\exp \left(\frac{Q_m K_{i,t}^T}{\sqrt{d_k}}\right)}{\sum_{i'} \sum_{t'} \exp \left(\frac{Q_m K_{i',t'}^T}{\sqrt{d_k}}\right)}
+\end{equation}
+where $\mathcal{A}(Q_m, K_{i,t})$ represents the attention score of the $m$-th token in the decoding process to the $t$-th token in the $i$-th candidate document.
+
+The reranker retains only the top-\( k \) documents for attention computation, and these top-\( k \) documents, as a set, are used as part of the prompt. The order of these documents is no longer important. Therefore, we can use a corresponding \textit{hard} attention mask \( \mathcal{M}^{\mathcal{R}} \) to simulate the reranking process.
+
+\begin{equation}\label{eq: hard attention mask}
+    \mathcal{M}^{\mathcal{R}}_i = \begin{cases}
+        1, & \text{if } i \in \mathcal{I}_k \\
+        0, & \text{otherwise}
+    \end{cases}
+\end{equation}
+% When LLM processes retrieved documents, those not selected by the reranker do not contribute to the attention computation. This process can be formally described using masked attention:
+
+\begin{equation}
+    \mathcal{MA}(Q_m, K_{i,t}) = \frac{\mathcal{M}^{\mathcal{R}}_i \exp \left(\frac{Q_m K_{i,t}^T}{\sqrt{d_k}}\right)}{\sum_{i'} \mathcal{M}^{\mathcal{R}}_{i'} \sum_{t'} \exp \left(\frac{Q_m K_{i',t'}^T}{\sqrt{d_k}}\right)}
+\end{equation}
+
+This formulation of masked attention is mathematically equivalent to reranking. If document $i$ is not selected by the reranker, i.e., $\mathcal{M}^{\mathcal{R}}_i = 0$, then all tokens within document $i$ receive an attention score of zero, i.e., $\mathcal{MA}(Q_m, K_{i,t}) = 0,~ \forall t$.
+
+\paragraph{Independence Requirements in Pre-Filling} 
+To effectively simulate reranking via $\mathcal{MA}$, it is crucial to ensure the independence of candidate documents. First, all candidate documents should use the same positional encoding to eliminate position bias. Second, each document should be encoded independently during pre-filling to prevent information leakage across documents. To enforce these constraints, we adopt the parallel pre-filling architecture, as seen in models like FiD~\cite{DBLP:conf/eacl/IzacardG21}, CEPE~\cite{DBLP:conf/acl/YenG024}, and Parallel Windows~\cite{DBLP:conf/acl/RatnerLBRMAKSLS23}, where retrieved documents are encoded separately with independent position encodings during the pre-filling stage.
+
+% \paragraph{Independence Requirements in Pre-Filling} 
+% Fortunately, we can employ the Gumbel trick to design a \textit{soft} attention mask, enabling differentiability and facilitating direct optimization through backpropagation.
+
+
+
+% \paragraph{Stochastic Subset Mask}
+\subsection{Differentiable Masked Attention}\label{sec: DMA}
+The problem of learning a more effective reranker is thus reformulated as learning a better attention mask $\mathcal{M}^{\mathcal{R}}$. However, the \textit{hard} attention mask $\mathcal{M}^{\mathcal{R}}$ defined in \autoref{eq: hard attention mask} remains non-differentiable, preventing end-to-end optimization based on the final language loss. To solve this problem, we leverage the Gumbel-Softmax technique~\cite{DBLP:conf/iclr/JangGP17} to convert discrete sampling into a differentiable process. Specifically, we transform the reranker’s output $w_1, w_2, \dots, w_n$ into a probability distribution for sampling an attention mask:
+\begin{equation}
+\begin{aligned}\label{eq: single sample}
+  G_i &= -\log\Bigl(-\log(u_i)\Bigr), \quad u_i \sim \mathcal{U}(0,1),\\
+  \hat{\mathcal{M}}^\mathcal{R} &= \frac{\exp\!\Bigl(\tfrac{\tilde{w}_i}{\tau}\Bigr)}
+              {\sum_{j=1}^{n}\exp\!\Bigl(\tfrac{\tilde{w}_j}{\tau}\Bigr)}, \quad \tilde{w}_i = G_i + \kappa \cdot w_i
+\end{aligned}
+\end{equation}
+where $\hat{\mathcal{M}}^\mathcal{R}_i$ represents the probability of selecting the $i$-th document. \(\tau\) and \(\kappa\) are hyperparameters in the Gumbel training process. We discuss their effects in detail in \autoref{sec: Effect of hyper-parameters on the Training Process}. To approximate Top-$k$ reranking, we perform independent sampling $k$ times and compute the element-wise maximum:
+
+\begin{equation}
+    \hat{\mathcal{M}}^{\mathcal{R}} = \max \left( \hat{\mathcal{M}}^{\mathcal{R},1}, \dots, \hat{\mathcal{M}}^{\mathcal{R},k} \right)
+    \label{eq:subset_sampling}
+\end{equation}
+
+This results in a \textit{soft} attention mask representing the sampled subset, leading to Differentiable Masked Attention:
+
+\begin{equation}\label{eq: DMA}
+    \mathcal{DMA}(Q_m, K_{i,t}) = \frac{\hat{\mathcal{M}}^{\mathcal{R}}_i \exp \left(\frac{Q_m K_{i,t}^T}{\sqrt{d_k}}\right)}{\sum_{i'} \hat{\mathcal{M}}^{\mathcal{R}}_{i'} \sum_{t'} \exp \left(\frac{Q_m K_{i',t'}^T}{\sqrt{d_k}}\right)}
+\end{equation}
+
+This formulation allows end-to-end optimization of the reranker $\mathcal{R}$ based on final language model loss, improving overall RAG system performance.
+
+
+\begin{figure*}[!th]
+  \includegraphics[width=0.99\linewidth]{figs/method.pdf}
+  \centering
+\caption{Implementation workflow of G-Rerank. We focus on fine-tuning the reranker while keeping LLM parameters fixed. However, given sufficient computational resources, joint fine-tuning of both the LLM and the reranker is feasible. In the Pre-Filling phase, it is essential to maintain the independence of candidate documents.}
+\label{fig:method}
+\end{figure*}
+
+
+\subsection{Gumbel Reranking Pipeline}
+
+In this section, we introduce \textit{Gumbel Reranking}, an end-to-end reranker optimization framework leveraging the previously introduced $\mathcal{DMA}$. The overall pipeline is outlined in \hyperref[alg:ranker_as_selector]{Algorithm~\ref{alg:ranker_as_selector}}.
+
+\paragraph{Training Process} 
+Given a query $\mathbf{q}$ and a set of candidate documents $\mathbf{d_1}, \dots, \mathbf{d_n}$, the reranker first computes a relevance score for each document. The Stochastic Subset Mask algorithm then generates a Top-$k$ attention mask $\hat{\mathcal{M}}^{\mathcal{R},k}$, which represents the probability of selecting each candidate document. The selected documents are subsequently used in the generation process, where the attention mechanism follows \autoref{eq: DMA} to compute logits and the language modeling loss. Finally, the reranker is optimized by minimizing the language loss $\mathcal{L}_{LM}$. Since our proposed framework primarily focuses on enhancing the reranking module, we fix the parameters of the LLM in our experimental setup, as shown in \autoref{fig:method}. This also facilitates a fairer comparison of different reranker training strategies.
+
+\paragraph{Key Advantages} 
+This framework facilitates end-to-end optimization of the reranker via backpropagation, offering two primary advantages. First, by modeling reranking as applying a document-wise attention mask, it mitigates the discrepancy between training and inference, guiding the reranker to prioritize documents that minimize the final generation loss. Second, our approach leverages gumbel subset sampling, enabling the model to identify the complete evidence \textit{subset} during training, rather than analyzing each candidate document independently. This advantage makes our method well-suited for multi-hop QA scenarios and sets it apart from existing perplexity-based distillation techniques, as discussed in \autoref{sec: Challenges in Handling Indirectly Relevant Documents with EMDR/PDist}.

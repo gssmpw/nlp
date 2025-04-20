@@ -1,0 +1,291 @@
+\section{Design Principles}
+\label{sec:design-principles}
+
+In this section, we discuss the principles that drove our design. Those allow us to meet the requirements we set for a new cloud-native userspace stack (\S\ref{sec:requirements}).
+
+\subsection{LCD model for cloud NICs}
+\label{sec:lcd-cloudvnic}
+We must understand how to model a cloud NIC to meet the first requirement.
+%The conceptual contribution of this paper is a NIC model called the ``Least Common Denominator'' model.
+We define the ``Least Common Denominator'' (LCD) model, the common set of features available in all modern kernel-bypass capable NICs, including the vNICs of the three major cloud providers (Amazon EC2, Microsoft Azure, and Google Cloud Platform).
+
+Our insight is that for broad adoption of a stack, it must run seamlessly across bare-metal NICs, VFs, and vNICs; the LCD model captures the common features that stack designers can rely on.
+The LCD NIC model (Table~\ref{tab:lcd-model}) provides OS-bypass Ethernet packet I/O over a number of TX and RX queues up to the number of CPU cores, with queues containing up to 256 descriptors each. Receive side scaling is supported, but this NIC does not expose the RSS key or RSS indirection table to the guest VM for inspection or modification. %This model (Table~\ref{tab:lcd-model}) has been constant for several years (since at least 2019\ga{what has changed? might be worth mentioning}\as{we don't have data to even back this claim up}), so it is a stable target for userspace stack designers.
+
+\begin{table}
+    \centering
+    \begin{minipage}{.9\columnwidth}
+        \centering
+        \fbox{
+            \small
+            \begin{tabular}{>{\bfseries}ll}
+                I/O interface & Ethernet frames \\
+                \#RX/TX queues & = number of CPU cores \\
+                TX/RX queue size & 256 descriptors \\
+                List of offloads & Opaque receive side scaling
+            \end{tabular}
+        }
+    \end{minipage}
+    \caption{Least common denominator NIC model in \mt{}}
+    \label{tab:lcd-model}
+\end{table}
+
+Note that individual vNICs may support additional features beyond the LCD model and may be worth individually optimizing.
+For example, most vNICs in Azure VMs support registering application memory with the NIC for zero-copy transmission (see below).
+However, vNICs in other clouds do not support this feature (e.g., Google Cloud Platform, Amazon EC2), so we currently do not include it in the LCD model.
+
+\paragraph{Queues and descriptors.}
+Since a cloud provider must virtualize the NIC's queues and SRAM among tenants, each tenant gets a limited piece of these resources.
+Across all three major cloud providers, we observed that the number of TX/RX queue pairs equals the number of server vCPUs rented by the tenant, and the number of descriptors per queue is 256.
+This precludes designs like eRPC~\cite{erpc} that create very large receive queues to avoid host-side packet drops.
+The LCD NIC requires posting and polling one descriptor per packet; descriptor coalescing optimizations such as batching multiple packets per descriptor~\cite{erpc} are unavailable.
+
+\ul{\textit{Implication.}} %Recall that our target execution model (Section~\ref{sec:execution-models}) requires us to support a larger number of threads than the number of CPU cores.
+%Since the LCD NIC provides one NIC queue pair per CPU core, the lock-free library OS model of dedicating a NIC queue per thread is infeasible.
+%This is one of the reasons why, as we will show later,
+The new userspace stack should work as a separate process, multiplexing the available NIC queues among multiple threads.
+
+\paragraph{Flow-to-CPU core mapping.}
+The LCD NIC supports only opaque receive side scaling (RSS), i.e., the NIC randomly hashes flows to RX queues, but the stack may not query or modify the NIC's RSS key or indirection table.
+In contrast, granular control over bare-metal NICs' flow-to-core mapping units has been widely used to scale network stack throughput over multiple cores and to implement rich CPU scheduling policies.
+For example, Snap~\cite{snap} and eRPC~\cite{erpc} install NIC flow rules that match on packet headers and redirect matched packets to a specific RX queue, which are then processed by a particular CPU core.
+TAS~\cite{tas} and RSS++~\cite{rssplusplus} reconfigure the NIC's RSS indirection table to dynamically scale the number of CPU cores.
+mTCP~\cite{mtcp} installs a special symmetric RSS key on the NIC~\cite{tas}.
+IX~\cite{belay2014ix} queries the NIC's RSS key to choose UDP source ports for flows that maximize CPU affinity.
+
+\ul{\textit{Implication.}} The new userspace stack should use only opaque RSS while providing isolation between applications (no performance inference is created).
+%The LCD NIC's opaque RSS makes it challenging to implement inter-application performance isolation (\S\ref{subsec:mapping-challenges}).
+%With only opaque RSS, all traffic will contend for the same NIC queues and \mt{} CPU cores, causing performance interference between different applications using \mt{}.
+%This led us to design a new approach called \rssminus{} (\S\ref{subsec:rssminus}) that uses only opaque RSS, but still provides isolation between applications.
+
+\paragraph{Direct memory access.}
+During packet I/O with the LCD NIC, the stack copies packets between application memory and the NIC's TX/RX ring buffers.
+DMA-related optimizations are not available.
+For example, in Cornflakes~\cite{cornflakes}, the NIC reads DMA-registered application memory to serialize objects into Protocol Buffers.
+The benefits of RDMA have been widely studied in numerous systems~\cite{socksdirect, mrpc, farm}, but support for RDMA in guest VMs (e.g., for performance isolation~\cite{Kong:nsdi23}) is still in progress.
+
+\ul{\textit{Implication.}} The new userspace stack should be built atop plain packet I/O instead of relying on zero-copy packet transmission or RDMA.
+%Our finding is that this is sufficient to satisfy \mt{}'s main performance goal of low latency.
+%Memory copies in \mt{} take hundreds of nanoseconds.
+%While this can be significant in small bare-metal testbeds with sub-\us{3} round-trip latency, it is negligible compared to the 10+ microseconds of network round trip latency in large cloud datacenters that \mt{} targets.
+
+
+\subsection{Diverse application execution models}
+\label{subsec:sidecar}
+Userspace stacks have historically sacrificed application execution flexibility for performance.
+For example, the libOS-based approach---used by Sandstorm, libvma, Seastar, OpenOnload, eRPC, and Demikernel~\cite{Marinos:sigcomm14, libvma, seastar, openonload, erpc, demi-kernel} ---has been the standard, with a few notable exceptions~\cite{tas, snap}.
+The libOS approach imposes several constraints on the application's execution model, the most important of which is that one application ``owns'' the NIC, so only one process can use the NIC at a time.
+Additionally, each application thread typically owns one NIC queue, so the small number of NIC queues on cloud vNICs limits the number of threads.
+Note that simply attaching many vNICs to the cloud VM is not a feasible solution to these problems since it goes against the standard VM deployment model.
+In Microsoft Azure, among general-purpose, computer-optimized, memory-optimized, and storage-optimized VMs, the maximum vNICs allowed for VMs is 8~\cite{azure-vnic}.
+Further, Oracle cloud limits the number of vNICs to the number of vCPUs in a virtual machine~\cite{oracle-vnic}, and VMware only allows up to 10 vNICs regardless~\cite{vmware-vnic}.
+
+%\paragraph{Roots of the libOS model.} We believe that this restrictive model simply followed the roots of kernel-bypass networking in network function virtualization (NFV); a DPDK whitepaper presents a comprehensive history~\cite{dpdk-myth-busting-2020}.
+%In NFV, the focus was on softwarizing packet-processing applications like telecom appliances (e.g., LTE gateways~\cite{Lange:ieee2015, Mohammadkhan:ieee2019}) and middleboxes~\cite{packetshader, cuckooswitch}, which were traditionally implemented in hardware;
+%For example, a load balancer application is best structured as a single multi-threaded process with exclusive NIC queues per thread, and a libOS stack linked to the process.
+
+For Internet service applications, like databases, caches, and stream-processing engines, the libOS model is too restrictive.
+One server often runs multiple applications written in various languages, with possibly numerous threads per process.
+For example, Google production workloads are incompatible with this model since they run hundreds of threads per core and use high-level languages such as Go~\cite{google-workload}.
+
+% \begin{table}
+%     \centering
+%     \footnotesize
+%     \begin{tabular}{p{0.1\linewidth}p{0.20\linewidth}p{0.5\linewidth}}
+%     \textbf{System} & \textbf{Target \newline deployment} & \textbf{Rationale for choosing \newline sidecar over LibOS} \\
+%     \toprule
+%     TAS & Bare-metal \newline OS service & Applications cannot be trusted to comply with TCP congestion control \\
+%     \midrule
+%     Snap & Hypervisor & Provide busy-polling as a system-level service; hypervisor component \\
+%     \midrule
+%     \mt{} & User process \newline in guest VMs & Allow multiple processes and many threads to use the same cloud vNIC \\
+%     \end{tabular}
+%     \caption{Rationale for choosing a sidecar vs. a libOS design\ga{I think we shall remove this table as it does not add anything wrt the story we have now.}}
+%     \label{table:sidecar-vs-libos}
+% \end{table}
+
+
+\paragraph{No threading constraints.}
+\label{par:no-threading-constraints}
+There is a need to support an arbitrary number of threads to accommodate modern multi-threaded cloud applications.
+This problem is challenging in libOS approaches that require applications to use a single-threaded event loop.
+Particularly, the number of threads would be limited to either the number of NIC queues or the number of CPU cores available to the virtual machine.
+
+\ul{\textit{Implication.}} The new userspace stack should adopt a sidecar (microkernel) approach. Here, the sidecar owns the NIC. With this layer of indirection, multiple processes and threads can use the same NIC.
+The sidecar can send interrupts to applications permitting non-poll mode processing.
+
+\paragraph{Blocking receive.}
+\label{par:blocking-receive}
+Userspace stacks typically require applications to poll for incoming messages continuously.
+Although this approach gets the best latency, it restricts application execution flexibility by limiting the number of threads to the number of CPU cores.
+The problem is that in production workloads, often many threads share just one core~\cite{google-workload}.
+For example, one workload we learned about needed low latency when hosting thousands of database instances isolated in different processes on a single VM; most of these expected little traffic.
+Each database needs low-latency messaging to replicate data to remote servers when active.
+This execution model is ill-served by a polling model since the number of database processes exceeds the number of CPU cores.
+
+\ul{\textit{Implication.}} The new userspace stack should allow users to block on receive calls, i.e., application threads can sleep and be woken up by the sidecar when a message arrives.
+%We use semaphores to sleep and wake-up application threads, with an optimization to avoid the high overhead of posting a semaphore for every received message:
+%Before posting, the sidecar first checks if the application is sleeping by reading a shared memory address, which the application sets before it sleeps.
+%In the case where no thread is sleeping, the cost is near-zero since the address is likely cached in the sidecar's L1 cache.
+%We have handled the race conditions that arise from this approach, e.g., where the application goes to sleep and never gets woken up, but we omit the details for brevity.
+
+
+\subsection{Low-latency support}
+\label{subsec:low-latency}
+Linux, the most common OS in the cloud~\cite{azure_smartnic}, is notoriously slow, and existing research attempted to improve its latency with disruptive changes~\cite{terabit-ethernet}.
+While with this paper, we attempt to tackle this problem, designing the new stack following a sidecar model (as noted before) might raise performance concerns about the overhead imposed by the inter-process shared-memory communication (IPC) when data has to be delivered to the application.
+It is worth noting that the IPC is small, considering our target deployments in large cloud networks.
+Indeed, as we show later, an extra \us{1} is significant in small bare-metal testbeds, e.g., it is 43\% of eRPC's \us{2.3} median latency, but cloud networks are large, with VMs often separated by multiple switches and long fiber-optic cables~\cite{Guo:sigcomm16}.
+The extra \us{1} is relatively small, e.g., only 10\% higher than eRPC in our measurement (\S\ref{sec:evaluation}).
+
+%Other solutions such as Shenango~\cite{shenango}, or Demikernel~\cite{demi-kernel}, Go Runtime~\cite{go-runtime} provide low overhead coroutine mechanisms allowing for fast context switching.
+%While these fast solutions require new libraries and APIs, we aim to provide a simple and familiar API to developers.
+%\ul{\textit{Implication.}} \mt{} uses POSIX pthread which is widely compatible with existing applications. Applications can create as many threads and still use \mt{} APIs.
+%The small shim library API is easy to port to other languages.
+
+%\paragraph{Comparison with prior sidecar designs.}
+%TAS~\cite{tas} and Snap~\cite{snap} are two recent userspace stacks that use a sidecar design.
+%However, their design is not fully compatible with cloud vNICs: TAS reconfigures the NIC's RSS indirection table, and Snap uses the NIC's flow steering hardware.
+%In addition, these systems were never evaluated on cloud VMs; we had difficulties getting TAS to run on the cloud.
+
+%\mt{}'s rationale for using a sidecar design is different from these systems (Table~\ref{table:sidecar-vs-libos}).
+%TAS does not use a libOS design to avoid trusting applications to comply with TCP congestion control~\cite[Sec.~7]{tas}.
+%Snap uses a sidecar design to provide a system-level service for busy-polling and low-latency application scheduling, and to provide hypervisor functionality (e.g., network virtualization) that must be shared by multiple VMs.
+
+
+
+
+
+
+
+
+
+
+
+
+%\begin{table}
+%    \centering
+%    \begin{minipage}{.9\columnwidth}
+%        \centering
+%        \fbox{
+%            \small
+%            \begin{tabular}{>{\bfseries}ll}
+%                I/O interface & Ethernet frames \\
+%                \#RX/TX queues & = number of CPU cores \\
+%                TX/RX queue size & 256 descriptors \\
+%                List of offloads & Opaque receive side scaling
+%            \end{tabular}
+%        }
+%    \end{minipage}
+%    \caption{Least common denominator NIC model in \mt{}}
+%    \label{tab:lcd-model}
+%\end{table}
+
+%Table~\ref{tab:lcd-model} shows the conceptual Least Common Denominator NIC model that we design \mt{} for.
+%From our study, we have calculated this as the feature set supported today by all modern DPDK-capable NICs, including the three major cloud providers (AWS, Azure, and GCP).
+
+%\subsection{LCD NIC features}
+%The LCD NIC model provides OS-bypass Ethernet packet I/O, over a number of TX and RX queues up to the number of CPU cores, with queues containing up to 256 descriptors each.
+%Receive side scaling is supported, but this NIC does not expose the RSS key or RSS indirection table to the guest VM for inspection or modification.
+
+%Note that individual vNICs may support additional features beyond the LCD model, and may be worth individually optimizing for.
+%For example, most vNICs in Azure VMs support registering application memory with the NIC for zero-copy transmission (see below).
+%However, vNICs in other clouds do not support this feature, so we currently do not include it in the LCD model.
+
+% \begin{table*}
+% \centering
+% \small
+% \begin{tabular}{ll}
+% \textbf{NIC feature} & \textbf{Description} \\
+% \toprule
+% Flow steering & Redirect matching packets to a specific receive queue (e.g., eRPC~\cite{erpc}, Snap~\cite{snap}, Shinjuku~\cite{shinjuku}) \\
+% RSS reconfiguration & Query/modify the RSS key or redirection table (e.g., IX~\cite{belay2014ix}, TAS~\cite{tas}, RSS++~\cite{rssplusplus}, mTCP~\cite{mtcp}) \\
+% \midrule
+% Deep RX queues & RX queues with thousands of entries, to prevent host-side packet drops (e.g., eRPC~\cite{erpc}) \\
+% Multi-packet RQs & Receive multiple packets with one RX queue descriptor (e.g., eRPC~\cite{erpc}, Virtuoso~\cite{virtuoso}) \\
+% \midrule
+% TX DMA from app memory & Transmit packets directly from DMA-registered user memory (e.g., Cornflakes~\cite{cornflakes}, eRPC~\cite{erpc}) \\
+% Remote DMA & Access remote server memory without involving remote CPU (e.g., SocksDirect~\cite{socksdirect}, mRPC~\cite{mrpc}) \\
+% \midrule
+% Connectionless transports & Avoid connection setup overhead for short messages (e.g., Homa~\cite{homa}) \\
+% \bottomrule
+% \end{tabular}
+% \caption{Examples of features in existing projects that are not supported by the LCD model}
+% \label{table:unsupported_features}
+% \end{table*}
+
+% \begin{table*}
+% \centering
+% \resizebox{\textwidth}{!}{%
+% \small
+% \begin{tabular}{llll}
+% \textbf{NIC feature} & \textbf{Description} & \textbf{Year of introduction} & \textbf{Systems used} \\
+% \toprule
+% Flow steering & Redirect matching packets to a specific receive queue & 2013 (ConnectX3) & eRPC~\cite{erpc}, Snap~\cite{snap}, Shinjuku~\cite{shinjuku} \\
+% RSS reconfiguration & Query/modify the RSS key or redirection table & 2013 (ConnectX3) & IX~\cite{belay2014ix}, TAS~\cite{tas}, RSS++~\cite{rssplusplus}, mTCP~\cite{mtcp} \\
+% \midrule
+% Deep RX queues & RX queues with thousands of entries, to prevent host-side packet drops & 2014 (ConnectX4) & eRPC~\cite{erpc}) \\
+% Multi-packet RQs & Receive multiple packets with one RX queue descriptor & 2014 (ConnectX4) & eRPC~\cite{erpc}, Virtuoso~\cite{virtuoso}, Junction~\cite{junction} \\
+% \midrule
+% TX DMA from app memory & Transmit packets directly from DMA-registered user memory & 2011 (ConnextX3) & Cornflakes~\cite{cornflakes}, eRPC~\cite{erpc} \\
+% Remote DMA & Access remote server memory without involving remote CPU & 2011 (ConnextX3) & SocksDirect~\cite{socksdirect}, mRPC~\cite{mrpc} \\
+% \midrule
+% Poll Event Queue & Generate interrupts throughput PCI-e that allows for efficient polling & 2014 (ConnextX4) & Junction~\cite{junction} \\
+% \bottomrule
+% \end{tabular}
+% }
+% \caption{Examples of features in existing projects that are not supported by the LCD model.
+% These features prevent developers from using systems in the table.
+% In contrast, \mt{} adheres to the LCD model which avoids using these features altogether achieving higher adoptability.}
+% \label{table:unsupported_features}
+% \end{table*}
+
+%\subsection{Features outside the LCD model}
+%\label{subsec:unsupported-features}
+%Table~\ref{table:unsupported_features} lists some popular NIC features used by several recent userspace stacks and related projects that are not supported by the LCD NIC; we briefly discuss these below.
+%While these features have been ubiquitous in bare-metal NICs for over a decade (e.g., Intel's 82599 Ethernet controllers released in 2009 support flow steering~\cite{intel-82599}), they are not yet part of the virtualized NICs exposed to guest VMs.
+%As network virtualization technology improves, more features may be added to the LCD model.
+%The current LCD listed in Table~\ref{tab:lcd-model} has been constant for several years (since at least 2019), so it is a stable target for userspace stack designers.
+
+%\paragraph{Queues and descriptors.}
+%Since the cloud provider must virtualize the NIC's queues and SRAM among tenants, each tenant gets a limited piece of these resources.
+%Across all three major cloud providers, we observed that the number of TX/RX queue pairs is equal to the number of server vCPUs rented by the tenant, and the number of descriptors per queue is 256.
+%This precludes designs like eRPC~\cite{erpc} that create very large receive queues to avoid host-side packet drops.
+%The LCD NIC requires posting and polling one descriptor per packet; descriptor coalescing optimizations such as batching multiple packets per descriptor~\cite{erpc} are not available.
+
+%\ul{\textit{Implication.}} Recall that our target execution model (Section~\ref{sec:execution-models}) requires us to support a larger number of threads than the number of CPU cores.
+%Since the LCD NIC provides one NIC queue pair per CPU core, the lock-free library OS model of dedicating a NIC queue per thread is infeasible.
+%This is one of the reasons why, as we will show later, we design \mt{} as a separate process that multiplexes the available NIC queues among multiple threads (\S\ref{subsec:sidecar}).
+
+%\paragraph{Flow-to-CPU core mapping.}
+%The LCD NIC supports only opaque receive side scaling (RSS), i.e., the NIC randomly hashes flows to RX queues, but the stack may not query or modify the NIC's RSS key or indirection table.
+%In contrast, granular control over bare-metal NICs' flow-to-core mapping units has been widely used to scale network stack throughput over multiple cores, and to implement rich CPU scheduling policies.
+%For example, Snap~\cite{snap} and eRPC~\cite{erpc} install NIC flow rules that match on packet headers and redirect matched packets to a specific RX queue, which are then processed by a specific CPU core.
+%TAS~\cite{tas} and RSS++~\cite{rssplusplus} reconfigure the NIC's RSS indirection table to dynamically scale the number of stack CPU cores.
+%mTCP~\cite{mtcp} installs a special symmetric RSS key on the NIC~\cite{tas}.
+%IX~\cite{belay2014ix} queries the NIC's RSS key to choose UDP source ports for flows that maximize CPU affinity.
+
+%\ul{\textit{Implication.}} The LCD NIC's opaque RSS makes it challenging to implement inter-application performance isolation (\S\ref{subsec:mapping-challenges}).
+%With only opaque RSS, all traffic will contend for the same NIC queues and \mt{} CPU cores, causing performance interference between different applications using \mt{}.
+%This led us to design a new approach called \rssminus{} (\S\ref{subsec:rssminus}) that uses only opaque RSS, but still provides isolation between applications.
+
+%\paragraph{Direct memory access.}
+%During packet I/O with the LCD NIC, the stack copies packets between application memory and the NIC's TX/RX ring buffers.
+%DMA-related optimizations are not available.
+%For example, in Cornflakes~\cite{cornflakes}, the NIC reads DMA-registered application memory to serialize objects into Protocol Buffers.
+%The benefits of RDMA have been widely studied in numerous systems~\cite{socksdirect, mrpc, farm}, but support for RDMA in guest VMs (e.g., for performance isolation~\cite{Kong:nsdi23}) is still in progress.
+
+%\ul{\textit{Implication.}} We build \mt{} atop plain packet I/O instead of relying on zero-copy packet transmission or RDMA (\S\ref{sec:implementation}).
+%Our finding is that this is sufficient to satisfy \mt{}'s main performance goal of low latency.
+%Memory copies in \mt{} take hundreds of nanoseconds.
+%While this can be significant in small bare-metal testbeds with sub-\us{3} round-trip latency, it is negligible compared to the 10+ microseconds of network round trip latency in large cloud datacenters that \mt{} targets.
+
+%\paragraph{Transport protocol limitations.}
+%Cloud NICs favor connection-oriented protocols over connectionless protocols.
+%When a guest VM initiates a new connection, an SDN policy evaluation pipeline processes the control packets (e.g., SYN)~\cite{vfp}.
+%While this is transparent to the VM, it significantly increases first-packet latency, and limits the number of connections per second that can be initiated~\cite{sirius, andromeda}.
+%It is not uncommon for packets-per-second to drop by 100$\times$ or more when initiating new connections.
+%Transports that use connectionless transports in combination with packet spraying via random UDP ports (e.g., Homa~\cite{homa}, NDP) may run into SDN-related bottlenecks.
+
+%\ul{\textit{Implication.}} To reduce the SDN overheads of the public cloud, we design \mt{} to feature a connection-oriented protocol similar to TCP (\S\ref{par:network-protocol}).
+

@@ -1,0 +1,1288 @@
+\section{LoRA Fine-Tuning Parameter Counts}
+We provide details on the number of parameters tuned during fine-tuning of different ResNet models using LoRA with varying ranks, as shown in \cref{tab:lora}.
+
+\begin{table}[h]
+\caption{\small Number of parameters to be tuned during fine-tuning of different ResNet models (total parameters shown in parentheses) using LoRA with varying ranks. \textbf{While LoRA with low ranks significantly reduces the number of parameters required for fine-tuning, these values still range from tens of thousands to over a million, reinforcing the need for CT in highly resource-constrained scenarios.}}
+\label{tab:lora}
+\vskip 0.1in
+\begin{center}
+\begin{small}
+\resizebox{0.4\linewidth}{!}{%
+\begin{tabular}{|c|c|c|c|}
+  \hline
+  \multirow{2}{*}{\diagbox[]{Method}{Model}} 
+    & ResNet-18 & ResNet-50 & ResNet-152 \\
+  & (11.69M) & (25.89M) & (61.18M) \\
+  \hline
+  LoRA ($rank=1$) & 50K & 14K & 40K \\
+  \hline
+  LoRA ($rank=2$) & 8K & 22K & 64K \\
+  \hline
+  LoRA ($rank=4$) & 16K & 38K & 1.14M \\
+  \hline
+\end{tabular}
+}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table}
+
+\section{Spline Theory}\label{app:spline-theory}
+The spline theory of deep learning establishes that a large class of deep network (DN) layers can be modeled as MASOs. More precisely:
+\begin{theorem}
+\label{thm:spline}
+Any DN layer comprising a linear operator (e.g., fully connected or convolutional layer) followed by a convex and piecewise affine non-linear operator (e.g., ReLU, leaky-ReLU, absolute value activation, max/average/channel pooling, maxout; with or without skip connections) is a MASO \cite{balestriero2018spline}.
+\end{theorem}
+
+Consequently, a deep network (e.g., MLP, CNN, RNN, ResNet) composed of such linear operators and convex, piecewise affine non-linear operators is a composition of MASOs. However, it is important to note that the network as a whole is not a MASO but an ASO.  In other words, conditioned on the input, such deep networks are equivalent to an affine transformation, but globally, the transformation is not convex.
+
+\section{Curvature Tuning (CT) Implementation}\label{app:code}
+
+The following code provides a PyTorch implementation of CT. The \texttt{CT} class defines the new activation function as formulated in \cref{eq:CT}, while the \texttt{replace\_module} function searches for and replaces all ReLU activations in a network with CT.
+
+\newpage
+\begin{lstlisting}
+import torch
+from torch import nn
+
+
+class CT(nn.Module):
+    def __init__(self, beta=0, coeff=0.5, threshold=20, trainable=False):
+        assert 0 <= beta < 1
+        super().__init__()
+        self.beta = nn.Parameter(torch.tensor(beta))
+        self.beta.requires_grad_(trainable)
+        self.coeff = coeff
+        self.threshold = threshold
+
+    def forward(self, x):
+        beta = self.beta
+        normal_ver = (
+            self.coeff * torch.sigmoid(beta * x / (1 - beta)) * x +
+            (1 - self.coeff) * torch.log(1 + torch.exp(x / (1 - beta))) * (1 - beta)
+        )
+        overflow_ver = (
+            self.coeff * torch.sigmoid(beta * x / (1 - beta)) * x +
+            (1 - self.coeff) * x
+        )
+        return torch.where(x / (1 - beta) <= self.threshold, normal_ver, overflow_ver)
+
+
+class ReplacementMapping:
+    def __init__(self, old_module, new_module, **kwargs):
+        self.old_module = old_module
+        self.new_module = new_module
+        self.kwargs = kwargs
+
+    def __call__(self, module):
+        if isinstance(module, self.old_module):
+            return self.new_module(**self.kwargs)
+        return module
+
+
+def replace_module(model, old_module=nn.ReLU, new_module=CT, **kwargs):
+    if not isinstance(model, nn.Module):
+        raise ValueError("Expected model to be an instance of torch.nn.Module")
+
+    replacement_mapping = ReplacementMapping(old_module, new_module, **kwargs)
+
+    device = next(model.parameters(), torch.tensor([])).device  # Handle models with no parameters
+
+    for name, module in model.named_modules():
+        if name == "":
+            continue
+        replacement = replacement_mapping(module).to(device)
+
+        # Traverse module hierarchy to assign new module
+        module_names = name.split(".")
+        parent = model
+        for name in module_names[:-1]:
+            parent = getattr(parent, name)
+        setattr(parent, module_names[-1], replacement)
+
+    return model
+\end{lstlisting}
+\newpage
+
+
+\section{Supplementary Experimental Details}\label{app:exp}
+\subsection{Hardware}
+Our experiments are conducted with 8 RTX 3090 GPUs and 384GB of CPU memory. Since CT does not require backpropagation, the hardware demands for each experiment are minimal, allowing each experiment to fit on a single GPU.
+
+\subsection{Improving Generalization on Natural Image
+Datasets}\label{app:exp-natural-img}
+This subsection provides additional details on the pretraining of our models used in the experiments in \cref{sec:exp-natural-img}. We also present the complete results, including both the mean and standard deviation for ResNet-18, ResNet-50, and ResNet-152. Additionally, we provide visualizations of accuracy trends during the $\beta$ search process and report further experiments validating the robustness of CT under different linear probing configurations.
+
+\textbf{Pretraining Details:}
+For the \textbf{Cross-Dataset Transfer} experiment, we pretrain ResNet-18, ResNet-50, and ResNet-152 for 10 epochs on MNIST and 200 epochs on CIFAR-10 and CIFAR-100. For ImageNet, we use the pretrained weights provided by PyTorch \cite{paszke2019pytorch}. Training is conducted using SGD with a learning rate of 0.1, momentum of 0.9, and weight decay of $5 \times 10^{-4}$. The batch size is set to 128, and cross-entropy loss is used. 
+
+A MultiStepLR \cite{paszke2019pytorch} scheduler with a decay factor of 0.2 is applied, with learning rate reductions at epochs 3, 6, and 9 for MNIST, and at epochs 60, 120, and 160 for CIFAR-10 and CIFAR-100.
+
+For the \textbf{ImageNet-to-Multiple-Datasets Transfer} experiment, we use the pretrained weights provided by PyTorch.
+
+\textbf{Complete Experimental Results:}
+The full results for the \textbf{Cross-Dataset Transfer} experiment are presented in \cref{tab:gen-full}, while those for the \textbf{ImageNet-to-Multiple-Datasets Transfer} experiment are shown in \cref{tab:natural-img-full}.
+
+\begin{table*}[h]
+  \centering
+  \caption{\small Complete accuracy results of ResNet-18, ResNet-50, and ResNet-152 trained and tested across MNIST, CIFAR-10, CIFAR-100, and ImageNet (\textbf{bold} entries indicate improvement with CT). \textbf{CT consistently enhances generalization across models and datasets, with $\beta$ values close to 1.} Reported values include means and standard deviations over three runs.}
+  
+  \label{tab:gen-full}
+    \begin{subtable}[]{\textwidth}
+        \centering
+        \caption{\small \textbf{ResNet-18.} Avg rel improve: 1.68\%. Avg $\beta$: 0.82.}
+        \label{tab:gen-ResNet-18-full}
+        \resizebox{\linewidth}{!}{%
+        \begin{tabular}{|c|c|c|c|c|c|c|c|c|c|c|c|c|}
+          \hline
+          \multirow{2}{*}{\diagbox[]{Test}{Train}} & \multicolumn{3}{c|}{MNIST} 
+            & \multicolumn{3}{c|}{CIFAR-10} & \multicolumn{3}{c|}{CIFAR-100} 
+            & \multicolumn{3}{c|}{ImageNet} \\
+          \cline{2-13}
+          & ReLU (\%) & + CT (\%) & \textcolor{gray}{($\beta$)} & ReLU (\%) & + CT (\%) & \textcolor{gray}{($\beta$)} 
+          & ReLU (\%) & + CT (\%) & \textcolor{gray}{($\beta$)} & ReLU (\%) & + CT (\%) & \textcolor{gray}{($\beta$)} \\
+          \hline
+          MNIST     & 99.59 ± 0.00 & 99.59 ± 0.00 & \textcolor{gray}{1.00 ± 0.00} 
+                    & 86.08 ± 0.06 & \textbf{87.30 ± 0.17} & \textcolor{gray}{0.92 ± 0.02} 
+                    & 89.56 ± 0.09 & \textbf{92.85 ± 0.26} & \textcolor{gray}{0.88 ± 0.00} 
+                    & 98.10 ± 0.01 & \textbf{98.95 ± 0.01} & \textcolor{gray}{0.68 ± 0.01} \\
+          \hline
+          CIFAR-10  & 45.02 ± 0.03 & \textbf{47.68 ± 0.04} & \textcolor{gray}{0.51 ± 0.01}
+                    & 94.87 ± 0.00 & 94.87 ± 0.00 & \textcolor{gray}{1.00 ± 0.00} 
+                    & 76.03 ± 0.04 & \textbf{76.90 ± 0.09} & \textcolor{gray}{0.92 ± 0.02} 
+                    & 85.68 ± 0.02 & \textbf{85.83 ± 0.04} & \textcolor{gray}{0.93 ± 0.00} \\
+          \hline
+          CIFAR-100 & 20.30 ± 0.10 & \textbf{21.80 ± 0.03} & \textcolor{gray}{0.51 ± 0.01} 
+                    & 35.21 ± 0.03 & \textbf{35.61 ± 0.24} & \textcolor{gray}{0.97 ± 0.01} 
+                    & 76.19 ± 0.00 & \textbf{76.21 ± 0.00} & \textcolor{gray}{0.97 ± 0.00} 
+                    & 63.15 ± 0.04 & 63.15 ± 0.04 & \textcolor{gray}{1.00 ± 0.00} \\
+          \hline
+          ImageNet  & - & - & \textcolor{gray}{-} 
+                    & - & - & \textcolor{gray}{-} 
+                    & - & - & \textcolor{gray}{-} 
+                    & 69.76 ± 0.00 & \textbf{69.84 ± 0.00} & \textcolor{gray}{0.94 ± 0.00} \\
+          \hline
+        \end{tabular}
+        }
+    \end{subtable}
+
+  \vspace{0.5em}
+
+    \begin{subtable}[]{\textwidth}
+        \centering
+        \caption{\small \textbf{ResNet-50.} Avg rel improve: 1.96\%. Avg $\beta$: 0.89.}
+        \label{tab:gen-ResNet-50-full}
+        \resizebox{\linewidth}{!}{%
+        \begin{tabular}{|c|c|c|c|c|c|c|c|c|c|c|c|c|}
+          \hline
+          \multirow{2}{*}{\diagbox[]{Train}{Test}} & \multicolumn{3}{c|}{MNIST} 
+            & \multicolumn{3}{c|}{CIFAR-10} & \multicolumn{3}{c|}{CIFAR-100} 
+            & \multicolumn{3}{c|}{ImageNet} \\
+          \cline{2-13}
+          & ReLU (\%) & + CT (\%) & \textcolor{gray}{($\beta$)} & ReLU (\%) & + CT (\%) & \textcolor{gray}{($\beta$)} 
+          & ReLU (\%) & + CT (\%) & \textcolor{gray}{($\beta$)} & ReLU (\%) & + CT (\%) & \textcolor{gray}{($\beta$)} \\
+          \hline
+          MNIST     & 98.77 ± 0.00 & \textbf{98.85 ± 0.00} & \textcolor{gray}{0.89 ± 0.00} 
+                    & 88.95 ± 0.05 & \textbf{89.04 ± 0.11} & \textcolor{gray}{0.98 ± 0.01} 
+                    & 94.61 ± 0.13 & \textbf{94.77 ± 0.07} & \textcolor{gray}{0.97 ± 0.01} 
+                    & 98.44 ± 0.02 & \textbf{98.64 ± 0.02} & \textcolor{gray}{0.92 ± 0.01} \\
+          \hline
+          CIFAR-10  & 38.47 ± 0.18 & \textbf{40.52 ± 0.04} & \textcolor{gray}{0.60 ± 0.02}
+                    & 95.57 ± 0.00 & 95.57 ± 0.00 & \textcolor{gray}{1.00 ± 0.00} 
+                    & 83.54 ± 0.09 & \textbf{83.78 ± 0.10} & \textcolor{gray}{0.95 ± 0.01} 
+                    & 88.21 ± 0.02 & \textbf{88.47 ± 0.01} & \textcolor{gray}{0.95 ± 0.01} \\
+          \hline
+          CIFAR-100 & 12.99 ± 0.05 & \textbf{15.08 ± 0.02} & \textcolor{gray}{0.60 ± 0.02} 
+                    & 32.75 ± 0.16 & \textbf{33.54 ± 0.16} & \textcolor{gray}{0.97 ± 0.01}
+                    & 78.02 ± 0.00 & \textbf{78.18 ± 0.00} & \textcolor{gray}{0.98 ± 0.00} 
+                    & 69.94 ± 0.06 & \textbf{70.13 ± 0.04} & \textcolor{gray}{0.96 ± 0.01} \\
+          \hline
+          ImageNet  & - & - & \textcolor{gray}{-} 
+                    & - & - & \textcolor{gray}{-} 
+                    & - & - & \textcolor{gray}{-} 
+                    & 76.15 ± 0.00 & 76.15 ± 0.00 & \textcolor{gray}{1.00 ± 0.00} \\
+          \hline
+        \end{tabular}
+        }
+    \end{subtable}
+
+  \vspace{0.5em}
+
+    \begin{subtable}[t]{\textwidth}
+        \centering
+        \caption{\small \textbf{ResNet-152.} Avg rel improve: 0.40\%. Avg $\beta$: 0.96.}
+        \label{tab:gen-ResNet-152-full}
+        \resizebox{\linewidth}{!}{%
+        \begin{tabular}{|c|c|c|c|c|c|c|c|c|c|c|c|c|}
+          \hline
+          \multirow{2}{*}{\diagbox[]{Test}{Train}} & \multicolumn{3}{c|}{MNIST} 
+            & \multicolumn{3}{c|}{CIFAR-10} & \multicolumn{3}{c|}{CIFAR-100} 
+            & \multicolumn{3}{c|}{ImageNet} \\
+          \cline{2-13}
+          & ReLU (\%) & + CT (\%) & \textcolor{gray}{($\beta$)} & ReLU (\%) & + CT (\%) & \textcolor{gray}{($\beta$)} 
+          & ReLU (\%) & + CT (\%) & \textcolor{gray}{($\beta$)} & ReLU (\%) & + CT (\%) & \textcolor{gray}{($\beta$)} \\
+          \hline
+          MNIST     & 98.07 ± 0.00 & 98.07 ± 0.00 & \textcolor{gray}{1.00 ± 0.00} 
+                    & 80.45 ± 0.40 & \textbf{80.80 ± 0.28} & \textcolor{gray}{0.98 ± 0.01} 
+                    & 93.78 ± 0.15 & \textbf{93.97 ± 0.31} & \textcolor{gray}{0.99 ± 0.01} 
+                    & 98.66 ± 0.03 & \textbf{98.68 ± 0.03} & \textcolor{gray}{0.95 ± 0.03} \\
+          \hline
+          CIFAR-10  & 35.18 ± 0.07 & \textbf{35.70 ± 0.02} & \textcolor{gray}{0.86 ± 0.01}
+                    & 95.28 ± 0.00 & \textbf{95.39 ± 0.00} & \textcolor{gray}{0.99 ± 0.00} 
+                    & 84.09 ± 0.16 & \textbf{84.10 ± 0.15} & \textcolor{gray}{0.99 ± 0.01} 
+                    & 90.27 ± 0.03 & 90.27 ± 0.03 & \textcolor{gray}{1.00 ± 0.01} \\
+          \hline
+          CIFAR-100 & 11.10 ± 0.04 & \textbf{11.39 ± 0.02} & \textcolor{gray}{0.87 ± 0.01} 
+                    & 26.58 ± 0.10 & \textbf{26.62 ± 0.05} & \textcolor{gray}{0.99 ± 0.01} 
+                    & 79.43 ± 0.00 & \textbf{79.58 ± 0.00} & \textcolor{gray}{0.98 ± 0.00} 
+                    & 72.95 ± 0.07 & \textbf{72.97 ± 0.05} & \textcolor{gray}{1.00 ± 0.01} \\
+          \hline
+          ImageNet  & - & - & \textcolor{gray}{-} 
+                    & - & - & \textcolor{gray}{-} 
+                    & - & - & \textcolor{gray}{-} 
+                    & 78.32 ± 0.00 & 78.32 ± 0.00 & \textcolor{gray}{1.00 ± 0.00} \\
+          \hline
+        \end{tabular}
+        }
+    \end{subtable}
+\vskip -0.1in
+\end{table*}
+
+\begin{table*}[h]
+\caption{\small Complete accuracy results of ImageNet-pretrained ResNet-18, ResNet-50, and ResNet-152 when transferred to 9 downstream datasets (\textbf{bold} entries indicate improvement with CT). \textbf{CT consistently enhances generalization across models and datasets, with $\beta$ values close to 1.} Reported values include means and standard deviations over three runs.}
+\label{tab:natural-img-full}
+\begin{center}
+\begin{small}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{|c|c|c|c|c|c|c|c|c|c|}
+\hline
+\multirow{2}{*}{\diagbox[]{Dataset}{Model}} & \multicolumn{3}{c|}{\textbf{ResNet-18}} & \multicolumn{3}{c|}{\textbf{ResNet-50}} & \multicolumn{3}{c|}{\textbf{ResNet-152}} \\ \cline{2-10} 
+& ReLU (\%) & + CT (\%) & \textcolor{gray}{($\beta$)} & ReLU (\%) & + CT (\%) & \textcolor{gray}{($\beta$)} & ReLU (\%) & + CT (\%) & \textcolor{gray}{($\beta$)} \\ \hline
+Arabic Characters & 86.46 ± 0.00 & \textbf{92.11 ± 0.08} & \textcolor{gray}{0.70 ± 0.00} 
+                  & 88.02 ± 0.05 & \textbf{89.87 ± 0.06} & \textcolor{gray}{0.91 ± 0.00} 
+                  & 87.86 ± 0.05 & \textbf{88.70 ± 0.02} & \textcolor{gray}{0.95 ± 0.00} \\ \hline
+Arabic Digits     & 97.92 ± 0.03 & \textbf{98.92 ± 0.01} & \textcolor{gray}{0.72 ± 0.04} 
+                  & 98.70 ± 0.02 & \textbf{98.79 ± 0.02} & \textcolor{gray}{0.87 ± 0.00} 
+                  & 98.23 ± 0.01 & \textbf{98.55 ± 0.03} & \textcolor{gray}{0.95 ± 0.01} \\ \hline
+Beans             & 85.94 ± 0.00 & \textbf{94.53 ± 0.00} & \textcolor{gray}{0.60 ± 0.00} 
+                  & 93.75 ± 0.00 & \textbf{94.79 ± 0.45} & \textcolor{gray}{0.94 ± 0.01} 
+                  & 91.41 ± 0.00 & \textbf{93.75 ± 0.00} & \textcolor{gray}{0.91 ± 0.00} \\ \hline
+CUB-200-2011      & 62.93 ± 0.00 & \textbf{63.60 ± 0.00} & \textcolor{gray}{0.90 ± 0.00} 
+                  & 66.09 ± 0.03 & \textbf{66.57 ± 0.05} & \textcolor{gray}{0.93 ± 0.00} 
+                  & 68.76 ± 0.00 & \textbf{69.74 ± 0.00} & \textcolor{gray}{0.94 ± 0.00} \\ \hline
+DTD               & 64.38 ± 0.03 & \textbf{64.50 ± 0.03} & \textcolor{gray}{0.92 ± 0.00} 
+                  & 70.46 ± 0.08 & \textbf{70.82 ± 0.03} & \textcolor{gray}{0.95 ± 0.01} 
+                  & 70.48 ± 0.00 & \textbf{70.57 ± 0.06} & \textcolor{gray}{0.98 ± 0.01} \\ \hline
+Fashion MNIST     & 88.54 ± 0.03 & \textbf{89.52 ± 0.01} & \textcolor{gray}{0.87 ± 0.01} 
+                  & 90.99 ± 0.03 & \textbf{91.30 ± 0.03} & \textcolor{gray}{0.94 ± 0.01} 
+                  & 90.48 ± 0.03 & \textbf{90.84 ± 0.04} & \textcolor{gray}{0.93 ± 0.00} \\ \hline
+FGVC-Aircraft     & 43.75 ± 0.06 & \textbf{48.30 ± 0.04} & \textcolor{gray}{0.77 ± 0.01} 
+                  & 47.62 ± 0.06 & \textbf{51.09 ± 0.12} & \textcolor{gray}{0.89 ± 0.00} 
+                  & 49.93 ± 0.05 & \textbf{50.35 ± 0.03} & \textcolor{gray}{0.94 ± 0.00} \\ \hline
+Flowers102        & 87.80 ± 0.01 & \textbf{87.96 ± 0.01} & \textcolor{gray}{0.86 ± 0.00} 
+                  & 89.56 ± 0.00 & 89.56 ± 0.00 & \textcolor{gray}{1.00 ± 0.00} 
+                  & 88.97 ± 0.00 & \textbf{89.15 ± 0.01} & \textcolor{gray}{0.96 ± 0.00} \\ \hline
+Food101           & 59.70 ± 0.05 & \textbf{60.48 ± 0.02} & \textcolor{gray}{0.89 ± 0.02} 
+                  & 68.07 ± 0.05 & \textbf{68.13 ± 0.03} & \textcolor{gray}{0.97 ± 0.01} 
+                  & 70.95 ± 0.04 & \textbf{71.02 ± 0.01} & \textcolor{gray}{0.99 ± 0.01} \\ \hline
+\multirow{2}{*}{Avg Rel Improve \& $\beta$} & \multicolumn{2}{c|}{Rel Improve (\%)} & \textcolor{gray}{($\beta$)} & \multicolumn{2}{c|}{Rel Improve (\%)} & \textcolor{gray}{($\beta$)} & \multicolumn{2}{c|}{Rel Improve (\%)} & \textcolor{gray}{($\beta$)} \\ \cline{2-10} 
+                  & \multicolumn{2}{c|}{3.53} 
+                  & \textcolor{gray}{0.80}
+                  & \multicolumn{2}{c|}{1.36} 
+                  & \textcolor{gray}{0.93}
+                  & \multicolumn{2}{c|}{0.77} 
+                  & \textcolor{gray}{0.95} \\ \hline
+\end{tabular}
+}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table*}
+
+\textbf{Accuracy Trends During $\beta$ Search:}
+Accuracy trends observed during $\beta$ search across multiple models and datasets are illustrated in \cref{fig:acc-trend}. As $\beta$ increases, we observe a sharp rise in accuracy leading to a distinct peak, followed by a gradual decline as $\beta$ continues to increase.
+
+\begin{figure*}[h]
+\vskip 0.1in
+\begin{center}
+\begin{subfigure}{0.32\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{fig/resnet18_food101.png}
+    \caption{\small ResNet-18 on Food-101}
+    \label{fig:resnet18_food101}
+\end{subfigure}
+\hfill
+\begin{subfigure}{0.32\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{fig/resnet50_celeb_a.png}
+    \caption{\small ResNet-50 on CelebA}
+    \label{fig:resnet50_celeb_a}
+\end{subfigure}
+\hfill
+\begin{subfigure}{0.32\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{fig/resnet152_med_mnist.png}
+    \caption{\small ResNet-152 on MedMNIST}
+    \label{fig:resnet152_med_mnist}
+\end{subfigure}
+\caption{\small The accuracy trends during the $\beta$ search process on various models and datasets. \textbf{A sharp increase leading to a distinct peak, followed by a gradual decline as $\beta$ increases can be observed across models and datasets.}}
+\label{fig:acc-trend}
+\end{center}
+\vskip -0.1in
+\end{figure*}
+
+\textbf{Robustness of CT to Linear Probing Configurations:} We demonstrate that CT consistently improves the generalization performance of models across various linear probing settings.
+
+The first setting we modify is the \textbf{regularization strength} of logistic regression ($c$) used to train the new classifier layer. Note that $c$ here refers to the inverse of the regularization strength in logistic regression (as implemented in scikit-learn \cite{buitinck2013sklearn}), meaning that a larger value corresponds to a weaker regularization.
+
+For the baseline described in \cref{sec:exp-natural-img}, we set $c=1$. To evaluate the impact of different regularization strengths, we also test $c=0.1$ (stronger regularization) and $c=10$ (weaker regularization). The results, presented in \cref{tab:gen-diff-c}, demonstrate that CT consistently enhances generalization performance across all tested regularization strengths.
+
+The second setting we adjust is the \textbf{feature map} used for linear probing, specifically the number of layers contributing features to the linear classifier. The baseline configuration uses only the last layer's features. Here, we test using features from the last 2 and 3 layers for linear probing. Due to the increased dimensionality of the combined feature maps, we train a fully connected classifier using Adam with a learning rate of $10^{-3}$, optimizing for 30 epochs with cross-entropy loss. The results, shown in \cref{tab:gen-diff-layer}, indicate that CT consistently improves generalization performance regardless of the number of layers used for feature extraction.
+
+\begin{table*}[h]
+  \centering
+  \caption{\small Complete accuracy results of ResNet-18 trained and tested across MNIST, CIFAR-10, CIFAR-100, and ImageNet with varying regularization strengths ($c$) for logistic regression during linear probing (\textbf{bold} entries indicate improvement with CT). \textbf{CT consistently enhances generalization across different $c$ values, with $\beta$ values close to 1.} Reported values include means and standard deviations over three runs.}
+  \label{tab:gen-diff-c}
+    \begin{subtable}[]{\textwidth}
+        \centering
+        \caption{\small $c=0.1$. Avg rel improve: 1.37\%. Avg $\beta$: 0.86.}
+        \label{tab:gen-c-0.1}
+        \resizebox{\linewidth}{!}{%
+        \begin{tabular}{|c|c|c|c|c|c|c|c|c|c|c|c|c|}
+          \hline
+          \multirow{2}{*}{\diagbox[]{Test}{Train}} & \multicolumn{3}{c|}{MNIST} 
+            & \multicolumn{3}{c|}{CIFAR-10} & \multicolumn{3}{c|}{CIFAR-100} 
+            & \multicolumn{3}{c|}{ImageNet} \\
+          \cline{2-13}
+          & ReLU (\%) & + CT (\%) & \textcolor{gray}{($\beta$)} & ReLU (\%) & + CT (\%) & \textcolor{gray}{($\beta$)} 
+          & ReLU (\%) & + CT (\%) & \textcolor{gray}{($\beta$)} & ReLU (\%) & + CT (\%) & \textcolor{gray}{($\beta$)} \\
+          \hline
+          MNIST     & 99.59 ± 0.00 & 99.59 ± 0.00 & \textcolor{gray}{1.00 ± 0.00} 
+                    & 75.36 ± 0.08 & \textbf{76.94 ± 0.15} & \textcolor{gray}{0.93 ± 0.01} 
+                    & 86.36 ± 0.04 & \textbf{90.21 ± 0.15} & \textcolor{gray}{0.88 ± 0.00} 
+                    & 97.99 ± 0.01 & \textbf{98.65 ± 0.01} & \textcolor{gray}{0.71 ± 0.01} \\
+          \hline
+          CIFAR-10  & 43.19 ± 0.04 & \textbf{44.32 ± 0.03} & \textcolor{gray}{0.53 ± 0.01} 
+                    & 94.87 ± 0.00 & 94.87 ± 0.00 & \textcolor{gray}{1.00 ± 0.00} 
+                    & 76.10 ± 0.22 & \textbf{77.04 ± 0.07} & \textcolor{gray}{0.91 ± 0.01} 
+                    & 86.10 ± 0.01 & \textbf{86.24 ± 0.00} & \textcolor{gray}{0.96 ± 0.00} \\
+          \hline
+          CIFAR-100 & 15.66 ± 0.03 & \textbf{16.42 ± 0.04} & \textcolor{gray}{0.67 ± 0.01} 
+                    & 24.02 ± 0.08 & \textbf{24.23 ± 0.07} & \textcolor{gray}{0.98 ± 0.00} 
+                    & 76.19 ± 0.00 & \textbf{76.21 ± 0.00} & \textcolor{gray}{0.97 ± 0.00} 
+                    & 66.94 ± 0.03 & \textbf{67.35 ± 0.04} & \textcolor{gray}{0.94 ± 0.00} \\
+          \hline
+          ImageNet  & - & - & \textcolor{gray}{-} 
+                    & - & - & \textcolor{gray}{-} 
+                    & - & - & \textcolor{gray}{-} 
+                    & 69.76 ± 0.00 & \textbf{69.84 ± 0.00} & \textcolor{gray}{0.94 ± 0.00} \\
+          \hline
+        \end{tabular}
+        }
+    \end{subtable}
+
+  \vspace{0.5em}
+    
+    \begin{subtable}[]{\textwidth}
+        \centering
+        \caption{\small $c=10$. Avg rel improve: 2.48\%. Avg $\beta$: 0.83.}
+        \label{tab:gen-c-10}
+        \resizebox{\linewidth}{!}{%
+        \begin{tabular}{|c|c|c|c|c|c|c|c|c|c|c|c|c|}
+          \hline
+          \multirow{2}{*}{\diagbox[]{Test}{Train}} & \multicolumn{3}{c|}{MNIST} 
+            & \multicolumn{3}{c|}{CIFAR-10} & \multicolumn{3}{c|}{CIFAR-100} 
+            & \multicolumn{3}{c|}{ImageNet} \\
+          \cline{2-13}
+          & ReLU (\%) & + CT (\%) & \textcolor{gray}{($\beta$)} & ReLU (\%) & + CT (\%) & \textcolor{gray}{($\beta$)} 
+          & ReLU (\%) & + CT (\%) & \textcolor{gray}{($\beta$)} & ReLU (\%) & + CT (\%) & \textcolor{gray}{($\beta$)} \\
+          \hline
+          MNIST     & 99.59 ± 0.00 & 99.59 ± 0.00 & \textcolor{gray}{1.00 ± 0.00} 
+                    & 91.21 ± 0.12 & \textbf{92.04 ± 0.18} & \textcolor{gray}{0.90 ± 0.01}
+                    & 89.94 ± 0.30 & \textbf{92.73 ± 0.51} & \textcolor{gray}{0.88 ± 0.00} 
+                    & 97.78 ± 0.02 & \textbf{98.99 ± 0.02} & \textcolor{gray}{0.62 ± 0.01} \\
+          \hline
+          CIFAR-10  & 44.72 ± 0.03 & \textbf{47.46 ± 0.06} & \textcolor{gray}{0.53 ± 0.01} 
+                    & 94.87 ± 0.00 & 94.87 ± 0.00 & \textcolor{gray}{1.00 ± 0.00} 
+                    & 75.92 ± 0.13 & \textbf{76.74 ± 0.04} & \textcolor{gray}{0.91 ± 0.02} 
+                    & 85.51 ± 0.03 & \textbf{85.69 ± 0.02} & \textcolor{gray}{0.93 ± 0.00} \\
+          \hline
+          CIFAR-100 & 19.89 ± 0.01 & \textbf{23.29 ± 0.02} & \textcolor{gray}{0.51 ± 0.01} 
+                    & 42.88 ± 0.10 & \textbf{43.54 ± 0.06} & \textcolor{gray}{0.95 ± 0.01} 
+                    & 76.19 ± 0.00 & \textbf{76.21 ± 0.00} & \textcolor{gray}{0.97 ± 0.00} 
+                    & 58.75 ± 0.02 & \textbf{59.27 ± 0.04} & \textcolor{gray}{0.95 ± 0.01} \\
+          \hline
+          ImageNet  & - & - & \textcolor{gray}{-} 
+                    & - & - & \textcolor{gray}{-} 
+                    & - & - & \textcolor{gray}{-} 
+                    & 69.76 ± 0.00 & \textbf{69.84 ± 0.00} & \textcolor{gray}{0.94 ± 0.00} \\
+          \hline
+        \end{tabular}
+        }
+    \end{subtable}
+\vskip -0.1in
+\end{table*}
+
+\begin{table*}[h]
+  \centering
+  \caption{\small Complete accuracy results of ResNet-18 trained and tested across MNIST, CIFAR-10, CIFAR-100, and ImageNet with varying number of layers from which features are extracted for linear probing (\textbf{bold} entries indicate improvement with CT). \textbf{CT consistently enhances generalization across different numbers of layers used, with $\beta$ values close to 1.} Reported values include means and standard deviations over three runs.}
+  \label{tab:gen-diff-layer}
+    \begin{subtable}[]{\textwidth}
+        \centering
+        \caption{\small $layer=2$. Avg rel improve: 2.76\%. Avg $\beta$: 0.85.}
+        \label{tab:gen-layer-2}
+        \resizebox{\linewidth}{!}{%
+        \begin{tabular}{|c|c|c|c|c|c|c|c|c|c|c|c|c|}
+          \hline
+          \multirow{2}{*}{\diagbox[]{Test}{Train}} & \multicolumn{3}{c|}{MNIST} 
+            & \multicolumn{3}{c|}{CIFAR-10} & \multicolumn{3}{c|}{CIFAR-100} 
+            & \multicolumn{3}{c|}{ImageNet} \\
+          \cline{2-13}
+          & ReLU (\%) & + CT (\%) & \textcolor{gray}{($\beta$)} & ReLU (\%) & + CT (\%) & \textcolor{gray}{($\beta$)} 
+          & ReLU (\%) & + CT (\%) & \textcolor{gray}{($\beta$)} & ReLU (\%) & + CT (\%) & \textcolor{gray}{($\beta$)} \\
+          \hline
+          MNIST     & 99.59 ± 0.00 & 99.59 ± 0.00 & \textcolor{gray}{1.00 ± 0.00} 
+                    & 93.07 ± 0.46 & \textbf{94.66 ± 0.21} & \textcolor{gray}{0.92 ± 0.01} 
+                    & 92.62 ± 1.06 & \textbf{95.00 ± 0.49} & \textcolor{gray}{0.87 ± 0.01} 
+                    & 99.15 ± 0.08 & \textbf{99.32 ± 0.02} & \textcolor{gray}{0.77 ± 0.06} \\
+          \hline
+          CIFAR-10  & 51.90 ± 0.21 & \textbf{54.49 ± 0.17} & \textcolor{gray}{0.57 ± 0.01}  
+                    & 94.87 ± 0.00 & 94.87 ± 0.00 & \textcolor{gray}{1.00 ± 0.00}
+                    & 79.68 ± 0.17 & \textbf{80.37 ± 0.28} & \textcolor{gray}{0.94 ± 0.03} 
+                    & 87.14 ± 0.09 & \textbf{87.43 ± 0.03} & \textcolor{gray}{0.94 ± 0.02} \\
+          \hline
+          CIFAR-100 & 23.06 ± 0.32 & \textbf{25.50 ± 0.27} & \textcolor{gray}{0.56 ± 0.06} 
+                    & 40.31 ± 0.44 & \textbf{43.10 ± 0.40} & \textcolor{gray}{0.93 ± 0.02}
+                    & 76.19 ± 0.00 & \textbf{76.21 ± 0.00} & \textcolor{gray}{0.97 ± 0.00}
+                    & 63.41 ± 4.79 & \textbf{68.27 ± 0.24} & \textcolor{gray}{0.99 ± 0.00} \\
+          \hline
+          ImageNet  & - & - & \textcolor{gray}{-} 
+                    & - & - & \textcolor{gray}{-} 
+                    & - & - & \textcolor{gray}{-} 
+                    & 69.76 ± 0.00 & \textbf{69.84 ± 0.00} & \textcolor{gray}{0.94 ± 0.00} \\
+          \hline
+        \end{tabular}
+        }
+    \end{subtable}
+
+  \vspace{0.5em}
+
+    \begin{subtable}[]{\textwidth}
+        \centering
+        \caption{\small $layer=3$. Avg rel improve: 2.38\%. Avg $\beta$: 0.86.}
+        \label{tab:gen-layer-3}
+        \resizebox{\linewidth}{!}{%
+        \begin{tabular}{|c|c|c|c|c|c|c|c|c|c|c|c|c|}
+          \hline
+          \multirow{2}{*}{\diagbox[]{Test}{Train}} & \multicolumn{3}{c|}{MNIST} 
+            & \multicolumn{3}{c|}{CIFAR-10} & \multicolumn{3}{c|}{CIFAR-100} 
+            & \multicolumn{3}{c|}{ImageNet} \\
+          \cline{2-13}
+          & ReLU (\%) & + CT (\%) & \textcolor{gray}{($\beta$)} & ReLU (\%) & + CT (\%) & \textcolor{gray}{($\beta$)} 
+          & ReLU (\%) & + CT (\%) & \textcolor{gray}{($\beta$)} & ReLU (\%) & + CT (\%) & \textcolor{gray}{($\beta$)} \\
+          \hline
+          MNIST     & 99.59 ± 0.00 & 99.59 ± 0.00 & \textcolor{gray}{1.00 ± 0.00} 
+                    & 98.16 ± 0.03 & \textbf{98.37 ± 0.09} & \textcolor{gray}{0.90 ± 0.01} 
+                    & 97.44 ± 0.19 & \textbf{97.28 ± 0.09} & \textcolor{gray}{0.91 ± 0.03} 
+                    & 99.26 ± 0.03 & \textbf{99.36 ± 0.01} & \textcolor{gray}{0.85 ± 0.02} \\
+          \hline
+          CIFAR-10  & 56.19 ± 0.48 & \textbf{58.46 ± 0.13} & \textcolor{gray}{0.54 ± 0.04} 
+                    & 94.87 ± 0.00 & 94.87 ± 0.00 & \textcolor{gray}{1.00 ± 0.00} 
+                    & 84.49 ± 0.11 & \textbf{84.82 ± 0.06} & \textcolor{gray}{0.96 ± 0.03} 
+                    & 88.71 ± 0.07 & \textbf{89.15 ± 0.01} & \textcolor{gray}{0.94 ± 0.03} \\
+          \hline
+          CIFAR-100 & 25.57 ± 0.15 & \textbf{28.03 ± 0.11} & \textcolor{gray}{\textbf{0.53 ± 0.02}} 
+                    & 56.92 ± 0.10 & \textbf{57.30 ± 0.25} & \textcolor{gray}{0.97 ± 0.02} 
+                    & 76.19 ± 0.00 & \textbf{76.21 ± 0.00} & \textcolor{gray}{0.97 ± 0.00} 
+                    & 60.69 ± 5.12 & \textbf{69.86 ± 0.23} & \textcolor{gray}{0.94 ± 0.04} \\
+          \hline
+          ImageNet  & - & - & \textcolor{gray}{-} 
+                    & - & - & \textcolor{gray}{-} 
+                    & - & - & \textcolor{gray}{-} 
+                    & 69.76 ± 0.00 & \textbf{69.84 ± 0.00} & \textcolor{gray}{0.94 ± 0.00} \\
+          \hline
+        \end{tabular}
+        }
+    \end{subtable}
+\vskip -0.1in
+\end{table*}
+
+\subsection{Improving Generalization on Medical Image Datasets and Fine-grained Tasks}\label{app:exp-med-task}
+This subsection provides further details on the experimental setup for generalization in fine-grained tasks, as discussed in \cref{sec:exp-med-task}. We also present the complete results of the generalization experiments on medical image datasets and fine-grained tasks, along with a comparison of the per-attribute metrics for $\beta$ selected using different methods.
+
+\textbf{Detailed Settings of Generalizing on Fine-grained Tasks:} Since the ResNets are pretrained on single-label classification, when using them for more fine-grained downstream tasks, i.e. multi-label classification, regression and semantic segmentation, we need to adapt them specifically:
+\begin{itemize}
+    \item \textbf{Multi-label Classification on CelebA:} For the multi-label classification task, since the output dimension differs from the original single label classification one, we use \texttt{MultiOutputClassifier} from scikit-learn~\cite{buitinck2013sklearn} for linear probing, which trains 40 independent linear classifiers—one for each label.
+    \item \textbf{Regression on dSprites:} For the regression task, we use the orientation of the shapes in dSprites as targets. Due to the large dataset size, we only sample 50,000 images for training and 10,000 for testing. For transfer learning, we use linear regression.
+    \item \textbf{Semantic Segmentation on VOC2012:} For the semantic segmentation task, we use an untrained PSPNet with a ResNet-50 encoder pretrained on ImageNet. We first apply CT to the encoder, then freeze it while training the remaining network (i.e. the decoder) on semantic segmentation, as this setup follows the common practice of using a pretrained ResNet as a fixed feature extractor for downstream tasks. 
+\end{itemize}
+
+\textbf{Complete Experimental Results:} The full results for generalization on medical image datasets and fine-grained tasks are presented in \cref{tab:gen-med-task-full}. Additionally, the complete per-attribute metrics for $\beta$ selection using the Micro Best and Macro Best strategies are provided in \cref{tab:per-attr-celeba-micro-full-resnet18} and \cref{tab:per-attr-celeba-macro-full-resnet18} for ResNet-18, \cref{tab:per-attr-celeba-micro-full-resnet50} and \cref{tab:per-attr-celeba-macro-full-resnet50} for ResNet-50, and \cref{tab:per-attr-celeba-micro-full-resnet152} and \cref{tab:per-attr-celeba-macro-full-resnet152} for ResNet-152.  
+
+\begin{table}[h]
+  \centering
+    \caption{\small Complete results of the performance of ImageNet-pretrained ResNet-18, ResNet-50, and ResNet-152 when transferred to challenging medical image datasets and fine-grained tasks (\textbf{bold} entries indicate improvement with CT). \textbf{CT consistently improves generalization across diverse datasets and tasks.} Reported values include means and standard deviations over three runs.}
+  \label{tab:gen-med-task-full}
+  \begin{subtable}[]{0.8\linewidth}
+      \centering
+      \caption{\small \textbf{ResNet-18.} Avg rel improve: 2.69\%. Avg $\beta$: 0.83.}
+      \label{tab:gen-med-task-ResNet-18}
+          \resizebox{0.8\linewidth}{!}{%
+      \begin{tabular}{|c|c|c|c|c|c|}
+        \hline
+        Dataset & Metric & ReLU & + CT & Rel Improve (\%) & \textcolor{gray}{($\beta$)}\\
+        \hline
+        PathMNIST    & Acc (\%) $\uparrow$ & 86.21 ± 0.00 & \textbf{87.27 ± 0.01} 
+                     & 1.23 & \textcolor{gray}{0.81 ± 0.00} \\
+        \hline
+        OCTMNIST     & Acc (\%) $\uparrow$ & 65.47 ± 0.06 
+                     & \textbf{69.00 ± 0.26} & 5.40 & \textcolor{gray}{0.80 ± 0.04} \\
+        \hline
+        DermaMNIST   & Acc (\%) $\uparrow$ & 73.44 ± 0.03
+                     & \textbf{77.74 ± 0.08} & 5.86 & \textcolor{gray}{0.80 ± 0.01} \\
+        \hline
+        CelebA       & Mean Acc (\%) $\uparrow$ & 87.88 ± 0.00 & \textbf{88.44 ± 0.00} 
+                     & 0.64 & \textcolor{gray}{0.75 ± 0.01} \\
+        \hline
+        dSprites     & MSE $\downarrow$ & 4.09 ±0.01 & \textbf{4.08 ± 0.00} 
+                     & 0.33 & \textcolor{gray}{0.98 ± 0.00} \\
+        \hline
+        VOC2012      & mIoU $\uparrow$ & - & - 
+                     & - & - \\
+        \hline
+      \end{tabular}
+      }
+  \end{subtable}
+
+  \vspace{0.5em}
+
+  \begin{subtable}[]{0.8\linewidth}
+      \centering
+      \caption{\small \textbf{ResNet-50.} Avg rel improve: 1.74\%. Avg $\beta$: 0.86.}
+      \resizebox{0.8\linewidth}{!}{%
+      \begin{tabular}{|c|c|c|c|c|c|}
+        \hline
+        Dataset & Metric & ReLU & + CT & Rel Improve (\%) & \textcolor{gray}{($\beta$)}\\
+        \hline
+        PathMNIST    & Acc (\%) $\uparrow$ & 89.83 ± 0.04 & \textbf{89.88 ± 0.02} 
+                     & 0.06 & \textcolor{gray}{0.98 ± 0.01} \\
+        \hline
+        OCTMNIST     & Acc (\%) $\uparrow$ & 68.60 ± 0.20 
+                     & \textbf{69.93 ± 0.15} & 1.94 & \textcolor{gray}{0.90 ± 0.02} \\
+        \hline
+        DermaMNIST   & Acc (\%) $\uparrow$ & 73.67 ±0.00
+                     & \textbf{77.44 ± 0.06} & 5.12 & \textcolor{gray}{0.89 ± 0.00} \\
+        \hline
+        CelebA       & Mean Acc (\%) $\uparrow$ & 89.18 ± 0.01 & \textbf{89.42 ± 0.00} 
+                     & 0.27 & \textcolor{gray}{0.91 ± 0.00} \\
+        \hline
+        dSprites     & MSE $\downarrow$ & 4.40 ± 0.01 & \textbf{4.28 ± 0.02} 
+                     & 2.62 & \textcolor{gray}{0.53 ± 0.03} \\
+        \hline
+        VOC2012      & mIoU $\uparrow$ & 0.68 ± 0.00 & \textbf{0.69 ± 0.00} 
+                     & 0.41 & \textcolor{gray}{0.96 ±0.02} \\
+        \hline
+      \end{tabular}
+      }
+  \end{subtable}
+
+  \vspace{0.5em}
+
+  \begin{subtable}[]{0.8\linewidth}
+      \centering
+      \caption{\small \textbf{ResNet-152.} Avg rel improve: 4.22\%. Avg $\beta$: 0.85.}
+      \resizebox{0.8\linewidth}{!}{%
+      \begin{tabular}{|c|c|c|c|c|c|}
+        \hline
+        Dataset & Metric & ReLU & + CT & Rel Improve (\%) & \textcolor{gray}{($\beta$)}\\
+        \hline
+        PathMNIST    & Acc (\%) $\uparrow$ & 90.15 ± 0.04 & \textbf{90.75 ± 0.06} 
+                     & 0.66 & \textcolor{gray}{0.92 ± 0.00} \\
+        \hline
+        OCTMNIST     & Acc (\%) $\uparrow$ & 70.23 ± 0.15 & \textbf{71.03 ± 0.06} & 1.14 & \textcolor{gray}{0.98 ± 0.00} \\
+        \hline
+        DermaMNIST   & Acc (\%) $\uparrow$ & 74.39 ± 0.12
+                     & \textbf{77.92 ± 0.07} & 4.75 & \textcolor{gray}{0.93 ± 0.00} \\
+        \hline
+        CelebA       & Mean Acc (\%) $\uparrow$ & 89.16 ± 0.02 & \textbf{89.40 ± 0.02} 
+                     & 0.27 & \textcolor{gray}{0.92 ± 0.01} \\
+        \hline
+        dSprites     & MSE $\downarrow$ & 4.46 ± 0.02 & \textbf{3.82 ± 0.02} 
+                     & 14.27 & \textcolor{gray}{0.52 ± 0.02} \\
+        \hline
+        VOC2012      & mIoU $\uparrow$ & - & - 
+                     & - & - \\
+        \hline
+      \end{tabular}
+      }
+  \end{subtable}
+\vskip -0.1in
+\end{table}
+
+\begin{table*}[h]
+    \centering
+    \caption{\small Per-attribute accuracy, balanced accuracy, and F1-score of ImageNet-pretrained ResNet-18 when transferred to multi-label prediction on CelebA, with the $\beta$ of CT optimized per attribute (\textbf{Micro Best}). Reported values include means and standard deviations over three runs.}
+    \label{tab:per-attr-celeba-micro-full-resnet18}
+\resizebox{0.5\linewidth}{!}{%
+\begin{tabular}{|c|c|c|c|}
+\hline
+\diagbox[]{Attribute}{Metric} & Accuracy & Balanced Accuracy & F1\\ \hline
+5 Shadow           & 91.54 ± 0.02 & 65.91 ± 0.01 & 44.16 ± 0.03 \\ \hline
+Arch. Eyebrows     & 79.63 ± 0.01 & 72.46 ± 0.02 & 60.91 ± 0.03 \\ \hline
+Attractive         & 79.44 ± 0.00 & 79.47 ± 0.00 & 80.15 ± 0.00 \\ \hline
+Bags Un. Eyes      & 82.80 ± 0.00 & 65.29 ± 0.01 & 45.80 ± 0.02 \\ \hline
+Bald               & 98.71 ± 0.00 & 80.49 ± 0.10 & 66.95 ± 0.18 \\ \hline
+Bangs              & 93.51 ± 0.01 & 84.83 ± 0.05 & 77.62 ± 0.06 \\ \hline
+Big Lips           & 69.53 ± 0.01 & 54.83 ± 0.03 & 20.94 ± 0.08 \\ \hline
+Big Nose           & 81.71 ± 0.02 & 66.77 ± 0.02 & 48.63 ± 0.05 \\ \hline
+Black Hair         & 86.41 ± 0.01 & 80.91 ± 0.01 & 73.35 ± 0.02 \\ \hline
+Blond Hair         & 94.92 ± 0.01 & 87.45 ± 0.04 & 80.20 ± 0.05 \\ \hline
+Blurry             & 96.05 ± 0.01 & 69.44 ± 0.06 & 50.48 ± 0.13 \\ \hline
+Brown Hair         & 85.89 ± 0.01 & 72.45 ± 0.02 & 56.72 ± 0.04 \\ \hline
+Bushy Eyebrows     & 89.14 ± 0.02 & 65.36 ± 0.03 & 44.23 ± 0.07 \\ \hline
+Chubby             & 95.09 ± 0.02 & 62.03 ± 0.06 & 34.98 ± 0.10 \\ \hline
+Double Chin        & 95.71 ± 0.02 & 61.68 ± 0.13 & 34.04 ± 0.34 \\ \hline
+Eyeglasses         & 98.91 ± 0.00 & 93.42 ± 0.03 & 91.15 ± 0.03 \\ \hline
+Goatee             & 96.07 ± 0.01 & 71.22 ± 0.07 & 50.55 ± 0.15 \\ \hline
+Gray Hair          & 97.83 ± 0.00 & 79.04 ± 0.11 & 63.38 ± 0.10 \\ \hline
+Heavy Makeup       & 88.01 ± 0.01 & 87.70 ± 0.01 & 85.32 ± 0.02 \\ \hline
+H. Cheekbones      & 81.45 ± 0.00 & 81.35 ± 0.00 & 80.39 ± 0.03 \\ \hline
+Male               & 93.80 ± 0.00 & 93.69 ± 0.00 & 92.08 ± 0.00 \\ \hline
+Mouth S. O.        & 80.45 ± 0.01 & 80.43 ± 0.01 & 79.90 ± 0.03 \\ \hline
+Mustache           & 96.23 ± 0.00 & 57.92 ± 0.00 & 25.01 ± 0.03 \\ \hline
+Narrow Eyes        & 85.90 ± 0.00 & 55.09 ± 0.01 & 19.17 ± 0.04 \\ \hline
+No Beard           & 91.32 ± 0.01 & 78.68 ± 0.01 & 95.00 ± 0.01 \\ \hline
+Oval Face          & 73.70 ± 0.00 & 60.37 ± 0.03 & 38.47 ± 0.05 \\ \hline
+Pale Skin          & 96.65 ± 0.02 & 67.28 ± 0.13 & 46.94 ± 0.32 \\ \hline
+Pointy Nose        & 73.96 ± 0.02 & 59.41 ± 0.01 & 35.86 ± 0.06 \\ \hline
+Reced. Hairline    & 91.87 ± 0.01 & 59.94 ± 0.02 & 30.94 ± 0.07 \\ \hline
+Rosy Cheeks        & 94.08 ± 0.01 & 67.31 ± 0.14 & 46.46 ± 0.21 \\ \hline
+Sideburns          & 96.59 ± 0.02 & 72.92 ± 0.09 & 55.83 ± 0.18 \\ \hline
+Smiling            & 84.71 ± 0.01 & 84.71 ± 0.01 & 84.60 ± 0.01 \\ \hline
+Straight Hair      & 81.62 ± 0.00 & 63.30 ± 0.01 & 42.02 ± 0.02 \\ \hline
+Wavy Hair          & 81.32 ± 0.02 & 77.06 ± 0.01 & 70.52 ± 0.02 \\ \hline
+Wear. Earrings     & 85.37 ± 0.00 & 71.29 ± 0.03 & 57.11 ± 0.04 \\ \hline
+Wear. Hat          & 98.76 ± 0.00 & 91.38 ± 0.00 & 85.00 ± 0.03 \\ \hline
+Wear. Lipstick     & 90.97 ± 0.00 & 91.03 ± 0.02 & 91.21 ± 0.01 \\ \hline
+Wear. Necklace     & 86.27 ± 0.00 & 51.21 ± 0.03 & 5.37 ± 0.09 \\ \hline
+Wear. Necktie      & 94.72 ± 0.01 & 71.55 ± 0.03 & 54.24 ± 0.04 \\ \hline
+Young              & 84.10 ± 0.01 & 72.23 ± 0.02 & 90.08 ± 0.00 \\ \hline
+\end{tabular}
+}
+\vskip -0.1in
+\end{table*}
+
+
+\begin{table*}[h]
+\caption{\small Per-attribute accuracy, balanced accuracy, and F1-score of ImageNet-pretrained ResNet-18 when transferred to multi-label prediction on CelebA, with the $\beta$ of CT optimized globally for the highest mean accuracy across attributes (\textbf{Macro Best}) (\textbf{bold} values indicate cases where the metric remains the same under both Micro Best and Macro Best $\beta$). \textbf{The small performance gap between Micro Best and Macro Best demonstrates the stability of CT on more fine-grained downstream tasks.} Reported values include means and standard deviations over three runs.}
+\label{tab:per-attr-celeba-macro-full-resnet18}
+\begin{center}
+\begin{small}
+\resizebox{0.5\linewidth}{!}{%
+\begin{tabular}{|c|c|c|c|}
+\hline
+\diagbox[]{Attribute}{Metric} & Accuracy & Balanced Accuracy & F1\\ \hline
+5 Shadow           & 91.34 ± 0.02 & 65.57 ± 0.03 & 43.56 ± 0.08 \\ \hline
+Arch. Eyebrows     & 79.34 ± 0.01 & 71.97 ± 0.02 & 60.14 ± 0.02 \\ \hline
+Attractive         & 79.41 ± 0.02 & 79.46 ± 0.02 & 80.14 ± 0.02 \\ \hline
+Bags Un. Eyes      & \textbf{82.80 ± 0.00} & 65.12 ± 0.00 & 45.48 ± 0.02 \\ \hline
+Bald               & 98.55 ± 0.01 & 78.56 ± 0.10 & 62.94 ± 0.22 \\ \hline
+Bangs              & 93.33 ± 0.01 & 84.34 ± 0.02 & 76.91 ± 0.03 \\ \hline
+Big Lips           & 69.28 ± 0.01 & 54.39 ± 0.02 & 19.54 ± 0.07 \\ \hline
+Big Nose           & 81.65 ± 0.01 & 66.64 ± 0.02 & 48.36 ± 0.04 \\ \hline
+Black Hair         & 85.16 ± 0.01 & 79.45 ± 0.01 & 71.27 ± 0.01 \\ \hline
+Blond Hair         & 94.85 ± 0.00 & 87.33 ± 0.01 & 79.94 ± 0.01 \\ \hline
+Blurry             & 95.89 ± 0.00 & 68.48 ± 0.13 & 48.10 ± 0.28 \\ \hline
+Brown Hair         & 85.47 ± 0.01 & 70.99 ± 0.05 & 54.57 ± 0.08 \\ \hline
+Bushy Eyebrows     & \textbf{89.14 ± 0.02} & 64.74 ± 0.03 & 42.94 ± 0.07 \\ \hline
+Chubby             & 95.04 ± 0.01 & 61.84 ± 0.12 & 34.49 ± 0.26 \\ \hline
+Double Chin        & 95.70 ± 0.00 & 61.16 ± 0.07 & 32.83 ± 0.20 \\ \hline
+Eyeglasses         & 98.90 ± 0.00 & 93.40 ± 0.02 & \textbf{91.15 ± 0.03} \\ \hline
+Goatee             & 95.94 ± 0.00 & 69.30 ± 0.05 & 47.66 ± 0.08 \\ \hline
+Gray Hair          & 97.77 ± 0.01 & 78.74 ± 0.19 & 62.72 ± 0.25 \\ \hline
+Heavy Makeup       & 87.76 ± 0.01 & 87.50 ± 0.01 & 85.07 ± 0.01 \\ \hline
+H. Cheekbones      & 81.38 ± 0.00 & 81.18 ± 0.01 & 80.23 ± 0.01 \\ \hline
+Male               & 93.41 ± 0.02 & 93.44 ± 0.00 & 91.76 ± 0.01 \\ \hline
+Mouth S. O.        & 80.44 ± 0.01 & 80.35 ± 0.04 & \textbf{79.90 ± 0.03} \\ \hline
+Mustache           & \textbf{96.23 ± 0.01} & 57.30 ± 0.13 & 23.51 ± 0.31 \\ \hline
+Narrow Eyes        & 85.88 ± 0.01 & 54.91 ± 0.02 & 18.67 ± 0.04 \\ \hline
+No Beard           & 90.95 ± 0.01 & 77.63 ± 0.04 & 94.83 ± 0.01 \\ \hline
+Oval Face          & 73.63 ± 0.01 & 60.08 ± 0.02 & 37.76 ± 0.05 \\ \hline
+Pale Skin          & 96.46 ± 0.01 & 63.13 ± 0.06 & 38.83 ± 0.14 \\ \hline
+Pointy Nose        & 73.83 ± 0.00 & 58.86 ± 0.05 & 34.57 ± 0.11 \\ \hline
+Reced. Hairline    & 91.68 ± 0.01 & 59.12 ± 0.05 & 28.97 ± 0.12 \\ \hline
+Rosy Cheeks        & 93.91 ± 0.01 & 66.99 ± 0.09 & 45.60 ± 0.18 \\ \hline
+Sideburns          & 96.54 ± 0.01 & 71.33 ± 0.06 & 53.65 ± 0.04 \\ \hline
+Smiling            & 84.31 ± 0.01 & 84.15 ± 0.01 & 84.10 ± 0.02 \\ \hline
+Straight Hair      & 81.26 ± 0.01 & 62.67 ± 0.01 & 40.69 ± 0.02 \\ \hline
+Wavy Hair          & 80.98 ± 0.03 & 76.92 ± 0.02 & 70.32 ± 0.03 \\ \hline
+Wear. Earrings     & 85.26 ± 0.01 & 71.15 ± 0.01 & 56.84 ± 0.02 \\ \hline
+Wear. Hat          & 98.73 ± 0.00 & 90.19 ± 0.07 & 84.03 ± 0.11 \\ \hline
+Wear. Lipstick     & 90.92 ± 0.00 & \textbf{91.03 ± 0.02} & 91.19 ± 0.02 \\ \hline
+Wear. Necklace     & 86.05 ± 0.01 & 51.02 ± 0.04 & 4.79 ± 0.14 \\ \hline
+Wear. Necktie      & 94.38 ± 0.02 & 69.16 ± 0.07 & 50.14 ± 0.16 \\ \hline
+Young              & 84.03 ± 0.01 & 72.13 ± 0.01 & 90.04 ± 0.00 \\ \hline
+Avg Rel Reduction (\%) & 0.21 & 0.96 & 2.81 \\ \hline
+\end{tabular}
+}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table*}
+
+\begin{table*}[h]
+\centering
+\caption{\small Per-attribute accuracy, balanced accuracy, and F1-score of ImageNet-pretrained ResNet-50 when transferred to multi-label prediction on CelebA, with the $\beta$ of CT optimized per attribute (\textbf{Micro Best}). Reported values include means and standard deviations over three runs.}
+\label{tab:per-attr-celeba-micro-full-resnet50}
+\resizebox{0.5\linewidth}{!}{%
+\begin{tabular}{|l|c|c|c|}
+\hline
+\diagbox[]{\textbf{Attribute}}{\textbf{Metric}} & \textbf{Accuracy} & \textbf{Balanced Accuracy} & \textbf{F1}\\ 
+\hline
+5 Shadow           & 92.32 ± 0.02 & 71.34 ± 0.12 & 53.97 ± 0.21 \\ \hline
+Arched Eyebrows    & 80.61 ± 0.06 & 74.22 ± 0.10 & 63.54 ± 0.14 \\ \hline
+Attractive         & 80.68 ± 0.02 & 80.71 ± 0.02 & 81.20 ± 0.01 \\ \hline
+Bags Under Eyes    & 83.11 ± 0.02 & 67.27 ± 0.03 & 49.37 ± 0.06 \\ \hline
+Bald               & 98.73 ± 0.01 & 81.58 ± 0.30 & 67.90 ± 0.20 \\ \hline
+Bangs              & 94.79 ± 0.01 & 87.96 ± 0.03 & 82.34 ± 0.05 \\ \hline
+Big Lips           & 70.05 ± 0.01 & 56.10 ± 0.02 & 25.67 ± 0.09 \\ \hline
+Big Nose           & 82.52 ± 0.03 & 69.63 ± 0.03 & 53.41 ± 0.06 \\ \hline
+Black Hair         & 88.01 ± 0.02 & 83.17 ± 0.04 & 76.68 ± 0.05 \\ \hline
+Blond Hair         & 95.10 ± 0.02 & 88.07 ± 0.05 & 81.00 ± 0.06 \\ \hline
+Blurry             & 96.05 ± 0.02 & 71.40 ± 0.09 & 52.88 ± 0.11 \\ \hline
+Brown Hair         & 85.89 ± 0.03 & 74.11 ± 0.04 & 58.67 ± 0.07 \\ \hline
+Bushy Eyebrows     & 89.42 ± 0.00 & 67.66 ± 0.04 & 48.40 ± 0.06 \\ \hline
+Chubby             & 95.23 ± 0.02 & 65.82 ± 0.06 & 42.21 ± 0.13 \\ \hline
+Double Chin        & 96.00 ± 0.01 & 64.78 ± 0.09 & 41.04 ± 0.19 \\ \hline
+Eyeglasses         & 99.18 ± 0.00 & 95.01 ± 0.03 & 93.41 ± 0.04 \\ \hline
+Goatee             & 96.33 ± 0.01 & 75.45 ± 0.05 & 56.72 ± 0.10 \\ \hline
+Gray Hair          & 98.01 ± 0.01 & 80.34 ± 0.13 & 66.27 ± 0.16 \\ \hline
+Heavy Makeup       & 88.85 ± 0.01 & 88.66 ± 0.01 & 86.42 ± 0.02 \\ \hline
+High Cheekbones    & 84.00 ± 0.05 & 83.91 ± 0.05 & 83.05 ± 0.05 \\ \hline
+Male               & 95.74 ± 0.02 & 95.50 ± 0.02 & 94.49 ± 0.02 \\ \hline
+Mouth Slightly Open& 86.89 ± 0.02 & 86.87 ± 0.02 & 86.48 ± 0.02 \\ \hline
+Mustache           & 96.35 ± 0.02 & 60.56 ± 0.17 & 31.46 ± 0.30 \\ \hline
+Narrow Eyes        & 86.34 ± 0.02 & 57.40 ± 0.08 & 26.10 ± 0.24 \\ \hline
+No Beard           & 93.19 ± 0.01 & 83.34 ± 0.07 & 96.06 ± 0.00 \\ \hline
+Oval Face          & 74.31 ± 0.03 & 62.11 ± 0.03 & 42.61 ± 0.07 \\ \hline
+Pale Skin          & 96.59 ± 0.02 & 69.14 ± 0.05 & 48.66 ± 0.05 \\ \hline
+Pointy Nose        & 74.84 ± 0.02 & 61.83 ± 0.03 & 41.67 ± 0.05 \\ \hline
+Receding Hairline  & 92.69 ± 0.01 & 65.82 ± 0.04 & 43.72 ± 0.05 \\ \hline
+Rosy Cheeks        & 94.44 ± 0.02 & 70.59 ± 0.04 & 52.41 ± 0.04 \\ \hline
+Sideburns          & 97.04 ± 0.02 & 77.68 ± 0.11 & 63.88 ± 0.14 \\ \hline
+Smiling            & 88.23 ± 0.00 & 88.23 ± 0.00 & 88.12 ± 0.00 \\ \hline
+Straight Hair      & 82.77 ± 0.01 & 67.49 ± 0.05 & 50.05 ± 0.09 \\ \hline
+Wavy Hair          & 83.21 ± 0.01 & 79.41 ± 0.02 & 73.95 ± 0.02 \\ \hline
+Wearing Earrings   & 86.97 ± 0.03 & 75.77 ± 0.04 & 64.25 ± 0.08 \\ \hline
+Wearing Hat        & 98.94 ± 0.00 & 93.44 ± 0.03 & 87.36 ± 0.06 \\ \hline
+Wearing Lipstick   & 92.23 ± 0.03 & 92.26 ± 0.03 & 92.48 ± 0.03 \\ \hline
+Wearing Necklace   & 86.30 ± 0.01 & 52.81 ± 0.02 & 11.70 ± 0.14 \\ \hline
+Wearing Necktie    & 95.28 ± 0.00 & 76.54 ± 0.05 & 61.91 ± 0.06 \\ \hline
+Young              & 85.85 ± 0.01 & 75.81 ± 0.02 & 91.07 ± 0.01 \\ \hline
+\end{tabular}
+}
+\vskip -0.1in
+\end{table*}
+
+
+\begin{table*}[h]
+\centering
+\caption{\small Per-attribute accuracy, balanced accuracy, and F1-score of ImageNet-pretrained ResNet-50 when transferred to multi-label prediction on CelebA, with the $\beta$ of CT optimized globally for the highest mean accuracy across attributes (\textbf{Macro Best}) (\textbf{bold} values indicate cases where the metric remains the same under both Micro Best and Macro Best $\beta$). \textbf{The small performance gap between Micro Best and Macro Best demonstrates the stability of CT on more fine-grained downstream tasks.} Reported values include means and standard deviations over three runs.}
+\label{tab:per-attr-celeba-macro-full-resnet50}
+\begin{center}
+\begin{small}
+\resizebox{0.5\linewidth}{!}{%
+\begin{tabular}{|l|c|c|c|}
+\hline
+\diagbox[]{\textbf{Attribute}}{\textbf{Metric}} & \textbf{Accuracy} & \textbf{Balanced Accuracy} & \textbf{F1}\\
+\hline
+5 Shadow           & 92.24 ± 0.01 & 70.98 ± 0.06 & 53.47 ± 0.08 \\ \hline
+Arched Eyebrows    & 79.49 ± 0.02 & 72.08 ± 0.04 & 60.34 ± 0.07 \\ \hline
+Attractive         & \textbf{80.68 ± 0.02} & 80.57 ± 0.02 & 81.05 ± 0.02 \\ \hline
+Bags Under Eyes    & \textbf{83.11 ± 0.02} & \textbf{67.27 ± 0.04} & 49.36 ± 0.06 \\ \hline
+Bald               & 98.72 ± 0.00 & 81.18 ± 0.25 & 67.42 ± 0.36 \\ \hline
+Bangs              & 94.52 ± 0.00 & 87.58 ± 0.01 & 81.53 ± 0.01 \\ \hline
+Big Lips           & 70.03 ± 0.01 & 56.04 ± 0.03 & 25.48 ± 0.11 \\ \hline
+Big Nose           & \textbf{82.52 ± 0.03} & 69.48 ± 0.03 & 53.18 ± 0.05 \\ \hline
+Black Hair         & 87.58 ± 0.02 & 83.12 ± 0.04 & 76.57 ± 0.07 \\ \hline
+Blond Hair         & \textbf{95.10 ± 0.02} & 87.68 ± 0.02 & 80.42 ± 0.03 \\ \hline
+Blurry             & 95.96 ± 0.01 & 69.99 ± 0.06 & 50.43 ± 0.09 \\ \hline
+Brown Hair         & 85.59 ± 0.02 & 72.95 ± 0.06 & 56.99 ± 0.09 \\ \hline
+Bushy Eyebrows     & 88.96 ± 0.01 & 66.35 ± 0.02 & 45.76 ± 0.05 \\ \hline
+Chubby             & \textbf{95.23 ± 0.02} & 64.93 ± 0.06 & 40.46 ± 0.11 \\ \hline
+Double Chin        & 95.86 ± 0.00 & 64.08 ± 0.00 & 38.95 ± 0.07 \\ \hline
+Eyeglasses         & 99.06 ± 0.00 & 94.81 ± 0.07 & 92.96 ± 0.11 \\ \hline
+Goatee             & 96.19 ± 0.02 & 74.74 ± 0.07 & 55.57 ± 0.08 \\ \hline
+Gray Hair          & 97.94 ± 0.01 & \textbf{80.34 ± 0.13} & \textbf{66.27 ± 0.16} \\ \hline
+Heavy Makeup       & 88.76 ± 0.01 & \textbf{88.66 ± 0.01} & \textbf{86.42 ± 0.02} \\ \hline
+High Cheekbones    & 83.92 ± 0.03 & 83.82 ± 0.02 & 83.03 ± 0.02 \\ \hline
+Male               & 95.62 ± 0.02 & \textbf{95.50 ± 0.02} & \textbf{94.49 ± 0.02} \\ \hline
+Mouth Slightly Open& 86.34 ± 0.03 & 85.90 ± 0.00 & 85.50 ± 0.01 \\ \hline
+Mustache           & 96.18 ± 0.01 & 60.41 ± 0.04 & 30.68 ± 0.16 \\ \hline
+Narrow Eyes        & 85.89 ± 0.01 & 55.31 ± 0.02 & 20.08 ± 0.05 \\ \hline
+No Beard           & 92.97 ± 0.03 & 83.04 ± 0.09 & 96.02 ± 0.01 \\ \hline
+Oval Face          & 74.01 ± 0.02 & 61.74 ± 0.01 & 41.92 ± 0.03 \\ \hline
+Pale Skin          & 96.50 ± 0.01 & 68.31 ± 0.09 & 47.87 ± 0.11 \\ \hline
+Pointy Nose        & \textbf{74.84 ± 0.01} & 61.61 ± 0.04 & 41.22 ± 0.09 \\ \hline
+Receding Hairline  & 92.59 ± 0.01 & \textbf{65.82 ± 0.04} & \textbf{43.72 ± 0.05} \\ \hline
+Rosy Cheeks        & 94.32 ± 0.00 & 69.86 ± 0.09 & 50.94 ± 0.18 \\ \hline
+Sideburns          & 96.91 ± 0.02 & 76.67 ± 0.22 & 62.11 ± 0.41 \\ \hline
+Smiling            & \textbf{88.23 ± 0.00} & 88.15 ± 0.03 & 88.04 ± 0.03 \\ \hline
+Straight Hair      & 82.72 ± 0.02 & 67.25 ± 0.05 & 49.58 ± 0.08 \\ \hline
+Wavy Hair          & 82.91 ± 0.02 & 79.34 ± 0.02 & 73.85 ± 0.03 \\ \hline
+Wearing Earrings   & 86.80 ± 0.01 & 75.40 ± 0.02 & 63.68 ± 0.04 \\ \hline
+Wearing Hat        & 98.88 ± 0.01 & 92.99 ± 0.12 & 86.57 ± 0.09 \\ \hline
+Wearing Lipstick   & 92.22 ± 0.01 & \textbf{92.26 ± 0.03} & \textbf{92.48 ± 0.03} \\ \hline
+Wearing Necklace   & 86.25 ± 0.01 & \textbf{52.81 ± 0.02} & 11.68 ± 0.08 \\ \hline
+Wearing Necktie    & 95.27 ± 0.00 & 76.41 ± 0.20 & 61.73 ± 0.39 \\ \hline
+Young              & 85.77 ± 0.04 & 75.71 ± 0.02 & 91.04 ± 0.01 \\ \hline
+\textbf{Avg Rel Reduction (\%)} 
+& 0.18 & 0.65 & 1.87 \\ \hline
+\end{tabular}
+}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table*}
+
+
+\begin{table*}[h]
+    \centering
+    \caption{\small Per-attribute accuracy, balanced accuracy, and F1-score of ImageNet-pretrained ResNet-152 when transferred to multi-label prediction on CelebA, with the $\beta$ of CT optimized per attribute (\textbf{Micro Best}). Reported values include means and standard deviations over three runs.}
+    \label{tab:per-attr-celeba-micro-full-resnet152}
+\resizebox{0.5\linewidth}{!}{%
+\begin{tabular}{|c|c|c|c|}
+\hline
+\diagbox[]{Attribute}{Metric} & Accuracy & Balanced Accuracy & F1\\ \hline
+    5 Shadow           & 92.22 ± 0.05 & 70.68 ± 0.32 & 52.89 ± 0.55 \\ \hline
+    Arch. Eyebrows     & 79.90 ± 0.29 & 72.86 ± 0.37 & 61.54 ± 0.57 \\ \hline
+    Attractive         & 80.68 ± 0.10 & 80.71 ± 0.10 & 81.17 ± 0.09 \\ \hline
+    Bags Un. Eyes      & 83.30 ± 0.14 & 67.64 ± 0.25 & 50.06 ± 0.47 \\ \hline
+    Bald               & 98.69 ± 0.03 & 79.25 ± 0.98 & 65.60 ± 1.06 \\ \hline
+    Bangs              & 94.43 ± 0.01 & 87.16 ± 0.10 & 81.08 ± 0.08 \\ \hline
+    Big Lips           & 70.15 ± 0.14 & 56.21 ± 0.10 & 25.95 ± 0.29 \\ \hline
+    Big Nose           & 82.62 ± 0.07 & 69.63 ± 0.08 & 53.46 ± 0.15 \\ \hline
+    Black Hair         & 88.07 ± 0.11 & 83.39 ± 0.21 & 76.91 ± 0.27 \\ \hline
+    Blond Hair         & 95.01 ± 0.03 & 87.75 ± 0.05 & 80.59 ± 0.09 \\ \hline
+    Blurry             & 96.09 ± 0.08 & 71.55 ± 1.06 & 53.15 ± 1.87 \\ \hline
+    Brown Hair         & 86.44 ± 0.43 & 75.15 ± 1.21 & 60.29 ± 1.92 \\ \hline
+    Bushy Eyebrows     & 89.50 ± 0.35 & 67.69 ± 0.95 & 48.56 ± 1.98 \\ \hline
+    Chubby             & 95.10 ± 0.04 & 65.00 ± 0.53 & 40.24 ± 0.33 \\ \hline
+    Double Chin        & 95.84 ± 0.02 & 64.87 ± 0.56 & 40.32 ± 0.93 \\ \hline
+    Eyeglasses         & 99.04 ± 0.09 & 94.56 ± 0.34 & 92.35 ± 0.70 \\ \hline
+    Goatee             & 96.41 ± 0.07 & 75.42 ± 0.17 & 57.21 ± 0.59 \\ \hline
+    Gray Hair          & 97.89 ± 0.05 & 80.04 ± 0.15 & 64.72 ± 0.54 \\ \hline
+    Heavy Makeup       & 88.97 ± 0.08 & 88.72 ± 0.03 & 86.51 ± 0.06 \\ \hline
+    H. Cheekbones      & 84.04 ± 0.10 & 83.95 ± 0.09 & 83.11 ± 0.06 \\ \hline
+    Male               & 95.56 ± 0.01 & 95.34 ± 0.00 & 94.26 ± 0.00 \\ \hline
+    Mouth S. O.        & 84.97 ± 0.67 & 84.94 ± 0.68 & 84.44 ± 0.76 \\ \hline
+    Mustache           & 96.30 ± 0.09 & 61.01 ± 0.27 & 32.10 ± 0.45 \\ \hline
+    Narrow Eyes        & 86.04 ± 0.10 & 56.27 ± 0.70 & 22.85 ± 2.02 \\ \hline
+    No Beard           & 93.00 ± 0.15 & 82.94 ± 0.17 & 95.95 ± 0.09 \\ \hline
+    Oval Face          & 74.29 ± 0.18 & 62.11 ± 0.25 & 42.63 ± 0.47 \\ \hline
+    Pale Skin          & 96.71 ± 0.11 & 69.98 ± 1.09 & 51.08 ± 2.16 \\ \hline
+    Pointy Nose        & 74.95 ± 0.08 & 61.83 ± 0.06 & 41.59 ± 0.11 \\ \hline
+    Reced. Hairline    & 92.42 ± 0.20 & 64.20 ± 1.15 & 40.32 ± 2.44 \\ \hline
+    Rosy Cheeks        & 94.34 ± 0.06 & 70.34 ± 0.05 & 51.73 ± 0.11 \\ \hline
+    Sideburns          & 96.98 ± 0.01 & 76.50 ± 0.58 & 62.38 ± 0.56 \\ \hline
+    Smiling            & 87.93 ± 0.16 & 87.93 ± 0.16 & 87.85 ± 0.15 \\ \hline
+    Straight Hair      & 82.49 ± 0.03 & 66.92 ± 0.21 & 48.98 ± 0.37 \\ \hline
+    Wavy Hair          & 83.08 ± 0.02 & 79.22 ± 0.03 & 73.68 ± 0.04 \\ \hline
+    Wear. Earrings     & 86.83 ± 0.14 & 75.37 ± 0.17 & 63.61 ± 0.33 \\ \hline
+    Wear. Hat          & 98.95 ± 0.04 & 93.47 ± 0.22 & 87.52 ± 0.48 \\ \hline
+    Wear. Lipstick     & 91.87 ± 0.23 & 91.91 ± 0.22 & 92.10 ± 0.24 \\ \hline
+    Wear. Necklace     & 86.28 ± 0.01 & 52.80 ± 0.03 & 11.82 ± 0.10 \\ \hline
+    Wear. Necktie      & 95.36 ± 0.06 & 77.28 ± 0.59 & 62.92 ± 0.81 \\ \hline
+    Young              & 85.79 ± 0.02 & 75.89 ± 0.08 & 91.02 ± 0.02 \\ \hline
+    \end{tabular}
+}
+\vskip -0.1in
+\end{table*}
+
+
+\begin{table*}[h]
+\caption{\small Per-attribute accuracy, balanced accuracy, and F1-score of ImageNet-pretrained ResNet-152 when transferred to multi-label prediction on CelebA, with the $\beta$ of CT optimized globally for the highest mean accuracy across attributes (\textbf{Macro Best}) (\textbf{bold} values indicate cases where the metric remains the same under both Micro Best and Macro Best $\beta$). \textbf{The small performance gap between Micro Best and Macro Best demonstrates the stability of CT on more fine-grained downstream tasks.} Reported values include means and standard deviations over three runs.}
+\label{tab:per-attr-celeba-macro-full-resnet152}
+\begin{center}
+\begin{small}
+\resizebox{0.5\linewidth}{!}{%
+\begin{tabular}{|l|c|c|c|}
+\hline
+\diagbox[]{Attribute}{Metric}
+ & Accuracy 
+ & Balanced Accuracy 
+ & F1 \\
+\hline
+5 Shadow        & 92.18 ± 0.10 & 70.58 ± 0.64 & 52.64 ± 1.14 \\ \hline
+Arch. Eyebrows  & 79.70 ± 0.23 & 72.44 ± 0.51 & 60.86 ± 0.78 \\ \hline
+Attractive      & \textbf{80.68 ± 0.10} & 80.65 ± 0.07 & 81.12 ± 0.05 \\ \hline
+Bags Un. Eyes   & \textbf{83.30 ± 0.14} & 67.49 ± 0.24 & 49.77 ± 0.43 \\ \hline
+Bald            & 98.58 ± 0.09 & 78.18 ± 1.97 & 63.82 ± 2.62 \\ \hline
+Bangs           & 94.39 ± 0.10 & \textbf{87.16 ± 0.10} & \textbf{81.08 ± 0.08} \\ \hline
+Big Lips        & 70.11 ± 0.06 & 56.16 ± 0.19 & 25.62 ± 0.50 \\ \hline
+Big Nose        & \textbf{82.62 ± 0.07} & 69.35 ± 0.14 & 52.91 ± 0.22 \\ \hline
+Black Hair      & \textbf{88.07 ± 0.11} & 83.32 ± 0.14 & 76.79 ± 0.15 \\ \hline
+Blond Hair      & \textbf{95.01 ± 0.03} & \textbf{87.75 ± 0.05} & 80.56 ± 0.11 \\ \hline
+Blurry          & 96.06 ± 0.10 & 71.19 ± 0.88 & 52.38 ± 1.83 \\ \hline
+Brown Hair      & 86.30 ± 0.53 & 74.96 ± 1.22 & 60.02 ± 1.87 \\ \hline
+Bushy Eyebrows  & \textbf{89.50 ± 0.35} & 67.24 ± 0.98 & 47.59 ± 2.12 \\ \hline
+Chubby          & \textbf{95.10 ± 0.04} & 64.92 ± 0.11 & \textbf{40.24 ± 0.33} \\ \hline
+Double Chin     & \textbf{95.84 ± 0.01} & 64.67 ± 0.43 & 39.71 ± 0.70 \\ \hline
+Eyeglasses      & 98.96 ± 0.10 & 94.38 ± 0.41 & 92.20 ± 0.67 \\ \hline
+Goatee          & 96.29 ± 0.04 & 75.13 ± 0.19 & 56.80 ± 0.22 \\ \hline
+Gray Hair       & 97.85 ± 0.12 & 80.00 ± 0.09 & \textbf{64.72 ± 0.54} \\ \hline
+Heavy Makeup    & \textbf{88.97 ± 0.08} & 88.57 ± 0.07 & 86.35 ± 0.09 \\ \hline
+H. Cheekbones   & \textbf{84.04 ± 0.10} & 83.77 ± 0.18 & 82.96 ± 0.18 \\ \hline
+Male            & 95.38 ± 0.24 & 95.25 ± 0.12 & 94.12 ± 0.20 \\ \hline
+Mouth S. O.     & \textbf{84.97 ± 0.67} & 84.62 ± 0.51 & 84.17 ± 0.52 \\ \hline
+Mustache        & 96.24 ± 0.01 & 60.15 ± 0.15 & 30.39 ± 0.50 \\ \hline
+Narrow Eyes     & 85.98 ± 0.22 & 55.54 ± 0.33 & 20.75 ± 0.97 \\ \hline
+No Beard        & 92.80 ± 0.24 & 82.82 ± 0.22 & 95.92 ± 0.05 \\ \hline
+Oval Face       & \textbf{74.29 ± 0.18} & 62.04 ± 0.21 & 42.56 ± 0.42 \\ \hline
+Pale Skin       & \textbf{96.71 ± 0.11} & 69.80 ± 1.01 & 50.41 ± 1.76 \\ \hline
+Pointy Nose     & 74.74 ± 0.02 & 61.52 ± 0.02 & 41.15 ± 0.16 \\ \hline
+Reced. Hairline & \textbf{92.42 ± 0.20} & 64.04 ± 1.03 & 39.85 ± 2.23 \\ \hline
+Rosy Cheeks     & 94.28 ± 0.02 & 69.58 ± 0.05 & 50.24 ± 0.20 \\ \hline
+Sideburns       & 96.82 ± 0.08 & \textbf{76.50 ± 0.58} & \textbf{62.38 ± 0.56} \\ \hline
+Smiling         & 87.85 ± 0.21 & \textbf{87.93 ± 0.16} & \textbf{87.85 ± 0.15} \\ \hline
+Straight Hair   & \textbf{82.49 ± 0.03} & 66.83 ± 0.15 & 48.80 ± 0.25 \\ \hline
+Wavy Hair       & 82.82 ± 0.24 & 79.10 ± 0.21 & 73.50 ± 0.30 \\ \hline
+Wear. Earrings  & 86.78 ± 0.01 & \textbf{75.37 ± 0.17} & \textbf{63.61 ± 0.33} \\ \hline
+Wear. Hat       & 98.89 ± 0.02 & \textbf{93.47 ± 0.22} & \textbf{87.52 ± 0.48} \\ \hline
+Wear. Lipstick  & \textbf{91.87 ± 0.23} & 91.80 ± 0.24 & 92.01 ± 0.24 \\ \hline
+Wear. Necklace  & 86.17 ± 0.09 & 52.70 ± 0.06 & 11.44 ± 0.17 \\ \hline
+Wear. Necktie   & 95.34 ± 0.01 & 77.19 ± 0.50 & 62.83 ± 0.71 \\ \hline
+Young           & 85.62 ± 0.11 & \textbf{75.89 ± 0.08} & \textbf{91.02 ± 0.02} \\ \hline
+\multicolumn{1}{|r|}{Avg Rel Reduction (\%)} 
+                & 0.07 & 0.30 & 1.00 \\ \hline
+\end{tabular}
+}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table*}
+
+
+
+\subsection{Improving Robustness on Adversarial and Corrupted Data}\label{app:exp-rob}  
+This subsection provides details on the setup for robustness experiments and presents the complete results.  
+
+\textbf{Detailed Settings of Robustness Experiments:} To evaluate model robustness, we apply both adversarial attacks $\ell_2$ and $\ell_\infty$ and common corruptions. For the $\ell_2$ attack, we use an untargeted attack with $\ell_2 = 0.5$. For the $\ell_\infty$ attack, we use an untargeted attack with $\ell_\infty = \frac{8}{255}$. For corruption testing, we use CIFAR-C, CIFAR100-C, and ImageNet-C \cite{hendrycks2019corruption}.  
+
+\textbf{Complete Experimental Results:} The full results for the robustness experiments are presented in \cref{tab:rob-full}.
+
+\begin{table*}[h]
+  \centering
+  \caption{\small Complete robust accuracy results of ImageNet-pretrained ResNet-18, ResNet-50, and ResNet-152 under $\ell_2$/$\ell_\infty$ adversarial attacks and common corruptions on CIFAR-10, CIFAR-100, and ImageNet (\textbf{bold} entries indicate improvement with CT). \textbf{CT consistently enhances robustness across models, datasets, and robustness settings, with $\beta$ values close to 1.} Reported values include means and standard deviations over three runs.}
+  \label{tab:rob-full}
+    \begin{subtable}[]{\textwidth}
+        \centering
+        \caption{\small \textbf{ResNet-18.} Avg rel improve: 11.76\%. Avg $\beta$: 0.92.}
+        \label{tab:rob-ResNet-18-full}
+        \resizebox{\linewidth}{!}{%
+        \begin{tabular}{|c|c|c|c|c|c|c|c|c|c|}
+          \hline
+          \multirow{2}{*}{\diagbox[]{Dataset}{Attack}} & \multicolumn{3}{c|}{$\ell_2$} 
+            & \multicolumn{3}{c|}{$\ell_\infty$} & \multicolumn{3}{c|}{Corruption} \\
+          \cline{2-10}
+          & ReLU (\%) & + CT (\%) & \textcolor{gray}{($\beta$)} & ReLU (\%) & + CT (\%) & \textcolor{gray}{($\beta$)} 
+          & ReLU (\%) & + CT (\%) & \textcolor{gray}{($\beta$)} \\
+          \hline
+          CIFAR-10     & 53.67 ± 0.32 & 53.67 ± 0.32 & \textcolor{gray}{1.00 ± 0.00} 
+                       & 11.17 ± 0.06 & \textbf{14.93 ± 0.06} & \textcolor{gray}{0.90 ± 0.00} 
+                       & 77.73 ± 0.00 & 77.73 ± 0.00 & \textcolor{gray}{1.00 ± 0.00} \\
+          \hline
+          CIFAR-100    & 24.30 ± 0.10 & \textbf{25.50 ± 0.00} & \textcolor{gray}{0.92 ± 0.00}
+                       & 4.47 ± 0.06 & \textbf{6.90 ± 0.00} & \textcolor{gray}{0.92 ± 0.00} 
+                       & 51.81 ± 0.00 & \textbf{51.95 ± 0.00} & \textcolor{gray}{0.94 ± 0.00} \\
+          \hline
+          ImageNet     & 23.37 ± 0.06 & 23.37 ± 0.06 & \textcolor{gray}{1.00 ± 0.00} 
+                       & 0.00 ± 0.00 & \textbf{7.00 ± 0.10} & \textcolor{gray}{0.89 ± 0.00} 
+                       & 33.11 ± 0.00 & \textbf{33.32 ± 0.00} & \textcolor{gray}{0.92 ± 0.00} \\
+          \hline
+        \end{tabular}
+        }
+    \end{subtable}
+
+  \vspace{0.5em}
+
+    \begin{subtable}[]{\textwidth}
+        \centering
+        \caption{\small \textbf{ResNet-50.} Avg rel improve: 348.44\%. Avg $\beta$: 0.95.}
+        \label{tab:rob-ResNet-50-full}
+        \resizebox{\linewidth}{!}{%
+        \begin{tabular}{|c|c|c|c|c|c|c|c|c|c|}
+          \hline
+          \multirow{2}{*}{\diagbox[]{Dataset}{Attack}} & \multicolumn{3}{c|}{$\ell_2$} 
+            & \multicolumn{3}{c|}{$\ell_\infty$} & \multicolumn{3}{c|}{Corruption} \\
+          \cline{2-10}
+          & ReLU (\%) & + CT (\%) & \textcolor{gray}{($\beta$)} & ReLU (\%) & + CT (\%) & \textcolor{gray}{($\beta$)} 
+          & ReLU (\%) & + CT (\%) & \textcolor{gray}{($\beta$)} \\
+          \hline
+          CIFAR-10     & 55.10 ± 0.10 & \textbf{56.53 ± 0.21} & \textcolor{gray}{0.97 ± 0.00} 
+                       & 10.10 ± 0.17 & \textbf{14.83 ± 0.06} & \textcolor{gray}{0.95 ± 0.00} 
+                       & 77.26 ± 0.00 & 77.26 ± 0.00 & \textcolor{gray}{1.00 ± 0.00} \\
+          \hline
+          CIFAR-100    & 23.83 ± 0.06 & \textbf{25.80 ± 0.20} & \textcolor{gray}{0.96 ± 0.00} 
+                       & 4.43 ± 0.06 & \textbf{7.90 ± 0.00} & \textcolor{gray}{0.93 ± 0.00} 
+                       & 53.91 ± 0.00 & \textbf{53.93 ± 0.00} & \textcolor{gray}{0.98 ± 0.00} \\
+          \hline
+          ImageNet     & 31.90 ± 0.00 & 31.90 ± 0.00 & \textcolor{gray}{1.00 ± 0.00} 
+                       & 0.30 ± 0.00 & \textbf{9.30 ± 0.17} & \textcolor{gray}{0.93 ± 0.00} 
+                       & 39.64 ± 0.00 & 39.64 ± 0.00 & \textcolor{gray}{1.00 ± 0.00} \\
+          \hline
+        \end{tabular}
+        }
+    \end{subtable}
+
+  \vspace{0.5em}
+
+    \begin{subtable}[t]{\textwidth}
+        \centering
+        \caption{\small \textbf{ResNet-152.} Avg rel improve: 498.41\%. Avg $\beta$: 0.98.}
+        \label{tab:rob-ResNet-152-full}
+        \resizebox{\linewidth}{!}{%
+        \begin{tabular}{|c|c|c|c|c|c|c|c|c|c|}
+          \hline
+          \multirow{2}{*}{\diagbox[]{Dataset}{Attack}} & \multicolumn{3}{c|}{$\ell_2$} 
+            & \multicolumn{3}{c|}{$\ell_\infty$} & \multicolumn{3}{c|}{Corruption} \\
+          \cline{2-10}
+          & ReLU (\%) & + CT (\%) & \textcolor{gray}{($\beta$)} & ReLU (\%) & + CT (\%) & \textcolor{gray}{($\beta$)} 
+          & ReLU (\%) & + CT (\%) & \textcolor{gray}{($\beta$)} \\
+          \hline
+          CIFAR-10     & 56.27 ± 0.23 & 56.27 ± 0.23 & \textcolor{gray}{1.00 ± 0.00} 
+                       & 11.47 ± 0.06 & \textbf{15.00 ± 0.20} & \textcolor{gray}{0.99 ± 0.00} 
+                       & 78.82 ± 0.00 & \textbf{78.83 ± 0.00} & \textcolor{gray}{0.99 ± 0.00} \\
+          \hline
+          CIFAR-100    & 27.90 ± 0.10 & \textbf{28.23 ± 0.12} & \textcolor{gray}{0.98 ± 0.00} 
+                       & 5.40 ± 0.00 & \textbf{7.70 ± 0.17} & \textcolor{gray}{0.99 ± 0.00} 
+                       & 56.12 ± 0.00 & 56.12 ± 0.00 & \textcolor{gray}{1.00 ± 0.00} \\
+          \hline
+          ImageNet     & 42.50 ± 0.00 & 42.50 ± 0.00 & \textcolor{gray}{1.00 ± 0.00} 
+                       & 0.30 ± 0.00 & \textbf{13.53 ± 0.06} & \textcolor{gray}{0.97 ± 0.01} 
+                       & 45.47 ± 0.00 & 45.47 ± 0.00 & \textcolor{gray}{0.99 ± 0.00} \\
+          \hline
+        \end{tabular}
+        }
+    \end{subtable}
+\vskip -0.1in
+\end{table*}
+
+
+\subsection{Improving Generalization of Transformers}\label{app:exp-transformer}
+This subsection provides details on the pretraining of ReLU-based Swin transformers discussed in \cref{sec:exp-transformer}. It also includes the complete experimental results for Swin-T and Swin-S.
+
+\textbf{Pretraining Details:} The pretraining of ReLU-based Swin transformers on Imagenette follows the same training configuration as used for ResNet-18/ResNet-50/ResNet-152 on CIFAR-10 and CIFAR-100, detailed in \cref{app:exp-natural-img}. The training curves for Swin-T and Swin-S are shown in \cref{fig:swin_train_curves}.
+
+\begin{figure*}[h]
+\vskip 0.1in
+\begin{center}
+\begin{subfigure}{0.45\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{fig/swin_train_acc.pdf}
+    \caption{\small Train accuracy.}
+    \label{fig:swin_train_acc}
+\end{subfigure}
+\hfill
+\begin{subfigure}{0.45\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{fig/swin_val_acc.pdf}
+    \caption{\small Validation accuracy.}
+    \label{fig:swin_val_acc}
+\end{subfigure}
+\caption{\small Training and validation accuracy curves for Swin-T and Swin-S.}
+\label{fig:swin_train_curves}
+\end{center}
+\vskip -0.1in
+\end{figure*}
+
+\textbf{Complete Experimental Results:} The full results of the generalization experiments for Swin transformers are provided in \cref{tab:gen-swin-full}.  
+
+\begin{table*}[h]
+\caption{\small Complete accuracy reuslts of Imagenette-pretrained Swin-T and Swin-S (ReLU-based) when transferred to 9 downstream datasets (\textbf{bold} entries indicate improvement with CT). \textbf{CT consistently enhances generalization across models and datasets, with $\beta$ values close to 1, demonstrating its effectiveness even with partial theoretical guarantees.} Reported values include means and standard deviations over three runs.}
+\label{tab:gen-swin-full}
+\begin{center}
+\begin{small}
+\resizebox{0.7\linewidth}{!}{%
+\begin{tabular}{|c|c|c|c|c|c|c|}
+\hline
+\multirow{2}{*}{\diagbox[]{Dataset}{Model}} & \multicolumn{3}{c|}{Swin-T} & \multicolumn{3}{c|}{Swin-S} \\ \cline{2-7} 
+& ReLU (\%) & + CT (\%) & \textcolor{gray}{($\beta$)} & ReLU (\%) & + CT (\%) & \textcolor{gray}{($\beta$)} \\ \hline
+Arabic Characters & 43.08 ± 0.06 & \textbf{45.14 ± 0.07} & \textcolor{gray}{0.92 ± 0.00}
+                  & 43.90 ± 0.08 & \textbf{44.70 ± 0.09} & \textcolor{gray}{0.97 ± 0.00} \\ \hline
+Arabic Digits     & 90.38 ± 0.04 & \textbf{91.46 ± 0.03} & \textcolor{gray}{0.86 ± 0.01} 
+                  & 88.74 ± 0.01 & \textbf{89.15 ± 0.06} & \textcolor{gray}{0.95 ± 0.01}  \\ \hline
+Beans             & 75.00 ± 0.00 & \textbf{82.03 ± 0.00} & \textcolor{gray}{0.85 ± 0.00} 
+                  & 66.41 ± 0.00 & \textbf{71.09 ± 0.00} & \textcolor{gray}{0.83 ± 0.00}  \\ \hline
+% CelebA            & - & - & \textcolor{gray}{-}
+%                   & - & - & - \\ \hline
+CUB-200-2011      & 6.97 ± 0.00 & \textbf{7.02 ± 0.00} & \textcolor{gray}{0.93 ± 0.01} 
+                  & 6.40 ± 0.00 & \textbf{6.70 ± 0.00} & \textcolor{gray}{0.94 ± 0.00}  \\ \hline
+DTD               & 21.51 ± 0.06 & \textbf{21.70 ± 0.00} & \textcolor{gray}{0.93 ± 0.00} 
+                  & 20.59 ± 0.00 & \textbf{21.28 ± 0.00} & \textcolor{gray}{0.94 ± 0.00} \\ \hline
+Fashion MNIST     & 78.61 ± 0.02 & \textbf{79.08 ± 0.01} & \textcolor{gray}{0.92 ± 0.02}
+                  & 77.48 ± 0.01 & \textbf{77.64 ± 0.05} & \textcolor{gray}{0.95 ± 0.00} \\ \hline
+FGVC-Aircraft     & 8.13 ± 0.00 & \textbf{8.31 ± 0.00} & \textcolor{gray}{0.98 ± 0.00} 
+                  & 7.12 ± 0.07 & \textbf{7.70 ± 0.02} & \textcolor{gray}{0.96 ± 0.00} \\ \hline
+Flowers102        & 23.77 ± 0.02 & \textbf{24.19 ± 0.07} & \textcolor{gray}{0.94 ± 0.00}
+                  & 22.29 ± 0.02 & \textbf{23.01 ± 0.05} & \textcolor{gray}{0.95 ± 0.00} \\ \hline
+Food101           & 17.35 ± 0.02 & \textbf{17.41 ± 0.04} & \textcolor{gray}{0.98 ± 0.01} 
+                  & 17.11 ± 0.01 & \textbf{17.29 ± 0.03} & \textcolor{gray}{0.95 ± 0.01}  \\ \hline
+% MedMNIST 
+% (PathMNIST)       & 77.89 ± 0.05 & \textbf{78.93 ± 0.12} & \textcolor{gray}{0.86 ± 0.00} 
+%                   & - & - & - \\ \hline
+% MedMNIST 
+% (OCTMNIST)        & 54.40 ± 0.10 & \textbf{56.07 ± 0.06} & \textcolor{gray}{0.91 ± 0.00} 
+%                   & - & - & - \\ \hline
+% MedMNIST 
+% (DermaMNIST)      & 72.62 ± 0.09 & \textbf{72.82 ± 0.05} & \textcolor{gray}{0.92 ± 0.00} 
+%                   & - & - & - \\ \hline
+\multirow{2}{*}{Avg Rel Improve \& $\beta$} & \multicolumn{2}{c|}{Rel Improve (\%)} & \textcolor{gray}{($\beta$)} & \multicolumn{2}{c|}{Rel Improve (\%)} & \textcolor{gray}{($\beta$)} \\ \cline{2-7} 
+                  & \multicolumn{2}{c|}{2.43} 
+                  & \textcolor{gray}{0.92}
+                  & \multicolumn{2}{c|}{3.33} 
+                  & \textcolor{gray}{0.94} \\ \hline
+\end{tabular}
+}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table*}
+
+
+
+\subsection{Ablation Studies}\label{app:exp-abl}  
+This subsection presents the complete results of the ablation studies introduced in \cref{sec:exp-abl}. \Cref{tab:gen-abl-full} provides results for the generalization experiments, while \Cref{tab:rob-abl-full} the robustness experiments.  
+
+\begin{table*}[h]
+\caption{\small Complete accuracy results of ImageNet-pretrained ResNet-18 when transferred to 13 downstream datasets, steered with the Swish-only, SoftPlus-only, and combined (baseline) versions of CT (\textbf{bold} entries indicate improvement with CT). \textbf{While both the Swish-only and SoftPlus-only versions enhance model generalization, their improvements are less significant than the combined version, validating our CT implementation.} Reported values include means and standard deviations over three runs.}
+\label{tab:gen-abl-full}
+\begin{center}
+\begin{small}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{|c|c|c|c|c|c|c|c|c|c|}
+\hline
+\multirow{2}{*}{\diagbox[]{Dataset}{CT Implementation}} & \multicolumn{3}{c|}{Swish only} & \multicolumn{3}{c|}{SoftPlus only} & \multicolumn{3}{c|}{Combination} \\ \cline{2-10} 
+& ReLU (\%) & + CT (\%) & \textcolor{gray}{($\beta$)} & ReLU (\%) & + CT (\%) & \textcolor{gray}{($\beta$)} & ReLU (\%) & + CT (\%) & \textcolor{gray}{($\beta$)} \\ \hline
+Arabic Characters & 86.49 ± 0.05 & 86.49 ± 0.05 & \textcolor{gray}{1.00 ± 0.00}
+                  & 86.48 ± 0.12 & \textbf{89.90 ± 0.05} & \textcolor{gray}{0.92 ± 0.00}
+                  & 86.46 ± 0.00 & \textbf{92.11 ± 0.08} & \textcolor{gray}{0.70 ± 0.00} \\ \hline
+Arabic Digits     & 97.92 ± 0.03 & \textbf{97.99 ± 0.01} & \textcolor{gray}{0.95 ± 0.01} 
+                  & 97.91 ± 0.01 & \textbf{98.81 ± 0.02} & \textcolor{gray}{0.89 ± 0.00}
+                  & 97.92 ± 0.03 & \textbf{98.92 ± 0.01} & \textcolor{gray}{0.72 ± 0.04}  \\ \hline
+Beans             & 85.94 ± 0.00 & \textbf{86.72 ± 0.00} & \textcolor{gray}{0.92 ± 0.00} 
+                  & 85.94 ± 0.00 & \textbf{94.53 ± 0.00} & \textcolor{gray}{0.85 ± 0.00}
+                  & 85.94 ± 0.00 & \textbf{94.53 ± 0.00} & \textcolor{gray}{0.60 ± 0.00}  \\ \hline
+CelebA            & 87.88 ± 0.00 & 87.88 ± 0.00 & \textcolor{gray}{1.00 ± 0.00}
+                  & 87.88 ± 0.00 & \textbf{88.53 ± 0.01} & \textcolor{gray}{0.89 ± 0.01}
+                  & 87.88 ± 0.00 & \textbf{88.44 ± 0.00} & \textcolor{gray}{0.75 ± 0.01} \\ \hline
+CUB-200-2011      & 62.93 ± 0.00 & 62.93 ± 0.00 & \textcolor{gray}{1.00 ± 0.00} 
+                  & 62.97 ± 0.04 & \textbf{64.13 ± 0.06} & \textcolor{gray}{0.95 ± 0.00}
+                  & 62.93 ± 0.00 & \textbf{63.60 ± 0.00} & \textcolor{gray}{0.90 ± 0.00}  \\ \hline
+DTD               & 64.38 ± 0.03 & 64.38 ± 0.03 & \textcolor{gray}{1.00 ± 0.00} 
+                  & 64.41 ± 0.06 & \textbf{64.54 ± 0.03} & \textcolor{gray}{0.95 ± 0.00}
+                  & 64.38 ± 0.03 & \textbf{64.50 ± 0.03} & \textcolor{gray}{0.92 ± 0.00} \\ \hline
+Fashion MNIST     & 88.54 ± 0.02 & 88.54 ± 0.02 & \textcolor{gray}{1.00 ± 0.00}
+                  & 88.53 ± 0.01 & \textbf{89.38 ± 0.02} & \textcolor{gray}{0.94 ± 0.00}
+                  & 88.54 ± 0.03 & \textbf{89.52 ± 0.01} & \textcolor{gray}{0.87 ± 0.01} \\ \hline
+FGVC-Aircraft     & 43.70 ± 0.11 & \textbf{43.82 ± 0.02} & \textcolor{gray}{0.99 ± 0.01} 
+                  & 43.74 ± 0.03 & \textbf{46.84 ± 0.06} & \textcolor{gray}{0.91 ± 0.00}
+                  & 43.75 ± 0.06 & \textbf{48.30 ± 0.04} & \textcolor{gray}{0.77 ± 0.01} \\ \hline
+Flowers102        & 87.80 ± 0.01 & 87.80 ± 0.01 & \textcolor{gray}{1.00 ± 0.00} 
+                  & 87.79 ± 0.01 & \textbf{88.59 ± 0.06} & \textcolor{gray}{0.95 ± 0.00}
+                  & 87.80 ± 0.01 & \textbf{87.96 ± 0.01} & \textcolor{gray}{0.86 ± 0.00} \\ \hline
+Food101           & 59.70 ± 0.05 & \textbf{59.74 ± 0.02} & \textcolor{gray}{0.99 ± 0.01} 
+                  & 59.77 ± 0.07 & \textbf{61.06 ± 0.05} & \textcolor{gray}{0.93 ± 0.00}
+                  & 59.70 ± 0.05 & \textbf{60.48 ± 0.02} & \textcolor{gray}{0.89 ± 0.02}  \\ \hline
+MedMNIST 
+(PathMNIST)       & 86.22 ± 0.01 & \textbf{86.27 ± 0.02} & \textcolor{gray}{0.99 ± 0.00} 
+                  & 86.23 ± 0.02 & \textbf{88.58 ± 0.10} & \textcolor{gray}{0.90 ± 0.00}
+                  & 86.21 ± 0.00 & \textbf{87.27 ± 0.01} & \textcolor{gray}{0.81 ± 0.00} \\ \hline
+MedMNIST 
+(OCTMNIST)        & 65.47 ± 0.06 & 65.47 ± 0.06 & \textcolor{gray}{1.00 ± 0.00} 
+                  & 65.53 ± 0.15 & \textbf{67.27 ± 0.06} & \textcolor{gray}{0.93 ± 0.00}
+                  & 65.47 ± 0.06 & \textbf{69.00 ± 0.26} & \textcolor{gray}{0.80 ± 0.04} \\ \hline
+MedMNIST 
+(DermaMNIST)      & 73.44 ± 0.03 & \textbf{74.03 ± 0.07} & \textcolor{gray}{0.63 ± 0.01} 
+                  & 73.39 ± 0.03 & \textbf{76.61 ± 0.00} & \textcolor{gray}{0.88 ± 0.01}
+                  & 73.44 ± 0.03 & \textbf{77.74 ± 0.08} & \textcolor{gray}{0.80 ± 0.01} \\ \hline
+\multirow{2}{*}{Avg Rel Improve \& $\beta$} & \multicolumn{2}{c|}{Rel Improve (\%)} & \textcolor{gray}{($\beta$)} & \multicolumn{2}{c|}{Rel Improve (\%)} & \textcolor{gray}{($\beta$)} &
+\multicolumn{2}{c|}{Rel Improve (\%)} & \textcolor{gray}{($\beta$)} \\ \cline{2-10} 
+                  & \multicolumn{2}{c|}{0.23} 
+                  & \textcolor{gray}{0.87}
+                  & \multicolumn{2}{c|}{2.96} 
+                  & \textcolor{gray}{0.92}
+                  & \multicolumn{2}{c|}{3.46} 
+                  & \textcolor{gray}{0.80} \\ \hline
+\end{tabular}
+}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table*}
+
+\begin{table*}[h]
+  \centering
+  \caption{\small Complete robust accuracy results of ImageNet-pretrained ResNet-18 under $\ell_2$/$\ell_\infty$ adversarial attacks and common corruptions on CIFAR-10, CIFAR-100, and ImageNet, steered with the Swish-only, SoftPlus-only, and combined (baseline) versions of CT (\textbf{bold} entries indicate improvement with CT). \textbf{While both the Swish-only and SoftPlus-only versions enhance model robustness, their improvements are less significant than the combined version, validating our CT implementation.}  Reported values include means and standard deviations over three runs.}
+  \label{tab:rob-abl-full}
+    \begin{subtable}[]{\textwidth}
+        \centering
+        \caption{\small \textbf{Swish only.} Avg rel improve: 8.06\%. Avg $\beta$: 0.99.}
+        \label{tab:rob-abl-swish-full}
+        \resizebox{\linewidth}{!}{%
+        \begin{tabular}{|c|c|c|c|c|c|c|c|c|c|}
+          \hline
+          \multirow{2}{*}{\diagbox[]{Dataset}{Attack}} & \multicolumn{3}{c|}{$\ell_2$} 
+            & \multicolumn{3}{c|}{$\ell_\infty$} & \multicolumn{3}{c|}{Corruption} \\
+          \cline{2-10}
+          & ReLU (\%) & + CT (\%) & \textcolor{gray}{($\beta$)} & ReLU (\%) & + CT (\%) & \textcolor{gray}{($\beta$)} 
+          & ReLU (\%) & + CT (\%) & \textcolor{gray}{($\beta$)} \\
+          \hline
+          CIFAR-10     & 53.67 ± 0.32 & 53.67 ± 0.32 & \textcolor{gray}{1.00 ± 0.00} 
+                       & 11.17 ± 0.06 & \textbf{13.60 ± 0.26} & \textcolor{gray}{0.99 ± 0.00} 
+                       & 77.73 ± 0.00 & \textbf{77.77 ± 0.00} & \textcolor{gray}{0.99 ± 0.00} \\
+          \hline
+          CIFAR-100    & 24.30 ± 0.10 & 24.30 ± 0.10 & \textcolor{gray}{1.00 ± 0.00} 
+                       & 4.47 ± 0.06 & \textbf{6.37 ± 0.15} & \textcolor{gray}{0.99 ± 0.00} 
+                       & 51.81 ± 0.00 & 51.81 ± 0.00 & \textcolor{gray}{1.00 ± 0.00} \\
+          \hline
+          ImageNet     & 23.37 ± 0.06 & 23.37 ± 0.06 & \textcolor{gray}{1.00 ± 0.00} 
+                       & 0.00 ± 0.00 & \textbf{4.50 ± 0.30} & \textcolor{gray}{0.99 ± 0.00} 
+                       & 33.11 ± 0.00 & \textbf{33.13 ± 0.00} & \textcolor{gray}{0.99 ± 0.00} \\
+          \hline
+        \end{tabular}
+        }
+    \end{subtable}
+
+  \vspace{0.5em}
+
+    \begin{subtable}[]{\textwidth}
+    \centering
+    \caption{\small \textbf{SoftPlus only.} Avg rel improve: 9.91\%. Avg $\beta$: 0.98.}
+    \label{tab:rob-abl-softplus-full}
+    \resizebox{\linewidth}{!}{%
+    \begin{tabular}{|c|c|c|c|c|c|c|c|c|c|}
+      \hline
+      \multirow{2}{*}{\diagbox[]{Dataset}{Attack}} & \multicolumn{3}{c|}{$\ell_2$} 
+        & \multicolumn{3}{c|}{$\ell_\infty$} & \multicolumn{3}{c|}{Corruption} \\
+      \cline{2-10}
+      & ReLU (\%) & + CT (\%) & \textcolor{gray}{($\beta$)} & ReLU (\%) & + CT (\%) & \textcolor{gray}{($\beta$)} 
+      & ReLU (\%) & + CT (\%) & \textcolor{gray}{($\beta$)} \\
+      \hline
+      CIFAR-10     & 53.67 ± 0.32 & \textbf{54.07 ± 0.06} & \textcolor{gray}{0.98 ± 0.00} 
+                   & 11.17 ± 0.06 & \textbf{14.47 ± 0.06} & \textcolor{gray}{0.99 ± 0.00} 
+                   & 77.73 ± 0.00 & 77.73 ± 0.00 & \textcolor{gray}{1.00 ± 0.00} \\
+      \hline
+      CIFAR-100    & 24.30 ± 0.10 & \textbf{24.93 ± 0.31} & \textcolor{gray}{0.97 ± 0.00} 
+                   & 4.47 ± 0.06 & \textbf{6.53 ± 0.15} & \textcolor{gray}{0.99 ± 0.00} 
+                   & 51.81 ± 0.00 & 51.81 ± 0.00 & \textcolor{gray}{1.00 ± 0.00} \\
+      \hline
+      ImageNet     & 23.37 ± 0.06 & 23.37 ± 0.06 & \textcolor{gray}{1.00 ± 0.00} 
+                   & 0.00 ± 0.00 & \textbf{6.60 ± 0.10} & \textcolor{gray}{0.94 ± 0.01} 
+                   & 33.11 ± 0.00 & \textbf{33.15 ± 0.00} & \textcolor{gray}{0.99 ± 0.00} \\
+      \hline
+    \end{tabular}
+    }
+\end{subtable}
+\vskip -0.1in
+\end{table*}

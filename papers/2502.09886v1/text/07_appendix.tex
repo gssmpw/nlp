@@ -1,0 +1,340 @@
+\section{Appendix}
+
+\subsection{Implementation Details of Code Generation}
+\label{app:code_generation}
+
+\textbf{Examples of Generated Codes} To further illustrate the generated codes described in Sec. \ref{sec:method:policy_learning}, we take the task \texttt{insert fork into storage} as an example, shown in Fig. \ref{fig:task_code}. We provide detailed prompts and examples to inform the GPT-4o for code generation. In the beginning, we generate 8 code samples and then leverage GPT-4o to select the most reasonable one as the base code. Afterward, we perform iterations for the reward function part, during which only the reward function code is required to generate. For each iteration, we learn RL policies under the N different reward functions and select the one with the highest success rates as the base code for the next iteration. Noticed that the VLM can add some states such as \texttt{dist\_to\_fork} and change the observation space automatically. 
+
+\begin{figure}[H]
+\centering
+\begin{lstlisting}[language=Python]
+...
+from factory.tasks.task import Task
+
+...
+scene_info = {'task_class_name': ..., 'objects': ...}
+
+...
+class InsertForkIntoStorageBox(Task):
+    """
+    insert fork into storage box
+    """
+    def __init__(self, envs, urdf_assets_root) -> None:
+        super().__init__(envs, urdf_assets_root, scene_info)
+        self.task_description = "insert fork into storage box"
+    def reset_objects_states(self, env_ids):
+        return super().reset_objects_states(env_ids)
+    def compute_observation_key(self, states):
+        obs_keys = super().compute_observation_key(states)
+        # Add distance observation between the end-effector and the fork
+        dist_to_fork = torch.norm(states["fork_pos"] - states["eef_pos"], dim=-1)
+        states["dist_to_fork"] = dist_to_fork
+        obs_keys.append("dist_to_fork")
+        # Add distance observation between the fork and the storage box
+        dist_fork_to_box = torch.norm(states["fork_pos"] - states["storage_box_pos"], dim=-1)
+        states["dist_fork_to_box"] = dist_fork_to_box
+        obs_keys.append("dist_fork_to_box")
+        return obs_keys
+    def get_observation_space(self):
+        obs_space = super().get_observation_space()
+        # Increase the observation space by the number of new observations added
+        return obs_space + 2
+    def compute_success(self, states):
+        # the fork in the storage
+        # xy position of the fork is within the storage box
+        # z position of the fork is within the storage box
+        xy_distance = torch.norm(states["fork_pos"][:, :2] - states["storage_box_pos"][:, :2], dim=-1)
+        ...
+        # fork should be inside the storage box's boundary in Z-axis
+        z_condition = (lower_z_of_fork < upper_z_of_box) & (upper_z_of_fork > lower_z_of_box)
+        # fork should be inside the storage box's boundary in XY-axis
+        xy_condition = xy_distance < 0.01
+        success = z_condition & xy_condition
+        return success
+    def compute_reward(self, actions, states):
+        return reward_function(actions, states)
+        
+# REWARD FUNCTION
+@torch.jit.script
+def reward_function(actions, states):
+...
+\end{lstlisting}
+\vskip -.5cm
+\caption{An example of the generated code for the task \texttt{Insert}.}
+\label{fig:task_code}
+\end{figure}
+
+\textbf{Examples of Code Evolutions} We provide examples of modifying the reward function based on the reward logs. During reward iterations, we provide examples of how humans adapt and refine the reward functions. We add the logs of each reward component during training as prompts for the next iteration. They can be categorized into two groups: from successful and failure trajectories. It allows the GPT-4o to identify which reward components are most significant. If the training results in failure without any successful outcomes, we will prompt GPT-4o to redesign the reward function to improve performance and outcomes. The analysis example by the GPT-4o is in Fig. \ref{fig:reward_analysis}, and the generated reward function example is in Fig. \ref{fig:new_reward}. 
+
+\begin{figure}[t]
+\centering
+\begin{lstlisting}[language=Python]
+### Improved Reward Function
+Based on the analysis and suggestions, here's an improved reward function:
+@torch.jit.script
+def reward_function(actions, states):
+    # type: (Tensor, Dict[str, Tensor]) -> Tuple[Tensor, Dict[str, torch.Tensor]]
+    """
+    # Chain of Thoughts for reward designs:
+    1. Grasp the garlic.
+    2. Throw the garlic towards the bowl.
+    3. Ensure the garlic reaches the bowl.
+    # Reward Components:
+    1. The distance between the gripper and the garlic.
+    2. The garlic's distance to the bowl.
+    3. The velocity of the garlic towards the bowl.
+    4. The final position of the garlic being inside the bowl.
+    """
+    batch_size = states['eef_pos'].shape[0]
+    rewards = torch.zeros(batch_size, device=states['eef_pos'].device, dtype=torch.float32)
+    reward_components = {}
+    # 1. Adjust Distance from gripper to garlic reward
+    dist_eef_to_garlic = torch.norm(states['garlic_pos'] - states['eef_pos'], dim=-1)
+    dist_grasp_reward = 1 - torch.tanh(8.0 * dist_eef_to_garlic)  # Adjusting TANH temperature
+    reward_components['dist_grasp_reward'] = dist_grasp_reward * 0.15  # Updated scale for emphasis
+    # 2. Increased temperature for distance between garlic and bowl
+    dist_garlic_to_bowl = 1 - torch.tanh(12.0 * states['dist_garlic_to_bowl'])  # Increased temperature for better gradient
+    reward_components['dist_garlic_to_bowl'] = dist_garlic_to_bowl * 0.25  # Increased scale to 0.25
+    # 3. Velocity reward (slight temperature increase)
+    garlic_vel = states['garlic_vel_linear']
+    garlic_to_bowl_dir = states['bowl_pos'] - states['garlic_pos']
+    garlic_to_bowl_dir = garlic_to_bowl_dir / torch.norm(garlic_to_bowl_dir, dim=-1, keepdim=True)
+    vel_towards_bowl = torch.sum(garlic_vel * garlic_to_bowl_dir, dim=-1)
+    vel_reward = torch.tanh(4.0 * vel_towards_bowl)  # Slight adjustment in temperature
+    reward_components['vel_reward'] = vel_reward * 0.30  # Increased scale to 0.30 for stronger influence
+    # 4. Final Position Reward (revised and scaled)
+    dist_xy_to_center = torch.norm(states['garlic_pos'][:, :2] - states['bowl_pos'][:, :2], dim=-1)
+    upper_z_of_bowl = states["bowl_pos"][:, 2] + states["bowl_size"][:, 2] / 2
+    lower_z_of_bowl = states["bowl_pos"][:, 2] - states["bowl_size"][:, 2] / 2
+    garlic_in_bowl = ((dist_xy_to_center < (states['bowl_size'][:, 0] / 2)) & (states['garlic_pos'][:, 2] < upper_z_of_bowl) & (states['garlic_pos'][:, 2] > lower_z_of_bowl)).float()
+    final_position_reward = garlic_in_bowl * 0.70  # Actually achievable state
+    reward_components['final_position_reward'] = final_position_reward
+    # Total Reward including penalties
+    total_reward = dist_grasp_reward * 0.15 + dist_garlic_to_bowl * 0.25 + vel_reward * 0.30 + final_position_reward * 0.70
+    step_penalty = torch.ones_like(total_reward) * 0.01
+    rewards = total_reward - step_penalty
+    reward_components['total_reward'] = total_reward
+    reward_components['step_penalty'] = step_penalty
+    return rewards, reward_components
+\end{lstlisting}
+\vskip -.5cm
+\caption{An example of the newly generated reward function for the task \texttt{Throw}.}
+\label{fig:new_reward}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\begin{lstlisting}[language=Python]
+...
+### Analysis of Policy Feedback
+1. **Distance from Gripper to Garlic (dist_grasp_reward)**
+    - **Observation**: The values fluctuate around 0.1, with a minimum of 0.0018 and a maximum of 0.1320. The last value is 0.1272.
+    - **Suggestion**: The fluctuation indicates variability, but the impact may be insufficient for success. Adjust the scale or temperature slightly for better sensitivity.
+2. **Distance from Garlic to Bowl (dist_garlic_to_bowl)**
+    - **Observation**: The values are quite low (0.0000 - 0.0029), indicating this component is not significantly contributing.
+    - **Suggestion**: Increase the temperature parameter for better gradient.
+3. **Velocity Reward (vel_reward)**
+    - **Observation**: The values show variability and seem to be contributing to the learning process. The last value is 0.1746.
+    - **Suggestion**: It is effective but might need a slight adjustment in temperature and scaling.
+4. **Final Position Reward (final_position_reward)**
+    - **Observation**: This component consistently shows zeros, indicating it's not achieved in any of the episodes.
+    - **Suggestion**: Rewriting or significantly adjusting this component is necessary.
+5. **Total Reward (total_reward)**
+    - **Observation**: The total reward has shown improvement over time but doesn't lead to success. It fluctuates with no episodes achieving success.
+    - **Suggestion**: Improve the component scales to better balance the total reward for successful episodes.
+### Key Points for Improvement
+- Re-scale or rewrite dist_garlic_to_bowl for better contribution.
+- Rework or introduce final_position_reward to enhance the likelihood of success.
+- Adjust the scales and temperatures for proper balance.
+\end{lstlisting}
+\vskip -.5cm
+\caption{An example of the reward analysis for the task \texttt{Throw}.}
+\label{fig:reward_analysis}
+\end{figure}
+
+
+
+\subsection{More experiments}
+\label{app:more_exp}
+
+\textbf{Robustness analysis for each component.} To quantify the robustness of our method, we evaluate vision models used in our pipeline individually by testing their reconstruction success rates. For instance, when assessing the grounding accuracy of DINO, we sample 20 videos. Similarly, for evaluating the segmentation accuracy of SAM-2, we sample 20 successful bounding boxes generated by DINO. Following this approach, we systematically test the robustness of each module in the pipeline. If the reconstruction is broken or identifies the wrong object, it is classified as a failure case. The results are in Tab. \ref{tab:robust}. We can find that the segmentation and mesh reconstruction parts are more robust than the others. 
+
+% \begin{figure}[h]
+%     \centering
+%     \vskip -1cm
+%     \includegraphics[width=\linewidth]{pdfs/iteration_time.pdf}
+%     \vskip -.3cm
+%     \caption{Video2Policy achieves better performance across iteration, which demonstrates better superior Pareto optimality.}
+%     \label{fig:iteration_time}
+% \end{figure}
+
+\begin{table}[t]
+    \centering
+    \caption{\label{tab:robust} Failure rates (smaller is better) of the vision models in our pipeline. The average failure rate is 42\%, and SAM-2 is the most robust model.} 
+    \begin{tabular}{l|cccc|c}
+        \toprule
+        \textbf{Failure Rates} & Grounding DINO & SAM-2 & InstantMesh & FoundationPose &  \textbf{Avg.} \\
+        \midrule
+        SSv2 Videos & 0.60 & \textbf{0.15} & 0.35 & 0.55 & 0.42 \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+\begin{table}[!h]
+    \centering
+    \caption{\label{tab:d1_depth} D1 distance between the predicted depth by Unidep \citep{piccinelli2024unidepth} and the ground-truth depth in \texttt{Sliding} video.} 
+    \begin{tabular}{l|ccc}
+        \toprule
+         & Full size & Center region (0.8x crop) & Object bounding box \\
+        \midrule
+        d1 distance & 67.3\% & 86.9\% & \textbf{93.4\%} \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+\begin{table}[!h]
+    \centering
+    \caption{\label{tab:pred_size} D1 distance between the predicted depth by Unidep \citep{piccinelli2024unidepth} and the ground-truth depth in \texttt{Sliding} video.} 
+    \begin{tabular}{l|cc}
+        \toprule
+        Object & Remote Control & Mouse \\
+        \midrule
+        Predicted Size (l, w, h) & (0.18, 0.04, 0.02) & (0.17, 0.10, 0.05) \\
+        Ground-truth Size (l, w, h) & (0.21, 0.05, 0.02) & (0.19, 0.08, 0.03) \\
+        \midrule
+        Delta size (l, w, h) & (0.03, 0.01, 0.00) & (0.02, 0.02, 0.02) \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+Moreover, we also conduct experiments to evaluate the noise effects of the depth estimation component. For one thing, we use the depth-aware Realsense Camera to get the ground-truth depth of the self-recorded video \texttt{Sliding} and evaluate the d1 metric (higher is better) for the video \citep{piccinelli2024unidepth}.$\text{d1} = \frac{\text{Number of pixels where } \frac{|d_{\text{pred}} - d_{\text{gt}}|}{d_{\text{gt}}} > \text{0.1m}}{\text{Total number of pixels}}$. The results are in Tab. \ref{tab:d1_depth}. The depth estimation of the object region is accurate. And the size error under the depth prediction is as shown in Tab. \ref{tab:pred_size}. The error of the size prediction is small. Furthermore, we resize the objects to the GT size and apply the previously trained model to study how the noise affects the final performance. We keep the same state inputs. The performance drops from 97\% to 83\%, but the model can still solve the task at a high success rate.
+
+\textbf{Performance analysis for iterative generation.} Following Eureka \citep{ma2023eureka}, we visualize the performance of our method and baselines after each evolution iteration in Fig. \ref{fig:iteration_time}. And we also conduct an ablation study, Video2Policy w.o. Evolution (16 Samples), which only performs the initial reward generation step without iterative improvement. The results are based on the tasks \texttt{lifting}, \texttt{uncover}, \texttt{throw}, which follow the setting in Sec. \ref{sec:experiment:ablation_study}. This study examines whether, given a fixed reward function budget, it is more effective to allocate resources toward iterative evolution or simply generate more first-attempt rewards. The results demonstrate that our method significantly outperforms the other baselines across multiple iterations. Our method demonstrates superior Pareto optimality, effectively balancing multiple objectives to achieve optimal trade-offs compared to other approaches, shown in Fig. \ref{fig:iteration_time}.
+
+\subsection{More Ablation Results}
+\label{app:more_ablation}
+All the ablation experiments follow the setting in Sec. \ref{sec:experiment:ablation_study}.
+
+\begin{figure}
+    \centering
+    \includegraphics[width=0.8\linewidth]{pdfs/correlation.pdf}
+    \caption{
+  \textbf{Correlation analysis} of generated success functions and the manual ground-truth functions.}
+    \label{fig:correlation}
+\end{figure}
+
+% \begin{wrapfigure}{R}{0.5\textwidth}
+%   \begin{center}
+%   \vskip -.5cm
+%     \includegraphics[width=\linewidth]{pdfs/correlation.pdf}
+%   \end{center}
+%   \vskip -.5cm
+%   \caption{
+%   \textbf{Correlation analysis} of generated success functions and the manual ground-truth functions.}
+%   \label{fig:correlation}
+%   \vskip -0.5cm
+% \end{wrapfigure}
+
+\textbf{Success Function Evaluation}
+Moreover, we attempt to calculate the correlation between the generated success functions and the manually designed ones, as shown in Fig. \ref{fig:correlation}. We choose the success rates calculated under different success functions as the data points. Compared to Eureka, the success function generated by more visual information can be more reasonable and closer to the ground-truth ones, with a higher correlation coefficient qual to 0.83. In addition, the generated success functions with visual information can be over-confident, as the data points lie below the y=x curve. Instead, it can be noise with caption only when generating the success functions. 
+
+\textbf{Tracking prompts help for policy learning.} Here we investigate the tolerance of 6D position errors for the tracking part. We conduct an ablation study that removes the 6D position tracking information obtained from FoundationPose in Tab. \ref{tab:ablation_no_tracking}. As shown, after removing the tracking information, the performance drops for the tasks with multiple objects.
+
+\begin{table}[!h]
+    \centering
+    \caption{\label{tab:ablation_no_tracking} After removing the tracking information in prompts, the performance drops from 87\% to 75\%, which is still superior to Eureka.} 
+    \begin{tabular}{l|ccc|c}
+        \toprule
+         & Lifting Up & Uncover & Throw & Average \\
+        \midrule
+        Video2Policy & \textbf{0.93} $\pm$ 0.05 & \textbf{0.97} $\pm$ 0.05 & \textbf{0.70} $\pm$ 0.36 & \textbf{0.87} \\
+        Video2Policy, w.o. tracking info & 0.90 $\pm$ 0.08 & 0.77 $\pm$ 0.13 & 0.57 $\pm$ 0.17 & 0.75 \\
+        Eureka & 0.83 $\pm$ 0.13 & 0.63 $\pm$ 0.38 & 0.37 $\pm$ 0.29 & 0.61 \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+\begin{figure}[h]
+\centering
+\begin{lstlisting}[language=Python]
+Example 1:
+def compute_observation_key(self, states):
+    obs_keys = super().compute_observation_key(states)
+    return obs_keys
+def get_observation_space(self):
+    obs_space = super().get_observation_space()
+    return obs_space\
+def compute_success(self, states):
+    card_lifted = (states['card_pos'][:, 2] - states['table_height']) > (torch.max(states['card_size'])  / 2)
+    success = card_lifted
+    return success
+
+Example 2:
+def compute_observation_key(self, states):
+    obs_keys = super().compute_observation_key(states)
+    dist_gripper_card = torch.norm(states["card_pos"] - states["eef_pos"], dim=-1)
+    states["dist_gripper_card"] = dist_gripper_card
+    obs_keys.append("dist_gripper_card")
+    return obs_keys
+def get_observation_space(self):
+    obs_space = super().get_observation_space()
+    return obs_space + 1
+def compute_success(self, states):
+    card_height_above_table = states['card_pos'][:, 2] - states['table_height']
+    card_lifted = card_height_above_table > 0.2
+    success = card_lifted & (states['card_vel_linear'].norm(dim=-1) < 0.01)
+    return success
+...
+
+Example 2 is more reasonable and better for several reasons:
+1. Inclusion of the End-Effector-Card Distance in Observations: 
+    This is beneficial because it provides an additional critical feature that can help the agent understand its relative position to the target object. This added information is highly useful for learning tasks involving object manipulation.
+    ...
+2. Enhanced Success Criteria: ...
+    The second implementation refines the success criteria by adding a condition that the card's linear velocity should be minimal (states['card_vel_linear'].norm(dim=-1) < 0.01), ensuring that the card is not just lifted but also stable. This is a more precise definition of success for manipulation tasks.
+    ...
+3. Dynamic and Informative Observations: ...
+4. Observation Space Adjustment: ...
+\end{lstlisting}
+\vskip -.5cm
+\caption{An example of how GPT-4o picks better code for less hallucination.}
+\label{fig:picking_example}
+\end{figure}
+
+\textbf{Hallucination issue can be alleviated by picking under GPT-4o.} To evaluate the validity of the generated task code, we have some instructions. For example, for correctness, we inform the GPT-4o to read and analyze the success part; for reasonability, we inform the GPT-4o to avoid picking the code that assumes some scalar value or states.
+To quantify the frequency of the hallucination, we run Video2Policy (16 samples, 1 iteration) for the 3 tasks (Lifting, Uncover, Throw). Here we remove the while-loop generation so that not all samples are runnable. (Previously, if one sample fails, we regenerate again until all 8 samples are runnable.) Here the hallucination samples include non-runnable samples and zero-score samples. We can find that after picking by GPT-4o, the hallucination problem alleviates in a degree. Here is an example of how GPT-4o picks better task codes, shown in Fig. \ref{fig:picking_example}.
+ 
+\begin{table}[!h]
+    \centering
+    \caption{\label{tab:hallucination} Querying GPT-4o for choosing across multiple samples helps alleviate hallucination.} 
+    \begin{tabular}{l|cc}
+        \toprule
+         & Without Picking & Picking by GPT-4o \\
+        \midrule
+        Hallucination & 0.40 & \textbf{0.19} \\
+        \midrule
+        Hallucination - Non-runnable & 0.25 & \textbf{0.13} \\
+        Hallucination - Runnable & 0.15 & \textbf{0.07} \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+\textbf{The generated codes do not reset cheating.} Since the task codes are generated under different prompts for all the methods, we conduct ablation studies by choosing the same 'reset' function from our method for the baselines. For the code-as-policy, we generate the policy code and execute it in the Issac Gym. Thus, the 'reset' function is the same as the Video2Policy since they share the task code. We choose 3 tasks, one of a single object and two of multiple objects. The results are illustrated in Tab. \ref{tab:ablation_reset}. For tasks with a single object, the results are the same because the generated 'reset' function calls the base reset function. For tasks with multiple objects, the results have limited changes. The reason is that when generating the reset function, the LLM introduces certain constants. These constants may vary.
+However, the variance has limited effects on the final results. It indicates that there is no reset cheating.
+
+\begin{table}[!h]
+    \centering
+    \caption{\label{tab:ablation_reset} Using the same 'reset' function as the Video2Policy, the baselines have limited changes for the evaluation results. This proves that the better results of our method do not come from 'reset' cheating.} 
+    \begin{tabular}{l|ccc|c}
+        \toprule
+         & Lifting Up & Uncover & Throw & Average \\
+        \midrule
+        Video2Policy & \textbf{0.93} $\pm$ 0.05 & \textbf{0.97} $\pm$ 0.05 & \textbf{0.70} $\pm$ 0.36 & \textbf{0.87} \\
+        Code-as-Policy & 0.33 $\pm$ 0.21 & 0.10 $\pm$ 0.08 & 0.00 $\pm$ 0.00 & 0.14 \\
+        \midrule
+        RoboGen & 0.28 $\pm$ 0.09 & 0.67 $\pm$ 0.26 & 0.03 $\pm$ 0.05 & 0.33 \\
+        RoboGen (same reset function) & 0.28 $\pm$ 0.09 & 0.60 $\pm$ 0.28 & 0.03 $\pm$ 0.05 & 0.30 \\
+        \midrule
+        Eureka & 0.83 $\pm$ 0.13 & 0.63 $\pm$ 0.38 & 0.37 $\pm$ 0.29 & 0.61 \\
+        Eureka (same reset function) & 0.83 $\pm$ 0.13 & 0.67 $\pm$ 0.21 & 0.37 $\pm$ 0.29 & 0.62 \\
+        \bottomrule
+    \end{tabular}
+\end{table}

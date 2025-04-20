@@ -1,0 +1,205 @@
+\section{Method}
+\label{sec:method}
+In this section, we explain the \methodname{} method. \methodname{} initializes an MoE model by utilizing a pre-trained dense model and consists of three steps:
+
+\begin{enumerate}
+\item \textbf{Expert Replication:} The weights of the dense model are copied to create the MoE model. All layers, except for the FFN layers, are copied directly from the dense model. The FFN layers are replaced with MoE layers, and the original FFN weights are copied to all experts within these MoE layers.
+
+\item \textbf{Diversity Re-initialization:} In each MoE layer, a subset of the expert parameters is randomly selected and re-initialized using the original statistical information. This promotes diversity among the experts while partially retaining the knowledge of the original model, which facilitates expert specialization during subsequent training.
+
+\item \textbf{Continued Training:} After initialization, the MoE model is trained using the standard next-token prediction loss. Optionally, a load-balancing loss, commonly applied in MoE training, can also be incorporated.
+\end{enumerate}
+In the following, we explain the expert initialization and diversity injection processes.
+
+
+\subsection{SwiGLU and MoE Layers}
+\label{sec:methods:preliminaries}
+
+We provide a brief overview of the MoE architecture. First, we review the feedforward network (FFN) layer in transformers. The SwiGLU activation function~\citep{shazeer2020gluvariantsimprovetransformer}, now standard in state-of-the-art LLMs like LLaMA~\citep{touvron2023llamaopenefficientfoundation} and Mixtral~\citep{jiang2024mixtralexperts}, will be used for explanation here. However, it should be noted that \methodname{} can be applied to transformers with any activation function. The FFN layer with SwiGLU is defined as follows:
+
+\begin{equation}
+\text{SwiGLU}(\mathbf{x}) = (\text{Swish}(\mathbf{x}^\mathrm{T} \mathbf{W}_\text{gate}) \odot \mathbf{x}^\mathrm{T} \mathbf{W}_\text{up}) \mathbf{W}_\text{down}.
+\label{eq:ffn_swiglu}
+\end{equation}
+%ここで, $\mathbf{x} \in \mathbb{R}^{d_h}$は入力ベクトル, $\odot$はアダマール積を表し, 重み行列のサイズは以下の通りである：
+Here, $ \mathbf{x} \in \mathbb{R}^{d_h}\ $ represents the input vector and \(\odot\) denotes the Hadamard product. Each FFN layer contains the following three weight matrices: $
+%\begin{equation}
+\mathbf{W}_\text{gate}, \mathbf{W}_\text{up} \in \mathbb{R}^{d_h \times d_f}$, and $\mathbf{W}_\text{down} \in \mathbb{R}^{d_f \times d_h}.
+%\label{eq:weight_matrices}
+%\end{equation}
+$
+The dimensions \(d_h\) and \(d_f\) are referred to as the hidden size and intermediate size, respectively.
+
+When MoE is introduced into a transformer, each FFN layer is replaced with an MoE layer, while the rest of the architecture remains unchanged. Let us assume we use \(n\) experts and Top-$k$ gating. 
+An MoE layer comprises a router and \(n\) expert FFNs. The router has a weight matrix \(\mathbf{W}_\text{router} \in \mathbb{R}^{d_h \times n}\). The $i$-th expert FFN is denoted as \(\text{SwiGLU}^{(i)}(\mathbf{x})\), which, like a standard FFN layer, consists of three weight matrices. These weights are denoted as \(\mathbf{W}^{(i)}_\text{gate}, \mathbf{W}^{(i)}_\text{up},\) and \(\mathbf{W}^{(i)}_\text{down}\). 
+%
+The output \(\mathbf{y}\) of the MoE layer is computed as follows:
+%$n$エキスパートで, Top-Kゲーティングを使用する時, $\mathbf{W}_g \in \mathbb{R}^{d_h \times n}$をゲーティング重みとすると, MoE層の最終出力$\mathbf{y}$は以下のように計算される：
+\begin{equation}
+\mathbf{y} = \sum_{i=1}^{n} g(\mathbf{x})_i \cdot \text{SwiGLU}^{(i)}(\mathbf{x}),
+\label{eq:moe_output}
+\end{equation}
+where \(g(\mathbf{x})_i\) is the $i$-th element of the output $g(\mathbf{x}) \in \mathbb{R}^n$ of the Top-$k$ routing function, defined as:
+% ここで, $g_i(\mathbf{x})$はTop-Kゲーティング関数の出力で, 以下のように定義される：
+\begin{equation}
+g(\mathbf{x}) = \text{Softmax}(\text{Top-}k(\mathbf{x}^\mathrm{T} \mathbf{W}_\text{router})).
+\label{eq:gating_function}
+\end{equation}
+
+Since \(k < n\) is typically the standard setting, only the top-$k$ selected experts out of \(n\) are computed. Therefore, the MoE layer is sparsely activated, meaning that only a subset of the parameters is involved in the computation. The number of parameters engaged in the computation for a given input is referred to as the \emph{active parameters} of the MoE model. This value is widely used as an approximation for the computational cost as it correlates well with the cost of both training and inference.
+For non-MoE models, the total number of parameters corresponds to the active parameters as all parameters are involved in every computation.
+
+
+
+
+
+\subsection{Expert Replication}
+%まず、通常のFFN layerを用いたtransfomerのweightをコピーし、MoE layerを用いたtransformerを構築します。上で説明した通り、FFN層以外は全く同じアーキテクチャなので、それらについてはweightをそのままコピーします。各FFN層はMoE層に置き換える必要があります。新しいMoEレイヤーは以下の方法で作ります。
+
+%routerのweightである $\mathbf{W}_\text{router}$ はランダムに初期化します。 $n$個のexpertについては、元のFFNのweightをコピーします。即ち、 \(\mathbf{W}^{(i)}_\text{gate} = \mathbf{W}_\text{gate}, \mathbf{W}^{(i)}_\text{up} = \mathbf{W}_\text{up},\) and \(\mathbf{W}^{(i)}_\text{down} = \mathbf{W}_\text{down}\) とします。
+
+Following \citep{komatsuzaki2023sparse}, we first construct a Transformer with MoE layers by replicating the weights from a pre-trained Transformer with standard FFN layers. As explained earlier, the architecture remains identical except the FFN layers, so we simply copy the weights of all non-FFN components. Each FFN layer needs to be replaced with an MoE layer, and the new MoE layers are constructed as follows:
+%
+The router weights \(\mathbf{W}_\text{router}\) are initialized randomly. For the \(n\) experts, the weights from the original FFN are copied, such that \(\mathbf{W}^{(i)}_\text{gate} = \mathbf{W}_\text{gate}, \mathbf{W}^{(i)}_\text{up} = \mathbf{W}_\text{up},\) and \(\mathbf{W}^{(i)}_\text{down} = \mathbf{W}_\text{down}\).
+% \footnote{There has been a recent approach that uses fine-grained experts by reducing the FFN width of MoE models~\citep{dai-etal-2024-deepseekmoe}. \methodname{} can be applied in this context as well. In this scenario, expert replication is performed by splitting either the columns ($\mathbf{W}_\text{gate}$ and $\mathbf{W}_\text{up}$) or the rows ($\mathbf{W}_\text{down}$) of the original FFN, and subsequent steps can be carried out in the same manner. \diff{See Appendix~\ref{appendix:extensions} for a detailed discussion.}}
+
+% \diff{There has been a recent approach that uses fine-grained experts by reducing the FFN width of MoE models~\citep{dai-etal-2024-deepseekmoe}. See Appendix~\ref{appendix:extensions} for a detailed discussion.}
+
+\diff{\methodname{} can also be applied to fine-grained experts and shared experts~\citep{dai-etal-2024-deepseekmoe}. See Appendix~\ref{appendix:extensions} for details.}
+
+
+%密モデルのFFN層を$n$個のMoEモデルのエキスパート層に初期化する. 各エキスパート$j \in \{1, \ldots, n\}$の重み$\mathbf{W}^{(j)}$は以下のように初期化される：
+%\begin{equation}
+%\begin{aligned}
+%\mathbf{W}^{(j)}_{up} &= \mathbf{W}_{up:,\mathcal{S}_j}, \quad \mathbf{W}^{(j)}_{gate} = %\mathbf{W}_{gate:,\mathcal{S}_j} \in \mathbb{R}^{d_h \times |\mathcal{S}_j|} \\
+%\mathbf{W}^{(j)}_{down} &= \mathbf{W}_{down: ,\mathcal{S}_j,} \in \mathbb{R}^{|\mathcal{S}_j| \times d_h}
+%\end{aligned}
+%\label{eq:expert_init}
+%\end{equation}
+%ここで, $\mathcal{S}_j$は$\{1, \ldots, d_f\}$からランダムに選択された要素からなる集合, $|\mathcal{S}_j|$はその集合の要素数, $d_h$はモデル次元, $d_f$は元のFFN層の中間次元を表す. 
+
+%本研究の実験では, $|\mathcal{S}_j| = d_f$ としている.
+
+\subsubsection{Diversity Re-initialization}
+\label{sec:reinit}
+
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\textwidth]{images/partial_reinit.pdf}
+\vskip -8pt
+\caption{\textbf{Initialization of expert weights.} Columns (rows) are selected according to \diff{a set of randomly selected indices of the intermediate layer} $\mathcal{S}$, then all elements of them are re-initialized with the normal distribution. Other columns (rows) are maintained.}
+\label{fig:partial-re-initialization}
+\end{figure}
+
+
+
+
+Diversity re-initialization is the key step in \methodname{}. 
+%Re-initializing each expert randomly encourages the diversification of experts during subsequent training. 
+This process is carefully designed to balance between knowledge retention and expert diversification. In particular, it is crucial to drop original weights along the intermediate dimension of the FFN layer based on shared indices across all three weight matrices. Specifically, the following operation is applied to every expert FFN in every MoE layer.
+
+
+
+\paragraph{Step 1: Column-wise Sampling.}
+We sample indices from the set of integers from 1 to intermediate size \(d_f\), namely,  $\mathcal{I}_{d_f}=\{ 1, 2, \cdots, d_f \}$, to create a set of partial indices \(\mathcal{S}\). A hyperparameter $r$ ($0 \leq r \leq 1$) controls the intensity of re-initialization, determining the proportion \(r\) used for sampling. That is, $\mathcal{S} \subseteq \mathcal{I}_{d_f}$ and $\left| \mathcal{S} \right| = \lfloor r d_f \rfloor$.
+
+
+\paragraph{Step 2: Statistics Calculation.}  
+We calculate the mean and standard deviation of the matrices of the weights corresponding to the selected indices $\mathcal{S}$. Specifically, we compute the mean and variance \((\mu_\text{up}, \sigma_\text{up})\), \((\mu_\text{gate}, \sigma_\text{gate})\), and \((\mu_\text{down}, \sigma_\text{down})\) 
+from the values obtained only from the non-zero columns of $\mathbf{I}_{\mathcal{S}}$ in the products 
+$\mathbf{I}_{\mathcal{S}}\odot W_{\text{gate}}$,
+$\mathbf{I}_{\mathcal{S}} \odot W_{\text{up}}$, and 
+$\mathbf{I}_{\mathcal{S}} \odot W_{\text{down}}^\top$, respectively, where $\mathbf{I}_{\mathcal{S}}$ is the indicator matrix whose values are 1 in the $i$-th column for $i\in\mathcal{S}$ and 0 otherwise.
+
+%for sub-matrices \(W_{\text{up\ } :,\mathcal{S}}\), \(W_{\text{gate\ } :,\mathcal{S}}\), and \(W_{\text{down\ } \mathcal{S},:}\).
+
+\paragraph{Step 3: Partial Re-Initialization.}
+%最後に、これらを用いて3つの重み行列 $\mathbf{W}_\text{gate}$, $\mathbf{W}_\text{up}$, and $\mathbf{W}_\text{down}$ の部分的な最初期化をし、 $\widetilde{\mathbf{W}}_\text{gate}$, $\widetilde{\mathbf{W}}_\text{up}$, and $\widetilde{\mathbf{W}}_\text{down}$ を得る。
+%選択されたindexについてはランダム初期化を、そうでないindexについては元のweightをコピーする。即ち、以下のようにする。
+Finally, using the calculated statistics, we perform partial re-initialization of the three weight matrices \(\mathbf{W}_\text{gate}\), \(\mathbf{W}_\text{up}\), and \(\mathbf{W}_\text{down}\), obtaining \(\widetilde{\mathbf{W}}_\text{gate}\), \(\widetilde{\mathbf{W}}_\text{up}\), and \(\widetilde{\mathbf{W}}_\text{down}\). 
+For the selected indices, the weights are dropped and re-initialized randomly, while for the unselected indices, the original weights are retained. 
+
+%Let $\bar{\mathcal{S}}$ denotes the difference set of $\mathcal{S}$, that is, $\bar{\mathcal{S}} = \mathcal{I}_{d_f}\backslash\mathcal{S} $.
+%
+Let ${\mathbf{R}}_{\text{type}}$ be a matrix whose values are sampled from the $\mathcal{N}( \mu_{\text{type}}, ( \sigma_{\text{type}} )^2 )$ distribution, where type is one of the gate, up, or down, i.e., $\text{type} =\{\text{gate},\text{up},\text{down}\}$.
+%
+We then obtain $\widetilde{\mathbf{W}}_{\text{type}}$ by using the following equation:
+\begin{equation}
+\widetilde{\mathbf{W}}_{\text{type}} = \mathbf{I}_{\mathcal{S}} \odot \mathbf{R}_{\text{type}} +  (1 - \mathbf{I}_{\mathcal{S}}) \odot \mathbf{W}_{\text{type}}
+,
+\label{eq:DU_rand_init}
+\end{equation}
+where we consider that the matrices, $\widetilde{\mathbf{W}}_{\text{type}}$, ${\mathbf{R}}_{\text{type}}$, ${\mathbf{W}}_{\text{type}}$ are all transposed if $\text{type} = \text{down}$. 
+
+%That is, 
+%$\widetilde{\mathbf{W}}_{\text{up\ } i,j} \sim \mathcal{N}\big( \mu_{\text{up}}, ( \sigma_{\text{up}} )^2 \big)$ if $j \in \mathcal{S}$, and 
+%$\widetilde{\mathbf{W}}_{\text{up\ } i,j} =\mathbf{W}_{\text{up\ } i,j}$ otherwise.
+%%
+%Similarly, $\widetilde{\mathbf{W}}_{\text{gate\ } i,j} \sim \mathcal{N}\big( \mu_{\text{gate}}, (\sigma_{\text{gate}})^2 \big)$ if $j \in \mathcal{S}$, and $\widetilde{\mathbf{W}}_{\text{gate\ } i,j} =
+%\mathbf{W}_{\text{gate\ } i,j}$ otherwise.
+%
+%Moreover, $\widetilde{\mathbf{W}}_{\text{down\ } i,j} \sim \mathcal{N}\big( \mu_{\text{down}}, ( \sigma_{\text{down}} )^2 \big)$ if  $i \in \mathcal{S}$, and 
+%$\widetilde{\mathbf{W}}_{\text{down\ } i,j} =\mathbf{W}_{\text{down\ } i,j}$ otherwise.
+%
+%
+%
+%\begin{equation}
+%\begin{aligned}
+%\widetilde{\mathbf{W}}_{\text{up\ } i,j} &= 
+%\begin{cases} 
+%\sim \mathcal{N}\left( \mu_{\text{up}}, \left( \sigma_{\text{up}} \right)^2 \right) & \text{if } j \in \mathcal{S} \\
+%%\mathbf{R}_{\text{up\ } :,j}  & (j \in \mathcal{S}) \\
+%\mathbf{W}_{\text{up\ } i,j} & \text{otherwise} %(j \not\in \mathcal{S})
+%\end{cases}
+%%\end{aligned}
+%%\end{equation}
+%%\begin{equation}
+%%\begin{aligned}
+%\\
+%\widetilde{\mathbf{W}}_{\text{gate\ } i,j} &= 
+%\begin{cases} 
+%\sim \mathcal{N}\left( \mu_{\text{gate}}, \left( \sigma_{\text{gate}} \right)^2 \right) & \text{if } j \in \mathcal{S} \\
+%%\mathbf{R}_{\text{gate\ } :,j}  & (j \in \mathcal{S}) \\
+%\mathbf{W}_{\text{gate\ } i,j} & \text{otherwise} %(j \not\in \mathcal{S})
+%\end{cases}
+%%\end{aligned}
+%%\end{equation}
+%%\begin{equation}
+%%\begin{aligned}
+%\\
+%\widetilde{\mathbf{W}}_{\text{down\ } i,j} &= 
+%\begin{cases} 
+%\sim \mathcal{N}\left( \mu_{\text{down}}, \left( \sigma_{\text{down}} \right)^2 \right) & \text{if } i \in \mathcal{S} \\
+%%\mathbf{R}_{\text{down\ } i,:}  & (i \in \mathcal{S}) \\
+%\mathbf{W}_{\text{down\ } i,j} & \text{otherwise}%(i \not\in \mathcal{S})
+%\end{cases}
+%\end{aligned}
+%\end{equation}
+%Note that \(\widetilde{\mathbf{W}}_\text{gate}\) and \(\widetilde{\mathbf{W}}_\text{up}\) are updated along the column dimension, whereas \(\widetilde{\mathbf{W}}_\text{down}\) is updated along the row dimension.
+%$\widetilde{\mathbf{W}}_\text{gate}$, $\widetilde{\mathbf{W}}_\text{up}$はカラム方向、$\widetilde{\mathbf{W}}_\text{down}$ は行方向に適用することに注意。
+
+Figure~\ref{fig:partial-re-initialization} illustrates how we generate a single expert weight matrix from the original dense weights.
+
+
+
+\subsubsection{Theoretical Characteristics}
+Applying the re-initialization strategy explained above, the initial MoE model obtained by \methodname{} has the following characteristics:
+\begin{enumerate}
+\item \textbf{Parameter sharing among experts}:
+since each expert retains the original representations with a ratio $(1-r)$, \diff{with Top-k routing where $k$ experts are selected, approximately $(1-r)^k$ of representations are preserved. }
+\item \textbf{Characteristics of initial feedforward layers}:
+\diff{Consider the output of an MoE layer with parameter re-initialization ratio $r$:}
+% \begin{equation}
+% \mathbf{y} \approx \text{FFN}_{\text{common}}(\mathbf{x}) + \sum_{i=1}^N g_i(\mathbf{x}) \cdot [\text{FFN}_{\text{retained}_i}(\mathbf{x}) - \text{FFN}_{\text{common}}(\mathbf{x}) + \text{FFN}_{\text{diverse}_i}(\mathbf{x})]
+% \end{equation}
+\begin{equation}
+\diff{\mathbf{y} = \text{FFN}_{\text{common}}(\mathbf{x}) + \sum_{i=1}^N 
+g(\mathbf{x})_i \cdot [\text{FFN}_{\text{retained}_i}(\mathbf{x}) - \text{FFN}_{\text{common}}(\mathbf{x}) + \text{FFN}_{\text{diverse}_i}(\mathbf{x})]}
+\end{equation}
+% where $\text{FFN}_{\text{common}}$ represents the output from parameters that are common to all selected $k$ experts (approximately ratio $(1-r)^k$ due to each expert independently preserving a ratio $(1-r)$ of original parameters), 
+% $\text{FFN}_{\text{retained}_i}$ is expert $i$'s output using uniquely retained original parameters (ratio $(1-r)$), and $\text{FFN}_{\text{diverse}_i}$ is the output using reinitialized parameters (ratio $r$). The approximation error comes from parameter overlap, with magnitude $O(\frac{1}{\sqrt{d_f}})$. A detailed derivation is provided in Appendix~\ref{subsec:theoretical}.
+% \end{enumerate}
+\diff{where $\text{FFN}_{\text{common}}$ represents the output from parameters that are common to all selected $k$ experts (the proportion of such parameters is approximately $(1-r)^k$ due to each expert independently preserving a ratio $(1-r)$ of original parameters), 
+$\text{FFN}_{\text{retained}_i}$ is expert $i$'s output using uniquely retained original parameters (ratio $(1-r)$), and $\text{FFN}_{\text{diverse}_i}$ is the output using reinitialized parameters (ratio $r$). The estimation error in the number of common parameters has magnitude $O\big(\frac{1}{\sqrt{\smash[b]{d_f}}}\big)$. A detailed derivation is provided in Appendix~\ref{subsec:theoretical}.}
+\end{enumerate}

@@ -1,0 +1,414 @@
+\section{Evaluation}~\label{sec:eval}
+\vspace{-15pt}
+\subsection{How to Apply the \projecttitle{} Library?} Developers can use the \projecttitle{}-lib API to transform their preferred CFT protocol for Byzantine settings without further modifying the core states of the protocol. Listing~\ref{lst:transformation} illustrates Raft's transformation using the same example of R-Raft from Figure~\ref{fig:raft_example}.  In Listing~\ref{lst:transformation}, the blue sections show the native Raft code, whereas the orange sections show the modifications introduced by \projecttitle{}.
+\vspace{10pt}
+
+
+
+\begin{lstlisting}[frame=h,style=customc,
+                    label={lst:transformation},
+                    caption= Raft transformation using \projecttitle{}: blue sections (native Raft) and orange sections (\projecttitle additions).]
+// ----------- Requests handlers definition -----------
+void replication_hdlr(Raft_ctx* ctx, Msg* recv_msg) {
+    // verifies recv_msg integrity and counter
+@\HilightYlinewidth@    [msg, cnt] = verify_msg(recv_msg);
+    ... // appends the req to the on-going reqs buffer
+@\Hilight@    conn.respond(@\HilightY@shield_msg(ACK_repl)); // transmits ACK
+}
+void cmt_hdlr(Raft_ctx* ctx, Msg* recv_msg) {
+@\HilightYlinewidth@    [msg, cnt] = verify_msg(recv_msg);
+    auto [key, val] = decode(req);
+    // stores val in host mem and its certificate in TEE
+@\Hilight@    ctx->kv.write(key, val);  
+@\Hilight@    conn.respond(@\HilightY@shield_msg(ACK_cmt)); // transmits ACK
+}
+// ----------- Init phase  -----------
+auto ctx = new Raft_ctx(metadata, node_type); 
+// init local KV with host allocated memory and a cipher
+@\Hilight@ ctx->kv = init_store(@\HilightY@HostMemSize, cipher); 
+@\Hilight@ RPC_obj conn = create_rpc(@\Hilightsmall@enc_key); // create RPC handle
+// registers handlers
+@\Hilight@ conn.reg_hdlr(&cmt_hdlr);
+@\Hilight@ conn.reg_hdlr(&replication_hdlr);
+// ----------- Raft leader -----------
+for (auto& node : followers_list) {
+    conn.wait_until_connected(node); // connects with followers
+}
+for (;;) {
+    ... // gets client request and marks it as on-going
+    for (auto& follower : connections) 
+    // generates a shielded message and bcast to followers
+@\Hilight@      follower.send(@\HilightY@shield_msg(rep_req), TypeRepl);    
+@\Hilight@    conn->poll(); // polls to flush TX/RX queues 
+    for (auto& follower : connections) ... // bcast commit
+@\Hilight@      follower.send(@\HilightY@shield_msg(cmt_req), TypeCmt);
+    ... // commit phase, apply changes to local kv
+@\Hilight@    ctx->kv.write(key, val); 
+}
+\end{lstlisting}
+
+Developers need to port the codebase within the TEE and use the \projecttitle{}'s network API to replace the conventional unsecured RPC-API~\cite{rdma, erpc, f04eb9b864204bab958e72055062748c} with \projecttitle{}-lib's networking functions extending the TEEs' trust across the network. Some of the \projecttitle{}'s API remains equivalent to the native API; typical examples are the poll() and reg\_hdlr() functions. On the other hand, we introduced some slight modifications in send() operation and Initialization APIs.  %Lastly, developers must shield the message before transmission and verify it upon reception in the request handler function. 
+%To effectively use them, developers must register a (configurable) amount of the host memory for the KV store data, initialize a cipher, and pass the encryption keys.
+
+
+
+%Note that, while our library considers unreliable networks that can manifest as a malicious attacker who tampers with the network traffic, we can provide reliability relying on the sequence numbers assigned to each message. 
+
+\if 0
+While implementing \projecttitle{}-lib, we found that allowing a configurable window of in-flight parallel messages improves performance. Developers can either allow parallel messages---however, we can only detect missing messages, delivery can be out of order---or they can implement total (and reliable) ordering through the network stack by setting the window to 1 (at the cost of some performance). We build these four protocols using a window of 32, and we relied on the protocols' ordering mechanisms (total ordering for R-Raft, Lamport clocks for R-ABD, etc.) to correctly serialize the requests.
+
+The last steps are now for developers to update the CAS with the configuration and use the attest API in all membership nodes. In \scone{}, a compiled binary can be executed through the \scone{}'s linker with the command: \texttt{<env-vars> ld-scone-x86\_64.so.1 <program-name>}.
+\fi 
+
+\begin{figure}
+    \centering
+    %\includegraphics[width=0.45\textwidth]{figs/evaluation-April_May_22/bench2.pdf}
+    % THIS WAS BEFORE COLORFUL PLOTS \includegraphics[width=0.45\textwidth]{figs/evaluation-April_May_22/bench2-fixed-y-axis.pdf}
+     \includegraphics[width=0.5\textwidth]{figs/plots-SoCC23/bench2-fixed-y-axis_c.pdf}
+
+    \caption{Performance of \projecttitle{} for different value sizes.}
+    \vspace{0pt}
+    ~\label{fig:value_sz}
+\end{figure}
+
+\subsection{\projecttitle{} in Action for CFT Protocols}
+
+\myparagraph{Experimental setup}
+We run our experiments in a cluster of three SGX machines (NixOS, 5.15.43) with CPU: Intel(R) Core(TM) i9-9900K each with 8 cores (16 HT), NIC: Intel Corporation Ethernet Controller XL710 for 40GbE QSFP+ (rev 02) and a 40GbE QSFP+ network switch. For the evaluation, we use the YCSB benchmark~\cite{YCSB} (configured with approx. 10K distinct keys with Zipfian distribution) with various R/W ratios and value sizes. 
+
+
+To show the benefits of our approach, we implement four widely adopted CFT protocols (one of each category in $\S$~\ref{sec:background}, Table~\ref{tab:categories}), with the \projecttitle{}-lib API. We build R-ABD, R-Raft, R-AllConcur, and R-CR, which are the \projecttitle{} versions of ABD, Raft, AllConcur, and CR, respectively. We compare these protocols with BFT-smart~\cite{bft-smart}, an optimized version of PBFT~\cite{Castro:2002} and Damysus~\cite{10.1145/3492321.3519568}, the state-of-the-art version of HotStuff~\cite{DBLP:journals/corr/abs-1803-05069} on top of SGX (with $2f$+1). Next, we discuss the characteristics of protocol categories, our chosen protocol, and our evaluation results.
+
+%In the presence of conflicts, CP might retry for an unbounded number of times.
+\myparagraph{\underline{A: Leaderless w/ per-key order}}
+Protocols in this family agree on a per-key order of writes in a distributed manner. All nodes can coordinate a write that is completed in at least two rounds. A typical example is Classic Paxos (CP) that achieves consensus in three broadcast rounds.  Several works~\cite{10.1145/2517349.2517350, https://doi.org/10.48550/arxiv.2003.11789, phdthesis, Hermes:2020, lynch:1997} simplify the complexity of CP to boost performance. Protocols such as~\cite{10.1145/2517349.2517350, https://doi.org/10.48550/arxiv.2003.11789, phdthesis} can offer consensus in two rounds but fall back to CP if conflicts occur. Others~\cite{Hermes:2020, lynch:1997} execute writes in two rounds, enforcing all messages to be received by all nodes or relaxing the Read-Modify-Write semantics. These protocols offer linearizable reads by executing quorum reads to consult (at least) the majority. Protocols like~\cite{Hermes:2020} where writes need to reach all nodes allow for local reads (at the cost of availability---if a node fails, writes block).
+
+
+\myparagraph{Choice: ABD~\cite{lynch:1997}} We implemented ABD, a multi-writer, multi-reader protocol with \projecttitle{} (R-ABD). R-ABD offers linearizable (quorum) reads using Lamport timestamps (TS)~\cite{Lamport:1982} for each key-value (KV) pair. R-ABD broadcasts requests to all replicas and waits for acks from the quorum. %A request is committed only when the coordination receives acks from the quorum. 
+%R-ABD read and write paths are executed as long as the majority acknowledges the operations. For both requests' types \projecttitle{} broadcasts the message to all replicas. The request is committed only when the quorum replies successfully to the request coordinator. 
+
+
+
+Writes are executed in two rounds of broadcasts. First, the coordinator asks all replicas to hand over the key's TS, which is securely stored inside the TEE (KVs' metadata). Upon receiving a majority of the timestamps, the coordinator creates a higher TS for that key by increasing the highest received TS. Finally, it broadcasts the new KV pair and its new TS to all replicas, which, in turn, insert the KV pair into their KV store. Upon gathering a majority of
+acks it replies to the client.
+
+%The request’s coordinator executes \texttt{PUT}s in two rounds of broadcasts. First, the coordinator asks from all replicas to hand over the timestamp they know about the key. In R-ABD, we store all timestamps inside the TEE as part of the KV store metadata. Upon receiving a majority of the remote timestamps (including the coordinator's locally stored timestamp), the coordinator creates a new (higher) timestamp for that key, by increasing the highest of the received timestamps and concatenating its own node-id. Finally, it broadcasts the new KV pair along with its new timestamp to all replicas which, in turn, insert the KV pair into their in-memory KVS. Upon gathering a majority of
+%acknowledgements it replies to the client.
+
+R-ABD (usually) executes reads in one round by collecting all values (and their TS) from the majority. If the majority agrees on the latest seen TS, the coordinator replies to the client. Otherwise, the coordinator chooses the highest TS and invokes the second round of the write-path (for availability).% Once the majority acks this round, the operation returns to the client. % (ensuring that the update will survive at least in one node after $f$ failures)
+
+%For reads, R-ABD (usually) executes one broadcast round where it collects all values (and their timestamps) from the majority. If the majority agree on the latest seen timestamp for that value, the operation returns back to the client. If the highest timestamp is not seen by the majority, R-ABD executes one an extra step (for availability). The coordinator chooses the more recent timestamp and invokes the second round of the \texttt{PUT}. Once the majority acknowledges this round, the operation returns to the client. % (ensuring that the update will survive at least in one node after $f$ failures)
+
+\begin{table*}[t]
+\begin{minipage}[b]{0.4\linewidth}
+\centering
+            %\rowcolors{1}{gray!10}{gray!0}
+            \begin{tabular}{>{\centering\arraybackslash}p{0.18\columnwidth}>{\centering\arraybackslash}p{0.15\columnwidth}>{\centering\arraybackslash}p{0.15\columnwidth}>{\centering\arraybackslash}p{0.15\columnwidth}>{\centering\arraybackslash}p{0.25\columnwidth}}
+              \rowcolor{gray!25}
+            \textbf{R/W ratio} &  \textbf{R-ABD} & \textbf{R-CR}  & \textbf{R-Raft}  & \textbf{R-AllConcur} \\
+            \hline
+            $50\%$ & $6.5\times$ & $13.7\times$  & $5.3\times$ & $6.8\times$\\
+            \hline
+            $75\%$ & $13.3\times$ & $14.8\times$  & $10.05\times$ & $9.4\times$\\
+            \hline
+            $90\%$ & $13\times$ & $24\times$  & $16.5\times$ & $9\times$\\
+            \hline
+            $95\%$ & $12.8\times$ & $21\times$  & $10.7\times$ & $9.5\times$\\
+            \hline
+            $99\%$ & $12.3\times$ & $23\times$  & $9.8\times$ & $10.5\times$\\
+            \hline
+        \end{tabular}
+        \vspace{10pt}
+        %\caption{Performance evaluation and comparison of BFT~\cite{bft-smart} with Raft (R-Raft), ABD (R-ABD), Chain Replication (R-CR) and AllConcur protocols implemented with \projecttitle{}.}
+
+    %caption{Performance comparison (speedup) between \projecttitle{} and BFT-smart for various workloads.}
+        \label{tab:speedup}
+\end{minipage}\hfill
+\begin{minipage}[b]{0.5\linewidth}
+\centering
+\centering
+      \vspace{10pt}
+%    \includegraphics[width=0.6\textwidth]{figs/recipe_integrity.pdf}
+       %\includegraphics[width=\textwidth]{figs/evaluation-April_May_22/bench1.pdf}
+      % THIS WAS BEFORE COLORFUL PLOTS \includegraphics[width=\textwidth]{figs/evaluation-April_May_22/bench1-fixed-axis.pdf}
+       \includegraphics[width=\textwidth]{figs/plots-SoCC23/bench1-fixed-axis_c.pdf}
+    %\vspace{-5pt}
+%\captionof{figure}{Performance evaluation and comparison of BFT~\cite{bft-smart} with Raft (R-Raft), ABD (R-ABD), Chain Replication (R-CR) and AllConcur protocols implemented with \projecttitle{}.}
+\end{minipage}
+%\vspace{-2pt}
+\captionof{figure}{Speedup (left Table) and throughput (right Figure) of four protocols with \projecttitle{} compared with PBFT (BFT-smart).}
+\label{fig:end_to_end_perf}
+\vspace{10pt}
+\end{table*}
+
+
+\myparagraph{\underline{B: Leader-based w/ total ordering}}
+The protocols~\cite{raft, Reed2008AST, 10.1145/2673577} serialize writes at the leader, offering total order. The writes usually require two broadcast rounds; the leader proposes writes to (passive)
+followers, which they ack the proposal. Once the leader collects the acks from the majority, the commit round is run, where the nodes apply the proposed writes in their total order.
+Since writes are propagated to the majority where the leader is always part of it, the leader can always know the latest committed to write for all keys. As such, leaders can always read locally while followers must forward reads to the leader. 
+Some protocols~\cite{Reed2008AST} allow followers to read locally. This is achieved in two ways: they might forego linearizability and downgrade to sequential consistency~\cite{attiya:1991} (with the possibility of reading stale values~\cite{Reed2008AST}), or ensure that all writes reach all followers at the cost of availability.
+
+\myparagraph{Choice: Raft~\cite{raft}} As a representative protocol of this family, we implement Raft with \projecttitle{} (R-Raft). We target linearizability; all reads are forwarded to the leader, which also serializes writes. The leader proposes writing to replicas and commits the request when the majority of them acknowledge the proposal.
+ %The protocol guarantees that writes are propagated to a majority of nodes and the leader node is part of this majority. Additionally, all nodes must apply committed writes in their total order. 
+
+
+
+The leader stores writes in an uncommitted\_queue inside the TEE. We spawn a dedicated (worker) thread to manage this queue and serialize all writes. The worker thread broadcasts the request (or a batch of consecutive requests) to all followers. The followers verify the messages. As an optimization, followers accept future messages, storing them in a separate queue. The followers commit requests respecting the leader's total order and send acks for one or more consecutive requests. The leader only commits a request and responds to the client when it receives a response from the majority. %Any subsequent requests are also committed in respect to their total ordering. %All reads are served locally from the leader offering linearizable local reads.
+
+
+
+
+
+
+
+
+
+\begin{figure}[t]
+\centering
+   %\includegraphics[width=0.5\textwidth]{figs/evaluation-April_May_22/bench3.pdf}
+   %  \caption{Performance evaluation of BFT-Smart with R-Raft, R-ABD, R-CR and R-AllConcur w/  confidentiality.}
+    %\includegraphics[width=0.5\textwidth]{figs/evaluation-April_May_22/bench3.pdf}
+    % THIS WAS BEFORE COLORFUL PLOTS \includegraphics[width=0.5\textwidth]{figs/evaluation-April_May_22/bench3-fixed-y-axis.pdf}
+
+    \includegraphics[width=0.5\textwidth]{figs/plots-SoCC23/bench3-fixed-y-axis_c.pdf}
+        %\vspace{-17pt}
+       
+       \caption{Throughput of \projecttitle{} (w/ confidentiality) compared with PBFT (BFT-Smart).}
+    \label{fig:confidentiality}
+\end{figure}
+\myparagraph{\underline{C: Leader-based w/ per-key order}}
+Protocols in this class use the leader node to only serialize
+writes to the same key. All writes are steered to
+the leader node, which ensures that writes to the
+same key are applied in the same order by all replicas. %A
+%typical example of this class is the CHT [10 ] protocol, where
+%the leader executes writes in two rounds as described in
+%the total order class. There are two possible optimizations
+%protocols can employ.
+These protocols can offer linearizability (it is a compositional property), similar to the leader-based protocols with total order. While writes are propagated to a majority of nodes, reads are propagated to the leader. As the protocols do not respect a total ordering, local reads to followers lead to weak guarantees such as eventual consistency~\cite{10.1145/1435417.1435432}. As before, we can allow for local reads to all nodes when writes are guaranteed to propagate to all followers. 
+
+\myparagraph{Choice: Chain Replication~\cite{chain-replication}} As a representative protocol, we implement Chain Replication (R-CR) with \projecttitle{}. In R-CR, the nodes are organized in a chain, through which writes are propagated from the head of the chain to its tail. Similarly to~\cite{f04eb9b864204bab958e72055062748c}, we consider CR among the leader-based protocols as the head node is the leader to serialize all writes.  A write traverses the chain until it reaches the tail where it is considered committed, which guarantees that all writes reach all nodes.  We offer linearizability by reading locally from the tail.  %to guarantee linearizability, the protocol forwards all read requests to the tail.
+
+
+%do not serialize writes in a central location but
+\myparagraph{\underline{D: Leaderless w/ total ordering}} These protocols rely on a predetermined static allocation of write-ids to nodes. For example, all nodes know that the writes 0 to N-1 will be proposed and coordinated by node-0, the next N writes will be proposed by node-1, and so on. Therefore, in each round each node can calculate the place of each write in the total order based on its own node-id, without synchronizing with any other node. Then, the node broadcasts its writes and their place in the total order. Typically, a commit message is broadcast after gathering acks from a majority of the nodes. Crucially, all nodes must apply the writes in the prescribed total order.
+
+\myparagraph{Choice: AllConcur~\cite{Poke2016AllConcurLC}} To study this category, we implemented AllConcur with \projecttitle{} (R-AllConcur), a decentralized replication protocol with total order that relies on an atomic broadcast primitive. Nodes are organized in a digraph ($G$)~\cite{Poke2016AllConcurLC} where the fault tolerance of the system is given by $G$'s connectivity. For example, to tolerate $1$ node failure on a $3$-node system, we calculated the vertex-connectivity to be equal to $2$; namely, each node is connected to the other two nodes.
+For the writes, all nodes track all messages for each round and commit them in a predefined order without synchronization. We can treat reads as writes (for linearizability), or we allow for local reads to replicas offering sequential consistency~\cite{Hunt:2010}.
+
+
+
+
+
+\if 0
+\begin{figure*}
+    \centering
+%    \includegraphics[width=0.6\textwidth]{figs/recipe_integrity.pdf}
+       \includegraphics[width=0.6\textwidth]{figs/evaluation-April_May_22/bench1.pdf}
+    \caption{Performance evaluation and comparison of BFT~\cite{bft-smart} with Raft (R-Raft), ABD (R-ABD), Chain Replication (R-CR) and AllConcur protocols implemented with \projecttitle{}.}
+    \label{fig:end_to_end_perf}
+    %\vspace{-4pt}
+\end{figure*}
+\fi
+
+
+
+\if 0
+\begin{itemize}
+    \item Compare secure Raft, ABD, Chain Replication with PBFT-smart
+\end{itemize}
+\fi 
+
+
+\subsection{Evaluation Analysis}
+
+\if 0
+\begin{minipage}{\textwidth}
+    \begin{minipage}[b]{0.49\textwidth}
+        \begin{table}[t]
+            \small
+            \vspace{-8pt}
+            \setlength{\tabcolsep}{3pt}
+            \center
+            %\rowcolors{1}{gray!10}{gray!0}
+            \begin{tabular}{>{\centering\arraybackslash}p{0.18\columnwidth}>{\centering\arraybackslash}p{0.15\columnwidth}>{\centering\arraybackslash}p{0.15\columnwidth}>{\centering\arraybackslash}p{0.15\columnwidth}>{\centering\arraybackslash}p{0.25\columnwidth}}
+              \rowcolor{gray!25}
+            \textbf{R/W ratio} &  \textbf{R-ABD} & \textbf{R-CR}  & \textbf{R-Raft}  & \textbf{R-AllConcur} \\
+            \hline
+            $50\%$ & $6.5\times$ & $13.7\times$  & $5.3\times$ & $6.8\times$\\
+            \hline
+            $75\%$ & $13.3\times$ & $14.8\times$  & $10.05\times$ & $9.4\times$\\
+            \hline
+            $90\%$ & $13\times$ & $24\times$  & $16.5\times$ & $9\times$\\
+            \hline
+            $95\%$ & $12.8\times$ & $21\times$  & $10.7\times$ & $9.5\times$\\
+            \hline
+            $99\%$ & $12.3\times$ & $23\times$  & $9.8\times$ & $10.5\times$\\
+            \hline
+        \end{tabular}
+        
+        \caption{Performance comparison (speedup) between \projecttitle{} and BFT-smart for various workloads.}
+        \label{tab:speedup}
+        \end{table}
+    \end{minipage}
+  \hfill
+  \begin{minipage}[b]{0.49\textwidth}
+  \centering
+    \begin{figure}
+        \includegraphics[width=0.5\textwidth]{figs/evaluation-April_May_22/bench4.pdf}
+        \caption{Performance overheads of TEEs for \projecttitle{}.}
+        ~\label{fig:overheads}
+    \end{figure}
+   \end{minipage}
+\end{minipage}
+\fi
+
+
+
+\myparagraph{\projecttitle{} vs. PBFT} Figure~\ref{fig:end_to_end_perf} shows the throughput (Ops/s) and the speedup of the four case studies we implemented with \projecttitle{} compared to BFT-smart~\cite{bft-smart} (PBFT) for different read/write workloads (and constant value size/payload, \SI{256}{\byte}). Our evaluation shows that all four protocols with \projecttitle{} outperform the classical BFT $5\times$ to $24\times$. We observe that the local linearizable reads offered by R-CR greatly improve performance. Unfortunately, we see less speedup in read-heavy workloads for the protocols with local reads (e.g., R-Raft and R-AllConcur). We found out that in these protocols, the total ordering was the bottleneck. In the case of R-Raft, the writer thread that serialized all writes was slower than the other worker threads (which executed reads or enqueued writes to the writer thread's queue). Additionally, for R-AllConcur, we saw that collecting all messages for each round decreased throughput. The speedup in R-ABD, R-Raft, and R-AllConcur is moderate for write-heavy workloads where writes require two rounds of messages. R-ABD has a lighter read path; reads require the majority to agree on a value, which is typically resolved in one round. R-CR outperforms R-ABD as reads are done locally. Lastly, as the workload becomes more read-heavy, the throughput is improved slightly due to (1) request rate limiter and (2) single-node bottlenecks.
+
+
+
+%\begin{figure}
+%    \centering
+%    \includegraphics[width=0.45\textwidth]{figs/evaluation-April_May_22/bench4.pdf}
+%    \vspace{-4pt}
+%    \caption{Performance overheads of TEEs for \projecttitle{}.}
+%    \vspace{-22pt}
+%    ~\label{fig:overheads}
+%\end{figure}
+
+
+
+
+\begin{figure*}[t]
+    \begin{minipage}[t]{.45\textwidth}
+        \centering
+        %\includegraphics[width=\textwidth]{figs/evaluation-April_May_22/bench4.pdf}
+        \includegraphics[width=\textwidth]{figs/plots-SoCC23/bench4_c.pdf}
+        \subcaption{Performance overheads of TEEs.}\label{fig:overheads}
+        \vspace{2pt}
+    \end{minipage}
+    \hfill
+    \begin{minipage}[t]{.45\textwidth}
+        \centering
+    %    \includegraphics[width=\textwidth]{figs/recipe-lib-final.pdf}
+        \includegraphics[width=\textwidth]{figs/plots-SoCC23/recipe-lib-final.pdf}
+        \subcaption{Performance evaluation of \projecttitle{}-lib (net).}\label{fig:network}
+        \vspace{2pt}
+    \end{minipage}  
+    \label{fig:1-2}
+    \caption{Performance overheads of transformation and TEEs and performance analysis of \projecttitle{} networking.}
+    \vspace{5pt}
+\end{figure*}
+
+
+
+\if 0
+\begin{table*}[h!]
+\small
+%\fontsize{9}{10}\selectfont 
+
+\begin{center}
+\begin{tabular}{ |c|c|c|c|c|c|c| } 
+ \hline
+ Protocols & Active/All Replicas & Resilience & Message complexity & TEEs & Fault Model & TCB \\ [0.5ex] \hline \hline
+ FastBFT~\cite{DBLP:journals/corr/LiuLKA16a}, CheapBFT~\cite{10.1145/2168836.2168866} & $f+1$/$2f+1$ & $0$ & $O(n), O(n^2)$ & Yes & Byz. & Small\\
+ MinBFT~\cite{minBFT}, Hybster~\cite{hybster} & $2f+1$/$2f+1$ & $f$ &  $O(n^2)$ & Yes & Byz. & Small\\
+ PBFT~\cite{Castro:2002}, HotStuff~\cite{DBLP:journals/corr/abs-1803-05069} & $3f+1$/$3f+1$ & $f$ & $O(n^2)$ $O(n)$ & No & Byz. & N/A\\
+ CFT & $2f+1$/$2f+1$ & $f$ & depends on the protocol & No & Crash-stop. & N/A\\
+ {\bf \projecttitle{}} & $\mathbf{2f+1}$/$\mathbf{2f+1}$ & ${\mathbf{f}}$ & depends on the protocol & \bf{Yes} & \bf{Byz.} & \bf{Low}\\ 
+ \hline
+\end{tabular}
+\end{center}
+%\vspace{-10pt}
+\caption{Related work vs \projecttitle{}.}
+\label{tab:recipe_vs_bft}
+%\vspace{-2pt}
+\end{table*}
+\fi
+
+
+
+\myparagraph{\projecttitle{} vs Damysus} We compare \projecttitle{} (in h/w) against Damysus~\cite{10.1145/3492321.3519568} with SGX in simulation mode. The setup shows the upper bounds for throughput for Damysus that achieves throughput of $320$ kOp/s, $230$ kOp/s and	$152$ kOp/s for payload sizes \SI{0}{\byte}, \SI{64}{\byte} and \SI{256}{\byte} respectively. Our \projecttitle{} (with \SI{256}{\byte} payload) outperforms $1.1\times$---$2.8\times$ and $2.3\times$---$5.9\times$ Damysus with \SI{0} and \SI{256}{\byte} payloads.%, respectively.
+
+%Damysus follows a similar approach to \projecttitle{}; it leverages SGX and reduces the number of replicas by $f$.
+
+\if 0
+
+\begin{table*}[h!]
+\small
+%\fontsize{9}{10}\selectfont 
+
+\begin{center}
+\begin{tabular}{ |c|c|c|c|c|c|c| } 
+ \hline
+ Protocols & Active/All Replicas & Resilience & Message complexity & TEEs & Fault Model & TCB \\ [0.5ex] \hline \hline
+ FastBFT~\cite{DBLP:journals/corr/LiuLKA16a}, CheapBFT~\cite{10.1145/2168836.2168866} & $f+1$/$2f+1$ & $0$ & $O(n), O(n^2)$ & Yes & Byz. & Small\\
+ MinBFT~\cite{minBFT}, Hybster~\cite{hybster} & $2f+1$/$2f+1$ & $f$ &  $O(n^2)$ & Yes & Byz. & Small\\
+ PBFT~\cite{Castro:2002}, HotStuff~\cite{DBLP:journals/corr/abs-1803-05069} & $3f+1$/$3f+1$ & $f$ & $O(n^2)$ $O(n)$ & No & Byz. & N/A\\
+ CFT & $2f+1$/$2f+1$ & $f$ & depends on the protocol & No & Crash-stop. & N/A\\
+ {\bf \projecttitle{}} & $\mathbf{2f+1}$/$\mathbf{2f+1}$ & ${\mathbf{f}}$ & depends on the protocol & \bf{Yes} & \bf{Byz.} & \bf{Low}\\ 
+ \hline
+\end{tabular}
+\end{center}
+%\vspace{-10pt}
+\caption{Replication protocols related work vs \projecttitle{}.}
+\label{tab:recipe_vs_bft}
+\vspace{0pt}
+\end{table*}
+
+\fi 
+
+
+\myparagraph{\projecttitle{} with confidentiality} Figure~\ref{fig:confidentiality} shows the throughput of \projecttitle{} when we also strive for confidentiality; an extra property that is not offered by classical BFT protocols. We guarantee confidentiality by encrypting all data that leave the enclave (network messages, values residing in the host memory). Briefly, the cost for this extra property is a throughput decrement by a factor of 2. Surprisingly, R-ABD shows minimal degradation compared to R-ABD without confidentiality. The reason is that R-ABD quickly saturated all memory resources in our system so the throughput was limited mainly by the requests' rate limiter. We see that even with stronger properties, i.e., confidentiality, \projecttitle{} achieves higher throughput than PBFT: on average we calculate $7\times$ and $13\times$ speedup for $50\%$ and $95\%$ workloads respectively. %VALUE SIZE 256B
+
+\projecttitle{} with confidentiality boosts throughput up to $4.9\times$ w.r.t. Damysus that does not offer confidentiality.% (\SI{256}{\byte} payload). % we compared with 50%.
+
+%\myparagraph{Transformation and TEEs overheads} Figure~\ref{fig:overheads} shows the overheads introduced by  \projecttitle{} where we compare a native implementation of the protocols using the similar network stack but de-activating the authentication layer. Overall, a native CFT protocol experiences $2\times$---$5\times$ slowdown. We found out that the overheads mainly derive from TEEs. While we optimised \projecttitle{} to minimize EPC pressure and avoid syscalls, executing these protocols in \texttt{simulation} mode where the EPC is unlimited (e.g., no SGX-paging) gave us almost equivalent to the native results. Our observation is also explained from the fact that the higher overheads are for AllConcur and Raft. To optimize these protocols we found extremely helpful the batching. However, batching requires allocations/de-allocations of bigger continuous (virtual) memory buffers which stress test \scone{} memory subsystem.
+
+\myparagraph{Value size} Figure~\ref{fig:value_sz} shows the throughput for different value sizes (under a 90\% R workload) for each of the four protocols. The performance drops as the value size is increased due to the EPC's limited size. While \projecttitle{} places the values and network buffers in the untrusted (unlimited) memory, the bigger the allocations are the more we stress test the (limited) enclave memory. R-Raft and R-AllConcur show the greatest slowdown ($2\times$ to $7\times$ for \SI{4096}{\byte}). We interestingly found out that the batching technique in these protocols with value size of \SI{4096}{\byte} deteriorates the performance and, even, crashes the system by consuming all \scone{}'s memory. For these two protocols with value size \SI{4096}{\byte} we depict the numbers with little ($< 4$) or no batching factor. The other two protocols, R-ABD and R-CR, also show similar behavior. In these protocols we did not use batching as an extra optimization. %%WORKLOAD=90%
+
+
+
+
+
+\myparagraph{Transformation and TEEs overheads} Figure~\ref{fig:overheads} shows the overheads introduced by  \projecttitle{} where we compare a native implementation of the protocols with the same network stack without the authentication layer. Overall, an R-CFT protocol experiences $2\times$---$15\times$ slowdown compared to its native execution. The overheads mainly derive from the TEEs. To prove that, we also ran these protocols in \texttt{simulation} mode in \scone{} where the trusted memory (EPC) is unlimited: we found the throughput to be almost equivalent to the native runs' results. Our observation is also explained from the fact that the higher overheads are for AllConcur and Raft. To optimize these protocols we found extremely helpful the batching. However, batching requires allocations/de-allocations of bigger continuous (virtual) memory buffers which stress test \scone{} memory subsystem.
+
+
+\myparagraph{\projecttitle{}-lib network performance} Figure~\ref{fig:network} shows the network throughput (Gbps) of five competitive network stacks: \emph{(i)} a native and a TEE-based network stack on top of kernel sockets~\cite{iperf}, \emph{(ii)} a native and a TEE-based direct I/O for networking (RDMA/DPDK) and \emph{(iii)} our TEE-based \projecttitle{}-lib network library. This is to isolate the performance gains of the RDMA-based stack in \projecttitle{}.
+
+
+
+We deduct two core conclusions. First, TEEs (\scone{}) can degrade network throughput $4\times$---$8\times$ for both kernel-net and direct I/O networking compared to their unprotected (native) runs. Consequently, a naive adoption of TEEs for BFT does not necessarily translate to performance gains. Secondly, \projecttitle{}-lib network performs up to $1.66\times$ faster than the kernel-based networking (kernel-net (TEEs)). As a takeaway the performance speedup ($24\times$ w.r.t. PBFT and $5.9\times$ w.r.t. Damysus) for all our four use-cases with \projecttitle{} are primarily due to the transformation (\projecttitle{}) rather than the use of direct I/O.
+
+
+
+
+\myparagraph{Attestation} Table~\ref{tab:attest} shows the latencies of Intel's Attestation Service (IAS)~\cite{ias} and \projecttitle{} CAS. We found that the (mean) average of our CAS is $0.17$ s, i.e., $~18\times$ faster than the IAS ($2.9$ s).
+
+\begin{table}[t]
+%\small
+%\vspace{-2pt}
+\setlength{\tabcolsep}{3pt}
+\center
+%\rowcolors{1}{gray!10}{gray!0}
+\begin{tabular}{>{\centering\arraybackslash}p{0.225\columnwidth}>{\centering\arraybackslash}p{0.225\columnwidth}>{\centering\arraybackslash}p{0.225\columnwidth}}
+%\begin{tabular}{>{\centering\arraybackslash}p{0.225\columnwidth}>{\centering\arraybackslash}p{0.225\columnwidth}>{\centering\arraybackslash}p{0.225\columnwidth}>}
+  \rowcolor{gray!25}
+&  \textbf{Mean \ s} &  \textbf{Speedup}  \\
+\hline
+\projecttitle CAS & $0.169$ &  $18.2\times$ \\
+\hline
+IAS & $2.913$  &  \\
+\hline
+\end{tabular}
+\caption{The end-to-end latency comparison between the attestation mechanisms using \projecttitle CAS and IAS.}
+\label{tab:attest}
+\vspace{-2pt}
+\end{table}
+
+
+
+%\addition{\myparagraph{Attestation and trusted-leases} We measure end-to-end latency of our attestation mechanism compared to the IAS. We found that the (mean) average of our mechanism is $0.17$ s, namely, $~18\times$ faster than the IAS ($2.9$ s). We quantize the latency overhead of trusted and native classical leases (no-secure) by invoking the \texttt{rdtsc}. The overhead is about $2-3\times$.} @Dimitra: maybe re-run the rdtsc!
+

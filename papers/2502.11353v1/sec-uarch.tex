@@ -1,0 +1,257 @@
+%=========================================================================
+% SparseZipper: Micro-architecture
+%=========================================================================
+
+\section{S\lowercase{parse}Z\lowercase{ipper} Micro-Architecture}
+\label{sec-spz-uarch}
+
+This section describes SparseZipper micro-architecture that extends a baseline
+systolic array specialized for dense-dense GEMM to support the proposed
+instructions for sparse-sparse GEMM presented in Section~\ref{sec-spz-isa}.
+Each sorting/zipping instruction is decomposed into micro-operations.
+Each input matrix row corresponding to a data stream is processed in one
+micro-operation going through the systolic array in two passes: (1)
+sorting/zipping and (2) compressing.  The execution of one micro-operation is
+explained in Section~\ref{sec-spz-uarch-mssort} and~\ref{sec-spz-uarch-mszip}.
+In Section~\ref{sec-spz-uarch-multi-rows}, we then explain how pipelining
+happens across micro-operations of a single instruction and multiple
+instructions.
+Finally, in Section~\ref{sec-spz-uarch-ext}, we discuss hardware changes needed
+to support SparseZipper.
+
+\input{fig-systolic-exec-example}
+\input{fig-systolic-exec-all-rows}
+
+%----------------
+% Systolic execution of mssort*
+%----------------
+
+%\input{fig-mssortk-systolic-exec-example}
+%\input{fig-mszipk-systolic-exec-example}
+
+\subsection{Systolic Execution of Sorting Key-Value Chunks \\ in a Single Stream}
+\label{sec-spz-uarch-mssort}
+
+% explain input/output and components in the systolic array
+Figure~\ref{fig:mssortk-systolic-exec} shows a 3$\times$3 systolic array
+executing \TT{mssortk} instruction to sort two unsorted chunks of keys over
+multiple cycles.
+Initially, the two input chunks are located in the west and north sides of the
+array.
+Similar to a typical systolic execution of dense-dense GEMM, inputs are
+staggered into the array.
+Outputs come out from the east and south sides.
+The dataflow through the array is the same as in dense-dense GEMM.
+Each PE receives inputs from the west and north sides and sends outputs to the
+east and south sides.
+
+% explain how the data flow for mssortk
+Input keys flow through the array in two passes: sorting and compressing.
+In the sorting pass, keys in a chunk are sorted in an ascending order.
+If a chunk contains duplicates, the sorting pass combines them into one valid
+output key, and the rest become invalid outputs to be excluded.
+The invalid outputs may exist in between valid outputs after the sorting pass,
+so the compressing pass places valid outputs consecutively starting from the
+first position of an output chunk and moves invalid outputs to the end.
+For example, in Figure~\ref{fig:mssortk-systolic-exec}, after the sorting pass,
+the north-side inputs \{5,~8,~5\} come out in the east side as \{5,~\TT{d},~8\}
+(i.e., \TT{d} indicates excluded duplicated key(s)).
+In the compressing pass, the partial output chunk is pushed into the array from
+the west side, and the final output chunk \{5,~8,~\TT{d}\} comes out from the
+south side.
+
+% explain PE states
+When sorting keys, we need to store the key reordering so that their values can
+be shuffled to correct positions later.
+In each PE, we encode and store the direction in which west-side and north-side
+keys are routed towards and whether the keys are duplicate.
+Given a pair of input keys, there are four possible states: (1) initial (no
+data routing), (2) forwarding, (3) switching, and (4) combining.
+The forwarding state encodes a PE routes west-side and north-side keys to the
+east and south sides respectively.
+The switching state encodes a PE routes west-side and north-side keys to the
+south and east sides respectively.
+The combining state encodes that two input keys are duplicate and that they are
+combined into one valid key routed to the south side.
+Each PE needs to store the states for both sorting and compressing passes.
+
+% explain the algorithm
+The west- and north-side input keys are sorted independently using the
+bottom-left and top-right half of the systolic array.
+PEs on the main diagonal are hard-coded to always switch inputs so that data
+from two input chunks are not intermixed.
+In other PEs, two input keys are compared.
+The larger key is routed to the east, and the smaller key is routed to the
+south (e.g., cycle 2 in Figure~\ref{fig:mssortk-systolic-exec}).
+If keys are duplicate (e.g., cycle 5 in
+Figure~\ref{fig:mssortk-systolic-exec}), a single combined valid key is sent to
+the south port, and the east output is tagged as invalid key.
+In subsequent PEs, the invalid key is considered larger than any valid key, so
+it is always forwarded to the east.
+
+% explain the counters
+Instruction \TT{mssortk} updates special-purpose input and output counter
+vector registers: \TT{W\_IC} (for the west input), \TT{N\_IC} (for the north
+input), \TT{E\_OC} (for the east output) and \TT{S\_OC} (for the south output)
+as keys come out from the array as shown in
+Figure~\ref{fig:mssortk-systolic-exec} to count the number of processed input
+keys and valid output keys.
+Input counters (\TT{W\_IC} and \TT{N\_IC}) are updated in the sorting pass
+while output counters (\TT{E\_OC} and \TT{S\_OC}) are updated in the
+compressing pass.
+
+% mssortv
+Instruction \TT{mssortv} shuffles values based on a key reordering produced by
+\TT{mssortk}.
+Values are also passed through the array in two passes and directed based on
+the states captured in each PE during the execution of \TT{mssortk}.
+If the state is combining, two values are accumulated, and the accumulated
+value is forwarded to a PE's south side.
+Instruction \TT{mssortv} does not update the input and output counters.
+
+%----------------
+% Systolic execution of mszip*
+%----------------
+\subsection{Systolic Execution of Merging Key-Value Chunks \\ in a Single Stream}
+\label{sec-spz-uarch-mszip}
+
+% explain input and output
+Figure~\ref{fig:mszipk-systolic-exec} shows the systolic execution of
+\TT{mszipk} instruction in a 3$\times$3 array to merge two sorted key-value
+chunks from a single stream.
+Initially, the two input chunks are placed in the west and north sides.
+Keys in the west side are ordered from bottom to top in an ascending order
+while keys in the north side are ordered from left to right.
+The final output chunk is stored in two parts.
+For example, the part with smaller keys \{2,~3,~5\} is located in the east side
+while the second part with larger keys \{8\} is stored in the south side.
+
+% systolic data flow
+Keys flow through the systolic array in two passes: merging and compressing.
+The merging pass generates a merged list of sorted keys with invalid outputs
+(i.e., caused by duplicate keys) potentially located in between valid output
+keys.
+The compressing pass then places valid output keys consecutively.
+Unlike the sorting pass, the merging pass intermixes keys from both input
+chunks, so PEs on the main diagonal work the same as other PEs instead of being
+hard-coded to always switch inputs.
+Similarly, larger keys flow to the east while smaller keys flow to the south
+side.
+The compressing pass works exactly the same as in the sorting operation.
+
+% exclude keys that are not merged
+Not all input keys can be merged into the output chunk.
+Keys from an input chunk that are greater than all keys from the other chunk
+need to be excluded since we do not know yet their positions in the output
+stream as discussed in Section~\ref{sec-spz-isa-merge-spgemm}.
+For example, in Figure~\ref{fig:mszipk-systolic-exec}, the key 9 in the west
+input chunk is excluded from the output chunk (\TT{x} in cycle 4) since
+it is greater than every key from the north-side chunk.
+To detect keys to be excluded, each key is tagged with two extra bits to track
+(1) from which input side the key comes from (source bit) and (2) whether the
+key has been compared with another larger or equal key from the other input
+chunk yet (merge bit).
+The merge bit of a key is initially set to false and flipped to true when a
+PE detects a larger or equal key from the other input side.
+After the merging pass, if the merge bit is still false, the key is excluded
+from the output chunk.
+
+% explain the counters
+Input and output counters are updated in the same way as in the sorting
+operation.
+\TT{W\_IC} and \TT{N\_IC} count the numbers of merged keys for the
+west-side and north-side input chunks respectively.
+\TT{E\_OC} and \TT{S\_OC} count the numbers of valid output keys in the
+east-side and south-side output chunks respectively.
+Instruction \TT{mszipv.tt} shuffles values based on the reordering of their
+corresponding keys.
+
+%----------------
+% Multiple input lists
+%----------------
+\subsection{Merging and Sorting Key-Value Chunks \\ across Multiple Streams}
+\label{sec-spz-uarch-multi-rows}
+
+The execution of multiple micro-operations mapping to different streams can
+overlap in SparseZipper's systolic array.
+Figure~\ref{fig:systolic-exec-all-rows} shows the cycle-by-cycle systolic
+execution of sorting key-value chunks from multiple streams.
+Keys and values from multiple streams are mapped to different rows in matrix
+registers.
+Input keys and values from adjacent matrix register rows enter the systolic
+array back-to-back in consecutive cycles since there is no data dependency
+between micro-operations of an instruction.
+There are one-cycle stalls in cycle 4 and cycle 11 since the systolic array
+takes one extra cycle to route data from the west and south sides at the end of
+a sorting pass to the east and north sides at the beginning of a compressing
+pass.
+The execution of \TT{mssortk}/\TT{mszipk} and \TT{mssortk}/\TT{mszipv}
+instructions in a pair can overlap.
+Since the latency of a micro-operation through the systolic array is fixed
+(i.e., 2N+1 where N is the number of PEs in a row/column of the array), the
+array can schedule to start the following \TT{mssortv}/\TT{mszipv} as soon as
+the top-left-corner PE finishes its last key-compressing operation (e.g., in
+cycle 8 in Figure~\ref{fig:systolic-exec-all-rows}).
+However, the execution of different key-value instruction pairs processing
+different input matrices of key-value data streams do not overlap to avoid
+overwriting the array's output counters.
+The counters must be read out to a vector register before the array can start
+executing a new key-value instruction pair.
+
+%----------------
+% Systolic array details
+%----------------
+\subsection{Hardware Changes to the Baseline Systolic Array}
+\label{sec-spz-uarch-ext}
+\input{fig-sparse-zipper-uarch}
+
+Figure~\ref{fig:spz-sparse-zipper-uarch} shows micro-architectural changes to
+support SparseZipper in the baseline systolic array specialized for dense-dense
+GEMM.
+We add a second write port to the matrix register file as the sorting and
+merging instructions have two output operands.
+Since each physical matrix register is quite large (e.g., 1KB for a
+16$\times$16 32-bit-element matrix register), the matrix register file may
+consist of multiple SRAM banks, one for each physical matrix register.
+Therefore, adding an additional write port to the register file simply requires
+an extra crossbar instead of adding an extra write port to each SRAM bank which
+would incur significant area overheads.
+In order to retrieve the east-side output data from the systolic array, we add
+a second deskew buffer.
+
+% additional control signals and the loop-back paths
+Additional control bits (i.e., source, duplicate, and merge bits) are tagged
+along with data flowing through the systolic array as described in
+Section~\ref{sec-spz-uarch-mszip}.
+We add a three-bit control between any two PEs to the existing data paths.
+For routing data between a sorting/merging pass and a compressing pass, two
+loop-back paths are added to connect east and south output sides to the west
+and north input sides respectively.
+Each path is pipelined via an extra register to account for its long distance
+between two sides of the systolic array.
+
+% popc logic and input/output vectors of counters
+Four input and output vectors of N counters are added to track the number of
+valid input and output elements for N rows of matrix registers.
+Each counter counts up to N (i.e., the number of elements in a row), so a
+vector of N counters is $N \times \log_2 N$ bit wide.
+The population counting logic uses output control signals from the systolic
+array and increments corresponding input/output counters.
+
+% inside each PE
+In each PE, we slightly modify the existing adder to support comparison of
+input keys.
+An additional control unit uses the comparison outcome to make routing
+decisions (i.e., forwarding, switching, and combining) and route data from
+input to output ports by controlling the two output multiplexers.
+The control unit also updates the duplicate and merge bits based on the source
+bit and the comparison outcome.
+We use the same adder for adding up values for \TT{mssortv} and \TT{mszipv}
+instructions in case of combining inputs.
+We repurpose the weight register in each PE to store routing states.
+Each state requires two bits to encode.
+Each pair of rows from two input matrix registers needs to store two states for
+their sorting/merging and compressing passes.
+Therefore, for N pairs of rows, we need a total of $N \times 4$ bits for all
+the routing states (e.g., 64 bits for a hardware vector length of 16
+elements).

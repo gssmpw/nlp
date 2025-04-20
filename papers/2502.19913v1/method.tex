@@ -1,0 +1,161 @@
+
+\section{\sys}
+
+In this section we present a novel approach to pipeline parallelism, employing skipping and swapping to reduce the required resources and increase throughput without degrading the training performance for LLMs. 
+The goal is to find a viable partial pipeline schedule (paths of the microbatches) that minimizes the overall training latency given the throughput target.
+Before going into our scheduler, first we derive the convergence and throughput guidelines for partial pipelining.
+
+
+
+\textbf{Partial pipeline schedule.} Given a DP and PP arrangement of nodes (constituting a graph) with the given communication and computation limitations per link and node respectively, we need to find paths  \(p_1, p_2... \in \mathcal{P}\) (of a sequence of nodes) for each microbatches such that the time to complete a forward and a backward pass through them is minimized, i.e., end-to-end latency for training a batch of data. 
+
+Each path $p_i$ travels a sequence of nodes  from the starting node back to itself (considering forward and backward), such that only \(k\%\) of stages are skipped (and no stages are repeated in the path). The ordering of nodes in the backward pass needs to be the same as in the forward one.
+A path $p_i$ can be represented with respect to the stages ($p_i:= S_{i_1},\ldots,S_{i_l}$) or the nodes ($p_i:= N_{i_1},\ldots,N_{i_l} $) that it passes through where $l:=(100-k)\%$ of the stages. 
+
+\subsection{Guideline for Partial Pipelining Scheduler}
+\label{sec:31}
+
+Here, we explain our guideline for a partial pipeline scheduler that selects the paths for each microbatch through a motivation example. 
+We present three convergence and two throughput constraints to optimize the path selection. We derive the convergence constraints from our experimental results and previous work and the throughput constraints are based on the node and network limitations.
+
+\begin{figure*}[t]
+\begin{tabular}{ccc}
+	\includegraphics[width=\columnwidth]{figs/randomskip.pdf} &
+\includegraphics[width=\columnwidth]{figs/swapmatter.pdf} \\
+(a) Impact of skipped layer selection. & (b) Impact of stage swapping on full model.\\	
+\end{tabular}			
+\caption{Convergence of LLaMa-30M model. The validation loss is calculated for the whole model for every 50th iteration.}
+	\label{fig:motivation}
+\end{figure*}
+
+
+\textbf{Convergence Constraints}. To study the effects of stage skipping and swapping on the LLM convergence, we train a LLaMa-30M model (12 layers) divided in 6 stages with 2 layers each on the TinyStories dataset with 5 microbatches of size of 32 samples in two sets of experiments, summarized in Figure~\ref{fig:motivation}. 
+ In Figure~\ref{fig:motivation} (a), we vary the selection of which stage to skip (for skipping percentage of 25\%): random, random with no skipping the first stage, and round robin with no skipping the first stage (skip each intermediate stage equal number of times). By comparing random and random with no skipping the first stage cases, we observe that the first stage is more critical than other stage and should not be skipped. Similar effect is also observed for larger transformer architectures \cite{vitrob,LayerDrop} and architectures with residual connections \cite{skipconnresnet}. Additionally, when we compare random and round-robin cases, we see that convergence is better when each intermediate stage is skipped uniformly and trained for an equal number of microbatches. Figure~\ref{fig:motivation} (b) shows that swapping execution order of two consecutive stages has negligible effect on the training loss, and swapping multiple stages or stages that are not consecutive causes more degradation.
+
+ 
+
+	
+Combining the aforementioned observations, we derive the following \textbf{C}onvergence \textbf{C}onstraints for our path selection:
+\begin{itemize}
+	\item \cc{1}: A path $p_i$ never skips the first stage, i.e., $S_{i_1} = S_0 \; \forall p_i \in \mathcal{P}$.\footnote{Our scheduler also works when multiple stages hold the critical layers - for simplicity we refer to them collectively as \(S_0\).}
+	\item \cc{2}: A path $p_i$ may run out of order at most two consecutive stages (1 swap), i.e., for a path $p_i= S_{i_1},\ldots,S_{i_l}$,  $|{i_j} - {i_{j+1}}|  \leq 1 \;  \forall j \in (1,l)$.
+	\item \cc{3}: Each stage $S_i$ ($i\geq1$) is skipped for an equal amount of paths.   
+\end{itemize}
+
+
+
+\textbf{Throughput Constraints.}
+In a standard pipeline training, the whole model is executed sequentially and each node needs to receive activations of the microbatches from only one other node (the one before it) in the forward pass, and similarly for the backward pass as well. 
+In other words, each node receives only one microbatch to process from each direction, unless one of the nodes is significantly slower than the consecutive one.\footnote{Note that it is possible to receive both forward and backward activations at the same time, and these can be handled in 1F1B manner~\cite{pipedream} where the backward pass is prioritized in the execution order.} 
+However, as we introduce skips (and potentially swaps) in execution, it is possible for a node to simultaneously receive two microbatches from two different stages in the same direction. We refer to such cases as \textbf{collisions}, which can significantly degrade the end-to-end latency of a batch, which is the duration between the starting time of the first microbatch and the end time of the last microbatch (including the node computing time and communication time across stages). To avoid collisions, we employ swaps to run stages out of order for a microbatch, thus utilising a currently idle node to reduce instantaneous overutilisation of another. 
+
+In addition, because of the caching of the activations that is needed for the backward pass, the number of active microbatches going through each node is limited by the memory of a node and denoted by (\(m\)). Overall, we impose two \textbf{T}hroughput \textbf{C}onstraints:
+\begin{itemize}
+    \item \tc{1}: At most \(m\) paths can go through each node \(N_i\). 
+    \item \tc{2}: Minimize collisions via skipping or swapping the pipelining order.
+\end{itemize}
+
+
+
+\textbf{Problem Formulation.} We formalise the optimization problem of partial pipeline scheduler as follows: For a given network of $\mathcal{N}$ nodes with bandwidth and latency matrices $(\mathcal{B},\Lambda)$ and a LLM model consisting of pipeline stages $\mathcal{S}$, the number of microbatches $M$ and limitation of active microbatches $m$ per iteration, the partial pipeline scheduler aims to find the paths $\mathcal{P}$ that minimizes the maximum end-to-end latency across all microbatches of a given iteration:
+\begin{align*}
+&\mathcal{P} \leftarrow \texttt{Scheduler}(\mathcal{N},\mathcal{B},\Lambda,\mathcal{S},M,m) \\  
+&\text{such that} \; \mathcal{P} := \underset{\mathcal{P} \in \mathcal{P}_{ALL}, \; \forall p_i \in \mathcal{P} }{\arg \min \max E2E(p_i)} \\
+& \text{with constraints \cc{1}, \cc{2}, \cc{3}, \tc{1} and \tc{2}}
+\end{align*}
+where $E2E(\cdot)$ is the end-to-end latency of a microbatch where the starting time of a microbatch is also taken into account, and $\mathcal{P}_{ALL}$ is the set of all possible sets of paths. Forming the paths is itself an NP-hard problem (as detailed in Section~\ref{sec:partial_pipeline}). We thus split the problem into two parts: first allocation nodes in stages under full pipeline schedule and then finding the partial pipeline schedule for microbatches under the given node-stage mapping.
+
+
+
+
+
+\subsection{ Allocating Nodes to Stages}
+For a given network of $\mathcal{N}$ nodes (with bandwidth and latency matrices $(\mathcal{B},\Lambda)$) and the pipeline stages $\mathcal{S}$, the initial node arrangement matches each node with a stage for standard full and sequential pipelining (no skips or swaps).
+
+This problem is already analyzed for heterogeneous networks in DT-FM~\cite{dtfm}, solved through 
+a two-phase optimiser: clustering of nodes for DP and then arrangement of the connections for PP.  
+DP clustering can be seen as \textit{graph partition problem} where each cluster corresponds to a stage and the partition cost is bounded by the slowest communication between two nodes in the same stage.
+This problem can be solved via genetic algorithms as described in~\cite{dtfm}.
+Then these clusters are ordered for PP, which can be represented as
+an \textit{open-loop Traveling Salesman problem} \cite{TSP}.
+
+To allocate nodes to stages in \sys, we modify the algorithm given in~\cite{dtfm} for the  unbalanced cluster sizes.
+Following convergence constraints \cc{1} and \cc{3}, the initial stage is never skipped whereas all other stages are skipped equally, so that $k\%$ of the stages are skipped for each microbatch.
+
+Assume the nodes allocated in a stage, as $S_i(\mathbf{n})$, we formulate the number of nodes per stages regarding the following equation:
+
+\begin{align}
+|S_i(\mathbf{n})| = |S_0(\mathbf{n})| \left( 1- \frac{s}{s-1}\cdot \frac{k}{100} \right)  \; \forall i \in (1,s).
+\label{eqn:node_distribution}
+\end{align}
+
+To balance the workload across stages, we allocate the nodes per stage using the ratio given above.  
+Thus, the procedure employed here is the same with DTFM~\cite{dtfm}, with the differences that one stage is larger than the others and we use a closed-loop TSP, as we require that the loss is computed again on Stage 0. With the optimised arrangement of nodes in stages, we can look for paths through the system that would satisfy our constraints.
+
+
+
+\subsection{Partial and Reordered Pipelining}\label{sec:partial_pipeline}
+\par Once nodes are arranged into stages, we schedule the microbatches through the system by skipping and reordering stages, which is the core of \sys. It is important to note the difference between a path and a microbatch. While a microbatch does travel down a path, multiple microbatches may use the same path. For example, when a node completes a backwards pass for a given microbatch, it can reuse the path it had just traversed, as it is the one that immediately has nodes with free memory. Thus we find a set of paths for the first wave of microbatches and reuse them a number of times during an iteration to meet the desired batch size.
+
+
+ Given our problem formulation, we model the problem as a \textit{continuous-time Multi Agent Path Finding} (MAPF) \cite{ccbs} problem. In continuous-time MAPF, we are given a graph and a number of agents and each agent has a starting location and a desired end location. In our setting, we map the graph to the node connections after node allocation where the edges between nodes reflect the communication cost regarding the bandwidth and latency values of the corresponding nodes. Each agent represents a microbatch which travel from a starting node in stage \(S_0\) to the same destination node while passing $s(100-k)/100$ nodes in total.
+ An agent can either wait at a node, move through the node (computation), or move to a different node, via some edge connecting the two. Each move is associated with a given (communication) cost. In the continuous-time setting, actions do not take 1 unit of time, but can be of arbitrary length. The problem has the additional constraints that no two agents can collide (be on the same node at the same time or the same edge). Since we assume full-duplex links, we do not concern ourselves with collisions on edges and agents can perform the wait action at the end of a link (or a node's buffer). But, since nodes have real physical limitations, we allow traversal of only one agent at a time through a node (constraint \tc{2}). 
+ To find a viable solution we employ a modified version of the \textit{continuous-time Conflict-Based Search} (CBS)~\cite{ccbs} based on the changes described above. 
+ 
+ 
+ The first four constraints (\cc{1}, \cc{2}, \cc{3}, \tc{1}) are merely about finding the paths, while constraints \tc{2} deal with conflicts between two agents. %\lc{why}\NB{just the nature of CBS and its terminology, i dont understand the question}. 
+ \cc{1} and \cc{2} constraints are individual per agent and thus can be managed by an A* search \cite{astar}, an exhaustive graph traversal algorithm. We use A* instead of the Safe interval path planning used in \cite{ccbs}, so that we can model the skips, swaps, and the additional constraints better.
+However constraints \cc{3} and \tc{1} require inter-agent optimization %\lc{why?}\NB{
+because they specify global constraints - no more than this number of agents can go through this node in an iteration. This requires knowing all other agent's paths and thus existing solvers are insufficient. We thus delegate all constraints, apart from \cc{1} and \cc{2} to be resolved by CBS (with for \cc{3} and \tc{1} setting a constraint that an agent cannot visit all nodes in a stage or a specific node respectively, from \((-\inf,\inf)\). However, this proves extremely costly for large graphs or large number of agents, as an exponential number of possible solutions would need to be explored, before resolving \tc{2} constraints. 
+
+
+
+ We thus approximate the optimal solution, by employing several greedy heuristics, denoted by \hr{}. \hr{1}: When finding solutions we first employ CBS to find a number of solutions that satisfy \cc{1}, \cc{2} and \cc{3} constraints (32 in our experiments, as this proved sufficient to find good solutions, without expanding the subsequent search space too much). \hr{2}: For \cc{3} constraints we found it best to exclude from adding constraints for the \(\frac{|\mathcal{P}|}{4}\) slowest agents, as these would be the fastest paths they can take and any change would detrimentally affect the slowest path. Then for these generated solutions we solve for \tc{1} constraints. Here we again exclude the slowest path through a node from adding constraints for it. Once no \tc{1} constraints are detected, \tc{2} constraints are checked. Since we only concern ourselves with the critical path (the one that takes the longest, $i := {\arg \max E2E(p_i)} \; \forall p_i \in \mathcal{P}$), we priorities conflicts that occur with it. \hr{3}: For conflicts with paths faster than the \(\frac{|\mathcal{P}|}{4}\)th path, we only add constraints for the faster path. A constraint \tc{2} is added for each relevant agent by specifying that they cannot visit the conflicting node for the duration the other agent is traversing it.
+
+
+
+\subsection{Path finding} 
+
+The pseudocode of our path selection method is given in Algorithm~\ref{alg:csf_pseudocode}, the detailed steps can be found in Appx.~\ref{sec:appx_algorithm} in Algorithm~\ref{alg:csf}.
+To find a set of paths satisfying the current constraints, as per CBS \cite{cbs}, we employ A* for each agent with a time dimension. When an agent travels between two nodes, its time is increased by the time it takes for a microbatch to travel down that link. Whenever an agent travels through a node, its time is increased by the time it takes to process a microbatch. If an agent is to visit a node and during the processing time there is a conflict that prohibits the agent from being in that node, its time of visiting the node is delayed to the end of conflict. 
+\par An agent must skip exactly \(k\%\) of the stages. Thus when expanding a node, we do not consider the starting node until this condition is met. When we visit again the starting node the time of forward and backward, given all conflicts, for the given time is estimated and the node is readded to the heap with that cost and a special flag marking it as a potential final solution. When a node marked as a potential solution is popped from the heap, it is returned as the current fastest path for that agent that satisfies all current constraints.
+\begin{algorithm}
+\caption{Pseudocode of Path Selection Function.}
+\label{alg:csf_pseudocode}
+\begin{algorithmic}[1]
+{\small
+\REQUIRE{ \(\mathcal{S}\), \(k\%\), $G$ - initial node/stage arrangement}
+\ENSURE{\(\mathcal{P}\)}
+\STATE \(\mathcal{O} \leftarrow \emptyset\) 
+\STATE \(Open\leftarrow\) Path assignment with no constraints
+\WHILE{ \(|\mathcal{O}| < 32\)}
+\STATE \(T \leftarrow \) best solution from \(Open\)
+\IF{Violation of constraint \cc{3} in $T$}
+\STATE Add constraints for fastest paths 
+\STATE Find paths with new constraint via A*(\(G\))
+\STATE Re-add to \(Open\)
+\ELSE
+\STATE \(\mathcal{O} \leftarrow \mathcal{O} \cup T\)
+\ENDIF
+\ENDWHILE
+
+\WHILE{\(\mathcal{O}\) not empty}
+\STATE \(T \leftarrow \) best solution from \(\mathcal{O}\)
+\IF{Violation of constraint \tc{1} or \tc{2} in \(T\)}
+\STATE Add constraints for violating fastest paths to \(T\)
+\STATE Find paths with new constraint for \(T\) via A*(\(G\))
+\STATE Re-add to \(\mathcal{O}\)
+\ELSE
+\STATE \textbf{Return} $\mathcal{P} \leftarrow T$
+\ENDIF
+\ENDWHILE
+
+\STATE \textbf{Return} $\emptyset$
+}
+\end{algorithmic}
+\end{algorithm}
+
+\par Unlike traditional A* we do not make use of a visited set - we may consider a node during our search multiple times. This is because how we reach the starting node in the forward pass (which is what A* finds essentially), may not be the fastest way to do a forward + backward pass (which is why we read the starting node with the special flag). When expanding an A* node, we exclude all nodes that have been on that path or belong to a stage that has been visited from the set of potential next nodes. We may perform at most 1 swap in the ordering of stages for a given path (\cc{2} constraint).  Nodes that would go over the limit set by \cc{2} are excluded from consideration.
+
+
+

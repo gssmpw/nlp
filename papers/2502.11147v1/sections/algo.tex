@@ -1,0 +1,49 @@
+\section{Algorithm Design}
+\label{sec-algo}
+
+When directly applied to reasoning tasks, existing algorithms struggle with the ``impossible trinity'' of accuracy, time, and memory. For example, although the state-of-the-art Quest~\cite{tang2024quest} achieves promising accuracy (Figure~\ref{fig-eval-e2e}) with $O(L)$ time complexity, it requires storing the entire KV cache, thus $O(N)$ memory complexity (Figure~\ref{fig-eval-time-memory}). To break the ``impossible trinity,'' we analyze the decoding stage of reasoning tasks and discover a new attention pattern (Section~\ref{sec-algo-pattern}), based on which we design a new algorithm \algo\ (Section~\ref{sec-algo-algo}) that achieves $O(L)$ time and memory complexity, with accuracy comparable to Quest.
+
+% \hjh{See if we have time to solve the following para}
+% A simple solution to reduce memory footprint is to limit Quest to storing only the top-k tokens in the KV cache. However, this reduces its accuracy significantly (Figure~\ref{fig-eval-e2e}).
+
+\subsection{Reasoning Attention Pattern}
+\label{sec-algo-pattern}
+
+
+By analyzing the attention map of the decoding stage of reasoning tasks, we discover two key characteristics (Figure~\ref{fig-algo-waterfall}). First, we identify \textbf{milestone tokens}, which initially exhibit high attention scores but gradually receive lower scores and never receive high scores again. Analogous to lemmas in mathematical proofs, milestone tokens emerge, are utilized, and then fade away. These tokens, visible as bright columns on the attention map that slowly diminish --- similar to a water column in a waterfall (Figure~\ref{fig-algo-waterfall} (a)) --- must be carefully managed to prevent significant accuracy loss (Figure~\ref{fig-eval-e2e}). Second, we identify \textbf{phoenix tokens}, which receive low attention scores for a period long enough to be evicted from the cache but later regain importance. These tokens typically appear in short prefill prompts, such as user queries (Figure~\ref{fig-algo-waterfall} (b)). Quest~\cite{tang2024quest} retains the entire KV cache to avoid losing phoenix tokens, thus the $O(N)$ memory complexity.
+
+
+We offer a possible explanation for the waterfall pattern or milestone tokens in reasoning tasks. First, the emergence of milestone tokens is analogous to lemmas in mathematical proofs or subconclusions in thinking steps. Once an LLM generates milestone tokens, subsequent tokens primarily attend to the milestone tokens rather than the preceding tokens arriving at the milestone token. Second, the fading attention score of a milestone token mirrors the progression in mathematical reasoning. As reasoning advances from lower-level lemmas to higher-level ones, subsequent steps rely on the new lemmas rather than revisiting the older ones.
+
+
+% This finding suggests that Quest's conservative approach --- retaining all KV caches to handle phoenix tokens --- consumes unnecessary memory.
+
+To illustrate the preceding explanation, consider one example\footnote{Examples abound during the investigation of reasoning tasks, not limited to this one, and not limited to those extra examples in the appendix.} in Figure~\ref{fig-algo-milestone}. First, tokens \ding{172}\ding{173}\ding{174} serve as initial lemmas, which are crucial for subsequent deductions, corresponding to \ding{172}\ding{173}\ding{174} columns in Figure~\ref{fig-algo-waterfall}. Second, tokens \ding{175}\ding{176} serve as a new lemma, built upon \ding{172}\ding{173}\ding{174}, while at the same time, tokens \ding{172}\ding{173}\ding{174} fade. Third, the final answer (token \ding{177}) only attend to tokens \ding{175}\ding{176}.
+
+\input{figs/fig-algo-waterfall}
+
+\input{figs/fig-algo-milestone}
+
+\input{figs/fig-algo-algo}
+\subsection{Design of \algo}
+\label{sec-algo-algo}
+
+
+Based on the preceding observations, we propose \algo, a simple yet effective algorithm that addresses the ``impossible trinity'' and consists of two main ideas. First, we identify and retain milestone tokens until they are no longer needed, using timestamps to track their importance. When a token receives an attention score above $\alpha$ (e.g., $\alpha=0.01$), we assign it the latest timestamp. Milestone tokens always receive the latest timestamp until it becomes unimportant. When the cache is full, we evict tokens with the oldest timestamp. Second, we retain the KV cache of all prefill tokens without eviction. Since prefill tokens are typically short and phoenix tokens almost always appear within them in reasoning tasks, retaining these tokens ensures that critical information is not lost during the decoding process.
+
+
+To illustrate \algo\ step by step, consider Figure~\ref{fig-algo-algo}. In the \textbf{first five steps}, the cache size limit is not reached (we can store at most 5 tokens). In the 4-th row, the second token is cached and computed, but its timestamp is not updated because its attention score is below $\alpha$, which we consider insufficient for influencing the final result. However, in the 5th row, the second token’s attention score exceeds $\alpha$, and it is assigned the latest timestamp, 5. In the \textbf{last three steps}, the cache is full. In the 6th row, we evict the third token (the third column becomes gray) since it has the oldest timestamp. We then compute the remaining tokens and update their timestamps. A similar process is followed in the seventh and eighth rows.
+
+
+% \textbf{Discussion}. 1) The second column mirrors the ``water column'' in the waterfall pattern. If more decoding tokens are processed, its column will eventually turn gray, indicating that the token is no longer attended to (water column breaks). 2) Figure~\ref{fig-algo-algo} serves as a conceptual demonstration. In practice, the cache size may be 512 tokens, 1024 tokens, or larger. If a token’s timestamp is 4 and the cache size reaches 1024, it will not be used again according to the assumptions outlined. Thus, such tokens are eligible for eviction.
+
+\textbf{The Choice of $\alpha$.} The choice $\alpha$ affects the distribution of tokens' timestamps. If $\alpha$ is small, too many tokens receive the latest timestamp, preventing effective differentiation of milestone tokens. Conversely, if $\alpha$ is large, most tokens are deemed irrelevant, potentially leading to the loss of milestone tokens. To address this dilemma, we propose to assign the latest timestamp to $r = 50\%$ tokens with the highest attention scores in each decoding step, where $\alpha\approx 0.0001$ (The parameters $\alpha$ and $r$ are two sides of the same coin) and This method provides effective results (Figure~\ref{fig-eval-alpha}). Due to page limitations, we leave further exploration of the optimal $\alpha$/$r$ and its theoretical justification to future work.
+
+% We explore two approaches for selecting $\alpha$, both yielding similar accuracy. First, we assign a unique $\alpha$ to each token. Specifically, $\alpha$ is set such that the product of the L1 norm of the token's value vector and its $\alpha$ exceeds the median of all tokens' values. This method accounts for token importance not only via attention scores but also through the value vectors, as demonstrated in prior work~\cite{zhiyu2024value}. However, this method introduces additional implementation complexity, meta-data overhead, and computational cost. Second, we assign a fixed $\alpha$ value to all tokens. We set $\alpha=0.001$, assuming tokens with attention scores below this threshold are unimportant. This method is easy to implement, incurs negligible time and memory overhead, and achieves comparable accuracy to the first method.
+
+\subsection{Page-Based \algo}
+
+
+Directly applying the version of \algo\ in Section~\ref{sec-algo-algo} presents two challenges. First, managing KV caches at the token level is inefficient, as small gaps in the cache complicate memory management and hinder GPU computation. Second, \algo\ requires the attention scores of all tokens to update timestamps, but retrieving these scores is incompatible with optimized attention kernels like FlashAttention~\cite{dao2022flashattention, dao2024flashattention2}. As with H2O, bypassing fast kernels in favor of \algo\ could result in degraded performance.
+
+To address these challenges, we propose a page-based version of \algo\footnote{From now on, whenever we use \algo\, we refer to page-based \algo.}. First, we introduce a page-based caching system with a fixed page size of $page\_size = 16$. The timestamp management, as well as cache retention and eviction, is handled at the page level as in most of the modern inference engine~\cite{woosuk2023vllm, lianmin2024sglang}. Second, before using optimized attention kernels, we add a lightweight step to retrieve a representative attention score for each page to update its timestamp, similar to Quest. We select a representative key (K) for each page, and the query (Q) of the new decoding token attends to these representative keys to compute a single attention score per page. Based on this attention score, we update the timestamp for each page and make eviction decisions at the page level. Various methods exist for selecting a representative K, such as those used in Quest~\cite{tang2024quest} and ArkVale~\cite{chenarkvale}. For fairness, we adopt the same representative selection method as in Quest.

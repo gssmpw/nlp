@@ -1,0 +1,169 @@
+\section{Method}
+\label{sec:method}
+% 
+Our method addresses the now-familiar problem of constructing representations of scenes from image collections.
+As with NeRF~\cite{nerf} and its numerous successors, we achieve this reconstruction by gradient-based optimization of a differentiable scene representation.
+In the following sections we propose a volumetric mesh-based differentiable representation, and explain how we are able to effectively optimize it from image supervision.
+
+\input{fig/edge_flip/item}
+\subsection{Volume rendering}
+% 
+Volume rendering has become the workhorse of modern differentiable scene reconstruction methods.
+Volume rendering allows all points in space to make a continuously varying contribution to the observed color of viewing rays which pass through those points.
+The effect of this contribution is controlled by a density field, which creates occlusions, and a radiance field, which determines the brightness of light observed.
+Unlike many alternative rendering formulations, volume rendering of continuous fields is fully continuous with respect to all degrees of freedom, including both the viewpoint, as well as the density and radiance field values.
+This property makes it very amenable to gradient-based optimization.
+% 
+\quad
+% 
+Volume rendering is defined by an integral over the segment $(t_\textrm{min}, t_\textrm{max})$ of a viewing ray.
+Specifically the observed color $\radiance_\ray$ for a ray $\ray$ is:
+%
+\begin{align}
+\radiance_\ray &= \int_{t_\textrm{min}}^{t_\textrm{max}} \transmittance(t) \cdot \density(\ray(t)) \cdot \radiance(\ray(t)) \; dt, \label{eq:volrend}\\
+\transmittance(t) &= \textrm{exp}\left(-\int_{t_\textrm{min}}^t \density(\ray(u)) \; du \right),
+\end{align}
+%
+where $\ray(t)$ denotes the point in 3D space at distance $t$ along ray $\ray$, and $\density(\cdot)$ and $\radiance(\cdot)$ denote the density and radiance fields respectively; see~\cite{digest} for more details.
+
+\paragraph{Piecewise constant volumes}
+%
+In the case of \textit{piecewise constant} $\density(\cdot)$ and $\radiance(\cdot)$, the integral can be expressed as a sum over all $N$ ray segments with constant field values:
+%
+\begin{align}
+\radiance_\ray &= \sum_{n=1}^{N} \transmittance_n \cdot (1 - \textrm{exp}(-\density_n \delta_n)) \cdot \radiance_n \: dt, \label{eq:volrendconst}\\
+\transmittance_n &= \prod_{j=1}^n \textrm{exp}(-\density_j \delta_j),
+\end{align}
+%
+where $\delta_n$ is the width of segment $n$.
+This formulation admits a simple implementation as a loop over the segments in order of depth.
+NeRF-based methods typically use \cref{eq:volrendconst} as an \textit{approximation} to \cref{eq:volrend}, with segments sampled according to some importance sampling scheme, e.g.~see~\cite{mipnerf360}.
+
+
+Conversely, in our model these forms are \ul{exactly} equivalent.
+We propose to leverage the algorithm by~\citet{ray_plane} along with a model of constant field values within the cells of a volumetric mesh~(see~\cref{fig:ray_tracing}), arriving at a representation for which \cref{eq:volrendconst} gives the \textit{exact} volume rendering result.
+While this choice is highly advantageous in avoiding any complicated or expensive sampling schemes, we must take great care to not interfere with the continuity of the representation, which is critical for gradient-based optimizers.
+In particular, the volumetric mesh itself receives gradients only through the segment widths $\delta_n$, which are determined by the locations of ray intersections with cell boundaries.
+It is therefore critical that these boundary intersections \textit{vary continuously} with the optimizable parameters of the model.
+
+\subsection{Differentiable mesh representation}
+
+Constructing mesh representations of volumes or surfaces through gradient-based optimization is hardly a new problem, and many methods tackle it using a variety of strategies; see~\citet{dmtet} and citations therein.
+Our method, however, encounters and must solve a challenge that most mesh optimization methods either avoid, or solve with discrete optimization techniques.
+Generally, meshes are determined by degrees of freedom in two groups: vertex locations $\verts$ and cells $\cells$ (i.e. connectivity, or mesh topology).
+Assuming all other parameters are fixed, optimizing for vertex locations is typically straightforward, as the intersections between rays and cell boundaries vary smoothly with vertex locations.
+The true challenge arises if one desires to also 
+optimize the connectivity $\cells$ of the representation.
+
+
+\paragraph{The Delaunay triangulation}
+%
+Because mesh connectivity is inherently discrete, we can not optimize it directly with gradient-based methods.
+To avoid this problem, we can define connectivity in terms of the vertex locations, such that each possible configuration of vertices corresponds to a \textit{unique} set of cells.
+The most obvious choice for this mapping is the \emph{Delaunay triangulation}~\cite{delaunay}, which in 3D comprises the set of all tetrahedral cells $\cell_i {\in} \cells$ which may be formed from four vertices such that their circumspheres contain no additional vertices (the so-called ``Delaunay criterion'').
+% 
+This construction is unique for point sets in general position (those lacking groups of 5 or more co-spherical points), and is easily computed using well-known and efficient algorithms; see \Cref{sec:implementation}.
+% 
+This strategy encounters two significant problems if we wish to use it as a basis for differentiable volume rendering:
+\begin{enumerate*} [label=(\arabic*)]
+\item the discrete nature of the mesh connectivity is not entirely avoided, as the boundaries of Delaunay cells undergo discrete ``flips'' whenever a vertex enters the circumsphere of another cell.
+These flips introduce \textit{discontinuities} into the optimization landscape, which interfere with the convergence of gradient descent; 
+\item the number of tetrahedra in this model is not fixed in this model, and therefore it is not straightforward to associate each cell with optimizable $\density$ and $\radiance$ values as required for volume rendering.
+\end{enumerate*}
+% 
+The latter issue could be solved by associating field values with vertices (vs. tets), and interpolating those values within the cell, but this complicates volume rendering.
+
+
+\paragraph{The Voronoi diagram}
+%
+Rather than utilize the Delaunay mesh directly and suffer its limitations, we instead look to the dual graph of the Delaunay triangulation: the \emph{Voronoi diagram}~\cite{voronoi}.
+As shown in \Cref{fig:delaunay_voronoi}, this is constructed by placing a vertex at the circumcenter of each Delaunay tetrahedron; it partitions space into convex polyhedral cells $\cell_i{\in}\cells$ consisting of points which share a nearest neighbour among the primal vertices\footnote{Also known as Voronoi ``sites'' or ``seeds''.} $\primal_i$ of the Delaunay triangulation:
+%
+\begin{align}
+\cell_i = \{x \in \real^3 : \argmin_j ||x - \primal_j|| = i\}.\label{eq:voronoi}
+\end{align}
+% 
+This may at first seem like a strange choice... after all, \textit{if the Delaunay Triangulation is unavoidably discontinuous in optimization, will not its dual also suffer this issue?}
+% 
+\quad The answer to this question lies in the fact that any discrete change in the connectivity of the Voronoi Diagram exactly coincides with the point that the affected cell faces attain zero surface area.
+As shown in \Cref{fig:edge_flip}, the discrete flips are effectively \textit{hidden} within these zero-volume regions of space, and the resulting field representation remains completely continuous with respect to the primal vertex locations.
+% 
+\quad The number of cells in the Voronoi diagram is also constant regardless of configuration, which makes the association of $\density$ and $\radiance$ values to cells... trivial.
+The resulting model is then effectively a \textit{learnable point cloud}, not dissimilar to the formulation of 3D Gaussian Splatting~\cite{gsplat}, though lacking the per-point covariance matrix.
+% 
+\quad The only remaining issue is that our ray tracing algorithm~\cite{fastray} expects \emph{tetrahedral} cells.
+We therefore modify the algorithm to handle the more general case of convex cells.
+This modified tracing process pre-fetches the neighboring vertices of each vertex, thereby allowing an efficient iteration over the cell faces to find ray intersections.
+For more detail on this algorithm, see~\Cref{fig:pseudocode}.
+
+\input{fig/pseudocode/item}
+
+\subsection{Optimization}
+Similarly to~\citet{gsplat}, the (mostly) local nature of Voronoi cells renders the optimization landscape more prone to local minima.
+We follow a similar strategy, by first carefully initializing the optimization, and then adaptively \textit{densifying} and \textit{pruning} Voronoi sites.
+Additionally, to promote the formation of surface-like densities, we also employ a regularization objective similar to the \textit{distortion} loss~\cite{mipnerf360} commonly used by NeRF methods.
+
+\paragraph{Densification}
+Similarly to~\citet{gsplat}, to initialize training we start with a sparse point cloud obtained from~COLMAP~\cite{sfm}.
+Over training, we perform densification and pruning operations to control the number of Voronoi sites and their density, allowing the model to adaptively re-allocate representational capacity to areas of space with more geometric and/or photometric detail.
+\quad
+We observe that gradients of the reconstruction loss with respect to Voronoi site locations can be used to identify cells which are underfitting the training signal.
+We therefore use the norm of this gradient multiplied by the approximate radius of the cell as a measure of which cells require further densification.
+Inspired by~\citet{3dgs-mcmc}, we select the candidates for densification by sampling a Multinomial distribution with probability mass function proportional to this measure.
+
+\paragraph{Pruning}
+Towards building a parsimonious representation, we remove cells from the Voronoi diagram that do not contribute to rendering.
+However, it is not sufficient to simply delete ``empty'' cells (i.e. zero density), as the geometry of Voronoi cells is determined by the positions of adjacent sites, even when the density in those cells is zero.
+To accurately represent object boundaries, it is therefore essential to retain cells with near-zero density that define the boundary. 
+For this reason, our pruning strategy removes Voronoi sites that have very low density, \textit{and} are surrounded by neighbors with very low density.
+This pruning ensures that we eliminate sites that neither contribute to nor define the surfaces, thereby maintaining the accuracy of the object boundaries.
+
+\paragraph{Training objectives}
+% 
+Similarly to the \textit{distortion} loss of Mip-NeRF 360~\cite{mipnerf360}, we apply a regularization on the distribution of contribution to the volume rendering integral along the ray.
+This additional loss function encourages the density to concentrate at surfaces and reduces visible~``floater'' artifacts.
+This objective is computed as
+%
+\begin{align}
+\losst{quantile} = \expect_{t_1, t_2\sim\calU[0, 1]}[|W^{-1}(t_1) - W^{-1}(t_2)|],
+\end{align}
+%
+where $W^{-1}(\cdot)$ denotes the quantile function (inverse CDF) of the volume rendering weight distribution along the ray.
+This form has the same effect as the distortion loss~\cite{mipnerf360}, but avoids the need for a quadratic nested sum which would increase the computational cost and memory footprint of training.
+% 
+Denoting with~$\losst{rgb}$ the typical L2 photometric reconstruction loss, our overall training objective is
+% 
+\begin{equation}
+\losst{} = \losst{rgb} + \lambda \losst{quantile}
+\end{equation}
+
+
+\subsection{Implementation details}
+\label{sec:implementation}
+% 
+We implemented our method in Python and C++ within the PyTorch framework, with custom CUDA kernels for ray tracing, Delaunay triangulation, and other operations requiring high efficiency.
+This implementation includes an interactive viewer and a~(very) low overhead renderer, which we used to measure frame rates.
+Importantly, \ul{nothing} in our implementation is dependent on 
+dedicated ray tracing hardware, or the OptiX library, which is required by methods like~\cite{3dgrt}.
+Therefore, with some engineering effort, our entire rendering loop could easily be implemented in a portable rendering framework like WebGL.
+
+\paragraph{Training} 
+Our training pipeline uses the Adam~\cite{adam} optimizer, and similarly to 3DGS, directly optimizes per-point position, density and view-dependent color via spherical harmonics of degree three.
+We use the softplus activation function with $\beta{=}10$ for density to constraint it within the~$[0, \infty)$ range, while keeping smooth gradients.
+For the location of points, we start at a learning rate of $2e^{-4}$ and decay it using a cosine annealing scheduler to a final learning rate of $2e^{-6}$.
+For point density and spherical harmonics, we start at a learning rate of $1e^{-1}$ and $5e^{-3}$ respectively and decay it with a cosine annealing scheduler by a factor of $0.1$.
+Following 3DGS~\cite{gsplat}, we optimize only the zero-order component of SH coefficients and the high-order coefficients with a warmup for the first 25\% of the total training iterations.
+% 
+\quad
+Similarly to \cite{revising-densification, 3dgs-mcmc}, after initialization and warm-up training, we gradually grow the number of Voronoi sites so that points are placed at useful locations.
+We progressively increase the number of points up to half the total training iterations, linearly increasing the number of points until the maximum desired number of points is obtained.
+
+\paragraph{Voronoi optimization}
+We maintain an adjacency data structure throughout training, which defines the Voronoi cells for rendering.
+Whenever the primal vertex positions are changed we must update the adjacency by performing an incremental Delaunay triangulation.
+While much faster than a complete rebuild, the incremental update is still computationally expensive for large point sets, so we allow the optimizer to take multiple steps between mesh rebuilds.
+We start at a 1:1 ratio after each densification and increase to 1:100, as the frequency of discrete changes to the mesh decreases over time with the converging optimization.
+This strategy balances the overall speed of training with maintaining a relatively accurate mesh structure.
+All our experiments are optimized for 20k iterations, with the last 2k only updating radiance and density attributes while positions are frozen.
+This process takes, as an example, 70 minutes on the ``bonsai'' scene with an RTX 4090 GPU.
+

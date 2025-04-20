@@ -1,0 +1,122 @@
+\section{Method}
+
+\paragraph{Task Definition}
+
+We consider a data corpus consisting of data from $k$ training domains $D_1,\ldots,D_k$. Data mixture proportions (weights) $\lambda$ define a distribution over text sequences $x$:
+
+\vspace{-5pt}
+\[ D_\lambda (x) = \sum_{i=1}^{k}\lambda_i  \mathbf{unif}(D_i) \]
+
+\vspace{-5pt}
+This sampling distribution is used to train a language model.  The  training loss for mixture rates $\lambda$ and parameters $\theta$ is $L(\theta,\lambda) = - E_{x \sim D_\lambda}\ln p(x|\theta)$. The trained parameters for weights $\lambda$ approximate: 
+ \[ \theta^{*}_\lambda = \mathbf{argmin}_\theta L(\theta, \lambda) \]
+
+\vspace{-5pt}
+At a high level, our task is to find mixture rates $\lambda$, for which the corresponding trained model $\theta^{*}_\lambda$ has optimal generalization performance. Generalization can be defined in multiple ways. In this work, we assume that we are given a set of validation datasets $V_1,\ldots,V_m$, and a validation set loss aggregator $g$, such that we define generalization performance as the score:
+\[ s(\theta) = g(L(\theta,V_1),\ldots,L(\theta,V_m)), \]
+
+\noindent
+where the aggregator function takes as arguments the cross-entropy losses of model $\theta$ on all validation domains. $g$ can be a simple unweighted average, or a more complex function. Our task is then:
+
+\textit{Find $\lambda$, such that the estimated generalization loss $s(\lambda)$ defined as the loss of the trained parameters corresponding to these mixture proportions $s(\lambda) = s(\theta^{*}_\lambda)$, is minimized.}
+
+Note that in practice one might want to  optimize model decoding performance rather than cross-entropy losses. While e.g. a sigmoid of cross-entropy would provide a better fit for decoding task accuracy (\citet{grattafiori2024llama3herdmodels}), here we focus on simple weighted average loss aggregators.
+
+
+\paragraph{Proxy language models} We follow prior work and use proxy language models~\cite{doremi} to estimate the effect of different mixture proportions on LLM generalization performance. The proxy models can be significantly smaller than the full-scale size, and can be trained over a much shorter token horizon. Here we use  LMs of size 280M trained for 10K steps (5B tokens) as proxies for learning to rank data mixtures for 1B models trained for 200K steps (100B tokens). We consider additional proxy configurations for analysis. Appendix ~\ref{sec:appendix_lms} details the number of embedding and non-embedding parameters in each of our proxy model configurations.
+
+\subsection{Mixture of Data Experts approximation}
+
+
+Our Mixture of Data Experts (MDE) approximation provides an estimate $\hat{s}(\lambda)$ at the cost of training only $k$ (number of training domains) language models and computing the cross-entropy loss with these models on samples from each of the $m$ validation domains. The $k$ trained data expert model  $\theta^{*}_1,\ldots,\theta^{*}_k$ are language models trained on the individual domains: $ \theta^{*}_i = \mathbf{argmin}_\theta - E_{x \sim \mathbf{unif}(D_i)}\ln p(x|\theta)$.
+
+Given these trained data experts, for every candidate mixture $\lambda = (\lambda_1,\ldots,\lambda_k)$, we form the following ensemble language model (termed MDE), parameterized by $\lambda$, with a next token distribution defined as follows:
+\[ P_{\mathbf{MDE}}(x_t|x_{1\cdots{t-1}},\lambda ) \vcentcolon= \sum_{i=1}^k {\lambda}_i P_{\theta^{*}_i}(x_t|x_{1\cdots{t-1}}) \]
+
+Given this ensemble language model, we can compute cross-entropy losses on each of the validation domain datasets $L(P_{\mathbf{MDE}}(\lambda),V_j)$ and aggregate these estimates according to $g$.  Here we omit the dependence on the trained data expert model parameters for brevity.
+
+We then arrive to our MDE approximation estimate of the generalization performance corresponding to candidate mixture $\lambda$, $s_{\mathbf{MDE}}(\lambda)$,  as:
+\mbox{$g(L(P_{\mathbf{MDE}}(\lambda),V_1), \ldots, L(P_{\mathbf{MDE}}(\lambda),V_m))$}.
+
+\begin{algorithm}[]
+   \caption{MDE loss approximation}
+   \label{alg:mde}
+\begin{algorithmic}
+\footnotesize % Reduce font size here
+
+ \State {\bfseries Input:}
+ \begin{itemize}
+  \item Cached Per-token probs $\mathbf{p_i^{(j)}}$ of experts $\theta^{*}_i$ for validation domain tokens $j=1,\ldots,|V_j|$.
+  \item Mixture $\lambda$.
+\end{itemize}
+
+
+ \State {\bfseries Output:}
+ \begin{itemize}
+\item The MDE loss approximation of model trained with mixture $\lambda$.
+\end{itemize}
+
+ \State {\bfseries Algorithm:}
+ \ForAll{$j \in \{1,2,\dots,|V_j|\}$}
+    \State \hspace{1em} $\mathbf{p_{\text{MDE}}}^{(j)}$ = $\sum_i (\lambda_i \mathbf{{p}_i^{(j)})}$
+   \hspace{1em} \EndFor
+    \State \hspace{1em} $\text{Loss}_{\text{MDE}}$ = $\frac{1}{|V_j|} \sum_{j=1}^{|V_j|}{ -\ln \mathbf{p_{\text{MDE}}}^{(j)}}$ 
+
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Efficient implementation} To compute the MDE generalization estimate for each candidate mixture, we do not need to run neural network inference for every $\lambda$. Instead, we can pre-compute and cache the per-token next-token probabilities for all tokens $x_j, j=1,\ldots, |V_j|$ in  datasets $V_j$, according to each of the experts $\theta^{*}_i$. The probability of token $x_j$ according to expert $\theta^{*}_i$ is $P(x_j|x_1,\ldots,x_{j-1},\theta^{*}_i)$.  We can then compute the MDE estimates for each $\lambda$  on CPU, while performing only $O(k)$ operations over each token to compute a weighted sum and logarithm of the per-token probabilities. Algorithm~\ref{alg:mde} shows pseudo-code. Since validation sets are usually much smaller than training sets and we don't require neural network inference, the cost is negligible in practice.
+
+
+
+\subsection{Regression models}
+
+
+The MDE approximation provides one estimate of the generalization losses for each mixture. We additionally build on prior work that learns estimates through regression models, based on observations of mixture weights and corresponding losses. To create training examples for the regression models, we sample mixtures $\lambda_n$, train corresponding proxy models $\theta_n$, and obtain loss measurements for each of the validation domains through LM inference. Appendix ~\ref{sec:generating_training_mixture_examples} details how mixtures were sampled.
+
+For fixed model/data scale, prior work considers only the mixture rates $\lambda$ as input features for such regressors. Here, we study the value of the MDE approximation as additional source of features. We consider linear models, gradient boosting, and multi-task Gaussian process~\citep[MTGP;][]{mtgp}. For an arbitrary mixture, we predict validation losses by first computing the MDE per-domain loss approximations and then inputting them to the regression model to get the prediction $\hat{L}_j(\lambda)$ for the validation loss on domain $V_j$ corresponding to data mixture $\lambda$:
+
+
+\vspace{-10pt}
+\begin{align*}
+L_\mathbf{MDE}^j &= L(P_{\mathbf{MDE}}(\lambda),V_j), \forall j \in {1,\ldots,m} \\
+\hat{L}_j(\lambda) &= \text{M}_j(\tikzmarknode{lambda-features}{\lambda}; \underbrace{L_\mathbf{MDE}^1,\ldots,L_\mathbf{MDE}^m}_{\text{\scriptsize features introduced by this work}}), 
+\end{align*}
+\begin{tikzpicture}[remember picture, overlay]
+\draw[<-] ([xshift=-5pt,yshift=-8pt] lambda-features.south) -- node[xshift=-35pt, yshift=-2pt,below=0pt, align=left, black]{{\scriptsize features used in prior work}}([yshift=-3pt] lambda-features.south);
+\end{tikzpicture}
+
+%
+\vspace{-3pt}
+where $M_j$ denotes some regression model. Note that MDE features approximating the loss on other domains $V_{j'}$ are also used when predicting the loss on domain $V_j$. 
+
+
+In the experiments section, we evaluate the contribution of MDE features to multiple regressors, including ones proposed in prior work. 
+
+\paragraph{Finding optimal mixtures}
+
+To find the optimal mixture we first define the objective function $s(\lambda)$ to optimize. For given $\lambda$, the value $s(\lambda)$ is computed through aggregating loss predictions on each of the validation domains $V_j$.  We experiment with the average validation loss of pretraining domains as in \citet{DOGE} and other variants that use end task validation domains. We use the Vizier framework \cite{vizier} to perform the optimization. We define the search space as $k$ non-negative parameters corresponding to the mixture component weights and later normalize them to a valid probability distribution. The framework is general and does not require differentiability of the objective.
+
+
+
+\subsection{Theoretical justification of MDE}
+\label{sec:theory}
+
+Let us assume that each example in the pre-training dataset
+contains a prefix $x$ followed by a next token $y$. Thus, each component in pre-training data mixture can be described in terms of a distribution $D_{i,x}$ over the prefixes and $D_{i,y}$ over the following token.% For simplicity, we assume for now that the prefix 
+
+We now give our main theoretical result relating the minimizer of $L(p, \lambda)$ with the MDE approximation.
+
+\begin{proposition}
+    For any $\lambda$ in the $k-1$-simplex, let $p^\star_\lambda = \arg\min_{p\in\cP} L(p, \lambda)$ be the minimizer of the $\lambda$-weighted loss over all probability distributions. Then we have for any $(x,y)$: 
+    \begin{equation*}
+        p^\star_\lambda(y|x) = \sum_{i=1}^k \lambda_i^{'}(x) p^\star_i(y|x),
+    \end{equation*}
+    where we use the shorthand $p^\star_i$ for the minimizer of $L(p, D_i)$, the expected loss on domain $i$. The coefficients $\lambda_i'$ satisfy: $\lambda_i^{'}(x) \propto D_i(x)\lambda_i$.
+    In particular, we have $\lambda^{'}_i \propto \lambda_i p_i$, whenever $D_i(x) \equiv p_i$ for any $x$ such that $D_i(x) > 0$, for each domain $i$. 
+    \label{prop:mde}
+\end{proposition}
+
+
+We prove the proposition in Appendix~\ref{sec:proof}. In words, the result says that the distribution which minimizes the pre-training loss for the $\lambda$-weighted mixture can be expressed as a weighted combination of the data experts trained on the individual domains. In the simplest case where the domains only differ in the conditional distributions $D_i(y|x)$ and $D_i(x) = D_j(x)$ for all $i, j$, these coefficients are further equal to $\lambda_i$, since $p_i = p_j$ for all $i j$ in this case. This matches our MDE approximation in the most ideal scenario. When the $p_i$ are not all identical, but $D_i(x)$ is still uniform over its support, then the optimal mixture coefficients $\lambda'$ are still independent of $x$, and hence can potentially be captured by the regression methods we use in this work. In the most general setting, the coefficients in this linear combination have an $x$ dependent relationship with respect to $\lambda$. This suggests that using more flexible approximations that induce the mixture weights as a function of the token prefix might yield even better estimates of validation loss. We do not pursue these approaches here due to the relative simplicity and efficiency of the MDE approximation.
+

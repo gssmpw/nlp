@@ -1,0 +1,274 @@
+\section{Model}
+
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=\textwidth]{figure/model_architecture.png}
+    \caption{Architecture overview of Step-Video-T2V. Videos are represented by a high-compression Video-VAE, achieving 16x16 spatial and 8x temporal compression ratios. User prompts are encoded using two bilingual pre-trained text encoders to handle both English and Chinese. A DiT with 3D full attention is trained using Flow Matching and is employed to denoise input noise into latent frames, with text embeddings and timesteps serving as conditioning factors. To further enhance the visual quality of the generated videos, a video-based DPO approach is applied, which effectively reduces artifacts and ensures smoother, more realistic video outputs.}
+    \label{fig:overview}
+    %\vspace{-6mm}
+\end{figure*}
+
+
+The overall architecture of Step-Video-T2V is given in Figure~\ref{fig:overview}. Videos are represented by a high-compression Video-VAE, achieving 16x16 spatial and 8x temporal compression ratios. User prompts are encoded using two bilingual pre-trained text encoders to handle both English and Chinese. A DiT with 3D full attention is trained using Flow Matching \citep{lipman2023flowmatchinggenerativemodeling} and is employed to denoise input noise into latent frames, with text embeddings and timesteps serving as conditioning factors. To further enhance the visual quality of the generated videos, a video-based DPO approach is applied, which effectively reduces artifacts and ensures smoother, more realistic video outputs.
+
+Next, we will introduce the implementation details of Video-VAE, bilingual text encoders, DiT with 3D full attention, and Video-DPO, respectively.
+
+
+
+\subsection{Video-VAE}
+% \subsubsection{Limitations of }
+\subsubsection{Latent Space Compression in Video Generation}
+
+
+
+State-of-the-art video models, such as HunyuanVideo \citep{kong2024hunyuanvideo}, CogVideoX \citep{yang2024cogvideox}, and Meta Movie Gen \citep{polyak2024moviegencastmedia}, leverage Variational Autoencoders (VAEs) with spatial-temporal downscaling factors of $4{\times}8{\times}8$ or $8{\times}8{\times}8$. These VAEs map 3-channel RGB inputs to 16-channel latent representations, achieving compression ratios as high as 1:96. To further reduce the number of tokens, these systems typically employ patchifiers that group $2{\times}2{\times}1$ latent patches into individual tokens. 
+
+While this two-stage process of compression and tokenization is effective, it introduces architectural complexity and can potentially degrade the performance of the subsequent diffusion stages. The efficiency of text-to-video diffusion-transformer models is fundamentally dependent on their ability to operate within compressed latent spaces. Given that computational costs scale quadratically with the number of tokens due to attention operations, it is crucial to mitigate spatial-temporal redundancy through effective compression. This not only accelerates training and inference but also aligns with the diffusion process's inherent preference for condensed representations.
+
+\subsubsection{Advancing Compression through New Architecture}
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=0.7\textwidth, clip, trim=0.0cm 2.5cm 7.6cm 2.6cm,]{figure/vae.pdf}
+    \caption{Architecture overview of Video-VAE.}
+    \label{fig:vae}
+    %\vspace{-6mm}
+\end{figure*}
+
+Our Video-VAE introduces a novel dual-path architecture at the later stage of the encoder and the early stage of the decoder, featuring unified spatial-temporal compression. This design achieves $8{\times}16{\times}16$ downscaling through the synergistic use of 3D convolutions and optimized pixel unshuffling operations.
+For an input video tensor $\mathbf{X} \in \mathbb{R}^{B \times C \times T \times H \times W}$, the encoder $E$ produces latent representation $\mathbf{Z} = E(\mathbf{X}) \in \mathbb{R}^{B \times C_z \times \lceil T/8 \rceil \times \lceil H/16 \rceil \times \lceil W/16 \rceil}$ through:
+
+\paragraph{Causal 3D Convolutional Modules}
+The early stage of the encoder consists of three stages, each featuring two Causal Res3DBlock and corresponding downsample layers. Following this, a MidBlock combines convolutional layers with attention mechanisms to further refine the compressed representations.
+To enable joint image and video modeling, we employ temporal causal 3D convolution.
+Our architecture implements temporal causality through:
+\begin{equation}
+    \mathcal{C}_{3D}(\mathbf{X})_t = 
+    \begin{cases} 
+        \text{Conv3D}([\mathbf{0},...,\mathbf{X}_{t}], \mathbf{\Theta}) & t=0 \\
+        \text{Conv3D}([\mathbf{X}_{t-k},...,\mathbf{X}_t], \mathbf{\Theta}) & t>0 
+    \end{cases}
+\end{equation}
+
+where $k$ is the temporal kernel size, ensuring frame $t$ only depends on previous frames.
+
+\paragraph{Dual-Path Latent Fusion} 
+\textit{The primary motivation for Dual-Path Latent Fusion is to maintain high-frequency details through convolutional processing while preserving low-frequency structure via channel averaging.} Notably, \cite{chen2025deep} identify similar mechanisms within the realm of image VAE modeling. Our approach, however, introduces a unified structure adept at handling both image and video data. This approach allows the network to use its parameters more efficiently, thereby overcoming the blurring artifacts typically associated with traditional VAEs.
+\begin{enumerate}[left=0pt]
+    \item \textbf{Conv Path}: Combines causal 3D convolutions with pixel unshuffling,
+    \begin{equation}     
+        \mathbf{H}_{\text{conv}} = \mathcal{U}^{(3)}_s\left(\mathcal{C}_{3D}(\mathbf{X})\right)
+    \end{equation}
+
+    where $\mathcal{U}^{(3)}_s: \mathbb{R}^{B \times C \times T \times H \times W} \to  \mathbb{R}^{B \times C \cdot s^3 \times \frac{T}{s_t} \times \frac{H}{s_s} \times \frac{W}{s_s}} $ with spatial stride $s_s=2$, temporal stride $s_t=2$, and $\mathcal{C}_{3D}$ denoting our causal 3D convolution.
+
+    \item \textbf{Shortcut Path}: Preserves structural semantics through grouped channel averaging,
+    \begin{equation} 
+        \mathbf{H}_{\text{avg}} = \frac{1}{s^3}\sum_{k=0}^{s^3-1}\mathcal{U}^{(3)}_s(\mathbf{X})_{[...,kC_z:(k+1)C_z]}
+    \end{equation}
+    where $\mathcal{U}^{(3)}_s$ implements 3D pixel unshuffle with spatial-temporal blocking, $C_z$ is the latent dim of next stage.
+\end{enumerate}
+
+The output of fusion combines both paths through residual summation:
+\begin{equation}  
+    \mathbf{Z} = \mathbf{H}_{\text{conv}} \oplus \mathbf{H}_{\text{avg}}
+\end{equation}
+
+
+
+
+\subsubsection{Decoder Architecture}
+
+The early stage of the decoder consists of two symmetric Dual Path architectures. In these architectures, the 3D pixel unshuffle operation $\mathcal{U}$ is replaced by 3D pixel shuffle operator $\mathcal{P}$, the grouped channel averaging path is replaced by a grouped channel repeating operation, which efficiently unfolds the compressed information into spatial-temporal dimensions.
+In ResNet backbone, we replace all groupnorm with spatial groupnorm to avoid temporal flickering between different chunks.
+
+
+
+\subsubsection{Training Details}
+
+\textit{Our VAE training process is meticulously designed in multiple stages, which is the key reason for achieving our final goal of efficient and high-quality video data modeling.}
+
+In the first stage, we train a VAE with a 4x8x8 compression ratio without employing a dual-path structure. This initial training is conducted jointly on images and videos of varying frame counts, adhering to a preset ratio. In this stage, we set a lower compress goal for model to sufficiently learn low level representations.
+
+In the second stage, we enhance the model by incorporating two dual-path modules in both the encoder and decoder, replacing the latter part after the mid-block. During this phase, we gradually unfreeze the dual-path modules, the mid-block, and the ResNet backbone, allowing for a more refined and flexible training process.
+
+Throughout the training, we utilize a combination of L1 reconstruction loss, Video-LPIPS, and KL-divergence constrain to guide the model. Once these losses have converged, we introduce GAN loss to further refine the model's performance. This staged approach ensures a robust and high-quality VAE capable of handling complex video data efficiently.
+
+
+
+
+\subsection{Bilingual Text Encoder}\label{textencoder}
+The text encoder plays a crucial role in text-to-video generation by guiding the model in the latent space. In Step-Video-T2V, we use two bilingual text encoders to process user text prompts: Hunyuan-CLIP and Step-LLM.
+
+Hunyuan-CLIP is the bidirectional text encoder of an open-source bilingual CLIP model \cite{li2024hunyuanditpowerfulmultiresolutiondiffusion}. Due to the training mechanism of the CLIP model, Hunyuan-CLIP can produce text representations well-aligned with the visual space. However, because its maximum input length is limited to 77 tokens, Hunyuan-CLIP faces challenges when processing longer user prompts.
+
+Step-LLM, on the other hand, is an in-house, unidirectional bilingual text encoder pre-trained using the next-token prediction task. It incorporates a redesigned Alibi-Positional Embedding \cite{press2022trainshorttestlong} to improve both efficiency and accuracy in sequence processing. Unlike Hunyuan-CLIP, Step-LLM has no input length restriction, making it particularly effective for handling lengthy and complex text sequences.
+
+By combining these two text encoders, Step-Video-T2V is able to handle user prompts of varying lengths, generating robust text representations that effectively guide the model in the latent space.
+
+\subsection{DiT w/ 3D Full Attention}
+
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=\textwidth]{figure/dit-arch.png}
+    \caption{The model architecture of our bilingual text encoder  and DiT with 3D Attention.}
+\end{figure}
+
+
+\begin{table}[ht]
+\centering
+\resizebox{\textwidth}{!}{
+\begin{tabular}{c|c|c|c|c|c|c}
+\hline
+Layers& Attention Heads  & Head Dim & FFN Dim & Cross-Attn Dim & Activation Function & Normalization \\
+\hline
+\hline
+48 & 48 & 128 & 24,576 & (6,144, 1,024) & GELU-approx & RMSNorm \\
+\hline
+\end{tabular}
+}
+\caption{Hyper-parameters used in Step-Video-T2V.}
+\label{hyper}
+\end{table}
+
+Step-Video-T2V is built on the DiT \cite{peebles2023scalablediffusionmodelstransformers} architecture, which consists of 30B parameters and contains 48 layers. Each layer contains 48 attention heads, with each head’s dimension set to 128. The setting of hyper-parameters used in Step-Video-T2V is outlined in Table~\ref{hyper}.
+
+\textit{3D Full-Attention}: We employ the 3D full-attention in Step-Video-T2V instead of the spatial-temporal attention, which is more computationally efficient. This choice is driven by its theoretical upper bound for modeling both spatial and temporal information in videos, as well as its superiority in generating videos with smooth and consistent motion observed from large-scale experiments.
+
+\textit{Cross-Attention for Text Prompt}: We introduce a cross-attention layer between the self-attention and feed-forward network (FFN) in each transformer block to incorporate text prompts. This layer enables the model to attend to textual information while processing visual features. The prompt is embedded using two distinct bilingual text encoders, Hunyuan-CLIP and Step-LLM, as described in \S\ref{textencoder}. The outputs from these two encoders are concatenated along the sequence dimension, creating the final text embedding sequence. This combined embedding is then injected into the cross-attention layer, allowing the model to generate videos conditioned on the input prompt.
+
+\textit{Adaptive Layer Normalization (AdaLN) with Optimized Computation}: In standard DiT, each block includes an adaptive layer normalization (AdaLN) operation to embed timestep and class label information. Since the text-to-video task does not require class labels, we remove class labels from AdaLN. Furthermore, we follow \cite{chen2023pixartalphafasttrainingdiffusion} and adopt the AdaLN-Single structure to reduce the computational overhead of traditional AdaLN operations and improve overall model efficiency. In the first layer of the model, AdaLN uses an MLP block to embed timestep information. In subsequent layers, a learnable parameter is initialized to summarize the timestep embeddings, which are then used as parameters for the adaptive normalization in each block.
+
+\textit{RoPE-3D:}
+We use RoPE-3D, an extension of the traditional Rotation-based Positional Encoding (RoPE) \cite{su2023roformerenhancedtransformerrotary}, specifically designed to handle video data by accounting for temporal (frame) and spatial (height and width) dimensions. The original RoPE-1D applies a rotational transformation to positional encodings to enable flexible and continuous representation of positions in sequences of varying lengths. The rotational transformation is applied by rotating the positional encoding $\mathbf{E}_i$ at position $i$ by an angle $\theta_i = \frac{2\pi i}{\tau}$, where $\tau$ is a period controlling the rotation rate, and the resulting encoding $\mathbf{P}_i = \text{Rot}(\mathbf{E}_i, \theta_i)$ is obtained. To extend this to video data, we introduce RoPE-3D. This method splits the query and key tensors along the channel dimension, applying RoPE-1D independently to each tensor for the temporal (frame) and spatial (height and width) dimensions. The resulting encodings are then concatenated. This approach enables the model to handle video inputs with varying lengths and resolutions effectively. RoPE-3D offers several advantages, such as the ability to process videos with different frame counts and resolutions without being restricted by fixed positional encoding lengths. It improves generalization across diverse video data and effectively captures both spatial and temporal relationships within the video. By providing a continuous and flexible encoding for three-dimensional video data, RoPE-3D enhances the model’s capacity to process and generate high-quality video content.
+
+
+\textit{QK-Norm:}
+We use Query-Key Normalization (QK-Norm) to stabilize the self-attention mechanism. QK-Norm normalizes the dot product between the query (Q) and key (K) vectors, addressing numerical instability caused by large dot products that can lead to vanishing gradients or overly concentrated attention. This normalization ensures stable attention during training, accelerates convergence, and improves efficiency, allowing the model to focus on learning meaningful patterns. Additionally, QK-Norm helps maintain a balanced distribution of attention weights, enhancing the model's ability to capture relationships within the input sequence.
+
+
+\subsubsection{Training Objective for Video and Image Generation}
+We use Flow Matching in the training of Step-Video-T2V. At each training step, we begin by sampling a Gaussian noise, $X_0 \sim \mathcal{N}(0,1)$, and a random timestep $t \in [0,1]$. We then construct the model input $X_t$ as a linear interpolation between $X_0$ and $X_1$, where $X_1$ is the target sample corresponding to the noise-free input. Specifically, we define $X_t$ as:
+$X_t = (1 - t) \cdot X_0 + t \cdot X_1$. The ground truth velocity $V_t$, which represents the rate of change of $X_t$ with respect to the timestep $t$, is defined as:
+\begin{equation}
+    V_t = \frac{dX_t}{dt} = X_1 - X_0 .
+\end{equation}
+In other words, $V_t$ captures the direction and magnitude of change from the initial noise $X_0$ to the target data $X_1$.
+The model is then trained by minimizing the mean squared error (MSE) loss between the predicted velocity $u(X_t, y, t; \theta)$ and the true velocity $V_t$. Here, $u(X_t, y, t; \theta)$ denotes the model's predicted velocity at timestep $t$, given input $X_t$ and an optional conditioning input $y$ (e.g., a bilingual sentence). The training loss is given by:
+\begin{equation}
+    \text{loss} = \mathbb{E}_{t, X_0, X_1, y} \left[ \| u(X_t, y, t; \theta) - V_t \|^2 \right],
+\end{equation}
+where the expectation is taken over all training samples, with $t$ being the random timestep, and $X_0$, $X_1$, and $y$ drawn from the dataset. The term $\theta$ represents model parameters.
+This approach ensures that the model learns to predict the instantaneous rate of change of the noisy sample $X_t$ with respect to $t$, which can later be used to reverse the diffusion process and recover data samples from noise.
+
+\subsubsection{Inference}
+During inference, we begin by sampling random noise $X_0 \sim \mathcal{N}(0, 1)$. The goal is to recover the denoised sample $X_1$ by iteratively refining the noise through an ODE-based method. For simplicity, we adopt a Gaussian solver and define a sequence of timesteps $\{ t_0, t_1, \dots, t_n \}$, where $t_0 = 0$, $t_n = 1$, and $t_0 < t_1 < \dots < t_n$. The denoising process is then carried out by integrating over these timesteps. Specifically, the denoised sample $X_1$ can be expressed as:
+\begin{equation}
+    X_1 = \sum_{i=0}^{n-1} u(X_{t_i}, y, t_i; \theta) \cdot (t_{i+1} - t_i),
+\end{equation}
+where $u(X_{t_i}, y, t_i; \theta)$ represents the predicted velocity at timestep $t_i$, given the noisy sample $X_{t_i}$ and an optional conditioning input $y$. The integral is computed over the timesteps from $t_0$ to $t_n$, with each term $u(X_{t_i}, y, t_i; \theta)$ multiplied by the corresponding timestep difference $(t_{i+1} - t_i)$.
+This iterative process allows the model to gradually denoise the input sample, starting from the noise $X_0$ and progressing toward the target sample $X_1$ over the defined timesteps.
+
+
+
+
+
+\subsection{Video-DPO}
+\label{dpo}  
+
+%Through extensive pretraining on large-scale data and SFT, we have developed a competitive video generation model (referred to as the model or policy hereafter). To further enhance its visual quality, we incorporate human feedback into the training process.
+
+%\subsubsection{Incorporating Human Feedback}
+The integration of human feedback has been widely validated in the domain of LLMs, particularly through methods such as Reinforcement Learning with Human Feedback (RLHF) ~\cite{ouyang2022training,christiano2017deep}, where models adjust their generated content based on human feedback. Recently, this practice has also been applied in image and video generation, yielding significant advancements. To improve the visual quality of Step-Video-T2V, we design a pipeline to introduce human feedback. 
+The overall pipeline is shown in Figure~\ref{fig:dpopipe}, and details are discussed in the following.
+
+% \subsubsection{Algorithm}
+
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=\textwidth]{figure/dpo/DPOpipeline.pdf}
+    \caption{Overall pipeline of incorporating human feedback. }
+    \label{fig:dpopipe}
+    %\vspace{-6mm}
+\end{figure*}
+
+
+In Step-Video-T2V, we select Direct Preference Optimization (DPO)~\cite{rafailov2024direct} as the method for incorporating human feedback. It has been proven effective across a variety of generation tasks \cite{wallace2024diffusion, yang2024using}, and the essence of the method is simple, making it both intuitive and easy to implement. Intuitively, given human preference data and non-preference data under the same conditions, the goal is to adjust the current policy (i.e., the model) to be more aligned with the generation of preferred data, while avoiding the generation of non-preferred data. To stabilize training, the reference policy (i.e., the reference model) is introduced to prevent the current policy from deviating too far from the reference policy. The policy objectvie can be formulated as:
+\begin{equation}\label{eq:dpo_loss}
+\mathcal{L}_{\text{DPO}} = -\mathbb{E}_{(y, x_w, x_l) \sim \mathcal{D}} \left[ 
+\log \sigma \left( 
+\beta \left( 
+\log \frac{\pi_\theta(x_w|y)}{\pi_{\text{ref}}(x_w|y)} 
+- \log \frac{\pi_\theta(x_l|y)}{\pi_{\text{ref}}(x_l|y)}
+\right)
+\right)
+\right]
+\end{equation}
+where $\pi_\theta$ and $\pi_{ref}$ refers to current policy and reference policy, respectively, $x_w$ and $x_l$ are the preferred sample and non-preferred sample, and $y$ denotes the condition. 
+
+To collect these samples ($x_w$, $x_l$ given $y$) for training, we construct a diverse prompt set. First, we randomly select a subset of prompts from the training data to ensure prompt diversity. Second, we invite human annotators to synthesize prompts based on a carefully designed guideline that mirrors real-world user interaction patterns. And then, for each prompt, Step-Video-T2V generates multiple videos using different seeds. Human annotators rate the preference of these samples. The annotation process is monitored by quality control personnel to ensure accuracy and consistency. This process results in a set of preference and non-preference data, which serves as the foundation for model training. Two labeled examples are shown in Figure~\ref{fig:dpodata}. 
+
+At each training step, we select a prompt and its corresponding positive and negative sample pairs described above. Each sample is generated by the model itself, ensuring smooth updates and improving overall training stability. In addition, to maintain consistency in the training data, we align the positive and negative samples by fixing the initial noise and timestep, which contributes to a more stable training process. 
+Our training objective in Eqn.~\ref{eq:dpo_loss} is based on the DiffusionDPO method~\cite{wallace2024diffusion} and DPO~\cite{rafailov2024direct} but with slight modifications, extending it to the Flow Matching framework. By denoting the policy-related terms in Eqn.~\ref{eq:dpo_loss} as inside term $z$, it can be derived that:
+\begin{equation}\label{eq:dpo_beta}
+\frac{\partial \mathcal{L}_{\text{DPO}}}{\partial \theta} \propto -\beta (1 - \sigma(\beta z)) \cdot \frac{\partial z}{\partial \theta},
+\end{equation}
+which indicates large $\beta$ (\eg 5,000 in DiffusionDPO) may cause gradient explode when $z < 0$, as it amplifies gradients by $\beta$ times. As a result, gradient clipping and an extreme low learning rate (\eg 1e-8 in DiffusionDPO) are required to ensure stable training, leading to slow convergence.To address this, we reduce $\beta$ and increase the learning rate, results much faster convergence. 
+
+
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=1.3\textwidth, center, trim=0 0 0 0, clip]{figure/dpo/DPOData.pdf}
+    \caption{We generate different samples with same prompt ("A ballet dancer practicing in the dance studio" in this case), and annotate these samples as non-preferred (a) or preferred (b). }
+    \label{fig:dpodata}
+    %\vspace{-6mm}
+\end{figure*}
+
+
+Human feedback effectively improves visual quality. However, we observe that the improvements saturate when the model can easily distinguish between positive and negative samples. This phenomenon may stem from the following reason: the training data used in Video-DPO is generated by earlier versions of the model. After multiple iterations of DPO, the current policy has evolved significantly (e.g., distortions are now rare) and no longer aligns with the policies from previous iterations. Consequently, updating the current policy with outdated data from earlier iterations leads to inefficient data utilization.
+To address this, we propose training a reward model using human-annotated feedback data. This reward model dynamically evaluates the quality of newly generated samples during training. The reward model is periodically fine-tuned with newly annotated human feedback to maintain alignment with the evolving policy. By integrating it into the pipeline, we score and rank training data on-the-fly (on-policy), thereby improving data efficiency.
+
+
+
+
+
+
+
+
+\section{Distillation for Step-Video-T2V Turbo}
+Diffusion models for video generation typically require substantial computational resources during inference, often necessitating more than 50 steps of ODE integration to produce a video. Reducing the number of function evaluations (NFE) is crucial for improving inference efficiency. We demonstrate that a large-scale trained Video DiT can reduce NFE to as few as 8 steps with negligible performance degradation. This is achieved through self-distillation with a rectified flows objective and a specifically designed inference strategy.
+
+Our base model is trained using rectified flow, and the distillation objective aims to train a 2-rectified-flow model~\citep{Liu2022FlowSA}, which facilitates more direct ODE paths during inference. As discussed by~\cite{lee2024improving}, the loss function for the 2-rectified flow can be formulated as follows:
+\begin{equation}
+\mathcal{L}(\theta, t) := \frac{1}{t^2} \mathbb{E}[\|v - u_\theta(x_t, t)\|_2^2] = \frac{1}{t^2} \mathbb{E}[\|x - \mathbb{E}[x|x_t]\|_2^2] + \tilde{\mathcal{L}}(\theta, t). 
+\end{equation}
+Since all training samples are generated by the base 1-rectified model, the irreducible loss (first term) is relatively small. The reducible error (second term) can be efficiently optimized by assigning more weight to timesteps that are more challenging. Specifically, the training loss of 2-rectified flow is large at each end of the interval \( t \in [0, 1] \) and small in the middle.
+
+We sampled approximately 95,000 data samples using a curated distribution of SFT data prompts with 50 NFE and carefully designed positive and negative prompts to formulate a distillation dataset. We modified the timestep sampling strategy to a U-shaped distribution, specifically \( p_t(u) \propto \exp(a u) + \exp(-a u) \) on \( u \in [0, 1] \), with a larger \( a = 5 \) as the time shift required by the video model is higher.
+
+During inference, we observed that as the training progresses, the model requires more significant sampling time shifts and a lower classifier-free guidance (CFG) scale. By combining this with a linear diminishing CFG schedule as described in Eqn.~\ref{eq:cfg}, our model can achieve comparable sample quality with up to 10 times fewer steps. Figure~\ref{fig:distillation_result}, shows generated samples with 204 frames from our turbo model with 10 NFE.
+
+\begin{equation}
+\text{cfg}_t = \max(\text{cfg}_{\max} - 9t (\text{cfg}_{\max} - 1), 1) \quad \text{for} \quad 0 \leq t \leq 1
+\label{eq:cfg}
+\end{equation}
+
+\begin{figure}[ht]
+    \centering
+    % \begin{adjustbox}{width=1.3\textwidth,center}
+    % \includegraphics[width=1.3\textwidth, center, trim=0 0 0 0, clip]{figure/distill_results/00000012_展示厨师用大火炒菜的_a32f2105_all.png}
+    % \includegraphics[width=1.3\textwidth, center, trim=0 0 0 0, clip]{figure/distill_results/00000039_在非洲的草原上一只大_e549bae9_all.png}
+    % \includegraphics[width=1.3\textwidth, center, trim=0 0 0 0, clip]{figure/distill_results/00000061_一个时装秀舞台模特身_02eba5da_all.png}
+    % \includegraphics[width=1.3\textwidth, center, trim=0 0 0 0, clip]{figure/distill_results/00000131_一位跑步者在跑道上快_acbc29b3_all.png}
+    % \includegraphics[width=1.3\textwidth, center, trim=0 0 0 0, clip]{figure/distill_results/00000069_自动化农业机器在农田_a7f55b25_all.png}
+    % \includegraphics[width=1.3\textwidth, center, trim=0 0 0 0, clip]{figure/distill_results/00000116_一辆经典的年代轿车行_5d1af8d2_all.png}
+    \includegraphics[width=1.3\textwidth, center, trim=0 0 0 0, clip]{figure/distill_results/00000012_a32f2105_all.jpg}
+    \includegraphics[width=1.3\textwidth, center, trim=0 0 0 0, clip]{figure/distill_results/00000039_e549bae9_all.jpg}
+    \includegraphics[width=1.3\textwidth, center, trim=0 0 0 0, clip]{figure/distill_results/00000061_02eba5da_all.jpg}
+    \includegraphics[width=1.3\textwidth, center, trim=0 0 0 0, clip]{figure/distill_results/00000131_acbc29b3_all.jpg}
+    \includegraphics[width=1.3\textwidth, center, trim=0 0 0 0, clip]{figure/distill_results/00000069_a7f55b25_all.jpg}
+    \includegraphics[width=1.3\textwidth, center, trim=0 0 0 0, clip]{figure/distill_results/00000116_5d1af8d2_all.jpg}
+    % \end{adjustbox}
+    \caption{Generated samples with Step-Video-T2V Turbo with 10 NFE.}
+    \label{fig:distillation_result}
+\end{figure}

@@ -1,0 +1,140 @@
+\section{\mixtera's Design}\label{sec:design}
+
+We propose to address these challenges for training data management by building \mixtera, a foundation model training data plane.
+We derive the following design goals for such a system.
+
+\textbf{\underline{Goal G1:}} The system should implement a \emph{centralized} data layer that users can conveniently and declaratively query to mix data across arbitrary properties, independent of the filesystem structure.
+
+\textbf{\underline{Goal G2:}} The system needs to be \emph{lightweight}, i.e., not require many components to set up and be easily integratable into existing training setups.
+
+\textbf{\underline{Goal G3:}} While being user-friendly and flexible, the system needs to ensure \emph{high-throughput} and \emph{determinism} (reproducibility).
+
+\textbf{\underline{Goal G4:}} The system must support \emph{adjusting the mixture dynamically} during the training.
+
+
+\subsection{System Overview and Design}
+
+
+\begin{figure}
+    \centering
+    \begin{adjustbox}{trim=0cm 1cm 0cm 0cm}
+                \includegraphics[width=\linewidth]{img/mixtera_sys.pdf}
+    \end{adjustbox}
+    \caption{\mixtera{} system architecture.} 
+    \label{fig:mixtera-system}
+    \vspace{-0.5cm}
+    \Description{TODO!}
+\end{figure}
+
+
+
+
+
+Inspired by the Lakehouse architecture~\cite{Armbrust2021Lakehouse}, we design \mixtera{} as a read-only layer that can be deployed on top of existing training data collections, which are typically stored in a distributed filesystem.
+\Cref{fig:mixtera-system} shows the architecture of the system.
+\mixtera{} manages a centralized database of metadata (i.e., properties such as language or source dataset) of all training data samples (G1).
+A sample can be a piece of text (for LLM training) or a text-image pair (for VLM training).
+\mixtera{} assigns every sample a unique ID and properties instead of treating the training data as a blob of homogeneous, contiguous data. 
+It allows users to declaratively query the relevant samples for a training.
+To be lightweight (G2), \mixtera{} does not reorganize or modify the data files on disk. 
+For model training, it provides a standard iterator that can be used, e.g., in conjunction with a \texttt{torch.DataLoader}. 
+\mixtera{} is agnostic to the model training framework, supports training interruptions using checkpoints, and ensures determinism (G3) through careful shuffling, i.e., for identical queries, \mixtera{} always provides data in an identical order, which is important for reproducibility as well as for debugging issues like loss spikes~\cite{Zhuang2022Randomness,Cooper2022Determinism,Qian2021Seeds,Karamcheti2021Mistral,TensorflowDeterminism}.
+It supports adjusting the mixture during training (G4) by transferring chunks (lists of pointers to samples) whose mixture can change over time.
+
+\begin{figure}
+\begin{minted}
+[
+frame=lines,
+framesep=2mm,
+baselinestretch=0.8,
+bgcolor=LightGray,
+fontsize=\footnotesize,
+linenos
+]
+{python}
+client = MixteraClient("127.0.0.1", 8080)
+job_id = "test_job"
+query = Query.for_job(job_id).select(("license","==","CC"))
+mixture = StaticMixture(
+    { MixtureKey({"language": ["JavaScript"]}): 0.7,
+     MixtureKey({"language": ["HTML"]}): 0.3 },
+    chunk_size=1024)
+qea = QueryExecutionArgs(mixture=mixture, num_workers=4,
+                         dp_groups=1, nodes_per_group=1)
+rsa = ResultStreamingArgs(node_id=0, dp_group_id=0, job_id=job_id)
+ds = MixteraTorchDataset(client, query, rea, rsa)
+dl = torch.utils.data.DataLoader(ds, batch_size=1024, num_workers=4)
+
+for batch in dl:
+    print(batch)
+\end{minted}
+\vspace{-0.4cm}
+\caption{An example query using \mixtera.}
+\Description{TODO!}
+\label{listing:mixtera-query}
+\vspace{-0.55cm}
+\end{figure}
+
+\textbf{Query interface.} In~\Cref{listing:mixtera-query}, we show an example of a query that statically selects only Creative Commons data, and then mixes HTML and JavaScript data in a 70:30 ratio during training.
+\mixtera's implementation takes care of executing the query and obtaining the samples without needing to worry about correctness, even in distributed training.
+The user only needs to provide the ID of the node and its data parallel group, which is obtained from the training framework.
+\mixtera{} currently allows to express static filter operations on properties, and static as well as dynamic mixtures across all properties (G4).
+For more details on supported mixture types, we refer to~\Cref{subsubsec:impl-chunkgen}.
+
+
+\textbf{Dataflow.} \mixtera{} follows a server-client model.
+As shown in~\Cref{fig:mixtera-system}, the server runs on a node and each training node runs client instances.
+Users first register samples at the server to populate the metadata database.
+They then can submit queries.
+A query is executed at the server in two phases.
+First, \mixtera{} applies static filters from the query (e.g., English-only) to obtain all samples eligible for training.
+Second, during training, the server distributes \emph{chunks} of that query result to the client(s), which specify which samples to train on.
+The server ensures that the chunks are distributed correctly, i.e., tensor- and pipeline parallel stages receive the same input data.
+The server generates chunks according to the current mixture, i.e., it iteratively takes samples from the query result generated in the first phase of query execution, such that data in the chunk follow the current mixture.
+As an iterable data loader, \mixtera{} faces the challenges of determinism and checkpointing.
+We address this by shuffling based on the query and support to load/store the query state.
+
+\textbf{Chunks.} \mixtera{} does not store the sample payloads, but rather only the metadata of each sample.
+During training, the nodes receive \emph{chunks}.
+A chunk is a fixed-size collection of pointers to samples in files.
+They tell the  client which samples which file to load and train on (e.g., sample 10 in file \texttt{wikipedia.jsonl.zst}).
+The files can be local, in a distributed filesystem, or cloud storage.
+
+Storing and distributing pointers to samples instead has several advantages.
+First, users can store data in their locations of choice (e.g., an object store, or an distributed filesystem).
+Chunks are independent of the filesystem structure (G1).
+Second, it allows \mixtera{} to support dynamic mixtures (G4), as the data composition of chunks can change over time.
+Third, the pointer-model avoids creating a data fetching bottleneck at the \mixtera{} server.
+The server only creates chunks and each client fetches the data they need.
+Fourth, we avoid a lock-in effect on \mixtera{} and allow for easy adoption on existing data collections (G2).
+Last, we natively support other modalities like images, which would not be straightforward to ingest at scale into a database. 
+
+\textbf{Mixtures.} Users can use any subset of sample properties to define a mixture.
+Users can even change the properties that they mix on during training with dynamic mixture schedules.
+To handle this, \mixtera{} implements a \texttt{MixtureKey} abstraction that allows users to describe which samples they want to use.
+The keys also implement flexible property matching to define which samples to use during chunk generation (\Cref{subsubsec:impl-chunkgen}).
+
+
+
+
+
+
+
+\textbf{High-throughput data fetching.} The challenge of using chunks is that we need to handle suboptimal data layout.
+Files may have arbitrary property distributions, or might follow a partial structure (e.g., a file only contains Wikipedia data, but the languages are distributed randomly).
+We cannot re-organize data within the existing files.
+Formats like \texttt{jsonl} were not built with random access in mind, but chunks force clients to load individual samples from files.
+To avoid data stalls (G3), we implement chunk generation to use subsequent sample ranges in files if the samples have the same properties and engineer \mixtera's  implementation to fetch those ranges as efficiently as possible (\Cref{subsec:design-clientside}).
+
+
+\textbf{Open source.} 
+\mixtera{} comes as a Python package that provides the entrypoint for the server and abstractions for the client.
+Its codebase, consisting of approximately 11\,k lines of Python and C++ (excluding tests), is open-source\footnote{Available at \url{https://github.com/eth-easl/mixtera}.}.
+It is rigorously tested with a full set of unit and integration tests. 
+We are continuously working on enhancing the system and welcome contributions.
+
+
+
+
+
+

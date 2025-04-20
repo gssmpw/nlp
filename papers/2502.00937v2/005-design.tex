@@ -1,0 +1,130 @@
+\section{\sysname{} Design and Implementation}
+Based on our insights from the characterization study of open-source \lmm{} benchmarks and production \lmm{} workloads, we propose \sysname, a novel decoupled architecture for scalable and resource-efficient \lmm{} serving.
+
+The key idea in \sysname{} is to separate image- and text-specific inference stages into distinct instances, given the need to optimize each stage separately (\Cref{insight:1,insight:3}) and enable seamless interaction between stages.
+Unlike monolithic infrastructures, \sysname{} enables independent optimization of each stage, improving resource efficiency while meeting performance SLOs.
+This decoupling also enables modality-aware request serving, addressing tail latency, heterogeneous bursts, and resource contention.
+
+\myparagraph{Overview}
+\Cref{fig:overview} shows \sysname{}'s design.
+A pool of \emph{Image Instances} handles image preprocessing and encoding of image-text requests.
+The resulting image tokens are passed to a pool of \emph{Text Instances}, which performs LLM prefill and decode operations.
+Text-only requests bypass the image components and are queued directly at the \emph{Text Instances}.
+Two pools are managed by the \emph{Image and Text Pool Managers}.
+
+\sysname{} adopts a hierarchical architecture inspired by DynamoLLM~\cite{stojkovic2024dynamollm}.
+Onboarding any new \lmms{} (\eg{}, Llama3.2-11B) starts with an offline profiling phase to build model-stage profiles that capture how model configurations and load impact performance (\Cref{sec:design:profiling}).
+\sysname{} uses these profiles to guide model configuration and instance scaling.
+After model deployment, \sysname{} then reconfigures resources periodically to adapt to workload patterns, scaling for increased image-text requests (or vice versa) (\Cref{sec:design:resource-management}).
+For each request, \sysname{} selects the optimal \lmm{} Text or Image Instances for execution (\Cref{sec:design:modality-aware-serving}).
+
+\input{figs-tex/decoupling}
+
+\subsection{Offline \lmm{} Profile Generation}
+\label{sec:design:profiling}
+When onboarding a new \lmm{}, \sysname{} generates resource-performance profiles by characterizing the image encoder and LLM backend independently.
+This profiling runs controlled inference workloads with varying model parallelisms (\eg{}, TP-2 and TP-8), batch sizes, and load (\ie{}, image tokens per second for image encoders and prompt tokens per second for LLM backends) to capture per-stage performance characteristics.
+To efficiently model performance across different load conditions, \sysname{} profiles a set of representative load levels (up to the maximum throughput) and extrapolates the behavior for intermediate loads.
+The resulting profiles take load, parallelism, and batch size as inputs to predict key performance metrics, including encoding latency for \emph{Image Instances} and prefill time and TBT for \emph{Text Instances}.
+The \emph{Pool Managers} use these profiles to guide operational decisions (\Cref{sec:design:resource-management}):
+(1) pool autoscaling to meet latency SLOs without overprovisioning,
+(2) model sharding that selects optimal TP degrees, and
+(3) max batch sizing for each stage.
+
+Since multiple \lmms{} may share the same image encoder or LLM backend, \sysname{} minimizes overhead by reusing model profiles across deployments.
+These profiles are cached in cluster-local storage and synchronized via a global repository, enabling efficient sharing across clusters.
+
+
+\subsection{Decoupled Resource Management}
+\label{sec:design:resource-management}
+\sysname{}'s decoupled approach to resource management stems from our insights on stage-specific performance disparities in batching (\Cref{insight:4}), independent scaling benefits (\Cref{insight:5}), and modality-specific traffic patterns (\Cref{insight:6}).
+Specifically, \sysname{} periodically reconfigures resources (\ie{}, every five minutes to match the autoscaling overhead) to align with workload demands.
+
+The \emph{Image Pool Manager} maintains a pool of \emph{Image Instances}, which preprocess images on CPU and encode image workloads on GPU for image-text requests.
+Meanwhile, the \emph{Text Pool Manager} manages a pool of \emph{Text Instances} responsible for the prefill and decode stages of both image-text and text-only requests.
+Based on model profiles (\Cref{sec:design:profiling}), each manager independently optimizes pool autoscaling, model sharding, and max batch sizing to minimize costs while meeting performance SLOs.
+
+Before their online operation, the initial number of Image Instances ($N_i$) is determined using the median image QPS multiplied by the median image encoding latency.
+The number of Text Instances ($N_t$) is set as $N_i$ divided by the median number of images per request, based on historical \lmm{} inference traces.
+If no history is available, \sysname{} initially overprovisions resources to ensure reliability.
+
+\myparagraph{Token-Aware Pool Autoscaling}
+The \emph{Pool Managers} dynamically scale the number of \emph{Image and Text Instances} based on real-time workload demands.
+For example, a surge in image-heavy requests leads to more image preprocessors and encoders, while an increase in text requests or requests' prompt lengths triggers the \emph{Text Pool Manager} to scale LLM replicas to handle variations in prefill.
+
+The number of replicas per stage is computed as $\lceil{\frac{ML}{MC}}\rceil$
+where $ML$ is the modality-specific load (\eg{}, prompt tokens/sec for \emph{Text Instances}, image tokens/sec for \emph{Image Instances}) and $MC$ is the maximum capacity each stage can handle without violating SLOs, based on the offline \lmm{} profiling data.
+Unlike traditional web service autoscaling, which reacts to request rates, \sysname{} optimizes scaling based on token throughput (tokens/s), capturing variations in both request rates and request sizes (\Cref{insight:6} and \Cref{fig:text-len-prod}).
+
+For \emph{Image Instances}, image token counts are precomputed based on static mapping from image dimensions (\Cref{fig:img-token-distribution-open}).
+Autoscaling of \emph{Text Instances} is based on text token load in CroAttn models but total tokens in DecOnly models due to homogeneous self-attention across modalities.
+Advanced autoscaling hysteresis prevention techniques~\cite{optscaler} can be employed to avoid excessive scaling actions caused by transient workload fluctuations but are not covered in this paper.
+
+\myparagraph{Model Sharding}
+The \emph{Pool Managers} also determine instance sharding for optimal tensor parallelism (TP) for image encoders and LLM backends.
+Our characterization (\Cref{sec:characterization:open-source}) shows image encoders achieve peak throughput with lower TP than LLMs.
+Therefore, the model sharding degree for each instance is configured separately for maximum throughput while ensuring SLO attainment on TTFT and TBT.
+By decoupling the components, \sysname{} ensures independent sharding, optimizing parallelism without unnecessary synchronization overhead.
+
+When scaling beyond a single GPU server, \sysname{} prioritizes autoscaling over pipeline parallelism (PP)~\cite{shazeer2020megatron} to maximize throughput, seamlessly transitioning to batch-level optimizations as needed.
+
+\myparagraph{Identifying Max Batch Size}
+For each stage, the maximum batch size is configured to maximize throughput while meeting latency SLOs.
+Batch sizing decisions are guided by the offline model-stage profiles, which predict their impact on encoding and decoding latencies.
+\emph{Image Instances} may forgo batching as small max batch sizes often achieve optimal GPU utilization (\Cref{insight:3}).
+In contrast, \emph{Text Instances} batch requests when beneficial, optimizing token throughput during prefill/decode based on TTFT and TBT SLOs, particularly for CroAttn \lmms{} (\Cref{insight:4}).
+
+\subsection{Modality-Aware \lmm{} Request Serving}
+\label{sec:design:modality-aware-serving}
+For each incoming \lmm{} request, \sysname{} dynamically routes and schedules workloads to balance load across \emph{Image and Text Instances}.
+The \emph{Pool Managers} optimize this process to minimize queueing delays and improve TTFT latency.
+
+\myparagraph{Request Routing Across Instances}
+To mitigate tail TTFT latency surges caused by modality-specific bursts and queuing delays, \sysname{} employs a modality-aware routing strategy that balances image and text workloads independently.
+Traditional request-level LLM load balancing (\eg{}, round-robin, memory-based~\cite{sun2024llumnix}) overlooks the computational intensity of image encoding (\Cref{insight:2}), making them vulnerable to load imbalances during image bursts (\Cref{insight:6}), leading to high tail latencies.
+
+Instead, \sysname{} routes requests by input modality.
+Image-text requests are assigned to \emph{Image Instances} with the least image-token load.
+Large requests (\ie{}, those with more images) are consequently distributed across multiple \emph{Image Instances} for parallel processing and encoding (\Cref{insight:2}), preventing degraded batching performance that would occur if all images were routed to a single instance.
+This effectively enables a form of request chunking~\cite{sarathi-serve}, where images in a large request can be processed in an interleaved manner with other requests, reducing HoL blocking and improving scheduling flexibility.
+
+To route traffic between Text Instances, text-only requests and image-text requests with completed image tokens are directed to the \emph{Text Instance} with the least total pending tokens (text+image) for DecOnly models and the least total pending text tokens for CroAttn models because of the attention mechanism difference between the two model architectures (\Cref{insight:7}).
+Modality-aware routing enables parallel image encoding and dynamically adapts to image or text traffic bursts, reducing queueing delays and improving TTFT, particularly at the tail.
+
+\myparagraph{Instance Request Scheduling}
+At the instance level, \sysname{} minimizes resource contention between image-text and text-only requests with priority scheduling based on modality and prompt size.
+While decoupling isolates image and text processing, contention can still arise in \emph{Text Instances}, where both request types share prefill processing.
+This issue is particularly pronounced in DecOnly \lmms{}, which exhibits lower efficiency during the prefill stage (\Cref{fig:batch-size}).
+Performance degradation occurs from increased batching latency for all requests, while non-batched processing introduces HoL blocking and high queueing delays at tails due to request heterogeneity (\Cref{fig:prod-input}).
+
+To address these challenges, \sysname{} replaces traditional FIFO scheduling--which may exacerbate HoL blocking~\cite{patke2024queue,aiops2024qiu}--with an SLO-driven scheduling strategy that can prioritize shorter requests (\eg{}, text-only queries or small image-text requests with tight SLOs) to maintain low latency.
+
+\emph{Pool Managers} continuously monitor SLO attainment and trigger pool autoscaling when the rate falls below a predefined threshold (default 0.99 with a sensitivity study in \Cref{sec:eval:sensitivity}), ensuring adaptive resource allocation under dynamic workloads (especially in cases of unpredictable traffic).
+\sysname{} can work with state-of-the-art batch scheduling techniques~\cite{sarathi-serve,patel2024splitwise} to optimize TBT during the decode stage, which we leave to future work as we do not observe TBT degradation in \lmm{} characterization (\Cref{insight:4}).
+
+\myparagraph{Image Token Transfer}
+Once image processing is complete, \sysname{} transfers image tokens from \emph{Image Instances} to \emph{Text Instances} via a pull-based RDMA mechanism.
+Unlike a push-based approach that immediately sends image tokens upon availability, this strategy reduces synchronization overhead and optimizes load balancing.
+
+Since image-text requests may involve multiple images processed across different \emph{Image Instances}, the transfer follows a many-to-one pattern, aggregating all image tokens before text processing begins.
+This defers transfer until all tokens are ready, allowing for better scheduling decisions by routing requests to the least-loaded \emph{Text Instance}.
+Meanwhile, queuing at the \emph{Text Instance} overlaps with token transfer, effectively hiding transfer latency.
+
+\sysname{} colocates \emph{Image and Text Instances} in the same server when each \emph{Text Instance} is not taking up all GPUs on a server to avoid image transfer overhead and unallocated idle GPUs.
+For example, it may place one TP-4 Text Instance and two TP-2 Image Instances within the same 8-GPU server.
+Unlike monolithic deployments, colocated instances remain independently configurable and can serve corresponding stages of different requests independently.
+
+
+\subsection{Implementation}
+\label{sec:design:implementation}
+
+We implement \sysname{} using 5,000 lines of Python code.
+We base the \emph{Text Instance} on vLLM~\cite{vllm} (v0.7.2), a state-of-the-art generative model inference platform, and build the \emph{Image Instance} on HuggingFace Transformers~\cite{hf-transformers}.
+The modular architecture of \sysname{} enables easy integration with other serving engines (\eg{}, TensorRT~\cite{tensor-rt} and DeepSpeed~\cite{deepspeed}).
+We use \texttt{numactl} to restrict CPU and memory usage of image preprocessing to a single NUMA node, which reduces memory access latency and performance variation.
+To ensure efficient GPU-to-GPU memory transfer of image tokens, we use PyTorch's distributed communication with the NCCL backend and GPU Direct RDMA.
+The P99 transfer latency of image tokens per request is 5 ms.
+
+We implement the \emph{Image and Text Pool Managers} as lightweight gRPC servers (hosted on dedicated VMs) with low memory and compute requirements, drawing inspiration from DynamoLLM~\cite{stojkovic2024dynamollm}.
+For failure detection and recovery, the \emph{Pool Managers} use a simple heartbeat-based membership management protocol~\cite{gupta2001scalable}.
+However, \sysname{} can be easily extended to adopt more robust leader election (\eg{}, Raft~\cite{raft}) and fault-tolerance algorithms~\cite{pb}.

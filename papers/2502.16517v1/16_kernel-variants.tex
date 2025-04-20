@@ -1,0 +1,108 @@
+\section{Kernel realisation variants}
+\label{section:realisation-variants}
+
+We have various variations of the blueprint from Listing~\ref{algorithm:demonstrator:blueprint} at hand that we can augment with the annotations.
+
+
+\subsection{Generic kernels}
+
+\begin{figure}[htb]
+\centering
+ \includegraphics[width=0.75\textwidth]{sketches/generic-unordered.pdf}
+ \caption{
+   The generic kernel is written over arrays of pointers to structs.
+   They can be scattered.
+   \label{sketches:memlayout:unordered}
+ }
+\end{figure}
+
+
+Our generic vanilla version remains the variant that does not exploit any knowledge about the underlying memory arrangement.
+It simply loops over lists of pointers, which might point to arbitrarily scattered memory locations (Figure~\ref{sketches:memlayout:unordered}).
+
+
+\begin{figure}[htb]
+\centering
+ \includegraphics[width=0.75\textwidth]{sketches/generic-ordered.pdf}
+ \caption{
+  Our SPH code base can be instructed to sort the particles after each drift step, such that particles within one cell are stored as one continuous block in memory.
+  \label{sketches:memlayout:ordrered}
+ }  
+\end{figure}
+
+
+However, we offer the opportunity within the underlying SPH code base to make each particle movement be followed by a particle sorting step that rearranges the memory such that particles from one cell end up in one continuous memory block (Figure~\ref{sketches:memlayout:ordrered}).
+This variant in principle facilitates coalescent memory access.
+The generic kernel does not exploit such knowledge explicitly, as it works with lists of pointers without any visibility into any underlying allocation patterns, but it should, in principle, benefit from the memory arrangement.
+
+
+\subsection{Coalesced memory access and loop permutations}
+
+\input{code-snippets/coalesced-memory.tex}
+
+As part of (historic) performance engineering, we provide a second kernel variant that is passed an additional meta data structure indexing the particle sequence (Listing~\ref{algorithm:kernel-variants:coalesced}):
+The meta data stores a sequence of integers.
+Each integer identifies how many pointers within the AoS input point to consecutively stored objects on the heap.
+This mirros index data structures as found in compressed sparse row storage formats \cite{Liu:1986:Compact} for example.
+
+The compute kernel exploiting coalesced memory then does not host one loop over a continuous piece of data for the local and one for the active particles.
+Instead, it has two outer loops over chunks of particles.
+Within each chunk, it can then exploit a plain for loop over chunks-size consecutive particles.
+In our SPH code base, there will always be at least $2^d$ of these chunks per kernel, as we loop over the cell itself as well as its vertex-connected neighbours. 
+As we store connectivity information within the vertices, it is $2^d$. 
+Otherwise, it would be $3^d$ for all neighbouring cells.
+For adaptive meshes or setups where particles have massively differing search radii and hence have to be stored on multiple levels within the underlying spacetree, more chunks of cell data might have to be compared, i.e.~this is a lower bound on the chunks.
+
+
+
+\subsection{Symmetry considerations}
+
+Binary SPH kernels characteristically are symmetric or anti-symmetric.
+For example, we have $F(p_1,p_2) = -F(p_2,p_1)$ for the forces between two particles.
+Exploiting this symmetry reduces the overall compute cost per particle by a factor of two.
+However, such symmetry is difficult to exploit along domain boundaries of a distributed memory parallisation, where we work with ghost particles mirroring information from another domain partition stored somewhere else.
+It also requires careful design in the context of adaptive mesh refinement.
+
+
+We refrain from explicitly using any symmetry in our code and henc avoid any additional algorithmic logic or bookkeeping on this level.
+Instead, we exploit the vanilla $\mathcal{O}(N^2)$ code arrangement sacrificing the factor of $\frac{1}{2}$.
+
+
+\subsection{Loop reordering}
+
+Within each $\mathcal{O}(N^2)$ kernel, we can either loop over the active particles or the local particles first.
+If the outer loop runs over the active particles, we fix one particle around the cell and compute its impact on all local particles of the kernel, i.e.~all particles within the cell of interest.
+If the outer loop runs over the local particles, it runs over all particles within the cell and computes, per particle, its impact on all other praticles within the cell plus the surrounding area.
+
+The active-local version accumulates the impact of forces or density contributions onto one local particle at a time.
+The local-active version scattered the impact of one particle on its surrounding area.
+Active-local yields very condensed write accesses yet introduces a reduction requiring synchronisation.
+Local-active yields scattered writes.
+
+
+\subsection{Multilevel, long-range interactions}
+
+If we study long-range forces we have particles that do not interact exclusively with particles in neighbouring cells but also with particles far away.
+We can introduce virtual particles, i.e.~multipoles \cite{White:1994:FMM}, to represent a cluster of local particles and hence reduce how many particles interact with particles far away, but we cannot eliminate the long-range data access of compute kernels.
+While this challenge is out-of-scope here, similar data access patterns arise along adaptive mesh boundaries within the spacetree or in situations where particles have massively differing search radii.
+In these cases, we store particles on different mesh resolution levels within the spacetree and hence introduce non-local fine-to-coarse data accesses.
+To facilitate a parallel, task-based processing of the kernels, accesses to coarser levels are protected by atomics and semaphores.
+
+
+We note that these multiscale interactions are relatively rare, i.e.~the bulk of compute workload stems from particle-particle interactions on the same level which yield very localised data access patterns.
+It is hence possible to split the loops over particles artifcially into two segments:
+A preamble identifying which particle-particle interactions are local and which are non-local and hence require synchronisation primitives.
+For very few particles, they represent long-range interactions.
+We can filter out those interactions within the compute kernel and postprocess these interactions afterwards in a separate loop.
+
+
+
+% \subsection{Masking}
+% 
+% Schematically, SPH compute kernels decompose into two steps: Check if two particles could interact (predicate) and compute interaction.
+% In our code base, we map those two steps onto two separate function evaluations where the predicate opens up a big branch.
+% Realising a predicate over a branch is not the only realisation variant one could think of.
+% Instead, one might try to use some masking techniques, e.g.~evaluate the predicate into a floating point value $\mu \in \{0,1\}$, perform all calculations and eventually multiple the impact with $\mu$.
+% Such masking sometimes leads to improved vector efficiency.
+% 
+% \marginpar{This part will likely disappear}

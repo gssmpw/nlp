@@ -1,0 +1,249 @@
+\putsec{motiv}{Motivation}
+
+\putssec{}{3D Gaussian Splatting on Graphics Hardware}
+
+To understand the performance implications of exploiting the hardware pipeline
+for Gaussian splatting, we implement its rendering process using {OpenGL} and
+evaluate it across synthetic and real-world scenes on mobile and desktop GPUs.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\begin{figure}[t]
+  \centering
+  \includegraphics[trim=0in 0.15in 0in 0in, clip=True, width=0.95\columnwidth]{figures/opengl-3dgs.pdf}
+  \caption{Gaussian splatting rendering via graphics APIs.}
+  \vspace{-0.20in}
+  \label{fig:opengl-3dgs}
+\end{figure}
+
+\myparagraph{Rendering 3D Gaussians via Graphics APIs.}
+%
+\figref{opengl-3dgs} illustrates how 3D Gaussians are rendered using graphics
+APIs. To begin with, we implement custom CUDA kernels and use the NVIDIA CUB
+library for the preprocessing and sorting steps, similar to the software-based
+rendering~\cite{ker:kop23}. For the subsequent steps, we use {OpenGL} to
+implement vertex and fragment shaders that execute on graphics hardware.
+
+In the preprocessing and sorting steps, we first perform frustum culling to
+exclude invisible Gaussians and calculate a depth value, which is the $z$-value
+of the center of each Gaussian in camera space. We then project (i.e.,
+``splat'') the Gaussians onto screen space and compute an RGB color of each
+splat using SH coefficients and the viewing direction.
+%
+The splats are subsequently sorted by the depth values to perform alpha
+blending front-to-back in a draw call.
+
+Once we obtain a sorting order of the splats, we exploit fixed-function units
+in graphics hardware for rendering. This requires each splat to be represented
+as conventional graphics primitives (e.g., triangles). To achieve this, we
+specify an Oriented Bounding Box (OBB)~\cite{got:lin96} that surrounds each
+splat using two triangles with four vertices.
+%
+By using the center of the splat, two semi-axis vectors of the ellipse, and the
+vertex indices, the vertex shader computes a 2D coordinate for each vertex in
+screen space. Each vertex is also assigned the color and opacity values of the
+corresponding Gaussian, which were previously computed during the preprocessing
+step. 
+
+Subsequently, the hardware rasterizer produces fragments that overlap with the
+triangles. Afterward, the fragment shader computes the alpha value of each
+fragment by evaluating a Gaussian function at the pixel position
+(\eqnref{volumerender}). The fragments whose alpha values are small enough
+(i.e., $\alpha<\frac{1}{255}$) are excluded from blending, which we call
+\emph{alpha pruning} in this paper, and the remaining fragments are blended
+into the corresponding pixels in the ROP units.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[trim=0in 0.00in 0in 0in, clip=True, width=\columnwidth]{figures/cuda-vs-opengl.pdf}
+  \caption{Performance comparison between software-based (CUDA) and hardware-based (OpenGL) graphics rendering on Jetson AGX Orin and RTX 3090. See~\tabref{workloads} for the details of each scene.}
+  \vspace{-0.20in}
+  \label{fig:cuda-vs-opengl}
+\end{figure}
+
+\myparagraph{Performance Analysis.}
+%
+\figref{cuda-vs-opengl} compares the performance of the state-of-the-art
+software-based rendering using custom CUDA kernels~\cite{ker:kop23} and our
+OpenGL-based rendering that exploits fixed-function graphics units.
+%
+To reduce the amount of work in rasterization, we use a tight OBB\footnote{The
+Gaussian's boundary is defined where the alpha value is equal to
+$\frac{1}{255}$.} that accounts for the opacity of each Gaussian in both CUDA
+and OpenGL implementations. Specifically, for CUDA, this approach significantly
+reduces the number of ineffective Gaussian-tile assignments, resulting in a
+notable speedup in sorting and rasterization compared to the axis-aligned
+bounding box (AABB)-based method used in the original CUDA implementation, as
+discussed in previous studies~\cite{lee:lee24,rad:ste24}.
+%
+Note that this optimization does not alter the rendered image, as it only
+reduces ineffective computations.
+
+Results show that using fixed-function units generally offers better
+performance than software-based rendering.
+%
+In software-based rendering, preprocessing is inefficient, requiring per-tile
+buffers and duplicating depth and index data for Gaussians spanning multiple
+tiles, which is time-consuming.
+%
+In contrast, hardware-based rendering eliminates the inefficiencies, as the
+graphics hardware \emph{automatically manages} tiling and duplication.
+%
+This also leads to a reduction in sorting time, as we only need to sort the
+entire Gaussians by depth values without the need of duplication and per-tile
+sorting.
+%
+Furthermore, as noted in prior work~\cite{lee:lee24}, the lockstep execution of
+threads in CUDA leads to \emph{ineffective} alpha computation during
+rasterization.
+%
+Hardware-based rendering, operating at a finer granularity (e.g., a
+2$\times$2-fragment quad) than a warp (i.e., 32 threads), allows for more
+effective utilization of shader cores and ROPs, thereby improving performance
+during the rasterization step.
+
+While rendering using graphics hardware in GPUs is generally faster than
+software-based rendering, it still falls short of real-time rendering,
+particularly on mobile/edge devices with limited power and resources. 
+%
+As shown in~\figref{cuda-vs-opengl}(a), hardware-based rendering achieves less
+than 25 FPS for real-world scenes.
+%
+In the following section, we further discuss our observations and the
+inefficiencies of Gaussian-based rendering on the hardware pipeline.
+
+\putssec{opportunities}{Observations and Opportunities}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[trim=0in 0.00in 0in 0in, clip=True, width=\columnwidth]{figures/unit-utilization.pdf}
+  \caption{
+%
+    Throughput utilization of each hardware unit for OpenGL-based rendering, which is computed by $(\frac{\textrm{Measured
+    Throughput}}{\textrm{Max Throughput}}){\times}100$. 
+%
+  }
+  \vspace{-0.20in}
+  \label{fig:unit-utilization}
+\end{figure}
+
+\textbf{\textit{Observation I: ROP Pressure and Inefficient Use of Shader
+Cores.}}
+%
+\figref{unit-utilization} shows the average throughput utilization of several
+key graphics hardware units during a draw call.
+%
+We observe that the rendering performance of Gaussian splatting is dictated by
+the ROP units (i.e., PROP and CROP) rather than by the shader units (SM).
+%
+This is because there are a huge number of fragments to blend per pixel in
+Gaussian splatting.
+%
+The PROP (Pre-ROP) orchestrates the flow of depth and color fragments for a
+final pixel, while the CROP (Color ROP) performs blending in the order of
+fragments received from the PROP.
+
+In addition, the shader units are relatively underutilized because of two reasons.
+First, the ROP units are the pipeline bottleneck, so the shader units are often
+not fully utilized due to back pressure. Second, the vertex and fragment
+shaders used for Gaussian splatting are relatively simple compared to
+CUDA-based renderers. In detail, the vertex shader only computes the 2D screen
+coordinate using the center of the splat and axis vectors, and the vertex
+colors are shared for all vertices of the splat, which are already computed in
+the preprocessing step. 
+%
+The fragment shader computes the alpha value of each fragment by applying a dot
+product to a normalized pixel coordinate and performing an exponential
+operation of the Gaussian function.
+%
+Compared to other shading programs that require lighting calculations and
+texture fetching for each fragment~\cite{kru:wes03}, the shaders for Gaussian
+splatting are computationally cheaper.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\begin{figure}[t]
+  \centering
+  \includegraphics[trim=0in 0.00in 0in 0in, clip=True, width=\columnwidth]{figures/frag-heatmap.pdf}
+  \caption{Number of fragments per pixel with and without early termination (scene: Bonsai).}
+  \vspace{-0.20in}
+  \label{fig:frag-heatmap}
+\end{figure}
+
+\myparagraph{\textit{Observation II: Challenges of Supporting Early
+Termination.}}
+% 
+Gaussian splatting is a volume rendering technique that accumulates RGBA colors
+of fragments at the same pixel location \emph{front-to-back} to produce the
+final pixel color.
+%
+Consequently, similar to other volume rendering methods, it can benefit from
+\emph{early termination}, a widely-used optimization technique in the volume
+rendering process.
+%
+\figref{frag-heatmap} illustrates the impact of early termination on Gaussian
+splatting by comparing the number of fragments per pixel blended with
+\emph{and} without early termination.
+%
+With early termination, if the alpha value of a pixel surpasses a predefined
+threshold after blending, the subsequent fragments are discarded as they do not
+make a noticeable contribution to the final pixel color.
+%
+As a result, this technique effectively reduces the amount of computation by
+avoiding unnecessary shading and blending operations.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[trim=0in 0.00in 0in 0in, clip=True, width=\columnwidth]{figures/ert-in-cuda.pdf}
+  \caption{Speedup of CUDA-based rendering and the reduction in the number of fragments with early termination.}
+  \vspace{-0.10in}
+  \label{fig:ert-in-cuda}
+\end{figure}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[trim=0in 0.00in 0in 0in, clip=True, width=\columnwidth]{figures/warp-divergence.pdf}
+  \caption{Average percentage of threads in a warp that participate in blending in software-based (CUDA) rendering.}
+  \vspace{-0.15in}
+  \label{fig:warp-divergence}
+\end{figure}
+
+
+\figref{ert-in-cuda} shows the speedup of CUDA-based rendering and the
+reduction in per-pixel fragment count when using early termination.
+%
+In software-based rendering, while early termination helps improve rendering
+performance, its full benefits are difficult to realize due to the lockstep
+execution of threads working on different pixels.
+%
+In the worst case, even if only one thread (pixel) in a warp is not terminated,
+all other threads in the warp still ineffectively consume shader cores
+until the active thread finishes.
+%
+\figref{warp-divergence} shows the percentage of threads in a warp performing
+blending operations for the evaluated scenes.
+%
+With the combined effects of alpha pruning and early termination, less than
+40\% of threads perform effective work (i.e., blending) in a warp across all
+scenes.
+
+On the other hand, hardware-based rendering currently does \emph{not} natively
+support early termination. However, adding this capability to graphics hardware
+would significantly improve rendering performance for two reasons while better
+exploiting its benefits compared to software-based rendering.
+%
+First, the hardware graphics pipeline performs fragment blending at a finer
+granularity in ROPs (i.e., a quad; 2$\times$2 fragments) than a warp, thereby
+enabling more effective utilization of compute units when early termination is
+applied than software-based rendering.
+% 
+Second, since volume rendering places substantial pressure on ROPs, reducing
+the number of fragments sent to them would greatly streamline the hardware
+pipeline by alleviating their processing burden.
+%
+To harness this benefit in the hardware pipeline, \ssecref{early-term-hw}
+discusses our proposed architecture, which minimally extends the graphics
+hardware by \emph{repurposing} fixed-function units, such as stencil test
+hardware.
+
+In the following section, we discuss the performance of in-shader blending and
+software-based early termination via graphics APIs to demonstrate the need for
+architectural support for volume rendering.

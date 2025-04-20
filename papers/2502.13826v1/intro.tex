@@ -1,0 +1,184 @@
+
+\section{Introduction}
+
+Today, it has become commonplace to represent text,  web pages, images,
+audio,  video and multi-modal documents as \emph{vectors} in high-dimensional vector spaces using deep learning models. 
+These models represent various notions of semantic similarity as distances between
+vector representations of the objects, so that the nearest points to a query are the
+most semantically relevant~\cite{clip, ance, trecDL22}.
+An \emph{approximate nearest neighbor search} (\emph{ANNS}) a.k.a. \emph{vector search}
+system indexes and queries such vectors on collections of scales ranging from thousands
+to hundreds of billions of vectors.
+ANNS systems are used in online real-time applications and services such as search,
+recommendation, and retrieval-augmented generation (RAG)~\cite{rag}. 
+The latter is a core mechanism to augment a large language model (LLM) with content that
+the LLM was not trained on, such as an individual's or organization's private content~\cite{copilot}.
+Given a user query, the ANNS helps find relevant private content to add to the input prompt
+to improve the quality of the LLM's response.
+RAG systems are also used to ground LLMs and aid their reasoning capabilities with factual content
+(e.g., OpenAI DeepResearch~\cite{deepresearch}).
+
+
+Data-agnostic indexing methods based on Locality-Sensitive Hashing (LSH)~\cite{Indyk98, LSHSurvey08, Broder98}
+have theoretically optimal trade-offs between accuracy (ratio of distance to retrieved points
+vs. optimal result) and query complexity (number of points in the index that the query is compared to).
+However, data-dependent indices based on clustering~\cite{IMI12, douze2024faiss, SPANN}
+and proximity graphs~\cite{HNSW16, RNG, iwasaki2018, DiskANN19} are more
+efficient than the best implementations of LSH such as ANNOY~\cite{github:annoy}.
+%\todo{bc: do we really need to make this absolute claim of \emph{most efficient} and \emph{best tradeoff} here? could it annoy the LSH fans?}
+%\todo{harsha: it could annoy and has annoyed DB audience in pre-ChatGPT era. 
+%Now there are more non-LSH papers, so hopefully less allergy. YOur call on deleting this}
+% ok, i just toned this down a tad ...
+Proximity graphs in particular have been found to be very efficient in practice, with  their implementations
+providing a good trade-off across accuracy, query latency, and  throughput~\cite{Benchmark, bigann21, bigann23}.
+They are also adaptable to variations of ANNS that arise in practice, such as sparse high-dimensional indices
+and filtered queries ~\cite{bigann23, FilteredDiskANN, acorn}.
+
+
+A proximity graph consists of a designated starting point in the high-dimensional space,
+nodes representing each vector, and directed edges that connect these nodes. 
+The edge set of a proximity graph is carefully designed such that the closest neighbors of 
+a query can be found via a greedy search of the graph which, at each node, walks towards
+the out-neighbors closest to the query (see Algorithm~\ref{alg:search}).
+The edges consist a mix of nearby as well as some far-away vectors strategically selected to accelerate search.
+There are various techniques to build such graphs with varying graph construction cost,
+search quality, and efficiency. 
+In this paper, we focus on the simple yet powerful graph index in the DiskANN system~\cite{DiskANN19, diskann-github}.
+This technique is used in entries in recent NeurIPS BigANN competitions~\cite{bigann21, bigann23},
+and is reported to be used extensively in global services such as Bing and Microsoft 365,
+edge devices via Windows Copilot runtime~\cite{windowscopilot},
+and databases~\cite{cosmosdb, pgvectorscale, JVector}.
+
+ 
+While proximity graphs have been studied in the \emph{static} setting,
+there is a strong need for \emph{streaming updates} of vector indexes. 
+Online services continuously generate new contents from sources such as
+ database records, emails, videos, tweets, photographs, and webpages. 
+They also \emph{update} existing content by editing 
+existing documents, or deleting content due to expiration, inaccuracy, or privacy reasons. 
+Such updates should be made be available to new queries immediately,
+so that the ANNS system serves fresh content at all times. 
+This means that vector indices cannot be treated as static data,
+and must be updated while maintaining high quality in terms of query recall and latency.
+
+
+While insertion of new vectors is not too hard 
+%(many proximity graphs 
+(since many build algorithms for proximity graphs
+are naturally incremental),
+maintaining index quality after deletions 
+%and replacements 
+of vectors is quite challenging.
+Replacements of vectors are tricky to handle as well.
+As a result, many vector indices resort to \emph{soft-deletion} or \emph{segment-based} strategies
+both of which require expensive periodic index rebuilds.
+
+In the soft-deletion based strategy, indices mark each deleted point with a tombstone but do not
+remove it from the graph. As a result query quality degrades over time, and indices
+are typically rebuilt after, say, 10-20\% of nodes are deleted. 
+
+In the segment-based strategy, updates are captured in \emph{update} files which are published
+as immutable segments after they reach a certain size. 
+A vector index is built for the content in the index~\cite{Lucene-vector}.
+Periodically, segments are merged and indices are rebuilt.
+A query is processed using a combination of segment-level indices and a full scan of the update file which can be inefficient. Lucene~\cite{Lucene} has recent GitHub issues created on the CPU~\cite{lucene-hnsw-cpu} and memory~\cite{lucene-hnsw-memory} overheads of HNSW~\cite{HNSW16} graph merges, which indicate this to be a problem in practice.
+
+%For example, using this strategy with Lucene~\cite{Lucene} storage and the HNSW proximity graph,
+%we found that the system could not keep
+%up with high ingestion rates
+%(more than 1000 insertions per second)
+% bc: commenting specific number, because we do not report this experiment in this paper.
+%due to these overheads.
+%\todo{is this true? Have we measured it or are we citing some other work. ans: yes we measured this earlier (bc).}
+
+
+With either strategy, this leads to expensive rebuilds that can be impractical for large indices.
+For example, building a DiskANN index for one  billion scale SIFT vectors incurred a peak
+memory usage of 1.1TB and took 2 days with 32 vCPUs~\cite{DiskANN19}.
+
+
+An improvement on this is an incremental rebuild approach, as in FreshDiskANN~\cite{freshdiskann},
+the state-of-the-art update algorithm for DiskANN.
+Instead of rebuilding the index from scratch, it relies on incremental merges of tiered segments.
+A novel algorithm merges  recent updates and smaller lower-tier segments into larger higher-tier segments
+to produce a new index with minimal write amplification.
+Although this is more efficient than rebuilding the index from scratch,
+it still suffers from the other problems.
+For example, usage spikes from such rebuilds increase the 99.9$^\textrm{th}$ percentile of query latency.
+Moreover, the system must be provisioned with resources to handle usage spikes during merge,
+which increases the overall cost of running the ANNS system. 
+Further, queries are less efficient due to the need to query indices over multiple segments.
+
+
+%To improve the rebuild strategy, an ANNS system can use an \emph{incremental rebuild} strategy, where it periodically freezes the update file, builds an index over it so it can be searched more efficiently, and adds insertions and deletions to a new update file. 
+%This leads to a sequence of update files and indices.
+%A query is processed over the static index, the indices for frozen update files, and the currently active update file.
+%In order to combat this cost, modern systems such as Lucene~\cite{lucene} and research proposals such as FreshDiskANN~\cite{freshdiskann} batch updates and either index them separately or keep them unindexed. They periodically (lazily) merge back these updates to the large base index in the background. This approach is better than rebuilding the whole index from scratch as it amortizes some of the rebuilding costs, but it is still incredibly expensive at scale and with high update volumes. In particular, 
+%This approach results in searches over multiples indices and causes the query latency to worsen over time. Periodic consolidation of the indices -- a process similar to rebuilding them -- therefore becomes necessary, resulting in usage spikes as before.
+%Finally, queries are slowed down and exhibit higher variance, because in order to maintain result freshness, they may have to query multiple indexes as well as scan any unindexed data. 
+%\todo{pb: Is it too confusing to quote an HNSW experiment given our focus on DiskANN?}
+%\todo{bc: i removed my example experiment of HNSW and Lucene to comments, as suggested}
+%For example, in our  experiments with Lucene and HNSW, we found that up to $36\times$ latency variation of queries over time, and that the system could not keep up with high ingestion rates (more than 1000 insertions per second) due to these overheads.
+%Thus, this strategy reduces the frequency of index rebuilds, but does not eliminate them.
+%Eventually, the indices are cluttered with deleted vectors, and searches over multiple indices increase query latency.
+
+
+
+%It performs insertions in-place.
+%It collects deletions in an update file, and filters out deleted vertexs from each query results.
+%It periodically consolidates the deletions with the index by doing a sequential scan over the index. 
+%For each vertex, it deletes pointers to deleted out-neighbors.
+
+What we want is a way to process updates to the ANNS graph index \emph{in place}.
+The update algorithm must be fast and produce a graph that supports high recall.
+It must also be stable over long periods, so there is no need to rebuild the index.
+This would enable the ANNS system to maintain a single graph and absorb updates
+in a streaming fashion. It would avoid the periodic spikes in resource usage and
+query latency due to rebuild, which would translate to a stable and low-cost
+online service offering in the cloud.
+
+In-place insertions can use the same algorithm as the one used to build the graph.
+Deletions are more problematic.
+Since the index graph is singly-linked with out edges,
+when deleting a vertex we usually do not know its in-neighbors. 
+An obvious fix is to doubly-link the graph. 
+However, since most of the space consumed by a vertex is for its list of neighbors, 
+this would either halve the number of vectors that can be handled by a single graph or double its cost.
+It would also make the system more unwieldy due to increased locking complexity
+in a highly concurrent system. In practice, all these reasons make maintaining
+in-neighbors unacceptable.
+
+%, however, as we want the cost of updates and deletes to remain similar to normal ingestion costs (i.e., the cost of inserting a new vector during offline construction). At the same time, we want to avoid, or at least mitigate, the degradation of the index over time. Ideally, the online graph at any point in time should have recall and search costs similar to a graph constructed from scratch using the live snapshot of vectors at that point in time. 
+
+\textbf{Our main contribution is \name, a new algorithm for in-place deletions in a DiskANN graph index},
+thereby avoiding periodic batch consolidation or rebuilds. Furthermore, \name has the
+following properties:
+\begin{itemize}
+\item Queries over are as efficient as those over a graph built from scratch using the active vectors.
+\item Maintains stable recall over long update sequences of various kinds.
+\item The cost of each update in the stream
+is better than the cost of vector insertion during a static index build,
+and compared to prior lazy approaches.
+\item The cost of updates is also significantly lower than for 
+the HNSW algorithm, while providing comparable or better recall.
+\end{itemize}
+
+The paper is organized as follows:
+Section~\ref{sec:prelim} formally defines the notation related metrics used in this paper.
+Section~\ref{sec:algorithms} presents our algorithm, \name.
+An experimental evaluation is in Section~\ref{sec:experiments} followed by an ablation study in Section~\ref{sec:ablation}.
+Section~\ref{sec:related} discusses related work, and Section~\ref{sec:conclusion} concludes the paper.
+
+%Our contributions include:
+%\begin{itemize}
+%\item holding 
+%\item space
+%\item for
+%\item edits
+%\item to estimate
+%\item total
+%\item page
+%\item count
+%\end{itemize}
+
+%In this paper, we address this problem from an algorithmic standpoint, by proposing a new streaming ANNS graph update algorithm that is based on \emph{local} graph modifications of a specific nature -- briefly, our approach retains the core \emph{connectedness} characteristics of the ANNS graph, and empirically shows the strong ability to retain graph quality over time.

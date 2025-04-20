@@ -1,0 +1,48 @@
+\section{Background and Motivation}
+\label{sec:background}
+
+By default, the page cache buffers write and read operations to and from storage devices. %
+In Linux, the page cache tracks pages and stores them in lists (see \S\ref{sec:primer}), on which it approximates the LRU algorithm.
+While this scheme works reasonably well for some workloads, it is inadequate for many others. The classic example is scan-heavy workloads, which perform poorly with LRU or its approximations~\cite{lhd,stonebraker_support,arc}. While Linux provides some interfaces (\eg \texttt{fadvise()} or \texttt{sysctl}) through which the page cache behavior can be tweaked on a global or per-application basis, these interfaces are opaque and do not perform as intended, as we describe in \S\ref{sec:primer} and evaluate in \S\ref{sec:app-informed}.
+
+Therefore, to avoid compromising performance, some applications implement their own userspace-based caches~\cite{memory-rocksdb,wiredtiger,postgres-cache,innodb}. However, userspace-based caches are not a panacea. First, they require significant developer effort to implement. Second, they typically require the application to specify in advance how much memory will be allocated for the cache. However, the amount of memory available to an application may change over time (\eg when multiple applications run on the same physical server). Third, application-specific caches are very hard to share across processes, due to security and compatibility issues. Ultimately, even applications that implement their own userspace-based cache often still rely on the page cache by default as a ``second-tier'' cache~\cite{memory-rocksdb,wiredtiger,postgres-cache}, allowing operators to fully utilize the server's memory and share memory across processes.
+As such, despite the page cache's limitations, it is still used extensively by storage-optimized workloads, such as key-value stores~\cite{rocksdb,leveldb,wiredtiger}, databases~\cite{postgres,innodb}, and ML inference and training systems~\cite{pytorch-load,milvus-load}.
+
+Unfortunately, these factors yield a status quo where potential performance gains are left on the table. Properly customizing the page cache is not an easy task -- it is deeply intertwined with other performance- and correctness-critical memory management and filesystem code paths. While work to modernize the page cache is ongoing, it does not yet seem to have achieved this goal. In particular, MGLRU, an alternative LRU implementation for the page cache, has still not been enabled by default in upstream Linux several years after it was introduced, %
+and it does not provide customization interfaces~\cite{mglru,mglru2}. %
+Indeed, in \S\ref{sec:evaluation} we show that MGLRU sometimes underperforms and sometimes outperforms the default LRU algorithm, and that in general there is no single eviction policy that performs best across a wide range of workloads.
+
+We now provide a primer on the Linux page cache. We also describe the eBPF framework, which \name uses to allow applications to write custom page cache policies.
+
+\subsection{Linux Page Cache}
+\label{sec:primer}
+
+The page cache is a core component of the Linux kernel, responsible for accelerating access to storage. While anonymous memory pages are stored similarly to file-backed memory, in this paper we focus specifically on file-backed memory. %
+The kernel's default eviction policy is an LRU approximation algorithm which uses two FIFO lists.\footnote{The Linux page cache algorithm description is based on Linux v6.6.8.} As shown in Figure~\ref{fig:default-page-cache-policy}, when a page is first fetched from storage, it is added to the tail of the inactive list. If that page is accessed again, it will eventually be promoted to the active list. The goal of this policy is to use the inactive list as a preliminary filter and keep frequently accessed pages in the active list. When eviction is triggered, pages are removed from the head of the inactive list. If necessary, the page cache will balance the lists by demoting pages from the head of the active list to the tail of the inactive list. Notably, during balancing or shrinking, pages in the active list that have been referenced are typically demoted to the inactive list, rather than being given another chance in the active list, as is typical for LRU or CLOCK algorithms.
+
+Importantly, active and inactive lists are segmented by cgroup. cgroups are a Linux feature which isolate resource usage for groups of processes~\cite{cgroup-v2}. Each cgroup has its own set of page cache lists which count toward its memory allocation, allowing for cgroup-specific eviction when its memory threshold is reached. Processes in cgroup A can access a page ``owned'' by cgroup B -- such an access will update the page's metadata (affecting its placement in cgroup B's lists), but will not count against cgroup A's memory limit. The combination of these per-cgroup lists make up the page cache as a whole.\footnote{Technically, each NUMA node has its own set of per-cgroup lists, but this does not affect our design.}
+
+The page cache also keeps track of ``shadow entries'' in order to mitigate thrashing. These entries keep track of metadata enabling calculation of a page's refault distance (\ie the time elapsed between eviction and the new request). If a page has been evicted and then fetched again recently enough, the kernel may decide to insert it directly into the active list instead of the inactive list. There are several additional edge cases and heuristics in the kernel's implementation, but these are the broad strokes of the existing policy.
+
+\vspace{-1em}
+\paragraph{Folios.} Linux developers are in the process of converting various usages of \texttt{struct page} to \emph{folios}, which represent either zero-order pages (a single page) or the head page of a compound page (a group of contiguous physical pages that can be treated as a single larger page)~\cite{folios-lwn}. While the page cache now largely uses folios, we use the terms ``folio'' and ``page'' interchangeably, as in our workloads all folios represent a single page.
+
+\vspace{-1em}
+\paragraph{Userspace interfaces.} While LRU is a commonly-used eviction policy that works well across many workloads, there are many applications that would benefit from a different policy for part or the entirety of their I/O requests. For example, LRU is notoriously bad for scan-like access patterns. This gap between applications and the kernel can be partially mitigated by the \texttt{madvise()} and \texttt{fadvise()} system calls. These interfaces allow userspace applications to give \emph{hints} to the kernel about how to handle certain ranges of memory or files.
+
+While these hints may help in simple cases, we show in our evaluation that they don't function as expected for some workloads. Additionally, while the hints may have a semantic meaning, their actual behavior is highly dependent on the kernel implementation, which is opaque, may change across versions, and can yield unexpected results~\cite{madvise-man-pages,madvise-surge-2015}.
+Advice values may also be ignored by the kernel for a range of reasons, or may have restrictions on what memory they can be applied to.
+Most importantly, these hints are still subject to the basic inflexible structure of the kernel's approximate LRU policy. 
+
+\begin{figure}[ht]
+    \centering
+    \includegraphics[width=0.7\columnwidth]{figures/cache_ext_default_page_cache_policy.pdf}
+    \caption{Overview of the current Linux page cache eviction policy.}
+    \label{fig:default-page-cache-policy}
+\end{figure}
+
+\subsection{eBPF}
+
+eBPF~\cite{ebpf} is a sandboxing technology that enables userspace functions to run in the Linux kernel in a safe and controlled manner. %
+eBPF has found many use cases, including observability~\cite{gc-observability-bpf}, security~\cite{bpf-iptables,seccomp-bpf}, scheduling~\cite{sched_ext, syrup, ghost}, and I/O acceleration~\cite{xrp, xdp, electrode, dint, bpfof}. eBPF programs are \emph{verified} by the kernel before they can be run, ensuring, for example, that the programs don't contain illegal memory accesses, and that they will terminate within a fixed number of instructions. %
+

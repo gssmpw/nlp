@@ -1,0 +1,75 @@
+\section{Software library for NVM data prefetching}
+\label{sec:library}
+\noindent The data readiness problem is likely to appear in any application that directly accesses large pools of data residing in NVM. In this section, we provide details on our general purpose data prefetching library, that aims to aid programmability to easily prefetch desired data regions. The library uses POSIX threads and implements a simple API to create, control and assign jobs to threads.
+
+\subsection{Helper Threads}
+
+Prefetching data~\cite{annavaram2001data} reduces the cache miss rate and hence
+accelerates an application\textquotesingle s execution. An in-advance knowledge of memory regions
+to be accessed can be used to prefetch data into caches before it is needed. However,
+the application should not be stalled while prefetching the data. This can be achieved
+by using independent helper threads for data prefetching.
+
+Synchronization between the main computation thread and helper thread(s) is 
+important~\cite{jung2006helper}. Prefetching data too early before it is needed
+by the computation thread can result in cache pollution. Furthermore, required
+cache lines may get evicted before they are accessed. Similarly, prefetching data
+too late is also not useful, rather counter-productive. It can also lead to cache
+pollution and degrade performance.
+
+In our implementation, a helper thread is a simple block of code. Given a starting
+memory address and the amount of data to be prefetched, the helper thread prefetches
+data into caches without interfering with the main computation thread. We employ a
+job queue to build a single producer - (multiple) consumer relationship between
+a computation thread and one or multiple helper threads. We employ light-weight 
+compare and swap instructions for synchronization in the job queue between a 
+computation thread and the different helper threads.
+
+A computation thread places the starting address and the amount of data to be prefetched into a job unit and enqueues it into the job queue. On the other end, a helper thread picks the job item, unpacks it and then prefetches the data into caches. Data prefetching is performed without stalling the computation thread.
+
+\subsection{Library Services}
+A programmer is responsible for inserting API calls to construct helper threads. However, as SE2 already has knowledge of the size and location of the block to be read, inserting data prefetching APIs in SE2 source code is not a tedious task. Our library provides three basic services via a simple API.
+
+\begin{enumerate}%[leftmargin=*]
+ \item \textbf{Creation of helper threads:} The library supports the  creation of a user-specified number of helper threads per computation thread, that are synchronized using a job queue. A slightly different thread creation policy is also supported, as explained in detail in Section 7.3.
+ \item \textbf{Assigning work to helper threads:} Work is assigned to helper threads by placing jobs into their job queue. On arrival of a job into the queue, helper threads wake up, one fetches the job from the queue and starts the data prefetching. After completing the job, the helper thread again waits for the next job\textquotesingle s arrival if the queue is empty.
+ \item \textbf{Mapping threads to cores:} Our library also supports the selection of a core (in a multicore platform) on which a particular helper thread is to be executed by setting thread affinities. The affinities can also be set with respect to the computational thread, i.e., selecting the same or a different core.
+\end{enumerate}
+
+\subsection{Thread Mapping Schemes for Our Case Study}
+\label{sec:mapping-schemes}
+
+
+\noindent As discussed in Section~\ref{sec:evaluation}, \emph{SE2} directly accesses data located in NVM disk, without copying it into any local buffer. This direct access results in high cache miss rates when the data is needed for processing. However, due to ad-hoc data prefetching, SE2 achieves performance improvements for a few queries (i.e., Q11, Q15,  and Q19), but not for the majority of them. By performing ad-hoc data prefetching we were able to prefetch some blocks into caches, but not most of them due to the overheads it entailed performing the prefetching inside the computation thread. Furthermore, ad-hoc placement of data prefetching in the source code of an application can be tedious and difficult to maintain.
+
+By using our data prefetching library services, data can be brought closer to processing cores before 
+it is needed. When accessing a file for a read operation, \emph{SE2} creates a memory mapping of the file 
+using \verb+mmap()+. Additionally, it has knowledge of the location and size of the data block to be read. Therefore, \emph{SE2} can pack this information into a job and place it into the job queue to be processed by helper threads. By using this approach, PostgreSQL can continue with its computation while the required data is prefetched into caches by a helper thread. 
+
+Due to the way PostgreSQL is structured, it is not necessary to have more than one helper thread active to service a queued job in time before the next arrives. Therefore, we propose two mappings that employ only one helper thread and a third mapping that employs a different thread creation policy by instantiating two helper threads that work in tandem as we explain in the following subsections.
+
+\begin{figure*} %[htbp]
+\centering     %%% not \center
+\subfigure[\emph{M1} - Different physical core]{\label{CaseA}\includegraphics[width=32mm]{ThreadMapping_CaseA.eps}}
+\subfigure[\emph{M2} - Same physical core (HT)]{\label{CaseB}\includegraphics[width=52mm]{ThreadMapping_CaseB.eps}}
+\subfigure[\emph{M3} - Thread mapping for the two helper threads scheme]{\label{CaseE}\includegraphics[width=87mm]{ThreadMapping_CaseE.eps}}
+\caption{Different Helper thread mapping schemes with and without hyper-threading (HT) enabled}
+\label{Thread-Mapping}
+\end{figure*}
+
+
+\subsubsection{Single helper thread}
+
+
+
+When using a single helper thread there are two options for thread mapping. Mapping it to a different core than that of the computation thread, or to the same core. The latter option makes sense if the target machine supports hyper-threading - i.e., two hardware thread contexts per core. We explore these thread mappings:
+\begin{enumerate}
+ \item \verb+M1+ - Map helper thread to a different physical core, as shown in Fig.~\ref{CaseA}. In this case, each thread resides in a different core and hence prefetching is not done at the level of private caches but at the level of the last level cache, which is shared across cores.
+ \item \verb+M2+ - Map helper thread into the same physical core while making use of hyper-threading, as shown in Fig.~\ref{CaseB}. Both threads reside within the same physical core, hence prefetching will also populate the private L1 and L2 caches present in the core.
+\end{enumerate}
+
+\subsubsection{Two helper threads}
+
+As described for case \emph{M2}, the helper thread prefetches data into the private caches of the core where the computation thread is executing. However, in this scenario, the helper thread competes with the computation thread for hardware resources. This competition can slow down the execution of the computation thread. On the other hand, for case \emph{M1} there is no such competition for hardware resources at the expense of prefetching into the LLC, further away from the processing core.
+
+A good compromise can be achieved using two helper threads working together. One helper thread is mapped to a different physical core than that of the computation thread and will process the jobs enqueued by the computation thread, similar to case \emph{M1}. Once this first thread finishes processing the job, it enqueues the same job into a second job queue that is processed by the second helper thread that is mapped into the same physical core as the computation thread. This thread mapping scheme which we term \verb+M3+ is shown in Fig.~\ref{CaseE}. The rationale behind this proposal is that the high penalty miss from main memory to LLC will be paid by a different core, while the helper thread residing on the same core as the computation thread will put data into the private caches and complete jobs much faster since data will be already present in the LLC.

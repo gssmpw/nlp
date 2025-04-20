@@ -1,0 +1,135 @@
+
+\section{\proj Microarchitecture}
+\label{sec:architecture}
+
+% Efficient encoding and decoding.
+
+
+This section outlines the microarchitectural details of \proj{} that enable efficient quantization for LLM inference. Our hardware design supports the fusion of \proj{} decode and computation, as detailed in \Sec{sec:encode}. Additionally, it integrates microarchitectural components that facilitate real-time quantization of activations and the KV cache, as described in \Sec{sec:dse}.
+
+
+\subsection{Accelerator Overview}
+
+We first explain the rationale for the architectural extension. 
+Initially, the computing paradigm of \proj{} introduces an additional term in matrix operations, which the current Processing Element (PE) does not directly support. 
+Secondly, we need an on-chip quantization engine to minimize real-time quantization delays for activation and KV cache. 
+Finally, our quantization framework uses varying bit widths for weights, activations, and the KV cache, necessitating mixed-precision computations.
+
+
+\Fig{fig:arch_overview} provides an architectural overview that adopts a weight-stationary systolic array with only slight modifications.
+The array consists of $32 \times 32$ units, each capable of handling 8-bit integers, referred to in this section as Processing Elements Group (PEG).
+The real-time update engine incorporates a lightweight comparator unit to identify maximum values.
+During dequantization, output values are multiplied by a scaling factor and processed through this comparator to determine maximum values for use in the quantization units.
+% Above in \Fig{fig:arch_overview}, fixed-point multipliers facilitate the loading of the V cache from DRAM to the on-chip buffer.
+
+\input{figure_text/fig_arch_pe.tex}
+
+\subsection{\proj PE Unit}
+\label{sec:pe_unit}
+\paragraph{Tile Architecture.}
+We begin by describing the tile architecture of \proj, which is based on a weight-stationary systolic array~\cite{jouppi2023tpu}. Inputs to the systolic array are fed from the left, and outputs exit from the bottom. 
+The array's configuration varies with the type of operation: a 32 $\times$ 32 array for \texttt{INT8} $\times$ \texttt{INT8} operations, a 64 $\times$ 32 array for \texttt{INT8} $\times$ \texttt{INT4} operations, and a 128 $\times$ 32 array for \texttt{INT8} $\times$ \texttt{INT2} operations. 
+This variation in configuration is due to the architecture's support for mixed-precision operations.
+Specifically, the bit width of weight can be configured to 2, 4, or 8 bits.
+
+
+Our discussion will focus on \texttt{INT8} and \texttt{INT4} operations, where the weight tile dimension is $(64, 32)$, the input tile dimension is $(m, 64)$, and the output tile dimension is $(m, 32)$. In this configuration, each column of PEs represents the cumulative dimension, with elements in a column sharing both a scaling factor and the coefficient $a$ of \proj.
+
+
+Each PE in our architecture includes both multiply-accumulate (MAC) and shift-accumulate (SAC) components. The MAC components manage the first partial sum ($psum_1$) defined in Equation~\eqref{eqn:decode}, while the SAC handles the second partial sum ($psum_2$). Executing $psum_1 \times a$ within the PE facilitates the addition of $psum_1$ and $psum_2$. However, this process introduces an additional multiplication step across all PEs. To streamline computations in the systolic array, \proj directs $psum_2$ through an additional lane.
+
+
+
+\paragraph{Mixed Precision.}
+Given the varying bit-width requirements for weight, activation, and KV cache quantization, support for mixed precision is crucial, as noted in previous studies~\cite{guo2022ant,guo2023olive,song2020drq,zheng2022dota,zhou2016dorefa,micikevicius2018mixed,cai2020zeroq,cai2020rethinking,Reggiani2023mixgemm}. Our approach aligns with methodologies found in BitFusion~\cite{sharma2018bit}. As depicted in \Fig{fig:arch_overview}, each Processing Elements Group (PEG) within our system includes four Processing Elements (PEs), each capable of handling computations between \texttt{INT8} and \texttt{INT2} formats. Two PEs combined can perform an \texttt{INT8} $\times$ \texttt{INT4} operation. A single
+PEG can execute either one \texttt{INT8} $\times$ \texttt{INT8} operation or four \texttt{INT8} $\times$ \texttt{INT2} operations within one cycle. This configuration efficiently supports mixed-precision computations across 2, 4, and 8-bit widths for weights and KV cache.
+
+
+\subsection{Real-time Quantization Unit}
+\label{sec:real_time_engine}
+% Our quantization engine can easily deal with the encode of activation and key.
+We describe how our architecture implements real-time quantization for activations, K cache, and V cache. 
+We leverage the dataflow~\cite{guo2020balancing,jouppi2023tpu,zhou2021characterizing,chen2016eyeriss,VELTAIR,zhou2023ugrapher} of matrix multiplication to hide latency.
+In this scenario, the group size is set to 64.
+
+\input{figure_text/fig_arch_dataflow.tex}
+
+% \paragraph{Comparator.}
+Our real-time quantization unit (RQU) consists of two components: an \texttt{FP16} comparator and two \texttt{FP16} accumulators.
+In \proj, we utilize 32 RQUs matching the size of the systolic array to determine the maximum values and calculate variance parameters for the K cache and V cache.
+Besides, it can derive the maximum values for \texttt{INT} activation quantization.
+The RQU supports both \textbf{spatial} and \textbf{temporal} dataflow modes. 
+\Fig{fig:arch_cmp} illustrates these two modes and shows an example where RQUs are used to compute their maximum values.
+Once the systolic array completes the final computation in the accumulation dimension, it captures the full results of the output tile, which are then quantized to a low-bit format. 
+In the weight-stationary systolic array, the leftmost column initiates the computation, and the rightmost column begins 31 cycles later, offering a chance to pipeline the process of maximum comparison with the preceding computations.
+
+
+As depicted in \Fig{fig:arch_cmp}, at $t=0$, the first RQU ($RQU_0$) uses $C_{0, 0}$ as the initial maximum value, $max(C_{0, *})$, and passes it to $RQU_1$. 
+At $t=1$, $RQU_1$ compares the value of $C_{0, 1}$ with $max(C_{0, *})$ and forwards the greater value to $RQU_2$. By $t=32$, $RQU_{31}$ outputs the final maximum value $max(C_{0, *})$. 
+From this point, the RQUs operate in a fully pipelined manner, with $RQU_{31}$ producing one maximum value per cycle. Given that the output tile's dimensions are $(m, 32)$ (with $m=1$ during the decode phase), identifying the maximum of 64 elements in one group requires two comparison rounds. 
+Subsequently, activation can be quantized based on their maximum values.
+
+
+Conversely, the V cache utilizes the \textbf{temporal} dataflow mode of RQU, as illustrated on the right side of \Fig{fig:arch_cmp}. 
+In this mode, each RQU compares values from the same column of the systolic array and retains the maximum value in its register. 
+During the prefill phase, each RQU captures the maximum value of every 64 elements, allowing the 64 elements from the same column to be quantized based on these maximum values.
+
+The dataflow of calculating sum and square sum for variance is similar to deriving maximum value, except that the \texttt{FP16} accumulator replaces the comparator.
+This process of real-time quantization is pipelined with the dataflow of systolic array.
+Therefore, when the last computational dataflow of the systolic array finishes, it only needs several cycles to dequantize and compute the quantization parameter through the RQU.
+The RQU improves the efficiency of real-time quantization for activations and the KV cache.
+
+
+
+\subsection{Buffers}
+
+We use multi-bank structures for input, weight, output, and quantization buffers to enable parallel access.
+\Fig{fig:arch_cmp} shows that the 32 outputs from different rows and columns are dequantized in one cycle. 
+It requires 32 scaling factors for activations ($s_X$), 32 for weights ($s_W$), and 32 $a$.
+The $s_W$ and $a$ are fixed, so the key point is to ensure that $s_X$ are stored in different banks of quantization buffer to prevent bank conflict.
+
+
+
+\subsection{GEMM Computation}
+\label{sec:quant_dequant}
+
+
+We explain how our \proj{}-based accelerator design fuses the (de)quantization process with the original GEMM computation to hide their overhead.
+
+%The basic idea is that we can leverage 
+%Our design leverages the existing vector unit in the accelerator to perform the s.
+%The following paragraphs explain how we fully overlap these processes with the original GEMM to improve the performance. 
+%The accelerator includes vector units capable of performing floating-point operations such as addition, subtraction, multiplication, and division.
+% The latency of dequantization is optimized through pipeling, while the latency of quantization is reduced by employing both pipelining and overlapping.
+%The following paragraphs provide a detailed explanation of the .
+
+
+\input{figure_text/fig_arch_pipeline.tex}
+
+
+
+\paragraph{Dequantization.}
+The dequantization process of a group-quantized tensor is to multiply each element with its scaling factor.
+Typically, as shown in \Fig{fig:arch_pipeline}, the $M\times K \times N$ GEMM computation is tiled to run on the PE array. 
+As long as the group quantization size is greater than the PE array's accumulation dimension (i.e., the $K$ dimension), the scaling factor multiplication can be deferred to after the output of PE array and before the accumulation of the partial sum since all elements within the array share the same scaling factor.
+As such, we can concurrently compute the scaling factor product using the vector unit when the PE array starts computation, and augment the original accumulator design with additional multipliers.
+Since this accumulation is fully pipelined, its impact on the overall latency is negligible.
+
+
+
+\paragraph{Quantization.}
+The quantization only occurs when all partial sums finish the accumulation to the global sum. 
+In \Fig{fig:arch_pipeline}, after four iterations along the $K$ dimension, the global sum and maximum value for the output tile are determined.
+The vector units then compute the scaling factor based on the maximum value and perform division for that output tile.
+Note that the first division for the scaling factor occurs once for an entire group, and the second division occurs for each element.
+\Fig{fig:arch_pipeline} shows that quantization latency can be hidden by overlapping with GEMM tile computation.
+In our design, we model a 12-cycle non-pipelined division unit, which requires  12 $K$-dimension iterations to completely hide this latency.
+We show that this has little impact on our overall performance.
+In summary, \proj implements the operation fusion~\cite{niu2021dnnfusion,zhou2023ugrapher,zheng2023chimera,zhap2022tacker} between decoding, GEMM, dequantization, and quantization.
+
+
+
+
+% \subsection{Scalability and Flexibility}
+
+% The proposed components can grow with the size of a systolic array with affordable overhead.

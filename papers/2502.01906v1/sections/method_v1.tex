@@ -1,0 +1,185 @@
+\section{Method}
+
+\subsection{Motivation: Visual and Textual Embeddings are Created Different}\label{sec:method:motivation}
+
+Conventional formulation of LVLM is to first encode visual inputs with a pre-trained visual encoder, such as CLIP, into a sequence of visual embeddings.
+These visual embeddings are projected by a lightweight adapter layer and then concatenated with textual embeddings from text prompts as unified input embeddings into an LLM.
+In this formulation, the projected visual embeddings and textual embeddings are treated equally.
+However, in this paper, we argue that:
+
+\textit{Visual and textual embeddings are \textbf{created different}, and thus should be \textbf{processed differently} within an LLM.}
+
+It is self-evident that visual and textual embeddings are created different.
+Visual embeddings are created by passing a 2D image or 3D video through a visual encoder such as CLIP, while textual embeddings are created by table lookup of learnable parameters.
+This makes a significant difference on the information encoded in each embedding vector and on how they should be processed within the LLM:
+\begin{enumerate}[wide,labelindent=0pt]
+\item \label{enum:ctx} Each visual embedding vector has \emph{seen} all other visual embeddings (assume we use CLIP-style ViT visual encoder), while each textual embedding vector has \emph{no} such contextual information of other textual embeddings.
+\item \label{enum:pos} Visual inputs are intrinsically \emph{multi-dimensional}. 1-D rotary/relative position encoding within an LLM may introduce undesirable bias.
+\end{enumerate}
+
+For \ref{enum:ctx}, each visual embeddings has already encode contextual information of other visual embeddings.
+Therefore, there is no need to \emph{re-learn} this contextual information via LLM's 1D causal self-attention.
+It is not only a waste of computation ($\mathcal{O}(N^2)$ for $N$ visual embeddings), but encoding 2D bidirectional visual context via 1D causal attention may also be sub-optimal.
+To achieve this, in Sec.~\ref{sec:method:dattn} we first decompose the 1D causal self-attention into V2V attention (Fig.~\ref{fig:sattn} \textcolor{blue}{blue triangle}) and T2(V+T) attention (Fig.~\ref{fig:sattn} \textcolor{orange}{orange rectangle} plus \textcolor{green}{green triangle}), and then in Sec.~\ref{sec:method:diag-attn} convert the V2V attention into diagonal attention (Fig.~\ref{fig:dattn} \textcolor{blue}{blue diagonal}) such that each visual embedding only \emph{sees} itself within the LLM.
+It is worth noting that this formulation reduces the computation of V2V attention from $\mathcal{O}(N^2)$ to $\mathcal{O}(N)$, which is particularly useful for high-resolution image or long video inputs.
+
+\begin{figure*}[t]
+\centering
+\begin{subfigure}{.49\linewidth}
+  \centering
+  \includegraphics[width=0.7\linewidth]{figures/sattn.pdf}
+  \caption{Conventional causal self-attention}\label{fig:sattn}
+\end{subfigure}
+\hfill
+\begin{subfigure}{.49\linewidth}
+  \centering
+  \includegraphics[width=0.7\linewidth]{figures/dattn.pdf}
+  \caption{Our proposed decomposed-attention, \method{}}\label{fig:dattn}
+\end{subfigure}
+\caption{
+Comparison between convention causal self-attention (Fig.~\ref{fig:sattn}) and our proposed decomposed-attention, \method{} (Fig.~\ref{fig:dattn}). \textcolor{blue}{Blue squares} represent visual embeddings while \textcolor{green}{green diamonds} represent textual embeddings.
+Shaded areas represent non-zero attention, where \textcolor{blue}{blue}, \textcolor{orange}{orange}, and \textcolor{green}{green} are for V2V (visual-to-visual), T2V (textual-to-visual), and T2T (textual-to-textual) attention, respectively.
+}\label{fig:attn}
+\end{figure*}
+
+For \ref{enum:pos}, the rotary/relative position embedding introduces undesirable bias into the attention weights as shown in Fig.~\ref{fig:w-pos}, where distant embeddings have lower attention weights.
+With this bias, textual embeddings further away from visual embeddings may fail to properly leverage visual information necessary to conduct a multi-modal task.
+To address this, in Sec.~\ref{sec:method:dattn} we propose to further decompose the T2(V+T) attention into T2V bidirectional cross-attention (Fig.~\ref{fig:dattn} \textcolor{orange}{orange rectangle}) and T2T causal self-attention (Fig.~\ref{fig:dattn} \textcolor{green}{green triangle}), and then in Sec.~\ref{sec:method:pos-enc} \emph{discard} the rotary/relative position within T2V cross-attention, equivalent to setting relative position difference to 0, to eliminate this bias as shown in Fig.~\ref{fig:wo-pos}.
+% To enhance the spatial information of visual embeddings, we further proposed a learnable position encoding added to the visual embedding before feeding into the LLM.
+
+\subsection{\method{}: Decomposed-Attention}\label{sec:method:dattn}
+In this section, we detail how to analytically decompose conventional causal self-attention into V2V (visual-to-visual), T2V (textual-to-visual), and T2T (textual-to-textual) attentions.
+Built upon this decomposition, we can then easily and efficiently implement diagonal V2V attention and unbiased spatial encodings proposed in Sec.~\ref{sec:method:motivation}.
+This decomposition is mathematically equivalent to conventional causal self-attention and introduce no additional trainable parameters, and thus can work smoothly with a pre-trained LLM.
+
+Without loss of generality, assume visual embeddings are placed at the beginning of the input sequence, conventional causal attention in modern LLM is shown in Fig.~\ref{fig:sattn}.
+Our goal is to analytically decompose the causal attention into three parts: (1) V2V (\textcolor{blue}{blue triangle}, (2) T2V (\textcolor{orange}{orange rectangle}), and (3) T2T (\textcolor{green}{green triangle}) attentions.
+Starting with the V2V attention.
+As shown in Fig.~\ref{fig:sattn}, this part is straightforward by simply computing self-attention on visual embeddings only.
+For a visual embedding $v$:
+\begin{equation}
+    \bar{v} = \texttt{SA}(v, V)
+\end{equation}
+
+, where $V$ is the sequence of visual embeddings $V=[v_1, v_2, ..., v_N]$, and $\texttt{SA}(q, kv)$ represents self-attention operation between query and key value.
+The rest is now a cross-attention from text to text plus vision.
+For a text query embedding $t$:
+\begin{equation}
+\bar{t} = \texttt{XA}(t, [V, T]) = \sum_{i}^{L} \frac{e^{\bm{q}_t\cdot \bm{k}_{i}}}{\sum_{l}^{L} e^{\bm{q}_{t}\cdot \bm{k}_{l}}}\bm{v}_{i} \label{eq:xattn}
+\end{equation}
+
+, where $\bm{q}, \bm{k}, \bm{v}$ are projected query, key, value within an attention module, respectively.
+$\bm{k}$ and $\bm{v}$ are projected from the concatenated visual and textual embedding sequence $[V, T]$, where $\bm{k} \in \{\bm{k}_{t_1},...,\bm{k}_{t_M},\bm{k}_{v_1},...,\bm{k}_{v_N}\}$, and similarly $\bm{v} \in \{\bm{v}_{t_1},...,\bm{v}_{t_M},\bm{v}_{v_1},...,\bm{v}_{v_N}\}$.
+We then rewrite Eq.~\ref{eq:xattn} by splitting key value from $V$ and from $T$:
+
+\begin{align}
+\sum_{i}^{L} \frac{e^{\bm{q}_t\cdot \bm{k}_{i}}}{\sum_{l}^{L} e^{\bm{q}_{t}\cdot \bm{k}_{l}}}\bm{v}_{i}
+&= \sum_{i}^{M} \frac{e^{\bm{q}_t\cdot \bm{k}_{t_i}}}{\sum_{l}^{L} e^{\bm{q}_{t}\cdot \bm{k}_{l}}}\bm{v}_{t_i} +
+\sum_{i}^{N} \frac{e^{\bm{q}_t\cdot \bm{k}_{v_i}}}{\sum_{l}^{L} e^{\bm{q}_{t}\cdot \bm{k}_{l}}}\bm{v}_{v_i}\\
+&= \frac{\sum_{m}^{M} e^{\bm{q}_{t}\cdot \bm{k}_{t_m}}}{\sum_{l}^{L} e^{\bm{q}_{t}\cdot \bm{k}_{l}}} \sum_{i}^{M} \frac{e^{\bm{q}_t\cdot \bm{k}_{t_i}}}{\sum_{m}^{M} e^{\bm{q}_{t}\cdot \bm{k}_{t_m}}}\bm{v}_{t_i} +
+\frac{\sum_{n}^{N} e^{\bm{q}_{t}\cdot \bm{k}_{v_n}}}{\sum_{l}^{L} e^{\bm{q}_{t}\cdot \bm{k}_{l}}} \sum_{i}^{N} \frac{e^{\bm{q}_t\cdot \bm{k}_{v_i}}}{\sum_{n}^{N} e^{\bm{q}_{t}\cdot \bm{k}_{v_n}}}\bm{v}_{v_i}\\
+&= \frac{\sum_{m}^{M} e^{\bm{q}_{t}\cdot \bm{k}_{t_m}}}{\sum_{l}^{L} e^{\bm{q}_{t}\cdot \bm{k}_{l}}} \texttt{SA}(t,T) +
+\frac{\sum_{n}^{N} e^{\bm{q}_{t}\cdot \bm{k}_{v_n}}}{\sum_{l}^{L} e^{\bm{q}_{t}\cdot \bm{k}_{l}}} \texttt{XA}(t,V) \\
+&\equiv \alpha_T\ \texttt{SA}(t,T) + \alpha_V\ \texttt{XA}(t, I)\label{eq:dattn}
+\end{align}
+
+In summary, $\texttt{XA}(t, [V, T])$ can be decomposed into a weighted sum of $\texttt{SA}(t, T)$ and $\texttt{XA}(t, V)$.
+For numerical stability, modern deep learning packages take log of the summed exponentials:
+
+\begin{equation}
+\text{Let}\ S_T = \log\left(\sum_{m}^{M} e^{\bm{q}_{t}\cdot \bm{k}_{t_m}}\right) \text{, and}\ S_V = \log\left(\sum_{n}^{N} e^{\bm{q}_{t}\cdot \bm{k}_{v_n}}\right)
+\end{equation}
+Then the weights $\alpha_T$ and $\alpha_V$ can be expressed as:
+\begin{equation}
+\alpha_T
+= \frac{\sum_{m}^{M} e^{\bm{q}_{t}\cdot \bm{k}_{t_m}}}{\sum_{l}^{L} e^{\bm{q}_{t}\cdot \bm{k}_{l}}}
+= \frac{e^{S_T}}{e^{S_T}+e^{S_V}}
+= \frac{1}{1+e^{-(S_{T}-S_{V})}}
+= \texttt{Sigmoid}(S_T - S_V)
+\end{equation}
+
+We can similarly derive that $\alpha_V=\texttt{Sigmoid}(S_V - S_T) = 1-\alpha_T$.
+
+The model architecture of the proposed $\texttt{SA}(t,T)$ and $\texttt{XA}(t,V)$ decomposition is illustrated in Fig.~\ref{fig:arch-decomp}.
+$\texttt{SA}$ and $\texttt{XA}$ shares the same learnable parameters and operations as the conventional attention module (see Fig.~\ref{fig:arch-sattn}), but with different input query, key, and value combinations.
+The output from $\texttt{SA}$ and $\texttt{XA}$ are then weighted summed with weights $\alpha_T$ and $\alpha_V$, respectively.
+
+\begin{figure*}[t]
+\centering
+\begin{subfigure}{.22\linewidth}
+  \centering
+  \includegraphics[width=1\linewidth]{figures/arch_sattn.pdf}
+  \caption{Conventional attention module.}\label{fig:arch-sattn}
+\end{subfigure}
+\hfill
+\begin{subfigure}{.22\linewidth}
+  \centering
+  \includegraphics[width=1\linewidth]{figures/arch_diag.pdf}
+  \caption{Diagonal attention for visual embeddings.}\label{fig:arch-diag}
+\end{subfigure}
+\hfill
+\begin{subfigure}{.45\linewidth}
+  \centering
+  \includegraphics[width=1\linewidth]{figures/arch_decomp.pdf}
+  \caption{Decomposed T2V XAttn and T2T SAttn.}\label{fig:arch-decomp}
+\end{subfigure}
+\caption{
+1D rotary/relative position encoding introduces undesirable bias into the attention weights between textual and visual embeddings.
+In our decomposed-attention framework, the 1D position encoding can be easily discarded to eliminate this undesired bias.
+}\label{fig:pos}
+\end{figure*}
+
+
+\subsection{Diagonal V2V Attention}\label{sec:method:diag-attn}
+
+In Sec.~\ref{sec:method:motivation}, we point out that each visual embedding has seen all other visual embeddings already.
+Thus, there is no need to \emph{re-learn} this contextual information via LLM's 1D causal self-attention.
+Re-learning the visual context within LLM is not only a waste of computation, but may also be sub-optimal for encoding 2D bidirectional visual context.
+To achieve this, we turn the self-attention for visual embeddings into diagonal-attention.
+For V2V self-attention where visual embeddings $V \in N\times d$:
+\begin{align}
+\bar{V} &= \texttt{SA}(V, V) = \texttt{fc}_o\left( \underbrace{\texttt{softmax}\left( \frac{\texttt{fc}_q(V)\ \texttt{fc}_k(V)^T}{\sqrt{d}},\ \texttt{dim}=1\right)}_{\text{diagonalize} }\texttt{fc}_v(V) \right)\\
+&\Rightarrow \texttt{fc}_o\left(\mathds{1}\ \texttt{fc}_v(V) \right) =  \texttt{fc}_o\left(\texttt{fc}_v(V) \right)
+\end{align}
+
+, where $\mathds{1}$ is an identity matrix of size $N\times N$.
+By turning the softmax attention matrix into an identity matrix, we essentially force each visual embedding to only attend to itself but not all the others.
+Furthermore, we save the expensive computation of softmax attention weights, and reduce $\texttt{SA}(V, V)$ into two $\texttt{fc}$ layers, which has linear computational complexity with respect to the number of visual embeddings.
+
+The model architecture of proposed diagonal V2V attention is illustrated in Fig.~\ref{fig:arch-diag}.
+The core and expensive operations of an attention module for modeling the interaction and contextual information between embeddings are skipped (red mask).
+Eventually, the diagonal attention is simplified into only two linear layers, $\texttt{fc}_v$ and $\texttt{fc}_o$.
+
+\subsection{Unbiased Spatial Encodings}\label{sec:method:pos-enc}
+
+In Sec.~\ref{sec:method:motivation}, we observe that the rotary/relative position embedding introduces undesirable bias into attention weights between textual and visual embeddings as shown in Fig.~\ref{fig:w-pos}, where textual embeddings have lower attention values toward distant visual embeddings.
+To address this, we propose to \emph{discard} the rotary/relative position within T2V cross-attention to eliminate this bias as shown in Fig.~\ref{fig:wo-pos}.
+This cannot be trivially done in conventional self-attention, but is quite straightforward with our decomposed attention derived in Sec.~\ref{sec:method:dattn}:
+\begin{enumerate}
+    \item Decompose $\texttt{XA}(t, [V,T])$ into T2T self-attention $\texttt{SA}(t, T)$ and T2V cross-attention $\texttt{XA}(t, V)$ following Eq.~\ref{eq:xattn}-~\ref{eq:dattn}.
+    \item Discard rotary/relative position encoding when computing $\texttt{XA}(t, V)$.
+    \item Compute $\texttt{SA}(t, T)$ normally with position encoding.
+    \item Merge $\texttt{XA}(t, V)$ and $\texttt{SA}(t, T)$ following Eq.~\ref{eq:dattn}.
+\end{enumerate}
+
+By removing this undesirable bias, textual embeddings attend to visual embeddings independent of the distance in between as shown in Fig.~\ref{fig:pos}.
+Instead, the attention weight should be dependent of their contents and relatedness.
+
+\begin{figure*}[b]
+\centering
+\begin{subfigure}{.49\linewidth}
+  \centering
+  \includegraphics[width=0.8\linewidth]{figures/w_pos.pdf}
+  \caption{Biased attention weight from 1D rotary/relative position encoding.}\label{fig:w-pos}
+\end{subfigure}
+\hfill
+\begin{subfigure}{.49\linewidth}
+  \centering
+  \includegraphics[width=0.8\linewidth]{figures/wo_pos.pdf}
+  \caption{Unbiased attention weight by our proposed decomposed attention and the removal of position encoding.}\label{fig:wo-pos}
+\end{subfigure}
+\caption{
+1D rotary/relative position encoding introduces undesirable bias into the attention weights between textual and visual embeddings.
+In our decomposed-attention framework, the 1D position encoding can be easily discarded to eliminate this undesired bias.
+}\label{fig:pos}
+\end{figure*}

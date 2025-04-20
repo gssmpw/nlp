@@ -1,0 +1,82 @@
+\section{Implementation}
+
+\begin{figure}[t]
+	\centering
+	\includegraphics[scale=0.46]{figures/framework.pdf}
+	\caption{Implementation and usage of \solution.} 
+	\label{fig:framework}
+    % \vspace{+2mm}
+\end{figure}
+
+We implement \solution in PyTorch, one of the most widely used frameworks, and use its C++ extension\footnote{C++ extensions in PyTorch allow users to create custom operators outside the PyTorch backend, providing flexibility and reducing boilerplate code. Once defined, these extensions can be organized into native PyTorch functions for upstream contributions.} to create the backward filtering operator. \solution improves the efficiency of token filtering through two designs: filtering the activations and transforming sparse GEMM to dense GEMM. We implement these two designs in a single operator by directly reducing the sequence dimension, as the filtered activations (\ie, those set to zero) will be subsequently removed in the transformation from sparse GEMM to dense GEMM. Thus, we can directly remove the activations instead of setting them to zero in advance.
+To address the challenges posed by the dynamic computation graph and to support various LLM architectures, we implement \solution in two phases: the offline and online stages, as illustrated in \Cref{fig:framework}. In the offline stage, \solution employs an automatic workflow to generate a model-customized operator for updating the graph. In the online training (\S\ref{sec:imple:offline}), the operator filters the activations and transforms the sparse GEMM into dimension-reduced dense GEMM to accelerate the training process (\S\ref{sec:imple:online}).
+\solution can also be implemented in other frameworks, such as TensorFlow~\cite{TensorFlow}, by following similar procedures to update the computation graph during backpropagation.
+
+\subsection{Offline Generating Model-customized Operator} \label{sec:imple:offline}
+
+Given the model, we run forward and backward computations using synthetic data (\ie, simulating the training samples) to obtain all the node types. Due to runtime stability (\ie, the graph remains stable during training), the node information from synthetic data is identical to that during training. We then parse the node attributes from Torchgen and generate the operator's skeleton code for processing each node. \Cref{code:offline} shows examples of the generated skeleton code for processing GEMM and FlashAttention nodes.
+The generated code is a skeleton and cannot be used directly because the operator employs a greedy algorithm to determine the batch size and sequence dimension based on the inputs. However, the actual batch size and sequence length might be the same as other dimensions (\eg, hidden states of 2048), which can mislead the operator into reducing the wrong dimensions.
+
+
+\vspace{+2mm}
+\begin{lstlisting}[language=C, caption={Generated skeleton code for processing GEMM and FlashAttention nodes. The automatic code generation enables \solution to support various nodes with low implementation costs (\eg, PyTorch has more than 300 types of nodes).}, label={code:offline}]
+/* $$ start of code generation $$ */
+if(fn->name() == "MmBackward0") {
+  MmBackward0* op_fn = dynamic_cast<MmBackward0*>(fn); 
+  auto unpacked_self = op_fn->self_.unpack();
+  if(unpacked_self.defined()) 
+  op_fn->self_ = graph_filter->process_variable(unpacked_self, false);
+  auto unpacked_mat2 = op_fn->mat2_.unpack();
+  if(unpacked_mat2.defined()) 
+  op_fn->mat2_ = graph_filter->process_variable(unpacked_mat2, false); 
+  graph_filter->process_sizes(op_fn->mat2_sym_sizes);
+  graph_filter->process_sizes(op_fn->self_sym_sizes);
+}
+if(fn->name() == "ScaledDotProductFlashAttentionBackward0") {
+  ScaledDotProductFlashAttentionBackward0* op_fn = 
+    dynamic_cast<ScaledDotProductFlashAttentionBackward0*>(fn); 
+  auto unpacked_query = op_fn->query_.unpack();
+  if(unpacked_query.defined()) 
+  op_fn->query_ = graph_filter->process_variable(unpacked_query, false);
+  auto unpacked_key = op_fn->key_.unpack();
+  if(unpacked_key.defined()) 
+  op_fn->key_ = graph_filter->process_variable(unpacked_key, false);
+  auto unpacked_value = op_fn->value_.unpack();
+  if(unpacked_value.defined()) 
+  op_fn->value_ = graph_filter->process_variable(unpacked_value, false);
+  auto unpacked_output = op_fn->output_.unpack(op_fn->getptr());
+  if(unpacked_output.defined()) 
+  op_fn->output_ = graph_filter->process_variable(unpacked_output, true);
+  // ... more attributes omitted
+  graph_filter->process_sizes(op_fn->max_q);
+  graph_filter->process_sizes(op_fn->max_k);
+}
+// ... more nodes
+/* $$ end of code generation $$ */
+\end{lstlisting}
+
+To solve this issue, as demonstrated in \S\ref{sec:system:using_markers}, we compile the generated skeleton code and run the operator using inputs with special markers for both batch size and sequence length. These special markers (\ie, unique from other dimensions) enable the greedy algorithm to precisely identify the correct dimensions for reduction. The operator will save the output of the greedy algorithm and load it during online training, which is guaranteed to be correct due to runtime stability.
+
+After executing the above workflow, we obtain a model-customized operator that contains all the node information and corresponding dimension updating logic for a specific model. We have prepared scripts that allow users to easily execute the workflow and generate operators for their own models. The reset system implementation includes updating the node attributes, \eg, changing the InputMetadata to pass verification and update the saved variables, which is quite straightforward as long as the attributes and reducing dimensions are correctly identified.
+
+\subsection{Online Training using \solution} \label{sec:imple:online}
+
+\vspace{+2mm}
+\begin{lstlisting}[language=Python, caption={Using \solution in the online training.}, label={code:online}]
+	import (*@\solution@*)
+	...
+	for step, batch in enumerate(tokenized_dataset):
+		logits = self.model(batch["input_ids"]).logits
+(*@\textbf{\textcolor{red}{-}}@*)   (*@\textbf{\textcolor{red}{loss = causal\_loss(batch["input\_ids"], logits)}}@*)
+(*@\textbf{\textcolor{dkgreen}{+}}@*)   (*@\textbf{\textcolor{dkgreen}{loss, filter\_mask = token\_filter\_loss(}}@*)
+(*@\textbf{\textcolor{dkgreen}{+}}@*)   (*@\textbf{\textcolor{dkgreen}{\ \ \ \ batch["input\_ids"], logits,}}@*)
+(*@\textbf{\textcolor{dkgreen}{+}}@*)   (*@\textbf{\textcolor{dkgreen}{\ \ \ \ ref\_loss=batch["ref\_loss"], drop\_rate=0.4,}}@*)
+(*@\textbf{\textcolor{dkgreen}{+}}@*)   (*@\textbf{\textcolor{dkgreen}{)}}@*)
+(*@\textbf{\textcolor{dkgreen}{+}}@*)   (*@\textbf{\textcolor{dkgreen}{\solution.ops.backward\_filter(loss, filter\_mask)}}@*)
+		loss.backward()
+		optimizer.step()
+		optimizer.zero_grad()
+	...
+\end{lstlisting}
+
+\noindent Using the operator only requires adding a few lines (\ie, five lines) of code. \Cref{code:online} shows an example of using \solution in online training. Starting from regular training, we first need to change the loss computation to a token-filtered loss, \ie, only considering the loss on selected tokens. Then, we call the \solution operator using the loss and filter mask to update the graph. The filter mask is a tensor consisting of zeros and ones to indicate which tokens are filtered. For systems that already utilize token filtering, only one line of code \texttt{\solution.ops.backward\_filter(loss, filter\_mask)} is needed to get the full efficiency of token filtering.

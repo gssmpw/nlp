@@ -1,0 +1,152 @@
+\section{Methodology}
+\label{sec:method}
+
+\begin{figure*}
+    \centering
+    \includegraphics[width=\linewidth]{figures/framework11.drawio.png}
+    \caption{(a) shows the overall framework of Proxy Transforamtion. For simplicity, $^\dagger$ indicates that a 2D grid is used to represent the 3D spatial grid, with generated 3D offsets also expressed as 2D vectors for clarity. The Grid Prior spans the entire space, and we illustrate it with only four reference points for clearer visualization. In Proxy Transformation module, $\mathcal{M}$ and $\mathcal{T}$ are sets of transformation matrixs and translation vectors for all clusters. (b) details the structure of our deformable offset network, and indicates the input and output shapes, where \( M \) represents the number of clusters and \( K \) represents the number of points per cluster. (c) illustrates the information flow in proxy attention. This module combines with FFN and skip connection in a standard Transformer architecture to form the Proxy Block. }
+    \label{fig:framework}
+\end{figure*}
+
+
+In this section, we will introduce our network design. Firstly, we will give a brief introduction of the entire pipeline and what our module does in \cref{sub:overall}. Then, we introduce our effective yet efficient Proxy Attention in \cref{sub:proxy} and how deformable offsets are generated for reference points in \cref{sub:deform}. Finally, details of Proxy Transformation will be described in \cref{sub:trans}.
+
+\subsection{Overall Structure}
+\label{sub:overall}
+We improve upon the previous SOTA in ego-centric 3D visual grounding~\cite{wang2023embodiedscan}. Here we simply review the overall structure. First, the input RGB-D images from each view is transformed into a partial point cloud, which is then integrated into a holistic 3D point cloud \(P \in \mathbb{R}^{N \times 3}\) using global alignment matrices, thereby preserving geometric details. Next, multi-scale image and point features \(\{\mathcal{F}^s_{\rm img}\}^S_{s=1} \in \mathbb{R}^{V \times H_s \times W_s \times C_s}\), \(\{\mathcal{F}^s_{\rm point}\}^S_{s=1} \in \mathbb{R}^{N \times C_s}\), and text features \(\mathcal{T} \in \mathbb{R}^{L \times C}\) are learned by respective backbone. Here, \(N\) is the total number of points sampled from all perspective views \(V\), \(S\) is the number of 
+scale for the encoded feature maps and \(L\) is the length of text sequence. 
+% Fusion
+The point features are then projected onto the 2D feature planes using intrinsic and extrinsic matrices to get semantic information. Further, they are concatenated to form sparse fusion features \(\{\mathcal{F}^s_{\rm fusion}\}^S_{s=1} \in \mathbb{R}^{N \times 2C_s}\). Finally, they are fed into a DETR-like decoder and then finish 9-degree-of-freedom bounding box regression.
+
+However, due to the large number of points in the depth-reconstructed point cloud and computational limitations, only a sparse subset (about 2\%) is sampled, resulting in a negative influence on the point cloud manifold. Due to the varying manifold structures in different local regions of scene-level point clouds, applying a global transformation to the entire point cloud is infeasible. To address this issue, we introduce Proxy Transformation to modify point cloud \textbf{submanifolds} with Proxy Attention, providing richer geometric information for subsequent feature learning.
+% 因为scene-level点云的不同局部区域有着不同的流形规律，所以不能直接对点云进行全局的变换。
+
+\subsection{Proxy Attention}
+\label{sub:proxy}
+% attn theory + proxy bias 
+% xx借助中间媒介或者矩阵分解将自注意力机制的计算复杂度降低为线性，这种线性自注意力在矩阵乘法的角度来看与交叉注意力形式一致。基于这些观察，我们将自注意力机制与交叉注意力统一为更加广义的proxy attention。根据proxy的选取方式可以退化为对应的注意力机制，提供更高的灵活性与泛化性。
+For simplicity, we use following formulation to represent Softmax attention:
+\begin{equation}
+    O = {\rm \sigma}(QK^T)V \triangleq {\rm Attn}(Q,K,V)
+\end{equation}
+where $ Q, K, V\in\mathbb{R}^{N \times C} $ denote query, key and value matrices and $\rm{\sigma}(\cdot)$ represents Softmax function. And our proxy attention consists of three components as follows.
+\begin{equation} \label{eq:attn}
+    \begin{split}
+        O^{\rm P}&= {\rm ProxyAttn}(Q,K,V,P) \\
+        &=\ {\rm \sigma}(QP^T)\ {\rm \sigma}(PK^T)\ V \\ 
+        &=\ \underbrace{{\rm Attn}(Q,P,\underbrace{{\rm Attn}(P,K,V)}_{\rm Proxy\ Compression})}_{\rm Proxy\ Broadcast}. \\
+    \end{split}
+\end{equation}
+where \(P \in \mathbb{R}^{n \times C} \) is our proxy tokens.
+
+\noindent \textbf{Proxy Compression.}
+% proxy compression
+% 先前的工作已经证明自注意力中的query-key相似度计算中有很大的冗余，因此我们首先借助proxy tokens对注特征空间进行压缩，这里的proxy tokens的数量在实际计算时远远小于N，因此可以在保持表征能力的同时，极大地缓解计算开销，这在table中展示。具体地，我们首先将proxy tokens作为 query与输入特征的key计算相似度，进而聚合原始value，最终得到冗余度减少的proxy value
+Previous works~\cite{han2023agent,pu2024efficient} have shown significant redundancy in query-key similarity computations within self-attention. To address this, we first compress the attention feature space using proxy tokens, whose number is substantially smaller than \(N\) practically. This approach significantly alleviates computational overhead while preserving representational capacity, as shown in~\cref{tab:attn}. Specifically, we use proxy tokens as queries to compute similarity with initial keys, subsequently aggregating original values to obtain a compressed proxy value representation \(V^{\rm P}\) with reduced redundancy.
+
+\noindent \textbf{Proxy Broadcast.}
+% proxy broadcast
+% 随后，我们将proxy tokens 和proxy values作为keys和values与原始query进行第二次softmax计算，从而将精简的proxy特征广播到全局，如此一来就在维持全局上下文表征能力的同时，达到了线性复杂度。在实际应用时，these proxy tokens can be selected according to the model's representational learning needs (\eg downsampling points after pooing, multi-view image features or textual features), 这里的n远小于N，从而实现了线性广义注意力，兼顾了Efficient computation and high expressive capability
+Subsequently, we treat proxy tokens \(P\) and proxy values \(V^{\rm P}\) as keys and values for a second softmax operation with the original queries, allowing proxy features to be broadcast globally. This design preserves global contextual representation while reducing complexity to a linear scale. In practice, proxy tokens are selected based on the model's representational needs (\eg  downsampling points after pooing, multi-view image features or textual features). In these contexts, \(n\) is much smaller than \(N\). Thus, this approach achieves generalized attention with a linear complexity of $\mathcal{O}(Nnd)$ relative to the number of input features $N$, balancing computational efficiency with high representational capacity as shown in~\cref{tab:attn}.
+
+\noindent \textbf{Proxy Bias.}
+% proxy bias
+% 此外，为了弥补位置信息的缺失与特征信息的多样性，我们定义了新的proxy bias。基于减少参数的考虑，我们选择将两组低维子空间通过线性空间的并集运算合并为高维的子空间，具体地，两组可学习的低维参数首先被定义，他们分别代表特征线性空间的两个子空间，满足xxx。两组参数通过广播运算后即可得到与原始特征维数相同的形状，进而丰富了特征空间的位置信息，帮助proxy attention聚焦在多样化的区域。
+Additionally, to compensate for the lack of positional information and the diversity of features, we introduce a novel proxy bias. To minimize parameter overhead, we merge two low-dimensional subspaces into a higher-dimensional space through a union operation of linear space. Specifically, we define two sets of low-dimensional learnable parameters, representing two subspaces $V_c$ and $V_r$ within feature space $V$ that satisfy $V = V_c \cup V_r$. After broadcasting these two parameter sets, they match the original feature dimensionality, enriching the feature space with positional information, and guiding Proxy Attention to focus on diverse regions.
+
+\subsection{Deformable Point Clustering}
+\label{sub:deform}
+% 既然要对点云的子流形进行变换，那么首先就要得到合适的点云聚类。Motivated by xxx， 我们设计了可变形聚类用于得到合适的聚类中心位置，进而获取想要的的目标子流形。无论是纯粹的背景点云还是重要的目标区域，都是后续变换施加的想要的对象。
+To transform submanifolds, it is essential first to obtain suitable 
+ clusters. Motivated by \cite{deformabledetr,dai2017deformable,xia2022vision}, we design a deformable clustering approach to identify optimal cluster center locations, capturing the desired target submanifolds.
+
+\noindent \textbf{Grid Prior.}
+% 正如secxx提到的，随机采样的稀疏点云已经损失了大量的几何信息，为了弥补几何信息的丢失，我们选择首先生成3D均匀网格，将其中的网格中心作为参考点，用于进行第一次聚类：we find experimentally that it does not affect the performance but better stabilizes the training process in comparison to stochastic sampling, as shown in Sec.
+As mentioned in \cref{sub:overall}, the randomly sampled sparse point cloud has already lost a significant amount of geometric information. To compensate for this loss, we first generate a 3D uniform grid and use its grid centers as reference points for the initial clustering:
+\begin{equation}\label{eq:grid}
+    \begin{aligned}
+        \mathcal{Q}\  &\triangleq \{q_{(i,j,k)}\}_{i,j,k=1}^{x_s,y_s,z_s} \sim U[\mathcal{C}_{min},\mathcal{C}_{max}], \\
+        \mathcal{N}_{(i,j,k)} &\triangleq \{\ p_l^{i,j,k}\}_{l=1}^{m} = \gamma\ (\ \mathcal{Q}_{(i,j,k)},\ \{p_l\}_{l=1}^N\ ),
+\end{aligned}
+\end{equation}
+where reference points $\mathcal{Q}$ are also the initial cluster centers. $U$ is a uniform distribution. $\mathcal{C}$ is the 3D coordinate of points. $p_l^{i,j,k}$ is a specific point in corresponding cluster $\mathcal{N}_{(i,j,k)}$ and $\gamma$ is clustering function, \eg ball query or kNN. $N$ and $m$ are respective numbers of point cloud and local cluster.
+
+To simplify, we regard $\mathcal{N}_{(i,j,k)}$ as $\mathcal{N}_t$, where $t \in [0, n-1]$, where $n=x_s \times y_s \times z_s$ and $x_s,y_s,z_s$ are predefined as hyperparameter. Experimentally, we find that this approach does not affect performance, but provides greater stability in the training process compared to stochastic sampling.
+
+\noindent \textbf{Deformable Offsets.}
+% 为了增加子流形选取的多样性，我们针对每个初始点云聚类设计了对应的偏置网络，使模型可以基于当前的聚类区域的流形状况将聚类中心向着周围更加重要的区域移动。
+To increase the diversity of submanifold selection, an offset network outputs the offset values for reference points respectively, allowing them to shift toward more relevant surrounding regions based on the current submanifold structure. Considering that each reference point covers a local $s$ ball region ($s$ is the largest value for offset), the offset network is able to percept local features to learn reasonable offsets. In addition, we also provide global information to further enhance offset generation. 
+% 具体地，针对某一个聚类，我们首先将点云与中心的相对坐标和全局坐标拼接起来，然后输入到1*1的二维卷积中提取聚类的逐点特征，然后使用平均池化得到聚类的高维local-global特征，最后输入1*1卷积得到最后的offsets。值得注意的是我们将1*1卷积的bias设置为0来避免扰动。
+\begin{equation}\label{eq:offset}
+    \begin{aligned}
+        \hat{q}_{t} &= q_{t} + \Gamma_{\rm{offset}}(\mathcal{N}_t), \\
+        \hat{\mathcal{N}}_t &= \gamma\ (\ \hat{q_{t}},\ \{\ p_l\}_{l=1}^N\ ),
+    \end{aligned}
+\end{equation}
+where $\Gamma_{\rm{offset}}(\cdot)$ is our offset network. $\hat{q}_t \in \hat{\mathcal{Q}}$ is a new cluster center and $\hat{\mathcal{N}}_t$ is a new neighborhood.
+
+Specifically, for $\mathcal{N}_t$, we first concatenate the relative coordinates of sub-points with respect to the center and their global coordinates. It's then passed through $1 \times 1$ Conv2D and ReLU activation to extract point-wise features. We apply average pooling to obtain high-dimensional local-global features for each cluster, which are then fed into another $1 \times 1$ convolution to generate the final offsets, as shown in~\cref{fig:framework}. Notably, we set the bias of the $1 \times 1$ convolution to zero to avoid introducing additional perturbations. Finally, we discard some clusters according to a predefined drop ratio $\beta$ with a certain sampling method(\eg random sampling or FPS), allowing us to obtain a more diverse neighborhood based on the new cluster centers.
+
+\subsection{Proxy Transformation}
+\label{sub:trans}
+% submanifold fine-grained trans
+For each submanifold, we leverage the Proxy Block to learn a unique manifold transformation. Any arbitrary transformation in 3D space can be decomposed into a linear transformation and a translation. Then, these transformations are applied to each deformable cluster. Details about the transformation generation module are described below.
+
+\noindent \textbf{Proxy Block.} Following the standard block design in Transformer architectures~\cite{vaswani2017attention}, we developed a Proxy Block based on proxy attention, aimed at cross-modal learning for subsequent manifold transformations. We denote $P_0$ and $F_0$ as a set of proxy tokens and cluster features. And $F_0$ is extracted by a simplified PointNet~\cite{qi2017pointnet}. Then a transformer block comprises of proxy attention module and feedforward network:
+\begin{equation}\label{b1}
+    F = F_0 + B^{\rm P},
+\end{equation}
+\begin{equation}\label{b2}
+    Q = FW_Q, K = FW_K, V = FW_V, P = P_0W_P,
+\end{equation}
+\begin{equation}\label{b3}
+    O^{\rm P} = F + {\rm ProxyAttn}(Q,K,V,P),
+\end{equation}
+\begin{equation}\label{b4}
+    O = O^{\rm P} + {\rm FFN}(O^{\rm P}),
+\end{equation}
+where $B^{\rm P}$ is our proxy bias introduced in \cref{sub:proxy}. $W_Q,W_K,W_V$ are are projections for query, key and value. ${\rm ProxyAttn}(\cdot)$ is a proxy attention module in \cref{eq:attn}. ${\rm FFN}(\cdot)$ is a position-wise feedforward network.
+
+In the following sections, for simplicity, we use
+\begin{equation}
+    O = {\rm ProxyBlock}(F, P),
+\end{equation}
+to represent the basic proxy block (\cref{b1,b2,b3,b4}).
+
+\noindent \textbf{Text Guided Translation.}
+% 在ego-centric 3D visual grounding中，文本中包含了目标物体与其他参考物体之间的全局相对位置关系，此外的其他部分也自然就是背景点云。因此文本特征可以引导模型学习不同的子流形之间的平移向量，从而增强点云结构中蕴含的全局相对信息。所以我们使用文本特征作为代理的proxy block来生成文本引导的点云特征，进而得到最终的平移向量。
+In ego-centric 3D visual grounding, the input text contains global relative positional information between the target object and other reference objects, while the remaining parts naturally correspond to background point clouds. Therefore, text features can effectively guide the model in learning translation vectors that establish spatial relationships between various submanifolds, thereby enhancing the global relational information embedded within the point cloud structure. Specifically, we leverage text features as proxies within the Proxy Block, allowing it to generate text-guided point cloud features that ultimately yield accurate and context-aware final translation vectors for more precise grounding results.
+\begin{equation}
+    F^{l+1} = {\rm ProxyBlock}(F^l, P_{T}),l=0,..,L-1, 
+\end{equation}
+\begin{equation}
+    T = F^{L}U_{\rm text},
+\end{equation}
+where $P_T$ are text features $\mathcal{F}_{\rm text} \in \mathbb{R}^{S \times C}$. $L$ is number of layers and $U_{\rm text}$ is a fully connected layer to generate final translation vectors $T \in \mathbb{R}^{n \times 3}$.
+
+\noindent \textbf{Image Guided Transformation.}
+% 输入的多视角图像信息中包含了丰富的细粒度语义信息，可以弥补点云降采样导致的语境缺失。多视角图像中包含了从不同方位观察到的目标物体的位姿信息，可以引导模型学习子流形相对于聚类中心的内部变换。所以我们使用图像特征作为代理的proxy block来生成图像引导的点云特征，进而得到每个子流形的线性变换。
+The input multi-view image contains rich fine-grained semantic information, compensating for the contextual loss caused by point cloud downsampling. Multi-view images provide pose information of the target object from various perspectives, guiding the model to learn internal transformations of each sub-points relative to the cluster center. Thus, we use pooled image features as proxies in the Proxy Block to generate reshaped image-guided point cloud features, which in turn yield the linear transformations for each submanifold:
+\begin{equation}
+    F^{l+1} = {\rm ProxyBlock}(F^l, P_{I}),l=0,..,L-1, 
+\end{equation}
+\begin{equation}
+    M = F^{L}U_{\rm image},
+\end{equation}
+where $P_I \in \mathbb{R}^{V \times C}$ are pooled image features from an additional attention pooling layer. And $L$ is the number of layers and $U_{\rm image}$ is a fully connected layer to generate final transformation matrices $M \in \mathbb{R}^{n \times 3 \times 3}$.
+
+\noindent \textbf{Submanifold Reshape.}
+% 得到包含图像中细粒度语义信息的变换矩阵与包含文本中精确的全局相对信息的平移向量后，我们将分别对每一个子流形进行proxy transformation，进而可以得到最终增强后的新点云。
+Once the transformation matrixs, containing fine-grained semantic information from the image, and the translation vectors, encompassing precise global relative information from the text, are obtained, we can apply a Proxy Transformation to each submanifold and finally get a diverse enhanced point cloud manifold. To represent this process, we use  concise set operations:
+\begin{equation}\label{eq:set trans}
+    \hat{\mathcal{P}} = \mathcal{M} \odot \mathcal{P}\ \  \oplus \ \ \mathcal{T}, 
+\end{equation}
+where $\mathcal{M}$ and $\mathcal{T}$ are sets of transformation matrixs and translation vectors for all clusters. $\mathcal{P}$ is a union set of submanifolds of different neighborhoods $\{{\mathcal{N}_i}\}_{i=1}^n$, namely a subset of original point cloud. $\odot$ and $\oplus$ represent element-wise multiplication and addition for sets.
+
+Equivalently, for a specific submanifold:
+\begin{equation}\label{eq:element trans}
+    \hat{P}_i = P_iM_i^T + T_i,
+\end{equation}
+where $P_i \in \mathcal{P} \cap \mathbb{R}^{m \times 3}$ represent sub-points in $\mathcal{N}_i$. $M_i \in \mathcal{M} \cap \mathbb{R}^{3 \times3}$ and $T_i \in \mathcal{T} \cap \mathbb{R}^{3}$ are the specific transformation matrix and translation vector for this submanifold.
+
+Finally, we replace the corresponding parts of the original point cloud with transformed submanifolds to obtain final enhanced point cloud, consisting of rich diversity in manifold structure, which is then fed into 3D backbone during training, enabling efficient multimodal-guided point cloud manifold enhancements.

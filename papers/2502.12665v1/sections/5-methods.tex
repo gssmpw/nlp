@@ -1,0 +1,172 @@
+\section{Method}
+
+% \begin{itemize}
+%     \item Workflow
+%     \item WRoPE
+%     \item Query-aware vector quantization
+%     \item Heterogeneous inference
+% \end{itemize}
+
+% In this section, we first introduce the overall workflow of our proposed {\name}.
+% Then detail the vector-quantization-compatible Windowed Rotary Position Embedding (WRoPE), and query-aware vector quantization for accurate top-K tokens retrieval.
+% Lastly, we present the heterogeneous inference design.
+
+% \subsection{Overview}
+
+In {\name}, there are two stages.
+During the offline pre-processing stage (1st stage), {\name} constructs a shared codebook on a representative dataset for each attention head of each layer.
+
+During the inference stage (2nd stage), {\name} applies quantization functions to key states to map them to the nearest codewords.
+At each autoregressive decoding step, {\name} first utilizes codebooks and codeword indices to approximate attention scores, then retrieves the top-K tokens with the highest attention scores for computation, thereby mitigating the memory overhead of accessing the entire KV cache.
+
+\subsection{Windowed Rotary Position Embedding}
+
+As discussed in Section~\ref{sec:codebook_sharing}, the position-dependent nature of post-PE key states hinders the direct application of a shared codebook in the vector quantization process.
+A seemingly straightforward solution would be to quantize pre-PE key states, and then incorporate RoPE when approximating attention scores.
+However, this approach is computationally expensive, as it necessitates calculating and applying the rotary matrices for each token at each inference.
+
+To overcome this inefficiency, while eliminating the inherent position-dependent nature of post-PE key states, 
+we propose Windowed Rotary Position Embedding (WRoPE).
+This approach builds on the findings by~\citet{rerope, rerope-blog} that transformer-based models are nonsensitive to the positional information of non-local tokens.
+The core idea of WRoPE is to use standard RoPE for local tokens (i.e. those in the window) and use approximate positional information for non-local tokens (i.e. those not in the window).
+% Specifically, local tokens are the tokens closest to and have a significant impact on the current token that is generated in the autoregressive decoding phase.
+% The number of local tokens is determined by the window size.
+% For tokens that are not in the window, they may not have a significant impact on the generation of the current token, so the top K tokens with significant influence are selected based on the approximate position information.
+% Therefore, approximate position information of these tokens is computed with a constant rotation matrix.
+%The core idea of WRoPE is to use standard RoPE for local tokens, and approximate positional information for tokens outside this window with a constant rotation matrix.
+Specifically, WRoPE computes the attention scores as follows:
+\begin{equation}
+    \label{eq:wrope}
+    u_{i,j} = 
+    \begin{cases}
+        \begin{aligned}
+            q_i R_{i-j} k_j^\top, \quad & i-j < w \\
+            q_i R_b k_j^\top, \quad & i-j \ge w
+        \end{aligned}
+    \end{cases}
+\end{equation}
+where \(w\) is the window size, acting as a threshold for local vs. non-local tokens, and \(b\) is a constant value representing a fixed relative position approximation for non-local tokens.
+
+For local tokens (i.e., \(i - j < w\)), WRoPE functions identically to standard RoPE, as defined in Equation~\ref{eq:rope}.
+For non-local tokens outside the window (i.e., \(i - j \ge w\)), the position-dependent rotation matrix \(R_{i-j}\) is replaced by a fixed rotation matrix \(R_b\), approximating the relative positional information \( (i-j) \) with a constant offset \(b\).
+Then, we can calculate the post-PE query and key states as:
+\begin{equation}
+    \tilde q_i = q_iR_b, \quad \tilde k_i = k_i
+\end{equation}
+
+Since post-PE key \(\tilde k_i\) states are identical to their pre-PE counterparts \(k_i\), WRoPE decouples the positional dependency from post-PE representations, therefore optimizes subsequent vector quantization.
+
+\subsection{Query-Aware Vector Quantization}
+
+\label{sec:query_aware_vq}
+
+As discussed in Section \ref{sec:objective_mismatch}, conventional vector quantization fails to achieve accurate approximation of attention scores, due to the objective misalignment between vector quantization and attention score approximation. 
+
+To address this limitation, \textbf{we propose query-aware vector quantization, a custom vector quantization method that directly optimizes the objective of attention score approximation. }
+Specifically, we replace the squared Euclidean distance \(\|\tilde k - \hat k\|^2\) of conventional vector quantization with a query-aware quadratic form \((\tilde k - \hat k) H (\tilde k - \hat k)^\top\) derived from formula (\ref{eq:objective_attention_score_approximation}), where \(H\) represents the second-moment matrix of query states. 
+% This custom method formulation explicitly optimizes for attention score approximation accuracy.
+
+Formally, the query-aware vector quantization minimizes the following objective:
+\begin{equation}
+    \label{eq:query_aware_vq}
+    J'(C) = \mathbb E_{\tilde k \sim \mathcal {D^\mathrm{key}}} \left[(\tilde k - \hat k) H (\tilde k - \hat k)^\top\right]
+\end{equation}
+where \(\hat k = c_{f'(\tilde k; C)}\) denotes the quantized \(\tilde k\), and the corresponding query-aware quantization vector quantization is formulated as:
+\begin{equation}
+    f'(\tilde k; C) = \operatorname*{argmin}_j (\tilde k - c_j) H (\tilde k - c_j)^\top    
+\end{equation}
+% Notably, the definition of \(\hat k\) in Equation~\ref{eq:objective_attention_score_approximation}
+
+% \note{For the codebook construction process, we should reformulate the objective function that efficiently supports the conventional vector quantization algorithms like k-means++~\citep{kmeans++}.
+% Thus,}
+
+For the codebook construction process, we reformulate the objective function to utilize conventional efficient vector quantization algorithms like k-means++~\citep{kmeans++}.
+Specifically, we apply Cholesky decomposition to the positive definite matrix \(H = LL^T\), where \(L \in \mathbb R^{d \times d}\) denotes the Cholesky factor.
+% Thus,
+%########
+%To enable efficient codebook construction with conventional vector quantization algorithms like k-means++~\citep{kmeans++},
+% we transform this problem through Cholesky decomposition of the positive definite matrix \(H = LL^\top\), where \(L \in \mathbb R^{d \times d}\) denotes the Cholesky factor. 
+%#########
+% This allows us to reformulate the objective as:
+% \begin{equation}
+%     \begin{aligned}
+%         J'(C) & = \mathbb E_{\tilde k \sim \mathcal {D^\mathrm{key}}} \left[(\tilde k - \hat k) LL^\top (\tilde k - \hat k)^\top\right] \\
+%         & = \mathbb E_{\tilde k \sim \mathcal {D^\mathrm{key}}} \left[(\tilde kL - \hat kL)(\tilde kL - \hat kL)^\top\right]
+%     \end{aligned}
+% \end{equation}
+Let
+\begin{equation}
+    \label{eq:definition_z}
+    z = \tilde k L, \quad C^z = CL, \quad\hat z = \hat k L
+\end{equation}
+where \(z \in \mathbb R^{1 \times d}\) denotes the transformed key state.
+Then, we can re-derive the objective of attention score approximation \(J'\) as:
+\begin{equation}
+  \label{eq:objective_transform}
+    \begin{aligned}
+        J'(C) & = \mathbb E_{\tilde k \sim \mathcal {D^\mathrm{key}}} \left[(\tilde k - \hat k)H(\tilde k - \hat k)^\top\right] \\
+        & = \mathbb E_{\tilde k \sim \mathcal {D^\mathrm{key}}} \left[(\tilde k - \hat k)LL^\top(\tilde k - \hat k)^\top\right] \\
+        & = \mathbb E_{\tilde k \sim \mathcal {D^\mathrm{key}}} \left[(\tilde kL - \hat kL)(\tilde kL - \hat kL)^\top\right] \\
+        & = \mathbb E_{z \sim D^z} \left[(z - \hat z)(z - \hat z)^\top\right]
+    \end{aligned}
+\end{equation}
+And the quantization function \(f'\) can be re-derived as:
+\begin{equation}
+    \begin{aligned}
+        f'(\tilde k; C) & = \operatorname*{argmin}_j (\tilde k - c_j) H (\tilde k - c_j)^\top     \\
+        & = \operatorname*{argmin}_j (\tilde k L - c_jL)(\tilde k L - c_jL)^\top \\
+        & = \operatorname*{argmin}_j (z - c^z_j)(z - c^z_j)^\top \\
+        & = f(z; C^z)
+    \end{aligned}
+\end{equation}
+where \(f(z; C^z)\) denotes the quantization function of conventional vector quantization.
+Then, we can derive that
+\begin{equation}
+    \label{eq:quantization_function_transform}
+    \begin{aligned}
+        \hat z = \hat k L & = c_{f'(\tilde k; C)}L = c^z_{f(z; C^z)} 
+    \end{aligned}
+\end{equation}
+
+% With 
+Equations~\ref{eq:objective_transform},~\ref{eq:quantization_function_transform}
+% the objective of attention score approximation \(J'\) simplifies to:
+% This transoformation reveals 
+reveal that \textbf{the objective of attention score approximation is equivilant to that of conventional vector quantization on transformed \(z\)}.
+This alignment enables the application of conventional efficient vector quantization algorithms in codebook construction process.
+
+During the offline pre-processing stage, we collect \(z\) on a representative dataset and construct its codebook \(C^z\) using k-means++~\citep{kmeans++}.
+Then, The original shared codebook \(C\) for \(\tilde k\) is calculated as:
+\begin{equation}
+    C = C^z L^{-1}
+\end{equation}
+During inference, the codeword index of \(\tilde k\) is computed through query-aware quantization function:
+\begin{equation}
+    f'(\tilde k; C) = \operatorname*{argmin}_j (\tilde k L - c_jL)(\tilde k L - c_jL)^\top
+\end{equation}
+Let \(s \in \{1, 2, \dots, L\}^{1 \times n}\) denotes the codeword index vector of all key states after applying query-aware vector quantization, where \(s_j = f'(\tilde k_j; C)\).
+Then, the attention score is approximated as:
+\begin{equation}
+    \hat u_{i,j} = \tilde q_i \hat k_j = \tilde q_i c_{s_j}
+\end{equation}
+
+\subsection{Heterogeneous Inference Design}
+
+Although approximating attention scores via vector quantization and then selectively retrieving top-K tokens for computation reduces memory access overhead, the issue of KV Cache occupying substantial GPU memory remains unresolved. 
+To reduce the memory footprint of KV Cache and enable larger batch sizes for improved GPU utilization, we design a heterogeneous inference system. 
+
+We partition the decoding process of our proposed {\name} into three components:  
+
+\noindent (1) \textbf{GPU-based model execution}: All model weights reside on the GPU memory. 
+Computations involving model weights are executed on the GPU during inference.  
+
+\noindent(2) \textbf{GPU-based approximation of attention scores}: The codebook is stored on the GPU. 
+During inference, the GPU first executes the quantization function to assign codewords to key states, then computes attention weight approximations using the codebooks and indices, and lastly gathers the indices of top-K tokens.
+
+\noindent(3) \textbf{CPU-based selective attention}: The full KV Cache is maintained on the CPU memory. 
+During decoding, the top-K token indices and the current query state are transferred to the CPU, where selective attention computation is performed to derive the attention output. 
+This output is then transferred back to the GPU for subsequent computations.
+
+This design aims to minimize data transfer between CPU and GPU, thereby reducing latency. 
+% Compared to alternative approaches that transfer Top-K tokens' KV cache back to the GPU for computation, our solution only requires transferring query states, top-K indices, and attention outputs across devices, thereby reducing latency induced by data transfers. 
+Furthermore, to fully leverage the CPU's thread-level parallelism and SIMD capabilities, we implement a custom selective attention kernel optimized for CPU execution.

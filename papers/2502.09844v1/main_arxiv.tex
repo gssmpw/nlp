@@ -1,0 +1,1324 @@
+\documentclass{article}
+\usepackage{graphicx, amsmath, amsthm, multirow} 
+\usepackage{amsfonts, bm, prettyref, subcaption, algorithm, algorithmic}
+\usepackage{float, url, booktabs}
+\usepackage{amssymb, amsthm}
+\usepackage{ifthen}
+\usepackage{hyperref}
+\usepackage{fullpage} 
+
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{assumption}[theorem]{Assumption}
+\theoremstyle{remark}
+\newtheorem{remark}[theorem]{Remark}
+
+\input{pkgs_and_defns}
+
+\newcommand{\figurewidth}{0.5\columnwidth} 
+
+\title{Solving Empirical Bayes via Transformers}
+
+\author{Anzo Teh, Mark Jabbour, Yury Polyanskiy\thanks{
+    M.J. was with the Department of EECS, MIT, Cambridge,
+		MA, email: \url{mjabbour@mit.edu}. 
+    A.T. and Y.P. are with the Department of EECS, MIT, Cambridge,
+		MA, email: \url{anzoteh@mit.edu} and \url{yp@mit.edu}.}}
+
+\begin{document}
+
+\maketitle 
+\begin{abstract}
+This work applies modern AI tools (transformers) to solving one of the oldest statistical problems: Poisson means under empirical Bayes (Poisson-EB) setting. In Poisson-EB a high-dimensional mean vector $\theta$ (with iid coordinates sampled from an unknown prior $\pi$) is estimated on the basis of $X=\mathrm{Poisson}(\theta)$. A transformer model is pre-trained on a set of synthetically generated pairs $(X,\theta)$ and learns to do in-context learning (ICL) by adapting to unknown $\pi$. Theoretically, we show that a sufficiently wide transformer can achieve vanishing regret with respect to an oracle estimator who knows $\pi$ as dimension grows to infinity. Practically, we discover that already very small models (100k parameters) are able to outperform the best classical algorithm (non-parametric maximum likelihood, or NPMLE) both in runtime and validation loss, which we compute on out-of-distribution synthetic data as well as real-world datasets (NHL hockey, MLB baseball, BookCorpusOpen). Finally, by using linear probes, we confirm that the transformer's EB estimator appears to internally work differently from either NPMLE or Robbins' estimators.
+\end{abstract}
+
+\tableofcontents
+
+
+\section{Introduction}\label{sec:intro}
+Transformers have received a lot of attention due to the prevalence of large language models (LLM). More generally, we think of (encoder-only) transformers as generic engines for learning from exchangeable data. Since most classical statistical tasks are formulated under iid sampling assumption, it is very natural to try to apply transformers to them~\cite{garg2022can}. 
+
+Training transformers for classical statistical problems serves two purposes. One is obviously to get better estimators. Another, equally important, goal of such exercises is to elucidate the internal workings of transformers in a domain with a much easier and much better understood statistical structure than NLP. 
+In this work, we believe, we found the simplest possible such statistical task: \textit{empirical Bayes (EB) mean estimation}. 
+We believe transformers are suitable for EB because EB estimators naturally exhibit a shrinkage effect (i.e. biasing mean estimates towards the nearest mode of the prior), and so do transformers, as shown in \cite{geshkovski2024emergence} that the attention mechanisms tend to cluster tokens. 
+Additionally, the EB mean estimation problem is permutation equivariant, removing the need for positional encoding. 
+In turn, estimators for this problem are in high demand 
+\cite{koenker2024empirical, gu2023invidious, gu2022nonparametric} and unfortunately the best classical estimator (so-called non-parametric maximum likelihood, or NPMLE) suffers from slow convergence. In this work, we demonstrate that transformers outperform NPMLE while also running almost 100x faster. 
+We now proceed to defining the EB task.
+
+\textit{Poisson-EB task:} One observes $n$ samples $X_1,\ldots,X_n$ which are generated iid via a two-step process. First, $\theta_1,\ldots,\theta_n$ are sampled from some unknown prior $\pi$ on $\mathbb{R}$. The $\pi$ serves as an unseen (non-parametric) latent variable and we assume nothing about it (not even continuity or smoothness). Second, given $\theta_i$'s, we sample $X_i$'s conditionally iid via $X_i \sim \text{Poi}(\theta_i)$. The goal is to estimate $\theta_1, \cdots, \theta_n$ via $\hat{\theta}_1, \cdots, \hat{\theta}_n$ upon seeing $X_1, \cdots, X_n$ that minimizes the expected mean-squared error (MSE), $\mathbb{E}[(\hat{\theta}(X) - \theta)^2]$. 
+If $\pi$ were known, the Bayes estimator that minimizes the MSE is the posterior mean of $\theta$, which also has the following form. 
+\begin{equation}\label{eq:poisson-bayes}
+\hat{\theta}_{\pi}(x) = \mathbb{E}[\theta | X = x] = (x + 1)\frac{f_{\pi}(x + 1)}{f_{\pi}(x)}\,.
+\end{equation}
+where $f_{\pi}(x)\triangleq \mathbb{E}_{\pi}[e^{-\theta}\frac{\theta^x}{x!}]$ is the posterior density of $x$. 
+Given that $\pi$ is unknown, an estimator $\pi$ can only instead approximate $\hat{\theta}_{\pi}$. 
+We quantify the quality of the estimation as the \emph{regret}, defined as the excess MSE of $\hat{\theta}$, over $\hat{\theta}_{\pi}$. 
+\begin{flalign*}
+        \Regret(\hat{\theta}) &= \E\left[\left(\hat{\theta}(X)-\theta\right)^2\right] - \E\left[\left(\theta_{\pi}(X)-\theta\right)^2\right] 
+        \\&= \E\left[\left(\hat{\theta}(X)-\theta\right)^2\right] - \mmse(\pi)
+\end{flalign*}
+
+In this Poisson-EB setting, multiple lines of work have produced estimators that resulted in regret that vanishes as sample size increases \cite{brown2013poisson, polyanskiy2021sharp, jana2022optimal, jana2023empirical}. 
+Robbins estimator \cite{Rob51, Rob56} replaces the unknown posterior density $f_{\pi}$ in \prettyref{eq:poisson-bayes} with $N_n(\cdot)$, the empirical count among the samples $X_1, \cdots, X_n$. 
+Minimum distance estimators first estimate a prior (e.g. the NPMLE estimator $\hat{\pi}_{\mathsf{NPMLE}} = \argmax_{Q} \prod_{i=1}^n f_Q(X_i)$), 
+and then produces the plugged-in Bayes estimator $\hat{\theta}_{\hat{\pi}}$.  
+Notice that Robbins estimator suffers from multiple shortcomings like numerical instability (c.f. \cite{efron2021computer}) and the lack of monotonicity property of Bayes estimator $\hat{\theta}_{\pi}$ 
+(c.f. \cite{houwelingen1983monotone}), 
+while minimum-distance estimators are too computationally expensive and do not scale to higher dimensions. 
+\cite{jana2023empirical} attempts to remedy the `regularity vs efficiency' tradeoffs in these estimators with an estimator based on score-estimation equivalent in the Poisson model. 
+However, despite the monotone regularity added, this estimator still does not have a Bayesian form: a cost one pays to achieve an efficient computational time. 
+
+
+\textit{Solving Poisson-EB via transformers.} 
+We formulate our procedure for solving Poisson-EB as follows: we generate synthetic data and train our transformers on those. Then, we freeze their weights and present new data to be estimated. 
+To our knowledge, this is the first line of work that studies using neural network models for empirical Bayes. Concretely, our contributions are as follows: 
+\begin{enumerate}
+    \item In \prettyref{sec:theory}, we show that transformers can approximate Robbins and the NPMLE via the universal approximation theorem. We also use linear probes to show that our pre-trained transformers work differently than the two aforementioned estimators. 
+
+    \item In \prettyref{sec:synthetic}, we set up synthetic experiments to demonstrate that synthetically pre-trained transformers can generalize to unseen sequence lengths and evaluation priors. 
+    This is akin to \cite{xie2021explanation} where ICL occurs at test time despite distribution mismatch. 
+
+    \item In \prettyref{sec:real}, we evaluate these transformers on real datasets for a similar prediction task to demonstrate that they often outperform the classical baselines and crush them in terms of speed.
+\end{enumerate}
+One significance of our synthetic experiments is that transformers demonstrate \textit{length-generalization} by achieving lower regret upon being tested on sequence lengths up to 4x the length they are trained on, even on unseen priors. 
+This comes as multiple works show mixed success of length-generalization of transformers \cite{zhou2024transformers, wang2024length, kazemnejad2024impact, anil2022exploring}. 
+
+We mention that there is a long literature studying transformers for many statistical problems~\cite{bai2024transformers}. What makes this work different is that a) our estimator does not just match but improve upon existing (classical) estimators, thus advancing the statistical frontier; b) our setting is unsupervised and much closer to NLP compared to most previous work considering supervised learning (classification and regression), in which data comes in \textit{pairs}, thus requiring unnatural tricks to pair tokens; c) our problem is non-parametric.
+
+In summary, we demonstrate that even for classical statistical problems, transformers offer an excellent alternative (in runtime and performance). 
+For the simple 1D Poisson-EB task, we also found that already very economically sized transformers ($< 100$ k parameters) can have excellent performance.
+
+\section{Related Work}
+\textbf{Transformers and in-context learning (ICL). }
+Transformers have shown the ability to do ICL, as per the thread of work summarized in 
+\cite{dong2022survey}. 
+ICL is primarily manifested in natural language processing \cite{brown2020language, dai2022can} 
+and learning linear models \cite{akyurek2022learning, zhang2023trained}. 
+Other examples that transformers can learn are gradient descent \cite{bai2024transformers}, 
+several non-linear function classes \cite{garg2022can}, and support vector machine \cite{tarzanagh2023transformers}, 
+while having limited ability on boolean functions \cite{bhattamishra2023understanding}. 
+Recent works have also explained ICL from the Bayesian point of view 
+\cite{muller2024bayes, panwar2023context}, including showing Bayesian behavior even upon train-test distribution mismatch \cite{xie2021explanation}. 
+
+
+\textbf{How do transformers work?} 
+\cite{yun2019transformers} have established the universal approximation theorem of transformers. 
+This was later extended for sparse transformers \cite{yun2020n} and ICL setting \cite{furuya2024transformers}. Its limitations are further discussed in \cite{nath2024transformers}. 
+Transformers have also been shown to do other approximation tasks, like Turing machines 
+\cite{wei2022statistically, perez2021attention}. 
+From another perspective, 
+\cite{alain2018understanding} introduces linear probes as a mechanism of understanding the internals of a neural network, which is further studied in \cite{belinkov2022probing}. 
+Linear probe has also been applied in transformers to study its ability to perform NLP tasks \cite{tenney2019bert}, achieve second order convergence \cite{fu2024transformers}, and learn various functions in-context \cite{guo2023transformers}. 
+One such application is ICL linear regression to look for moments \cite{akyurek2022learning}. 
+Recently, linear probe has been used by \cite{abbas2024enhancing} to improve in-context learning. 
+
+\textbf{Empirical Bayes. }
+Empirical Bayes is a powerful tool for large-scale inference \cite{efron2012large}. 
+Some of its applications include performing downstream tasks like linear regression 
+\cite{kim2024flexible, mukherjee2023mean}, estimating the number of missing species \cite{fisher1943relation}, 
+and large scale hypothesis testing \cite{efron2001empirical}. 
+In computational biology, empirical Bayes has also been used in sequencing frameworks 
+\cite{hardcastle2010bayseq, leng2013ebseq}, 
+though these frameworks are mostly parametric and rely on estimating the parameters of a prior. 
+
+In the theoretical setting, multiple lines of work have established the theoretical bounds that can be achieved by empirical Bayes estimators. 
+In the Poisson-EB problem, Robbins \cite{Rob51, Rob56} formulated an estimator based on Tweedie's formula, known as $f$-modelling. In the normal means EB problem, \cite{jiang2009general} formulated a $g$-modelling approach via prior estimation, which was also adapted to the Poisson-EB problem. 
+More recently, \cite{jana2023empirical} formulated an estimator based on ERM on monotone functions, 
+which introduces regularity to the estimators while also escaping the computationally expensive prior estimation process. 
+The optimality of these estimators has been established in the following works: 
+\cite{brown2013poisson, polyanskiy2021sharp, jana2022optimal, jana2023empirical}. 
+
+\section{Preliminaries}\label{sec:task}
+\iffalse 
+We consider the following Poisson model: 
+let $\pi\in \mathcal{P}([0, \theta_{\max}])$ be a prior supported on $[0, \theta_{\max}]$, 
+and consider the following prediction task based on the hidden parameters 
+$\theta_1, \cdots,\theta_n\stackrel{\text{iid}}{\sim}\pi$, 
+and 
+$X_i\sim \text{Poi}(\theta_i)$. 
+Our goal is to reconstruct $\theta$ via an estimator $\hat{\theta} : \integers_{\ge 0}\to \reals$ that minimizes $\EE[(\hat{\theta}(X) - \theta)^2]$. 
+If $\pi$ is known, then the optimal $\hat{\theta}$ that minimizes the mean-squared error (MSE) is the Bayes estimator, 
+defined as $\hat{\theta}_{\pi}(x)\triangleq \mathbb{E}[\theta | X = x]$, i.e. the posterior mean. 
+In our situation where $\pi$ is unknown with only the mildest assumption made (e.g. boundedness / light-tailedness), 
+existing lines of work have been focusing on approximating the Bayes estimator. 
+One metric of such approximation is \emph{regret}, defined as the excess expected mean-squared error as compared to the one achieved by the Bayes estimator. 
+These are all defined in the following. 
+    
+\begin{definition}[mmse]\label{def:mmse}
+    The minimum mean squared error of a prior $\pi$ is the expected squared error of the Bayes estimator. Specifically, 
+    \begin{align*}
+        \mmse(\pi)\triangleq \min_y \E_{\pi}[(\hat{\theta}_{\pi}(X)-\theta)]=\E_{\pi}[(y_{\pi}(X)-\theta)^2].
+    \end{align*}
+\end{definition}
+\begin{definition}[Regret]\label{def:regret}
+    The regret of an estimator $y$ is 
+    \begin{flalign*}
+        \Regret(\hat{\theta}) &= \E\left[\left(\hat{\theta}(X)-\theta\right)^2\right] - \E\left[\left(\theta_{\pi}(X)-\theta\right)^2\right] 
+        \\&= \E\left[\left(\hat{\theta}(X)-\theta\right)^2\right] - \mmse(\pi)
+    \end{flalign*}
+\end{definition}
+\fi 
+
+\subsection{Baselines description}\label{sec:baselines}
+We outline some of the classical algorithms that we will be benchmarking against. 
+
+\textbf{Non empirical Bayes baselines.} 
+When nothing is known about the prior $\pi$ the minimax optimal estimator is the familiar maximum-likelihood (MLE) estimator
+$\hat{\theta}_{\mathsf{MLE}}(x) = x$. However, when one restricts priors in some way, the minimax optimal estimator is not MLE, but rather a Bayes estimator for the \emph{worst-case} prior. In this work, we consider priors restricted to support $[0,50]$. The minimax optimal estimator for this case is referred to as the \emph{gold standard} (GS) estimator to signify its role as the ``best'' in the sense of classical (pre-EB) statistics.
+\prettyref{app:worstprior} contains derivation of GS.
+
+\textbf{Empirical Bayes baselines.}
+We will use the following empirical Bayes estimators as introduced in \prettyref{sec:intro}: 
+the Robbins estimator, NPMLE estimator, and the ERM-monotone estimator with algorithm described in Lemma 1 of  \cite{jana2023empirical}. 
+
+\subsection{Transformer Architecture}
+Next, we describe our transformer architecture, 
+which closely mimics the standard transformer architecture in \cite{vaswani2017attention}. 
+Given the permutation invariance of the Bayes estimator, we do not use positional encoding or masking. 
+Thus effectively, it is a full-attention encoder-only transformer with one linear decoder on top. 
+
+One aspect worth mentioning is that at the encoding stage, 
+we are using \emph{two} different weights, split evenly across the $N$ layers. 
+The intuition behind it is that one learns the encoding part (input) and the other the decoding part (output). 
+
+\subsection{Training Protocol}
+\textbf{Data generation.}
+We emphasize that all our transformers are trained on synthetic data, using the Poisson-generated integers $X$ as inputs and the hidden parameters $\theta$ as labels.
+We use the plain vanilla MSE loss $\sum (\hat{\theta}(X_i) - \theta_i)^2$. 
+There are two classes of priors from which we generate $\theta$, 
+the neural-generated prior-on-priors, and Dirichlet process with base distribution $\mathsf{Unif}[0, 50]$ within each batch. 
+We fix the sentence length = 512 throughout training. 
+With the exception as noted later in \prettyref{sec:generalize}, 
+we cap the label at $\theta_{\max} = 50$ (i.e. our priors are in the class $\mathcal{P}([0, 50])$. 
+We defer the detailed discussion to \prettyref{app:train-priors}, including the motivation to train with a mixture of the two priors. 
+
+\textbf{Parameter Selection.}
+We consider models of 6, 12, 18, 24, and 48 layers, embedding dimension $\mathsf{dmodel}$ either 32 or 64, 
+and number of heads in 4, 8, 16, 32. 
+We fix the number of training epochs to 50k, the learning rate to 0.02, and the decay rate every 300 epochs to 0.9. 
+Among the trained models, we chose our models based on the mean-squared error evaluated on neural prior-on-prior and Dirichlet process during inference time. 
+We then arrive at the two models described in \prettyref{tab:gridsearch}, 
+which we will name T18 and T24 depending on their number of layers. 
+Both have around 25.6k parameters. 
+We also define T18r and T24r as the transformers we train with random $\theta_{\max}$. 
+\footnote{In the future, we will add T18r and T24r to all comparisons, but for now they only appear on \prettyref{fig:thetamax_rand} and \prettyref{sec:generalize}. }
+
+\begin{table}[ht]
+    \centering 
+    \caption{The characteristics of T18 and T24, respectively.}
+    \label{tab:gridsearch}
+    \begin{tabular}{|c||c|c|c|c|}
+        \hline 
+        Transformer & Layers & Embedding dimension & \# Heads & $\theta_{\max}$\\
+        \hline 
+        \hline 
+        T18 & 18 & 32 & 16 & 50\\
+        T24 & 24 & 32 & 8 & 50\\
+        T18r & 18 & 32 & 16 & Random $[10, 150]$\\
+        T24r & 24 & 32 & 8 & Random $[10, 150]$\\
+        \hline 
+    \end{tabular}
+    
+\end{table}
+
+\section{Understanding transformers}\label{sec:theory}
+In this section, we try to gain an intuition on how transformers work in our setting. 
+We achieve this from two angles. First, we establish some theoretical results on the expressibility of transformers in solving empirical Bayes tasks. 
+Second, we use linear probes to study the prediction mechanism of the transformers. 
+
+\subsection{Expressibility of Transformers}
+We discuss the feasibility of using transformers to solve the empirical Bayes prediction task. Indeed, the study of the universal approximation theorem has been done on multilayer perceptron, c.f. \cite{augustine2024survey}, 
+with some variations like bounded weights \cite{guliyev2018approximation}
+and width \cite{pmlr-v125-kidger20a, park2020minimum}. 
+More recently, universal learnability of transformers has been established, 
+first in \cite{yun2019transformers}, which shows that 2 heads, each of size 1, and 4 hidden dimensions are all we need. 
+\cite{furuya2024transformers} further characterizes universal learnability in terms of in-context learning. 
+
+To start with, we consider the clipped Robbins estimator, defined as follows: 
+\begin{equation}
+    \hat{\theta}_{\mathsf{Rob}, d, M}(x) = 
+    \begin{cases}
+        \min \{(x + 1)\frac{N(x + 1)}{N(x)}, M\} & x < d\\
+        M & x\ge d
+    \end{cases}
+\end{equation}
+Here, we show that transformers can learn this clipped Robbins estimator up to an arbitrary precision. 
+
+\begin{theorem}\label{thm:robbins-transformers}
+    Set a positive integer $d$ and a positive real number $M$. 
+    Then for any $\epsilon > 0$, there exists a transformer architecture with one encoding layer, skip connection, and embedding dimension $d + 1$ that learns the clipped Robbins estimator 
+    $\hat{\theta}_{\mathsf{Rob}, d, M}$ up to a precision $\epsilon$. 
+\end{theorem}
+
+Similarly, we may show that transformers can approximate NPMLE up to an arbitrary input value and precision. 
+
+\begin{theorem}\label{thm:univ_npmle}
+    Let $M > 0$, and denote the NPMLE estimator $\hat{\theta}_{\mathsf{NPMLE}, M}$, the NPMLE estimator chosen among 
+    $\mathcal{P}([0, M])$. For each integer $d > 0$ consider the following modified NPMLE function: 
+    \[
+    \theta_{\mathsf{NPMLE}, d, M}(x)
+    =
+    \begin{cases}
+        \hat{\theta}_{\mathsf{NPMLE}}(x) & x \le d\\
+        M & x > d\\
+    \end{cases}
+    \]
+    then for any $\epsilon > 0$ there exists a transformer network that can approximate $\theta_{\mathsf{NPMLE}, d}$ uniformly up to $\epsilon$-precision. 
+\end{theorem}
+
+Full proofs are deferred to \prettyref{app:proofs} and we only give a sketch for now. 
+For Robbins approximation, we create an encoding mechanism that encodes $\frac{N(X_i)}{N(X_i)+(X_i + 1)N(X_i + 1)}$ at position $i$ among $1, \cdots, n$ and use a decoder to approximate the function $x\to \min\{\frac{1}{x} - 1, M\}$. For NPMLE approximation, we pass in the Sigmoid of the integer inputs as embedding, 
+and show that $\hat{\theta}_{\mathsf{NPMLE}}$ can be continually extended, with sigmoid-transformed empirical distribution as arguments. For the encoding part, we provide a pseudocode in \prettyref{app:transf-robbins} that closely follows PyTorch's implementation. 
+
+To illustrate the significance of both of these theorems, we demonstrate that transformers can learn an empirical Bayes prediction task to an arbitrarily low regret. 
+
+\begin{corollary}\label{cor:vanish-regret}
+    For any $\epsilon > 0$, there exists an integer $N$ and a transformer network $\Gamma$ such that for all $n\ge N$, 
+    the minimax regret of $\Gamma(X_1, \cdots, X_n)$ on prior $\pi\in\mathcal{P}([0, \theta_{\max}])$ satisfies 
+    \[
+    \sup_{\pi\in\mathcal{P}([0, \theta_{\max}])}\mathsf{Regret}(\Gamma(X_1, \cdots, X_n))\le \epsilon
+    \]
+\end{corollary}
+
+\subsection{How do transformers learn?}
+We study the mechanisms by which transformers learn via linear probe \cite{alain2018understanding}. 
+To this end, we take the representation of each layer of our pretrained transformers, and train a decoder that comprises a layer normalization operation, linear layer, and GeLU activation. 
+This decoder is then trained with the following labels: frequency $N(x)$ within a sequence, 
+and posterior density $f_{\hat{\pi}}(x)$ estimated by the NPMLE. 
+The aim is to study whether our transformers function like the Robbins or NPMLE. 
+In the plot in \prettyref{fig:linear_probe}, we answer this as negative, showing that our transformers are not merely learning about these features, but instead learning what the Bayes estimator $\hat{\theta}_{\pi}$ is. 
+
+\begin{figure}[ht]
+\vskip 0.2in
+\begin{center}
+\centerline{\includegraphics[width=\figurewidth]{plots/linear_probe_freq.png}}
+\caption{$R^2$ score of linear probe results against $N(x)$,$f_{\pi}(x)$ and $x$ for T18 (the plots for T24 appear similar). We see that while $x$ itself is easily recoverable from any layer, ``knowledge'' about the former two quantities appears to decrease with depth. }
+    \label{fig:linear_probe}
+\end{center} 
+\end{figure}
+
+\section{Synthetic Experiments}\label{sec:synthetic}
+We now evaluate our trained transformers on the following: 
+How well do they generalize? This can be done by evaluating on the following: 
+sequence lengths other than the ones we have trained on, 
+unseen priors, and unknown bound $\theta_{\max}$. 
+We also compare against the classical algorithms introduced in \prettyref{sec:task} to demonstrate the superiority of these transformers by showing the average regret; 
+most other details are deferred to \prettyref{app:synthetic}. 
+We also investigate the inference time to show its advantage over NPMLE. 
+
+\subsection{Ability to Generalize}\label{sec:generalize}
+\textbf{Adaptibility to various sequence lengths.} 
+In this experiment, we evaluate the ability of transformers to adapt to different sequence lengths, 
+both fewer than and more than what is trained. 
+To do so, we evaluate them on 4096 neural prior-on-priors (which is part of the training distribution), 
+but on various sequence length $n$: 128, 256, 512, 1024, and 2048. 
+For each such prior, we generate 192 batches for evaluation. 
+We report the average regret over the 4096 priors in \prettyref{fig:regret_seqlen}. 
+
+\begin{figure}[ht]
+\vskip 0.2in
+\begin{center}
+\centerline{\includegraphics[width=\figurewidth]{plots/regret_seqlen.png}}
+    \caption{Regret vs sequence length (neural prior). 
+    The regret decreases for both transformers as the sequence length increases, 
+    showing that they do have the ability to generalize. 
+    We nevertheless note that NPMLE has a better generalization ability, as shown by the regret at sequence length 2048 as compared to smaller sequences. 
+    In comparison, the average regret for ERM monotone is 11.20, 8.19, 5.58, 3.66, and 2.36 for the various sequence lengths, 
+    while the average regret for MLE and GS stays constant at 14.816 and 14.658, respectively. 
+    }
+    \label{fig:regret_seqlen}
+    \end{center}
+\vskip -0.2in
+\end{figure}
+
+\textbf{Robustness against unseen priors.} 
+Our transformers are trained on a mixture of neural and Dirichlet priors. 
+Here, we consider their performances on the worst case prior in $\mathcal{P}([0,50])$ as mentioned in \prettyref{sec:baselines} and further explained in \prettyref{app:worstprior}. 
+The numbers of batches we use in this prior are 786k (for sequence lengths $n = 128, 256, 512$), 393k (for $n=1024$), and 197k (for $n = 2048$). 
+We also consider another unseen prior-on-prior: the multinomial prior supported on $[0, 50]$ with fixed, evenly split grids and weights distributed as Dirichlet distribution, 
+using sequence lengths 512, 1024, and 2048, using 192 batches for each of the 4096 priors we evaluate on. 
+We report the estimated regret in \prettyref{fig:worstprior_seqlen} and \prettyref{fig:multn_seqlen} to show that transformers produce regret comparable to the strongest alternative (NPMLE). 
+
+\begin{figure}[ht]
+\vskip 0.2in
+\begin{center}
+\centerline{\includegraphics[width=\figurewidth]{plots/worstprior_seqlen.png}}
+    \caption{Regret of various transformers on worst prior compared to NPMLE. 
+    Again, transformers show the ability to generalize to longer sequence lengths, 
+    although for longer sequences NPMLE generalizes better. Note that this is already better than ERM-monotone's regret at 12.79, 9.80, 6.99, 4.81, and 3.26 across the 5 sequence lengths, while MLE's regret stays at 11.73. }
+    \label{fig:worstprior_seqlen}
+    \end{center}
+\vskip -0.2in
+\end{figure}
+
+\begin{figure}[ht]
+\vskip 0.2in
+\begin{center}
+\centerline{\includegraphics[width=\figurewidth]{plots/multinomial_seqlen.png}}
+    \caption{Average regret of various transformers on multinomial priors compared to NPMLE. Here, transformers show $\ge 2$ times improvement over NPMLE even on sequence lengths it never trained on. In comparison, ERM-monotone's regret across sequence lengths are at 5.17, 3.69, 2.57, while MLE's and GS's regrets stay at 5.87 and 5.63, respectively.}
+    \label{fig:multn_seqlen}
+    \end{center}
+\vskip -0.2in
+\end{figure}
+
+\textbf{Training under randomized $\theta_{\max}$.}
+In another experiment, we investigate the effect of mismatched $\theta_{\max}$. 
+on the performance of transformers without knowledge of $\theta_{\max}$. 
+Specifically, we train two sets of transformers, one as reported in \prettyref{tab:gridsearch}, 
+the other set (T18r, T24r) with the same parameters but with $\theta_{\max}$ randomized according to the following mixture: 
+\[
+\theta_{\max}\sim \frac 34 \mathcal{N}(0, 50, 10^2) + \frac 18\text{Exp}(50) + \frac 18\text{Cauchy}(50, 10)
+\]
+and clamped at $[10, 150]$. 
+Then, for the two sets of transformers, we evaluate them on 4096 neural prior-on-priors, 
+using the default sequence length = 512 and 192 batches for each prior. 
+We report the distribution of regrets in \prettyref{fig:thetamax_rand} which demonstrates that transformers trained with randomized $\theta_{\max}$ see a small deterioration in regret, but nonetheless still outperform NPMLE in regret minimization.
+
+
+\begin{figure}[ht]
+\vskip 0.2in
+\begin{center}
+\centerline{\includegraphics[width=\figurewidth]{plots/randthetamax_violin.png}}
+    \caption{Comparison of regrets when $\theta_{\max}$ is trained randomly. 
+    The mean regret increases by 18.5\% and 23.4\% for the transformers with 18 and 24 layers, respectively, 
+    when compared against transformers that learn the true $\theta_{\max}$ during training, but still outperforms NPMLE. All comparisons resulted in a significant $t$-score ($p < $1e-100). }
+    \label{fig:thetamax_rand}
+    \end{center}
+\vskip -0.2in
+\end{figure}
+
+
+\subsection{Inference Time Comparison}
+We evaluate their inference time of various estimators over 4096 neural prior-on-priors, where for each prior we consider the time needed to estimate the hidden parameter of 192 batches and sequence length 128, 256, 512, 1024, and 2048. 
+Each program is given 2 Nvidia Volta V100 GPUs and 40 CPUs for computation. 
+The results are tabulated at \prettyref{fig:time_seqlen}, 
+where we see that the transformers' runtime is comparable to that of ERM's. 
+
+\begin{figure}[ht]
+\vskip 0.2in
+\begin{center}
+\centerline{\includegraphics[width=\figurewidth]{plots/time_vs_seqlen.png}}
+    \caption{Time vs sequence length, 
+    showing that the inference time of transformers is comparable with that of ERM monotone. 
+    We nevertheless qualify this finding by noting that these running times seem to scale superlinearly with sequence length. 
+    For comparison, the running time of NPMLE for sequence lengths 128, 256, 512, 1024, and 2048 are 41.69, 67.70, 109.81, 175.72, and 289.79 seconds, respectively, which indicates that transformers are 2 orders of magnitudes faster than NPMLE. 
+    }
+    \label{fig:time_seqlen}
+    \end{center}
+\vskip -0.2in
+\end{figure}
+
+\section{Real Data Experiments}\label{sec:real}
+
+In this section, we answer the following question: 
+Can our transformers that are pre-trained on synthetic data perform well on real datasets without re-training on any part of the real datasets?
+
+To do so, we consider the following experimental setup: 
+Given an integer-valued attribute, let $X$ be the count of the attribute in the initial section we observe, and $Y$ be the count of a similar attribute in the remaining section that we should predict. 
+We assume that given a horizon length (duration, sentence length, etc) 
+$n_X$ and $n_Y$ of the two sections, there exist hidden parameters $\theta_i$ 
+such that $X_i\sim \text{Poi}(n_X\theta_i)$ and $Y_i\sim \text{Poi}(n_Y\theta_i)$, independently 
+(for convenience we will scale $\theta_i$ such that $n_X = 1$). 
+Our goal is to predict $\hat{Y} = n_Y\hat{\theta}(X)$ using empirical Bayes methods. 
+We will focus on the following two types of datasets: 
+sports and word frequency. Below, we describe the types of datasets that we would study. 
+Throughout this section, we name $(X, Y)$ as the input and label sets, respectively. 
+
+\subsection{Sports datasets} 
+Here, $X$ and $Y$ are the numbers of goals scored by a player within disjoint and consecutive timeframes, 
+and $\theta$ represents the innate ability of the given player. We will consider two datasets: 
+National Hockey League (NHL) and Major League Baseball (MLB). 
+
+\textbf{NHL dataset}. 
+We proceed in the same spirit as \cite{jana2022optimal}, Section 5.2, 
+and study the data on the total number of goals scored by each player in the National Hockey League for 29 years: 
+from the 1989-1990 season to the 2018-2019 season (2004-2005 season was canceled). 
+The data is obtained from \cite{HockeyReference}, 
+and we focus on the skaters' statistics. 
+Here, given the number of goals a player scored in season $j$, we wish to predict the same for season $j + 1$ 
+(thus the input and label sets are the number of goals a player scored in consecutive seasons, and $n_Y=1$). 
+We study the prediction results when fitting all players at once, 
+as well as fitting only positions of interest (defender, center, and winger).  
+
+\textbf{MLB dataset}. 
+The dataset is publicly available at \cite{Retrosheet}, 
+and can be processed by \cite{EstiniRetrosheet}. 
+Here, we study the hitting count of each player in batting and pitching players from 1990 to 2017. 
+Unlike the between-season prediction as we did for the NHL dataset, we do in-season prediction. 
+That is, we take $X$ as the number of goals scored by a player in the beginning portion of the season, 
+and $Y$ in the rest of the season. 
+For batting and pitching players (which we fit separately), 
+we use $X$ as the goals in the first $\frac 15$ and first $\frac 16$ of the season (i.e. $n_Y = 4, 5$), respectively. 
+
+\subsection{Word frequency datasets} 
+In this setting, we model the alphabet of tokens as $M$ categorical objects $A = \{A_1, \cdots, A_M\}$. 
+Given $n$ samples from these objects, and denote $(X_1, \cdots, X_M)$ the frequency of the samples. 
+Suppose we are to estimate the frequencies $(Y_1, \cdots, Y_M)$ of an unseen section of length $t$ (here $t$ known). 
+We model as follows: 
+consider $p_1, \cdots, p_M$ as the ``inherent'' probability distribution over $M$ 
+(or proportion in a population), so $\sum_{i = 1}^M p_i = 1$. 
+Now the frequency $X_i \sim \text{Binom}(n, p_i)$, which we may instead approximate as $X_i\sim\text{Poi}(np_i)$. 
+Thus we may use empirical Bayes method to estimate $\hat{\theta}_i = n\hat{p}_i$ based on the frequencies $X_1, \cdots, X_M$, 
+and then predict $\hat{Y}_i = \frac{t}{n}\hat{\theta}_i$. 
+
+\textbf{BookCorpusOpen}. 
+BookCorpus is a well-known large-scale text dataset, 
+originally collected and analyzed by \cite{zhu2015aligning}. 
+Here, we use a newer version named BookCorpusOpen, hosted on websites like 
+\cite{BookCorpusOpen}. 
+This version of the dataset contains 17868 books in English; 
+we discard 6 of the books that are too short ($\le 2000$ tokens), 
+and 5 other books where NPMLE incurs out-of-memory error. 
+To curate the dataset, we first tokenize the text using scikit-learn's 
+CountVectorizer with English stopwords removed. 
+For each book, the input set comprises the beginning section containing approximately 2000 tokens, 
+while the label set the remainder of the book. 
+Then for each word, $X$ and $Y$ are the frequency of each word within the input and label set, respectively. 
+We will then use the prediction $\hat{Y} = n_Y\cdot \hat{\theta}(X)$ where $n_Y$ is the ratio of the number of sentences in the label set to that of the input set. 
+
+\subsection{Evaluation Methods}
+We will use the RMSE of each dataset item, normalized by $n_Y$, as our main evaluation metric. 
+Specifically, for each dataset, we compute the RMSE incurred by each estimator. 
+We then compare them using the following guidelines. 
+
+\textbf{Comparison against MLE}. 
+We consider the ratio of RMSE of each estimator against that of the MLE, and ask, ``how much improvement did we achieve against the MLE'' by looking at the \emph{average} of the ratio. 
+
+\textbf{Relative ranking}. We use the Plackett-Luce \cite{plackett1975analysis,luce1959individual} ranking system to determine how well one estimator ranks over the other. 
+
+\textbf{Significance of improvement}. We will also consider whether one improvement is \emph{significant} by performing paired $t$-test on the RMSE of transformers against the baselines. 
+
+We tabulate our findings in \prettyref{tab:percentage_rmse} and \prettyref{tab:tstat_rmse}. 
+In addition, we also show a few violin plots in \prettyref{fig:hockey_violin}, \prettyref{fig:batting_violin}, \prettyref{fig:bookcorpus_violin} for NHL, MLB batting, and Bookcorpus to supplement \prettyref{tab:percentage_rmse} 
+(with Robbins removed due to its wide variance). 
+From \prettyref{tab:tstat_rmse}, we conclude a nontrivial improvement of the transformers over the classical methods in most of the datasets. 
+A more detailed comparison (e.g. the ELO rating of estimators' RMSE and the MAE metric), is shown in \prettyref{app:real}. 
+
+\begin{figure}[ht]
+\vskip 0.2in
+\begin{center}
+\centerline{\includegraphics[width=\figurewidth]{plots/hockey_violin_plot.png}}
+    \caption{Violin plots of RMSE ratio achieved by multiple estimators over MLE on NHL. }
+    \label{fig:hockey_violin}
+    \end{center}
+\vskip -0.2in
+\end{figure}
+
+\begin{figure}[ht]
+\vskip 0.2in
+\begin{center}
+\centerline{\includegraphics[width=\figurewidth]{plots/baseballbat_violin_plot.png}}
+    \caption{Violin plots of RMSE ratio achieved by multiple estimators over MLE on MLB batting. }
+    \label{fig:batting_violin}
+    \end{center}
+\vskip -0.2in
+\end{figure}
+
+\iffalse 
+\begin{figure}[ht]
+\vskip 0.2in
+\begin{center}
+\centerline{\includegraphics[width=\figurewidth]{plots/baseballpitch_violin_plot.png}}
+    \caption{Violin plots of RMSE ratio achieved by multiple estimators over MLE on MLB pitching. }
+    \label{fig:pitching_violin}
+    \end{center}
+\vskip -0.2in
+\end{figure}
+\fi 
+
+\begin{figure}[ht]
+\vskip 0.2in
+\begin{center}
+\centerline{\includegraphics[width=\figurewidth]{plots/bookcorpus_violin_plot.png}}
+    \caption{Violin plots of RMSE ratio achieved by multiple estimators over MLE on BookCorpusOpen.}
+    \label{fig:bookcorpus_violin}
+    \end{center}
+\vskip -0.2in
+\end{figure}
+
+\begin{table*}[ht]
+\caption{95\% confidence interval of the percentage improvement of RMSE by each algorithm over MLE.}
+\label{tab:percentage_rmse}
+\vskip 0.15in
+\begin{center}
+\begin{small}
+\begin{sc}
+\begin{tabular}{lccccc}
+\toprule
+Dataset & Robbins & ERM & NPMLE & T18 & T24 \\
+\midrule
+NHL & -30.55 $\pm$ 6.55 & 1.46 $\pm$ 0.65 & 3.24 $\pm$ 0.92 & \textbf{3.51 $\pm$ 1.01} & 3.46 $\pm$ 1.00 \\
+NHL (defender) & -19.54 $\pm$ 6.35 & 3.19 $\pm$ 1.32 & 6.48 $\pm$ 1.63 & 7.25 $\pm$ 1.88 & \textbf{7.41 $\pm$ 1.86} \\
+NHL (center) & -49.89 $\pm$ 10.36 & 0.38 $\pm$ 0.82 & 3.44 $\pm$ 0.94 & \textbf{4.12 $\pm$ 1.14} & 4.06 $\pm$ 1.07 \\
+NHL (winger) & -42.63 $\pm$ 7.58 & 0.76 $\pm$ 0.69 & 3.06 $\pm$ 0.87 & \textbf{3.39 $\pm$ 1.03} & 3.38 $\pm$ 1.01 \\
+\midrule
+MLB (batting) & -32.80 $\pm$ 5.67 & 2.50 $\pm$ 0.36 & 4.30 $\pm$ 0.41 & 4.45 $\pm$ 0.37 & \textbf{4.58 $\pm$ 0.39}\\
+MLB (pitching) & -21.71 $\pm$ 2.45 & 2.51 $\pm$ 0.31 & 4.70 $\pm$ 0.41 & 4.89 $\pm$ 0.42 & \textbf{4.95 $\pm$ 0.38} \\
+\midrule
+BookCorpusOpen  & -4.58 $\pm$ 0.43 & 9.38 $\pm$ 0.10 & 10.82 $\pm$ 0.11 & 10.38 $\pm$ 0.18 & \textbf{11.43 $\pm$ 0.17} \\
+\bottomrule
+\end{tabular}
+\end{sc}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table*}
+
+\begin{table*}[ht]
+\caption{$\mathbb{P}[\text{RMSE(transformers)} > \text{RMSE(baselines)}]$ obtained via paired $t$-test.}
+\label{tab:tstat_rmse}
+\vskip 0.15in
+\begin{center}
+\begin{small}
+\begin{sc}
+\begin{tabular}{lcccc|cccc}
+\toprule
+& \multicolumn{4}{c}{T18}  &  \multicolumn{4}{c}{T24}\\
+Dataset & MLE & Robbins & ERM & NPMLE & MLE & Robbins & ERM & NPMLE\\
+\midrule
+NHL & 1.44e-06 & 2.51e-11 & 8.42e-06 & 0.120 & 1.57e-06 & 3.14e-11 & 8.96e-06 & 0.150\\
+NHL (defender) & 2.15e-08 & 9.76e-11 & 4.71e-08 & 8.72e-05 & 1.48e-08 & 9.67e-11 & 3.54e-08 & 4.77e-05\\
+NHL (center) & 1.14e-06 & 1.33e-11 & 6.01e-07 & 2.98e-03 & 6.38e-07 & 1.73e-11 & 5.61e-07 & 1.65e-03\\
+NHL (winger) & 1.76e-06 & 8.01e-13 & 1.33e-05 & 0.153 & 1.54e-06 & 8.29e-13 & 1.16e-05 & 0.152\\
+\midrule
+MLB batting & 1.39e-21 & 6.51e-14 & 1.30e-11 & 1.08e-03 & 8.49e-22 & 6.21e-14 & 1.93e-12 & 2.11e-08\\
+MLB pitching & 9.62e-20 & 1.21e-16 & 1.49e-12 & 2.34e-03 & 5.95e-21 & 1.13e-16 & 2.10e-13 & 4.78e-06\\
+\midrule
+BookCorpusOpen & $<$ 1e-100 & $<$ 1e-100 & 0.0104 & 1 - 1.19e-05 & $<$ 1e-100 & $<$ 1e-100 & 6.88e-15 & 0.133\\
+\bottomrule
+\end{tabular}
+\end{sc}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table*}
+
+
+\section{Conclusion and Future Work}
+We have demonstrated the ability of transformers to learn EB-Poisson via in-context learning. 
+This was done by evaluating pre-trained transformers on synthetic data of unseen distribution and sequence length, 
+and compared against baselines like the NPMLE. 
+In this process, we showed that transformers can achieve decreasing regret as the sequence length increases. 
+On the real datasets, we showed that these pre-trained transformers can outperform classical baselines in most cases. 
+
+One future direction will be to extend our work to multi-dimensional input, 
+as discussed in
+\cite{jana2023empirical} (Section 1.3), \cite{jana2022optimal} (Section 6). 
+We believe that the transformers would still be able to learn the `context' of the inputs in multi-dimensional settings. 
+On the other hand, the $g$-modelling methods like the NPMLE can take $n^{\Theta(d)}$ inference time, 
+which makes it not scalable. 
+In addition, given that the focus of this work is on Poisson-EB, one natural direction is to extend it to the normal-means model \cite{jiang2009general}. 
+On the theoretical front, the expressibility and limitations of the transformers can be further studied, 
+including settings where the model dimension is bounded. 
+Finally, given that the focus has been studying transformers trained
+and evaluated on priors with compact support ($[0, 50]$ in
+our case), we plan to study further the behavior of transformers on priors with unbounded support (akin to how we did in one of the studies in \prettyref{sec:generalize}). 
+
+
+\section*{Acknowledgements} 
+  This work was supported in part by the MIT-IBM Watson AI Lab and the National Science Foundation under Grant No CCF-2131115. Anzo Teh was supported by a fellowship from the Eric and Wendy Schmidt Center at the Broad Institute.
+
+
+
+\bibliographystyle{alpha} 
+\bibliography{references}
+
+
+\appendix
+\section{Detailed Discussion on Setups}
+
+\subsection{Worst-case prior and Gold-Standard Estimator}\label{app:worstprior}
+We first define the worst-case prior and the gold-standard estimator. 
+\begin{definition}[Worst-case prior]
+    Let $A$ be a compact subset of $\mathcal{R}$. 
+    Then the worst-case prior $\pi_{!, A}$ is defined as 
+    \[
+    \pi_{!, A} = \argmax_{\pi\in \mathcal{A}} \mathsf{mmse}(\pi)
+    \]
+\end{definition}
+
+A sample distribution of the worst-case prior on $[0, 50]$ is illustrated in 
+Figure 1 of \cite{jana2022optimal}. 
+
+One motivation for using the worst case prior is that the Bayes estimator is considered the ``gold standard'' which minimizes the maximum-possible MSE across all priors supported on $A$. 
+A concrete statement can be found in the following lemma. 
+\begin{lemma}\label{lmm:worst_prior_mse}
+    Let $\hat{\theta}_{\pi}$ be the Bayes estimator to a prior $\pi$. 
+    and let $A$ be any compact subset of the reals. 
+    Then the least favorable prior $\pi_{!, A}$ of $A$ satisfies the following: 
+    \[
+    \mathsf{MSE}_{\delta_{\theta}}(\hat{\theta}_{\pi_{!, A}}) \le \mathsf{mmse}(\pi_{!, A}), \forall \theta\in A
+    \]
+    and equality holds whenever $\theta\in\mathsf{Supp}(\pi_{!, A})$. 
+\end{lemma}
+
+This leads to the following corollary. 
+\begin{corollary}
+    For any compact subset $A$ of the reals, we have 
+    \[
+    \min_{\hat{\theta}}\max_{\pi\in\mathcal{P}(A)} \mathbb{E}[(\hat{\theta}(X) - \theta)^2]
+    =\mathsf{mmse}(\pi_{!, A})
+    \]
+    achieved by the Bayes estimator $f_{\pi_{!, A}}$ of the least favourable prior, $\pi_{!, A}$. 
+\end{corollary}
+
+\begin{proof}
+From \prettyref{lmm:worst_prior_mse}, we have $\mathsf{MSE}_{\pi}(\hat{\theta}_{\pi_{!, A}})\le \mathsf{mmse}(\pi_!)$ for any $\pi\in\mathcal{P}(A)$. 
+Therefore $\min_{\hat{\theta}}\max_{\pi\in\mathcal{P}(A)} \mathbb{E}[(\hat{\theta}(X) - \theta)^2]\le\mathsf{mmse}(\pi_!)$ by taking 
+$\hat{\theta} = \hat{\theta}_{\pi_{!, A}}$. 
+Now, for any $\hat{\theta}$, we have $\mathbb{E}_{\pi_{!, A}}[(\hat{\theta}(X) - \theta)^2]\ge \mathsf{mmse}(\pi_!)$. 
+Therefore the conclusion follows. 
+\end{proof}
+
+On the flip side, however, this estimator $f_{\pi!, A}$ does not leverage the fact the low-MMSE nature of some prior, leading to suboptimal regret produced by $f_{\pi!, A}$. 
+Indeed, we consider the priors generated by the neural prior on prior protocols, 
+and the histogram of MMSEs as shown in \prettyref{fig:mmse_neural}. 
+The MSE given by $f_{\pi!, [0, 50]}$ on priors that are point masses as per 
+\prettyref{fig:worst_prior_bayes_mse} suggests that $f_{\pi!, [0, 50]}$ is incapable of achieving low regrets on priors with low MMSEs. 
+
+\begin{figure}[htbp]
+    \begin{subfigure}[b]{\figurewidth}
+        \centering 
+        \includegraphics[width=\textwidth]{plots/mses_bayes.png}
+        \caption{MMSE of neural priors in $\mathcal{P}([0, 50])$}
+        \label{fig:mmse_neural}
+    \end{subfigure}
+    \begin{subfigure}[b]{\figurewidth}
+        \centering 
+        \includegraphics[width=\textwidth]{plots/worst_prior_50_mse.png}
+        \caption{MSE of $f_{\pi!, [0, 50]}$ at point masses}
+        \label{fig:worst_prior_bayes_mse}
+    \end{subfigure}     
+    \caption{Discussion on Worst Prior}
+\end{figure}
+
+\subsection{Training Priors}\label{app:train-priors}
+We now offer a more detailed description of the training priors. 
+
+\textbf{Neural-generated: prior on priors.} 
+We sample the hidden mean parameter $\theta$ via the following: first, let $\mathcal{M}$ be classes of priors determined by some two-layer perceptron with a non-linear activation in-between. 
+This is concretely defined as: 
+\begin{equation*}
+    \mathcal{M} = \{\pi: \pi = \varphi^{W_1, W_2, \sigma}_{\sharp} \mathsf{Unif}[0, 1]\}
+\end{equation*}
+where $\varphi^{W_1, W_2, \sigma}(x) = \mathsf{Sigmoid}(10W_2\sigma(W_1x))$, $W_1, W_2$ are linear operators, and $\sigma$ is an activation function chosen randomly from \[GELU, ReLU, SELU, CELU, SiLU, Tanh, TanhShrink. \]
+The parameter $\theta$ is then produced by sampling from a mixture of 4 priors in $\mathcal{M}$, 
+and multiplied by $\theta_{\max}$ 
+(or in the random $\theta_{\max}$ experiment as described in \prettyref{sec:generalize}, each $\theta$ is then scaled differently). 
+
+\textbf{Dirichlet process}. 
+Let the base distribution be defined as $H_0\triangleq\text{Unif}([0, h])$. 
+Within each batch the elements $\theta_1, \cdots, \theta_s$ are generated as follows: 
+\[\theta_j = 
+    \begin{cases}
+        \theta_i & \text{w.p. }\frac{j - 1}{\alpha + j - 1},\forall i = 1, \cdots, j - 1\\
+        x\sim H_0 & \text{w.p. }\frac{\alpha}{\alpha + j - 1}
+    \end{cases}
+\]
+where $\alpha$ is a parameter that denotes how `close' we are to iid generation 
+($\alpha=\infty$ essentially means we have iid). 
+We use $\alpha = 50$ for a sequence length of 512. 
+Note that Dirichlet process implies that our data is not generated iid for each batch, 
+so the Bayes estimator has to be estimated differently. We omit the calculation of this Bayes estimator. 
+
+\subsection{Why do we train using a mixture of two prior classes?}
+We consider the hypothesis: that our transformer trained under the mixture of the two priors is robust when evaluated under each of the priors. 
+This can be verified via the following two tests: 
+when evaluated on neural prior, is the performance (in terms of MSE) of the mixture-trained transformers closer to that of neural-trained ones as compared to the Dirichlet-trained ones? 
+Similarly, when evaluated on Dirichlet prior, 
+is the performance (in terms of MSE) of the mixture-trained transformers closer to that of Dirichlet-trained ones as compared to the neural-trained ones? 
+Through the table of $T$-stat comparison done on the MSEs of 4096 seeds, 
+we answer both these questions in the positive 
+(the difference is especially obvious when evaluated on neural prior). 
+
+\begin{table}[ht]
+\centering
+\caption{Table of regret difference; $A - B$ denotes the difference of regret of transformers trained on $A$ vs trained on $B$}
+\label{tab:mixture-training}
+\begin{tabular}{|c||c|c||c|c|}
+\hline
+ & \multicolumn{2}{|c|}{Evaluated on Neural}  &  \multicolumn{2}{|c|}{Evaluated on Dirichlet} \\ 
+\hline 
+\hline 
+\# lyr & mix $-$ neu & dir $-$ mix & mix $-$ dir & neu $-$ mix\\
+\hline 
+12 & 0.0038 & 0.8645 & 0.0184 & 0.0379\\
+18 & 0.0133 & 1.0647 & 0.0173 & 0.0469\\
+24 & 0.0082 & 1.0021 & 0.0202 & 0.0388\\
+\hline 
+\end{tabular}
+\end{table}
+
+\section{Technical Proofs}\label{app:proofs}
+\subsection{Approximation of known empirical Bayes baselines}
+\begin{proof}[Proof of \prettyref{thm:robbins-transformers}]
+    \textbf{Encoding step.}
+    We embed our inputs representation $X\in\mathbb{R}^n$ into one-hot vector $Y\in\mathbb{R}^{n\times (d + 1)}$ such that 
+    $Y_i = e_{X_i + 1}$ if $X_i = 0, 1, \cdots, d$, and 0 otherwise. 
+    Then given sample size $n$, $Y \in\mathbb{R}^{(d + 1)\times n}$. 
+    Now recall the following attention layer definition in 
+    (1) of \cite{vaswani2017attention}: 
+    \[
+    \text{Attention}(Q, K, V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right) V
+    \]
+    where $Q=YW_Q, K = YW_K, V = YW_V$, and $W_Q, W_K\in\mathbb{R}^{(d + 1)\times d_k}$. 
+    Let $Z = \text{Attention}(Q, K, V)$. 
+    We now design en encoding mechanism such that the representation after skip connection has the following: 
+    \[
+    (Y + Z)_{ij} = 
+    \begin{cases}
+        1 + \frac{N(X_i)}{N(X_i) + (X_i + 1)N(X_i + 1)} & j = X_i + 1\le d\\
+        \frac{(X_i + 1)N(X_i + 1)}{N(X_i) + (X_i + 1)N(X_i + 1)} & j = X_i + 2\le d\\
+        1 & j = X_i + 1 = d\\
+        0 & \text{otherwise}.\\
+    \end{cases}
+    \]
+
+    Define $D$ be a large number, 
+    $W_Q = I_{d + 1}$ the $d$-dimensional identity matrix, 
+    $W_V = \begin{pmatrix}
+        I_d & 0\\ 
+        0 & 0\\
+    \end{pmatrix}$
+    and $W_K\in\mathbb{R}^{d\times d}$ satisfying
+    \[
+    (W_K)_{i, j} = 
+    \begin{cases}
+        D & i = j\\
+        D + \sqrt{d + 1}\log i & j = i + 1\\
+        0 & \text{otherwise}\\
+    \end{cases}
+    \] (thus $d_k = d + 1$). Then 
+    \[
+    (QK^T)_{i, j} = 
+    \begin{cases}
+        D & X_i = X_j = d\\
+        D + \sqrt{k}\log(X_i + 1) & X_j = X_i + 1\le d\\
+        0 & \text{otherwise}\\
+    \end{cases}. 
+    \]
+    Thus we have the following structure for $M \triangleq \text{Softmax}(S)$: 
+    $\text{row}_i(M) = \frac 1n$ if $X_i\ge d + 1$, 
+    otherwise \[M_{ij} = 
+    \begin{cases}
+        \frac{1}{N(X_i) + (X_i + 1)N(X_i + 1)} & X_i = X_j\le d - 1\\
+        \frac{X_i + 1}{N(X_i) + (X_i + 1)N(X_i + 1)} & X_j = X_i + 1\le d - 1\\
+        0 & \text{otherwise}.\\
+    \end{cases}\]
+    Now given that $V = 
+    \begin{pmatrix}\text{Col}_1(Y) & \cdots & \text{Col}_d(Y) & 0\end{pmatrix}$, $Z_{ij} = \sum_{k: j = X_k + 1} Z_{ik}$ for all $k\le d - 1$ (and 0 for $k$)
+    This means: 
+    \[Z_{ij} = 
+    \begin{cases}
+        \frac{N(X_i)}{N(X_i) + (X_i + 1)N(X_i + 1)} & j = X_i + 1\le d - 1\\
+        \frac{(X_i + 1)N(X_i + 1)}{N(X_i) + (X_i + 1)N(X_i + 1)} & j = X_i + 2\le d\\
+        0 & \text{otherwise}.\\
+    \end{cases}\]
+    Thus adding back $Y$ gives the desired output. 
+
+    \textbf{Decoding step.}
+    We define $Y_1 = \mathsf{ReLU}(Y + Z- 1)$, i.e. a linear operation (with bias) followed by the ReLU nonlinear operator. Notice that $Z$ has entries all in $[0, 1]$, 
+    so $Y_1$ acts like $Y* Z$ (i.e. $Z$ masked with $Y$). 
+    Let $Z' \in \mathbb{R}^n$ to be the row-wise sum of $Y_1$, 
+    i.e. 
+    $Z'_i = \frac{N(X_i)}{N(X_i) + (X_i + 1)N(X_i + 1)}$ if $X_i\le d - 1$ and 0 otherwise. 
+    Then we consider the following decoding function $f: [0, 1]\to [0, \theta_{\max}]$ by: 
+    \[
+    f(x) = 
+    \begin{cases}
+        \frac{1}{x} - 1 & x\ge \frac{1}{1 + M}\\
+        M & \text{otherwise}\\
+    \end{cases}. 
+    \]
+    Then $f$ is continuous, and $f(Z')$ is indeed $\hat{\theta}_{\mathsf{Rob}, d, M}$. 
+    Therefore by universal approximation theorem, there exists a multilayer perceptron that 
+    approximates $f$ within $[0, 1]$, as desired. 
+\end{proof}
+
+Before proving \prettyref{thm:univ_npmle}, we need to establish the continuity of the clipped NPMLE, 
+with arguments the sigmoid of the input integer and empirical distribution. 
+\begin{lemma}\label{lmm:npmle_cont}
+    Let $\varphi: \mathbb{R}_{\ge 0} \to [0, 1]$ be a strictly increasing and continuous function, 
+    and $\text{Sig} = \{\varphi(z): z\in \mathbb{Z}\}$. 
+    Let $S =  \sup(\text{Sig})$ and $\text{Sig}^+ = Sig \cup \{S\}$. 
+    Denote $\tilde{\theta}: (\mathcal{P}(\text{Sig}^+)\times \text{Sig}^+\to [0, M]$ be such that for each $p^{\mathsf{emp}}\in \mathcal{P}(\mathbb{Z}_{\ge 0})$ and 
+    $x\in \mathbb{Z}_{\ge 0}$, 
+    the function $\tilde{\theta}(\varphi_{\sharp}(p^{\mathsf{emp}}), \varphi(x)) = \hat{\theta}_{\mathsf{NPMLE}, d, M}(p^{\mathsf{emp}}, x)$. 
+    Then $\tilde{\theta}$ can be extended into a function that is continuous in both arguments. 
+    (Here $p^{\mathsf{emp}}$ acts like an empirical distribution). 
+\end{lemma}
+
+\begin{proof}[Proof of \prettyref{thm:univ_npmle}]
+    Starting with the input tokens $(X_1, \cdots, X_n)$, 
+    we consider the token-wise embedding 
+    $Y_i = \mathsf{Sigmoid}(X_i)$. 
+    Note that $\mathsf{Sigmoid}$ satisfies the assumption of $\varphi$ in \prettyref{lmm:npmle_cont}. 
+    Denote $p_n^{\mathsf{emp}}$ as the empirical distribution determined by $(X_1, \cdots, X_n)$. 
+    By \prettyref{lmm:npmle_cont}, 
+    the function 
+    $\hat{\theta}_{\mathsf{NPMLE}, d}(p_n^{\mathsf{emp}}, \cdot)$ can be continually extended 
+    (in the (weak$^*$, $\ell_2$) metric). Then \cite{furuya2024transformers}, Theorem 1 says that there exists a transformers network $\Gamma$ that satisfies 
+    \[
+    |\hat{\theta}(x_1, \cdots, x_n)_i - \Gamma(x_1, \cdots, x_n)_i|\le \epsilon\,,
+    \]
+    as desired. 
+\end{proof}
+
+\begin{proof}[Proof of \prettyref{lmm:npmle_cont}]
+    To establish continuity, it suffices to show that given a sequence of distributions
+    $p^{\mathsf{emp}}_1, p^{\mathsf{emp}}_2, \cdots$ and integers $x_1, x_2, \cdots$ such that 
+    $\varphi_{\sharp}(p^{\mathsf{emp}}_n)\to \phi_0$ and $\varphi(x_n)\to y_0$ 
+    in (weak$^*$, $\ell_2$) metric, we have 
+    $\hat{\theta}_{\mathsf{NPMLE}}(p^{\mathsf{emp}}_n, x_n) \to  \tilde{\theta}(\phi_0, y_0)$. 
+    Note that $x_n$ are nonnegative integers, 
+    so given that $\varphi$ is increasing and injective, 
+    either $x_n$ is eventually constant (in which case $x_n\to x_0$ for some $x_0$), or $x_n\to \infty$ 
+    (in which case $y_0 = S \triangleq\sup(\text{Sig})$). 
+    Note first that in the case $y_0 = S$ we have 
+    $\tilde{\theta}(\varphi_{\sharp}(p^{\mathsf{emp}}_n), \varphi(x_n)) = M$ for all $n$ sufficiently large. 
+    Note also that $p^{\mathsf{emp}}$ is a distribution on nonnegative integers so 
+    $\varphi_{\sharp}(p^{\mathsf{emp}}_n)(S) = 0$, 
+    which then follows that $\phi_0(S) = 0$ too. 
+    Thus $\phi_0\in \mathcal{P}(\text{Sig})$ and so there exists $p_0$ such that 
+    $\phi_0 = \varphi_{\sharp}(p_0)$. 
+
+    It now remains to consider the case where $x_n = x_0$ for all sufficiently large $n$; 
+    w.l.o.g. we may even assume $x_n = x_0$ for all $n$. 
+    If $x_0 > d$ we are done since $\hat{\theta}_{\mathsf{NPMLE}}(p^{\mathsf{emp}}, x_0) = M$ for all $\pi$.  
+    Assume now that $x_0 \le d$. 
+    Recall that $\hat{\theta}_{\mathsf{NPMLE}}(p^{\mathsf{emp}}, x_0) = (x_0 + 1) \frac{f_{\hat{\pi}}(x_0 + 1)}{f_{\hat{\pi}}(x_0)}$ where $\hat{\pi}$ is the prior estimated by NPMLE. 
+    Thus denoting $\hat{\pi}_n$ as NPMLE prior of $p^{\mathsf{emp}}_n$, for each $x$ it suffices to show that convergence of $f_{\hat{\pi}_n}(x)$.  
+    Now note that NPMLE also has the following equivalent form: 
+    $\hat{\pi}_n
+    = \argmin_Q \text{KL}(p^{\mathsf{emp}}_n || f_Q$, 
+    and note that $\text{KL}$ can be written in the following form 
+    (c.f. 
+    Assumption 1 of \cite{jana2022optimal}). 
+    \begin{equation}\label{eq:mindist_eqn}
+    \text{KL}(\pi_1 || \pi_2) = t(\pi_1)
+    + \sum_{x\ge 0} \ell(\pi_1, \pi_2)
+    \end{equation}
+    Notice that $\ell(a, b) := a\log \frac{1}{b}$ fulfills 
+    $b\to \ell(a, b)$ is strictly decreasing and strictly convex for $a > 0$. 
+    Fix $x_0\le d + 1$, we now have two subcases: 
+    
+    \textbf{Case $p_0(x_0) > 0$.}
+    The claim immediately follows from that $\ell(p_0(x_0), b)$ is \emph{strictly} convex in $b$, 
+        and that for each $x$ we have $p^{\mathsf{emp}}_n(x) \to p_0(x)$ following the weak convergence of $p^{\mathsf{emp}}_n$. 
+
+    \textbf{Case $p_0(x_0) = 0$.} 
+    Let $Q_0\in \argmin_Q t(p_0) + \sum_{x\ge 0} \ell(p_0(x), f_Q(x))$. 
+    By Theorem 1 of \cite{jana2022optimal}, 
+    this $Q_0$ is unique. 
+    Now suppose that there is a subsequence 
+    $n_1, n_2, \cdots$ and a real number $\epsilon > 0$ such that 
+    \[
+    |f_{\hat{\pi}_{n_i}}(x_0) - f_{Q_0}(x_0)| > \epsilon
+    \]
+    By the previous subcase, we have 
+    $f_{\hat{\pi}_{n_i}}(x)\to f_{Q_0}(x)$ for all $x\in \text{Supp}(p_0)$. 
+    We now consider $Q_1$ as the solution to 
+    \prettyref{eq:mindist_eqn}, but among the class of functions satisfying the constraint 
+    $|f_{Q_1}(x) - f_{Q_0}(x)| > \epsilon$. 
+    Such a constrained space is closed by proof of 
+    Theorem 1 in \cite{jana2022optimal}, 
+    so there exists $\delta > 0$ such that 
+    \begin{align*}
+        & ~\text{KL}(p_0 || f_{\hat{\pi}_{n_i}}) - \text{KL}(p_0 || f_{Q_0})
+        \\ 
+        \ge & ~\text{KL}(p_0 || f_{Q_1}) - \text{KL}(p_0 || f_{Q_0}) \ge \delta
+    \end{align*}
+    On the other hand, by fixing $Q, Q'$, we have 
+    \begin{align*}
+    & ~(\text{KL}(p_n^{\mathsf{emp}} || f_{Q}) - \text{KL}(p_n^{\mathsf{emp}} || f_{Q'}))
+    \\ 
+    - & ~(\text{KL}(p_0 || f_{Q}) - \text{KL}(p_0 || f_{Q'}))
+    \to 0
+    \end{align*}
+    given that $p_n^{\text{emp}}\to p_0$ weakly 
+    and that 
+    $\text{KL}(p || f_{Q}) - \text{KL}(p || f_{Q'})= \sum_y p(y)\log \frac{f_Q'}{f_Q}$, 
+    which is a contradiction. 
+\end{proof}
+
+\begin{proof}[Proof of \prettyref{cor:vanish-regret}]
+    Choose $d$ such that $\mathbb{P}[X > d] < \frac{\epsilon}{6\cdot \theta_{\max}^2}$. 
+    Note that there exists an $N$ such that for $n\ge N$, 
+    both the Robbins estimator \cite{brown2013poisson} and NPMLE \cite{jana2022optimal}, Theorem 3 enjoy a minimax regret bounded by $\frac{\epsilon}{6}$ over the class $\mathcal{P}([0, \theta_{\max}])$. 
+    Now, by the previous two theorems, there exists a transformers model $\Gamma$ that can approximate either Robbins or NPMLE up to $\sqrt{\frac{\epsilon}{6}}$ precision uniformly for inputs up to $d$. 
+    Then we have 
+    \begin{flalign*}
+        \text{Regret}(\Gamma)
+        &\le 2(\text{Regret}(\hat{\theta}) + \EE[(\hat{\theta} - \Gamma)^2])
+        \nonumber\\
+        &\le 2(\frac{\epsilon}{6} + \EE[(\hat{\theta}(X) - \Gamma(X))^2\indc{X \le d}] 
+        \nonumber\\
+        & + \EE[\theta_{\max}^2\indc{X > d}])
+        \nonumber\\
+        &\le 2(\frac{\epsilon}{6} + \frac{\epsilon}{6} + \frac{\epsilon}{6})
+        \nonumber\\
+        &=\epsilon
+    \end{flalign*}
+\end{proof}
+
+\subsection{Identities on Worst Prior}
+\begin{proof}[Proof of \prettyref{lmm:worst_prior_mse}]
+    We consider the prior $\pi_{\epsilon}\triangleq (1-\epsilon)\pi_! + \epsilon \delta_{\theta_0}$ for some $\theta_0\in A$. 
+    Then $\frac{\partial }{\partial \epsilon}\mathsf{mmse}(\pi_{\epsilon})|_{\epsilon = 0} \le 0$ with equality if 
+    $\theta_0\in\text{supp}(\pi_{!, A})$. 
+    Consider, now, the following form: 
+    \begin{flalign*}
+    \mathsf{mmse}(\pi) &= \mathbb{E}[\theta^2] - \mathbb{E}_X[\mathbb{E}[\theta | X]^2]
+    = \mathbb{E}[\theta^2] - \mathbb{E}_X[\mathbb{E}[\theta | X]^2]
+    \\&= \mathbb{E}[\theta^2] - \sum_x \frac{e_{\pi}(x)^2}{m_{\pi}(x)}
+    \end{flalign*}
+    where $m_{\pi}(x) = \int p(x|\theta)d\pi(\theta)$ and $e_{\pi}(x) = \int \theta p(x|\theta)d\pi(\theta)$ 
+    are the PMF and posterior mean of $x$, respectively. 
+
+    Now denote $e_{\theta_0}(x) = \theta_0p(x|\theta_0)$ and $m_{\theta_0}(x) = p(x|\theta_0)$.
+    Denote also the difference 
+    $d(x) \triangleq m_{\theta_0}(x) - m_{\pi_!}(x)$ and 
+    $k(x) \triangleq e_{\theta_0}(x) - e_{\pi_!}(x)$. 
+    Then 
+    \begin{align*}
+        & ~\mathsf{mmse}(\pi_{\epsilon})
+    \\= & ~\mathbb{E}_{\pi_!}[\theta^2] + \epsilon(\theta_0^2 - \mathbb{E}_{\pi_!}[\theta^2]) 
+    - \sum_x \frac{(e_{\pi_!}(x) + \epsilon k(x))^2}{m_{\pi_!}(x) + \epsilon d(x)}
+    \end{align*}
+    which means the derivative when evaluated at 0: 
+    \begin{flalign*}
+        0\ge &~\frac{\partial }{\partial \epsilon}\mathsf{mmse}(\pi_{\epsilon})|_{\epsilon = 0}
+        \\
+        =& ~\theta_0^2 - \mathbb{E}_{\pi_!}[\theta^2] 
+        - \sum_x \frac{2m_{\pi_!}(x)e_{\pi_!}(x)k(x) - e_{\pi_!}(x)^2d(x)}{m_{\pi_!}(x)^2}
+        \\
+        =&~\theta_0^2 - \sum_x \frac{2m_{\pi_!}(x)e_{\pi_!}(x)e_{\theta_0}(x) - e_{\pi_!}(x)^2m_{\theta_0}(x)}{m_{\pi_!}(x)^2} 
+        \\
+        &\quad -\mathsf{mmse}(\pi_!)
+        \\
+        =&~\theta_0^2 - 2\sum_x e_{\theta_0}(x) \frac{e_{\pi_!}(x)}{m_{\pi_!}(x)}
+        +\sum_x m_{\theta_0}(x)\left(\frac{e_{\pi_!}(x)}{m_{\pi_!}(x)}\right)^2 \\
+        &\quad - \mathsf{mmse}(\pi_!)
+        \\
+        =&~\mathsf{mse}_{\delta_{\theta}}(f_{\pi!}) - \mathsf{mmse}(\pi_!)
+    \end{flalign*}
+    where the last equality follows from that $\frac{e_{\pi_!}(x)}{m_{\pi_!}(x)} = f_{\pi_!}(x)$. 
+    Therefore the conclusion follows. 
+\end{proof}
+
+\section{Pseudocode on Robbins Approximation via Transformers}\label{app:transf-robbins}
+We present a pseudocode in \prettyref{alg:robbins-transformers} on how a transformer can be set up to approximate Robbins, using a formulation that closely mimics the PyTorch module. 
+All vectors and matrices use 1-indexing. 
+Note that the attention output is $Z = \text{Softmax}(\frac{YW_QW_K^TY^T}{\sqrt{d_k}})YW_V$. 
+
+\begin{algorithm}[tb]
+   \caption{Pseudocode that approximates $\hat{\theta}_{\mathsf{Rob}, d, \theta_{\max}}$ using a transformer.}
+   \label{alg:robbins-transformers}
+\begin{algorithmic}
+   \STATE {\bfseries Input:} Inputs $x_1, \cdots, x_n$, $\theta_{\max}$, $d$. 
+   \STATE {\bfseries Define: } $d_k = d + 1$, $n_{head} = 1$. 
+   \STATE {\bfseries Define: } $D = \max \{100, d_k^2\}$. 
+   \STATE {\bfseries Define: } $W_Q = I_{d_k}$, $W_V = \text{diag}(1, 1, \cdots, 1, 0), W_K$. 
+   \FOR {$i=1$ {\bfseries to} $d + 1$}
+       \STATE $W_k[i, i] = D$
+   \ENDFOR 
+   \FOR {$i=1$ {\bfseries to} $d$}
+       \STATE $W_k[i, i + 1] = D + \sqrt{d_k}\log i$
+   \ENDFOR 
+   \STATE {\bfseries Define: } AttnLayer = Attn($W_Q, W_K, W_V$). 
+   \STATE {\bfseries Define: } $Z=\text{AttnLayer}(Y, Y, Y)$. 
+   \STATE $Z' = \mathsf{ReLU}(Y + Z - 1).$
+   \STATE $Z_1 = \text{rowsum}(Z')$. 
+   \STATE \textbf{return} $\min \{\frac{1}{Z_1} - 1, M\}$. 
+\end{algorithmic}
+\end{algorithm}
+
+\section{Further Analysis on Experimental Results}
+\subsection{Synthetic Experiments}\label{app:synthetic}
+We recall that our synthetic experiments are measuring regret w.r.t. sequence length for both the neural and worst-prior. 
+In the main section, we show a plot of how the regret decreases with sequence length; 
+here, we provide a more comprehensive result on the Plackett-Luce rankings in 
+\prettyref{tab:pl-synthetic}, 
+along with the $p$-value by pairwise $t$-test of T18 and T24 against relevant classical baselines, 
+as per \prettyref{tab:tstat-sythetetic-18} and \prettyref{tab:tstat-sythetetic-24}. 
+From the $p$-value we conclude that the transformers outperform other baselines by a significant margin on various experiments.  
+(except in a handful of cases). 
+
+\begin{table*}[ht]
+\caption{Plackett-Luce coefficients of estimators' regrets on synthetic experiments. The coefficient of MLE is set to 0 throughout.}
+\label{tab:pl-synthetic}
+\vskip 0.15in
+\begin{center}
+\begin{small}
+\begin{sc}
+\begin{tabular}{lcccccc}
+\toprule
+Experiments & GS & Robbins & ERM & NPMLE & T18 & T24 \\
+\midrule 
+Neural-128 & -0.003 & -3.196 & 0.965 & 4.310 & 7.497 & \textbf{7.696}\\
+Neural-256 & -0.023 & -3.090 & 1.678 & 4.885 & 7.624 & \textbf{8.002}\\
+Neural-512* & -0.044 & -3.016 & 2.421 & 5.534 & 7.646 & \textbf{8.084}\\
+Neural-1024 & -0.066 & -2.930 & 3.032 & 6.197 & 7.579 & \textbf{7.983}\\
+Neural-2048 & -0.092 & -2.813 & 3.430 & 6.806 & 7.455 & \textbf{7.816}\\
+\midrule
+WP-128 & - & -4.925 & -2.434 & 2.476 & \textbf{7.416} & 4.945\\
+WP-256 & - & -2.470 & 2.470 & 4.943 & \textbf{9.878} & 7.412\\
+WP-512 & - & -2.466 & 2.463 & 4.924 & \textbf{9.842} & 7.385\\
+WP-1024 & - & -2.738 & 2.735 & 8.543 & \textbf{8.664} & 5.476\\
+WP-2048 & - & -2.468 & 2.470 & \textbf{9.863} & 7.405 & 4.938\\
+\midrule
+Multn-512 & 0.505 & -2.664 & 2.239 & 4.877 & \textbf{9.686} & 7.339\\
+Multn-1024 & 0.463 & -2.635 & 3.328 & 5.764 & \textbf{9.615} & 8.240\\
+Multn-2048 & 0.471 & -2.728 & 3.432 & 5.963 & \textbf{8.971} & 8.811\\
+\bottomrule
+\end{tabular}
+\end{sc}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table*}
+
+\begin{table*}[ht]
+\caption{$\mathbb{P}[\mathsf{Regret}\text{(T18)} > \mathsf{Regret}\text{(Classical)}]$ obtained via paired $t$-test.}
+\label{tab:tstat-sythetetic-18}
+\vskip 0.15in
+\begin{center}
+\begin{small}
+\begin{sc}
+\begin{tabular}{lccccc}
+\toprule
+Experiments & MLE & GS & Robbins & ERM & NPMLE \\
+\midrule 
+Neural-128 & $<$ 1e-100 & $<$1e-100 & $<$ 1e-100 & $<$ 1e-100 & $<$ 1e-100\\
+Neural-256 & $<$ 1e-100 & $<$1e-100 & $<$ 1e-100 & $<$ 1e-100 & $<$ 1e-100\\
+Neural-512* & $<$ 1e-100 & $<$1e-100 & $<$ 1e-100 & $<$ 1e-100 & $<$ 1e-100\\
+Neural-1024 & $<$ 1e-100 & $<$1e-100 & $<$ 1e-100 & $<$ 1e-100 & $<$ 1e-100\\
+Neural-2048 & $<$ 1e-100 & $<$1e-100 & $<$ 1e-100 & $<$ 1e-100 & 0.987\\
+\midrule
+WP-128 & $<$ 1e-100 & - & $<$ 1e-100 & $<$ 1e-100 & $<$ 1e-100\\
+WP-256 & $<$ 1e-100& - & $<$ 1e-100 & $<$ 1e-100 & $<$ 1e-100\\
+WP-512 & $<$ 1e-100 & - & $<$ 1e-100 & $<$ 1e-100 & $<$ 1e-100\\
+WP-1024 & $<$ 1e-100 & - & $<$ 1e-100 & $<$ 1e-100 & 7.13e-04\\
+WP-2048 & $<$ 1e-100 & - & $<$ 1e-100 & $<$ 1e-100 & $>$1 - 1e-100\\
+\midrule
+Multn-512 & $<$ 1e-100 & $<$1e-100 & $<$ 1e-100 & $<$ 1e-100 & $<$ 1e-100\\
+Multn-1024 & $<$ 1e-100 & $<$1e-100 & $<$ 1e-100 & $<$ 1e-100 & $<$ 1e-100\\
+Multn-2048 & $<$ 1e-100 & $<$1e-100 & $<$ 1e-100 & $<$ 1e-100 & $<$ 1e-100\\
+\bottomrule
+\end{tabular}
+\end{sc}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table*}
+
+\begin{table*}[ht]
+\caption{$\mathbb{P}[\mathsf{Regret}\text{(T24)} > \mathsf{Regret}\text{(Classical)}]$ obtained via paired $t$-test.}
+\label{tab:tstat-sythetetic-24}
+\vskip 0.15in
+\begin{center}
+\begin{small}
+\begin{sc}
+\begin{tabular}{lccccc}
+\toprule
+Experiments & MLE & GS & Robbins & ERM & NPMLE \\
+\midrule 
+Neural-128 & $<$ 1e-100 & $<$1e-100 & $<$ 1e-100 & $<$ 1e-100 & $<$ 1e-100\\
+Neural-256 & $<$ 1e-100 & $<$1e-100 & $<$ 1e-100 & $<$ 1e-100 & $<$ 1e-100\\
+Neural-512* & $<$ 1e-100 & $<$1e-100 & $<$ 1e-100 & $<$ 1e-100 & $<$ 1e-100\\
+Neural-1024 & $<$ 1e-100 & $<$1e-100 & $<$ 1e-100 & $<$ 1e-100 & $<$ 1e-100\\
+Neural-2048 & $<$ 1e-100 & $<$1e-100 & $<$ 1e-100 & $<$ 1e-100 & 0.273\\
+\midrule
+WP-128 & $<$ 1e-100 & - & $<$ 1e-100 & $<$ 1e-100 & $<$ 1e-100\\
+WP-256 & $<$ 1e-100& - & $<$ 1e-100 & $<$ 1e-100 & $<$ 1e-100\\
+WP-512 & $<$ 1e-100 & - & $<$ 1e-100 & $<$ 1e-100 & $<$ 1e-100\\
+WP-1024 & $<$ 1e-100 & - & $<$ 1e-100 & $<$ 1e-100 & $>$1 - 1e-100\\
+WP-2048 & $<$ 1e-100 & - & $<$ 1e-100 & $<$ 1e-100 & $>$1 - 1e-100\\
+\midrule
+Multn-512 & $<$ 1e-100 & $<$1e-100 & $<$ 1e-100 & $<$ 1e-100 & $<$ 1e-100\\
+Multn-1024 & $<$ 1e-100 & $<$1e-100 & $<$ 1e-100 & $<$ 1e-100 & $<$ 1e-100\\
+Multn-2048 & $<$ 1e-100 & $<$1e-100 & $<$ 1e-100 & $<$ 1e-100 & $<$ 1e-100\\
+\bottomrule
+\end{tabular}
+\end{sc}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table*}
+
+\subsection{Real Data Experiments}\label{app:real}
+In the main section, we focused on reporting the RMSE. 
+We supplement our finding on RMSE by showing a Plackett Luce ELO coefficient of RMSEs of the estimators in \prettyref{tab:elo_rmse}, 
+which shows that the transformers are consistently ranked at the top. 
+
+Here, we also study what happens if we compare the Mean Absolute Error (MAE) of various estimators on each datapoint. 
+Apart from the average percentage improvement of each algorithm over the MLE 
+as per \prettyref{tab:dataset_mae}, 
+we also display the $p$-values based on paired $t$-test of transformers vs other algorithms in \prettyref{tab:tstat_mae}, 
+and \prettyref{tab:elo_mae}. 
+In \prettyref{fig:hockey_violin_mae}, \prettyref{fig:batting_violin_mae}, 
+\prettyref{fig:pitching_violin_mae} and \prettyref{fig:bookcorpus_violin_mae}, 
+we also include the violin plots. 
+
+\begin{table*}[ht]
+\caption{Plackett-Luce coefficients of estimators' RMSE on real datasets. The coefficient of MLE is set to 0 throughout.}
+\label{tab:elo_rmse}
+\vskip 0.15in
+\begin{center}
+\begin{small}
+\begin{sc}
+\begin{tabular}{lccccc}
+\toprule
+Dataset & Robbins & ERM & NPMLE & T18 & T24 \\
+\midrule
+NHL & -2.536 & 1.458 & 3.252 & \textbf{3.756} & 3.587 \\
+NHL (defender) & -1.730 & 1.577 & 3.973 & 5.366 & \textbf{5.636} \\
+NHL (center) & -2.739 & 0.399 & 2.111 & 3.118 & \textbf{3.408} \\
+NHL (winger) & -3.350 & 0.674 & 2.271 & \textbf{3.004} & 2.756 \\
+\midrule 
+MLB (batting) & -2.981 & 2.991 & 5.145 & 6.221 & \textbf{8.575}\\
+MLB (pitching) & -3.217 & 3.225 & 5.916 & 6.696 & \textbf{7.689} \\
+\midrule 
+BookCorpusOpen  & 0.024 & 1.547 & 2.341 & 2.012 & \textbf{2.698} \\
+\bottomrule
+\end{tabular}
+\end{sc}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table*}
+
+\begin{table*}[ht]
+\caption{95\% confidence interval of the percentage improvement of MAE by each algorithm over MLE.}
+\label{tab:dataset_mae}
+\vskip 0.15in
+\begin{center}
+\begin{small}
+\begin{sc}
+\begin{tabular}{lccccc}
+\toprule
+Dataset & Robbins & ERM & NPMLE & T18 & T24 \\
+\midrule
+Hockey (all) & -20.14 $\pm$ 4.44 & -0.20 $\pm$ 0.60 & \textbf{0.90 $\pm$ 0.58} & 0.76 $\pm$ 0.58 & 0.77 $\pm$ 0.59 \\
+Hockey (defender) & -13.38 $\pm$ 4.24 & 1.44 $\pm$ 1.16 & 3.26 $\pm$ 1.07 & \textbf{3.66 $\pm$ 1.23} & 3.62 $\pm$ 1.22 \\
+Hockey (center) & -41.43 $\pm$ 9.21 & -0.65 $\pm$ 0.86 & 2.26 $\pm$ 0.82 & \textbf{2.87 $\pm$ 0.86} & 2.76 $\pm$ 0.86 \\
+Hockey (winger) & -32.43 $\pm$ 7.23 & -0.12 $\pm$ 0.78 & 1.43 $\pm$ 0.63 & \textbf{1.77 $\pm$ 0.67} & 1.68 $\pm$ 0.67 \\
+\midrule
+Baseball (batting) & -25.97 $ \pm$ 3.81 & 3.50 $ \pm$ 0.32 & 5.22 $ \pm$ 0.36 & \textbf{5.60 $ \pm$ 0.34} & 5.53 $\pm$ 0.36\\
+Baseball (pitching) & -16.74 $\pm$ 2.19 & 3.45 $\pm$ 0.46 & 5.65 $\pm$ 0.48 & 5.60 $\pm$ 0.47 & \textbf{5.70 $\pm$ 0.44} \\
+\midrule
+BookCorpusOpen  & 28.05 $\pm$ 0.14 & 29.54 $\pm$ 0.10 & 29.65 $\pm$ 0.10 & \textbf{31.70 $\pm$ 0.15} & 27.85 $\pm$ 0.15 \\
+\bottomrule
+\end{tabular}
+\end{sc}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table*}
+
+\begin{table*}[ht]
+\caption{$\mathbb{P}[\text{MAE(Transformers)} > \text{MAE(Classical)}]$ obtained via paired $t$-test.}
+\label{tab:tstat_mae}
+\vskip 0.15in
+\begin{center}
+\begin{small}
+\begin{sc}
+\begin{tabular}{lcccc|cccc}
+\toprule
+& \multicolumn{4}{c}{T18}  &  \multicolumn{4}{c}{T24}\\
+Dataset & MLE & Robbins & ERM & NPMLE & MLE & Robbins & ERM & NPMLE\\
+\midrule
+NHL & 0.0103 & 6.69e-10 & 9.32e-05 & 0.868 & 0.0111 & 7.95e-10 & 1.33e-04 & 0.887\\
+NHL (defender) & 9.42e-07 & 6.53e-10 & 1.54e-05 & 1.78e-03 & 9.03e-07 & 6.22e-10 & 4.45e-05 & 0.013\\
+NHL (center) & 5.97e-07 & 3.04e-10 & 3.27e-08 & 2.48e-03 & 1.02e-06 & 3.98e-10 & 1.23e-07 & 8.20e-03\\
+NHL (winger) & 7.33e-06 & 7.49e-10 & 1.13e-05 & 0.0173 & 1.35e-05 & 7.98e-10 & 2.75e-05 & 0.0518\\
+\midrule
+MLB batting & 1.63e-24 & 6.01e-16 & 5.06e-12 & 6.57e-07 & 3.68e-24 & 6.74e-16 & 1.49e-11 & 3.04e-07\\
+MLB pitching & 5.67e-21 & 2.76e-16 & 6.36e-12 & 0.780 & 7.27e-22 & 2.38e-16 & 7.12e-13 & 0.203\\
+\midrule
+BookCorpusOpen & $<$1e-100 & $<$1e-100 & 5.31e-26 & 3.62e-23 & $<$1e-100 & 9.5e-69 & 1-6.32e-10 & 1-1.87e-12\\
+\bottomrule
+\end{tabular}
+\end{sc}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table*}
+
+\begin{table*}[ht]
+\caption{Plackett-Luce coefficients of estimators' MAE on real datasets. The coefficient of MLE is set to 0 throughout.}
+\label{tab:elo_mae}
+\vskip 0.15in
+\begin{center}
+\begin{small}
+\begin{sc}
+\begin{tabular}{lccccc}
+\toprule
+Dataset & Robbins & ERM & NPMLE & T18 & T24 \\
+\midrule
+NHL & -2.928 & -0.023 & \textbf{1.769} & 1.490 & 1.435 \\
+NHL (defender) & -2.182 & 0.795 & 2.170 & \textbf{2.674} & 2.667 \\
+NHL (center) & -3.201 & -0.472 & 1.678 & \textbf{2.617} & 2.525 \\
+NHL (winger) & -2.820 & 0.196 & 1.464 & \textbf{2.302} & 1.916 \\
+\midrule
+MLB batting & -3.076 & 3.080 & 5.572 & \textbf{7.968} & 7.391\\
+MLB pitching & -3.332 & 3.331 & 6.677 & 6.253 & \textbf{7.146} \\
+\midrule
+BookCorpusOpen  & 4.325 & 4.896 & 5.067 & \textbf{5.319} & 4.704 \\
+\bottomrule
+\end{tabular}
+\end{sc}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table*}
+
+
+\begin{figure}[ht]
+\vskip 0.2in
+\begin{center}
+\centerline{\includegraphics[width=\figurewidth]{plots/hockey_violin_plot_mae.png}}
+    \caption{Violin plots of MAE ratio achieved by multiple estimators over MLE on NHL. }
+    \label{fig:hockey_violin_mae}
+    \end{center}
+\vskip -0.2in
+\end{figure}
+
+\begin{figure}[ht]
+\vskip 0.2in
+\begin{center}
+\centerline{\includegraphics[width=\figurewidth]{plots/baseballbat_violin_mae.png}}
+    \caption{Violin plots of MAE ratio achieved by multiple estimators over MLE on MLB batting.}
+    \label{fig:batting_violin_mae}
+    \end{center}
+\vskip -0.2in
+\end{figure}
+
+\begin{figure}[ht]
+\vskip 0.2in
+\begin{center}
+\centerline{\includegraphics[width=\figurewidth]{plots/baseballpitch_violin_mae.png}}
+    \caption{Violin plots of MAE ratio achieved by multiple estimators over MLE on MLB pitching.}
+    \label{fig:pitching_violin_mae}
+    \end{center}
+\vskip -0.2in
+\end{figure}
+
+\begin{figure}[ht]
+\vskip 0.2in
+\begin{center}
+\centerline{\includegraphics[width=\figurewidth]{plots/bookcorpus_violin_plot_mae.png}}
+    \caption{Violin plots of MAE ratio achieved by multiple estimators over MLE on BookCorpusOpen.}
+    \label{fig:bookcorpus_violin_mae}
+    \end{center}
+\vskip -0.2in
+\end{figure}
+
+
+\end{document}

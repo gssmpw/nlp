@@ -1,0 +1,160 @@
+% -------------------------------
+\section{Memory Efficient Transformer Adapter (META)}
+
+\subsection{Overall Architecture and Configurations}
+% -------------------------------
+As illustrated in Figure~\ref{fig1}, the network takes an arbitrary RGB image $\textbf{I} \in \mathbb{R}^{H \times W \times 3}$ as input and predicts a semantic mask $\textbf{O} \in \mathbb{R}^{H \times W \times C}$ as output. $H$ and $W$ denotes the image height and width, respectively, and $C$ denotes the class size of the used dataset.
+%
+Following~\citep{jie2023fact,li2022exploring,chen2022vision}, the whole network mainly consists of two parts: the upper part is a pre-trained plain ViT model (\eg, ViT~\citep{li2021benchmarking}), which consists of $4$ blocks. The $i$-th ($i = 1, 2, 3, 4$) block contains a set of semantic features $\textbf{F}^i_{vit}$ with the spatial size of $1/4$, $1/8$, $1/16$, and $1/32$ of $\textbf{I}$, respectively. 
+%
+The lower part is a trainable ViT adapter, which includes a spatial prior module as in~\citep{chen2022vision} for $\textbf{I}$'s encoding, where the encoded features within each block denote $\textbf{F}^i_{sp}$, as well as a set of cascaded memory efficient adapter (MEA) injectors (\emph{Ref.}~Sec.~\ref{sec:3:3}) and cascaded MEA extractors (\emph{Ref.}~Sec.~\ref{sec:3:4}) that act on each ViT backbone block. 
+%
+% As shown in Figure~\ref{fig1} (a), our main contribution of this work is the proposal of the MEA block, which serves as the foundation for the injector and the extractor. 
+%
+The ``cascaded'' refers to a computational scheme that is incorporated into the different heads of the proposed injectors/extractors, which can enhance the diversity of the obtained feature representations.
+%
+% The role of the injector and the extractor is to facilitate feature interactions between the ViT adapter and the pre-trained ViT backbone by operating on each block. 
+%
+Concretely, for the $i$-th trainable MEA injector, it injects the updated task-specific features back into the $i$-th ViT block and into the $i$-th extractor (as shown in Figure~\ref{fig1} (b)). For the $i$-th trainable MEA extractor, it extracts the $i$-th general features for the $(i+1)$-th injector (as shown in Figure~\ref{fig1} (c)). This process is repeated until the final ViT block is reached. 
+%
+% In training, only the adapter's parameters need to be updated, while the ViT's parameters remain fixed. 
+%
+Due to the incorporation of strategies aimed at reducing inefficient memory access operations in our method, which exhibits enhanced memory efficiency and reduced memory time consumption compared to existing ViT adapters, consequently leading to accelerated inference speed.
+%
+We will provide a detailed explanation of the basic component and mechanism of the MEA block in the following Sec.~\ref{sec:3:2} and how it can be deployed in the MEA injectors and MEA extractors to form a cascaded scheme.
+% -------------------------------
+\input{figures/figure1}
+% -------------------------------
+
+% -------------------------------
+\subsection{MEA Block}
+\label{sec:3:2}
+% -------------------------------
+The MEA block aims to interact the features extracted from the ViT backbone and the spatial prior module. Our block consists of the attention (\ie, Attn) branch, the feed-forward network (\ie, FFN) branch, and the lightweight convolutional (\ie, Conv) branch. The three branches exist in a parallel form, which is beneficial for computing in GPUs.
+%
+As shown in Figure~\ref{fig1} (a), consider an arbitrary block, the input is $\textbf{F}_{sp}$ and $\textbf{F}_{vit}$, and the output $\textbf{F}$ is obtained by concatenating the features from the Attn, FFN, and Conv branches along the channel dimension, and then passing them through a feature projection layer. Therefore, this process can be formulated as:
+% -------------------------------
+\begin{equation}
+\textbf{F} = \textrm{Conv}_{3 \times 3}(\textrm{Concat}(
+\underbrace{(\textrm{A}(\textbf{F}_{sp},\textbf{F}_{vit})}_{\textrm{\textbf{\textcolor{red}{Attn Branch}}}};
+\underbrace{\textrm{F}(\textbf{F}_{sp},\textbf{F}_{vit})}_{\textrm{\textbf{\textcolor{blue}{FFN Branch}}}};
+\underbrace{\textrm{C}(\textbf{F}_{sp},\textbf{F}_{vit})}_{\textrm{\textbf{\textcolor{orange}{Conv Branch}}}};\textbf{F}_{sp};\textbf{F}_{vit})),
+\label{eq:1}
+\end{equation}
+% -------------------------------
+where $\textrm{A} (\cdot)$, $\textrm{F} (\cdot)$, and $\textrm{C} (\cdot)$ denote the operation of the Atte, FFN, and Conv branch, respectively. In MEA, these three branches exist in a parallel manner. $\textrm{Concat} (\cdot)$ denotes the feature concatenation operation along the channel dimension, and $\textrm{Conv}_{3 \times 3}(\cdot)$ denotes a $3 \times 3$ convolution with the output channel size of $256$ for feature projection. 
+%In our implementation, we also concatenate with $\textbf{F}_{sp}$ and $\textbf{F}_{vit}$ in $\textrm{Concat} (\cdot)$. For simplicity, this part is omitted in~\eqref{eq:1}. 
+In particular, to construct an memory efficient block, following~\citep{he2023simplifying,wang2021gpt}, \emph{the Attn and FFN branches are subjected to a shared layer normalization operation, which leads to a decrease in memory time consumption associated with the normalization operations}.
+
+% -------------------------------
+\myparagraph{\textcolor{red}{Attn Branch.}} In our work, we adopt the cross-shaped self-attention (CSA) to reduce the model's access to the memory unit, which allows for \emph{the computation of the attention matrix across different spatial dimensions without requiring the input tensor to be frequently reshaped}~\citep{dong2022cswin,tu2022maxvit}. 
+%
+Specifically, CSA first performs self-attention separately along the horizontal and vertical dimensions of the given features. The outputs $\textrm{A}_H(\textbf{F}_{sp},\textbf{F}_{vit})$ and $\textrm{A}_V(\textbf{F}_{sp},\textbf{F}_{vit})$ of these two parallel groups are then concatenated along the channel dimension, followed by a feature projection operation via a $3 \times 3$ convolution with the output channel size of $256$, to form the output $\textrm{A}(\textbf{F}_{sp},\textbf{F}_{vit})$. 
+%
+For the horizontal self-attention, the input features $\textbf{F}_{sp}$ and $\textbf{F}_{vit}$ are first subjected to the shared layer normalization, and then divided into $M$ non-overlapping horizontal stripes, where each stripe has the spatial size of $s \times W$ (\ie, $s = H/M$). Then, the self-attention~\citep{vaswani2017attention} is performed on each stripe, which can be formulated as:
+% -------------------------------
+\begin{equation}
+\textrm{A}^{m}_H(\textbf{F}_{sp},\textbf{F}_{vit}) = \textrm{SA}(\textrm{LN}(\textbf{F}^{m}_{sp}W^Q),\textrm{LN}(\textbf{F}^{m}_{vit}W^K),\textrm{LN}(\textbf{F}^{m}_{vit}W^V)),
+\label{eq:2}
+\end{equation}
+% -------------------------------
+where $\textrm{LN}(\cdot)$ denotes the shared layer normalization operation. $\textrm{SA}(\cdot)$ denotes the classical single head self-attention~\citep{vaswani2017attention}. $m$ denotes the $m$-th stripe and $m = 1,2,...,M$. $W^Q$, $W^K$, and $W^V$ are used to project the input features into the queries, keys, and values spaces, respectively. The sub-attention results of different stripes are merged together to form the output $\textrm{A}_H(\textbf{F}_{sp},\textbf{F}_{vit})$ of the horizontal group. In~\eqref{eq:2}, we choose $\textbf{F}_{sp}$ as queries and $\textbf{F}_{vit}$ as keys and values for the sake of example. In our injector and extractor in Sec~\ref{sec:3:3} and Sec~\ref{sec:3:4}, the roles of $\textbf{F}_{sp}$ and $\textbf{F}_{vit}$ can be swapped depending on the specific requirements. The attention computation along the vertical dimension $\textrm{A}_V(\textbf{F}_{sp},\textbf{F}_{vit})$ is also performed in a similar fashion.
+
+% -------------------------------
+\myparagraph{\textcolor{blue}{FFN Branch.}} 
+% -------------------------------
+% FFN branch is to enable interaction between the obtained features in the channel dimension, thereby enhancing the representation capacity of the features
+Following the common setting~\citep{vaswani2017attention,tolstikhin2021mlp}, to enable interaction between the obtained features in the channel dimension, our FFN branch consists of two MLP layers and a non-linear activation layer~\citep{saxe2013exact,he2023simplifying}, where the MLP layer consists of a sequential arrangement of two $3 \times 3$ convolutional layers.
+
+%
+The input of the FFN branch is $\textbf{F}_{sp}$ and $\textbf{F}_{vit}$, which are sequentially processed by feature concatenation along the channel dimension, a $3 \times 3$ convolution with the output channel size of $256$, and the shared layer normalization. This process can be expressed as:
+% -------------------------------
+\begin{equation}
+\textrm{F}(\textbf{F}_{sp},\textbf{F}_{vit})_{\textrm{Tem}} = \textrm{LN}(\textrm{Conv}_{3 \times 3}(\textrm{Concat}(\textbf{F}_{sp};\textbf{F}_{vit}))).
+\label{eq:3}
+\end{equation}
+% -------------------------------
+The temporary $\textrm{F}(\textbf{F}_{sp},\textbf{F}_{vit})_{\textrm{Tem}}$ are then passed through a MLP layer, a non-linear activation layer~\citep{saxe2013exact}, and another MLP layer to obtain the output $\textrm{F}(\textbf{F}_{sp},\textbf{F}_{vit})$. Hence, this can be expressed as:
+% -------------------------------
+\begin{equation}
+\textrm{F}(\textbf{F}_{sp},\textbf{F}_{vit}) = \textrm{MLP}(\textrm{NLA}(\textrm{MLP}(\textrm{F}(\textbf{F}_{sp},\textbf{F}_{vit})_{\textrm{Tem}}))),
+\label{eq:4}
+\end{equation}
+% -------------------------------
+where $\textrm{MLP}(\cdot)$ denotes the MLP layer operation, and $\textrm{NLA}(\cdot)$ denotes the non-linear activation layer~\citep{saxe2013exact,he2023simplifying}.
+
+% -------------------------------
+\myparagraph{\textcolor{orange}{Conv Branch.}} 
+% -------------------------------
+Empirical evidence has demonstrated that incorporating local inductive biases into ViT models can provide notable benefits for visual tasks involving dense prediction~\citep{peng2021conformer,wu2021cvt,li2022next,zhang2023cae}. To achieve this goal, we introduce a lightweight convolutional branch into the ViT adapter. Specifically, the Conv branch also takes into $\textbf{F}_{sp}$ and $\textbf{F}_{vit}$ as the input, which consists of three $1 \times 1$ depth-wise convolutions concatenated in series, with a GLUE layer used to activate the features between every two convolutions~\citep{saxe2013exact,he2023simplifying}. The computation process of the Conv branch is formulated as:
+% -------------------------------
+\begin{equation}
+\textrm{C}(\textbf{F}_{sp},\textbf{F}_{vit}) = \textrm{DC}(\textrm{GLU}(\textrm{DC}(\textrm{GLU}(\textrm{DC}(\textrm{Concat}(\textbf{F}_{sp};\textbf{F}_{vit}))))),
+\label{eq:5}
+\end{equation}
+% -------------------------------
+where $\textrm{DC}(\cdot)$ denotes the $1 \times 1$ depth-wise convolution with the output channel size of $256$, and $\textrm{GLU}(\cdot)$ denotes the GLUE layer.
+% -------------------------------
+With the help of shared layer normalization and CSA, MEA becomes a memory-efficient module with rich local inductive biases. In the following sections, we will provide detailed instructions on how to deploy our MEA block on injectors and extractors.
+% -------------------------------
+\subsection{Cascaded MEA Injector}
+\label{sec:3:3}
+% -------------------------------
+% The injector aims at transmitting the updated task-specific features into the ViT backbone and into the extractor after feature interaction~\citep{marouf2024mini,chen2022adaptformer,dong2024efficient}. 
+As illustrated in Figure~\ref{fig1} (b), the cascaded MEA injector adopts the paradigm of self-attention in its computational process, where $\textbf{F}^i_{vit}$ is used as the query, and $\textbf{F}^{i-1}_{sp}$ generated by the last extractor is used as the key and value. 
+%
+Particularly, to enhance the diversity of the obtained attention maps, a cascaded mechanism is proposed to compute different head features in the cascaded MEA injector. Specifically, we first divide the given features into $H$ parts along the channel dimension in a multi-head manner, following the classic self-attention~\citep{vaswani2017attention}, where $H$ is set to 16 in our work.
+%
+In the computation process of each head, the output of the $h$-th head $\hat{\textbf{F}}^{h,i}_{sp}$ and $\hat{\textbf{F}}^{h,i}_{vit}$ is added into the input features of the next ($h+1$)-th head $\textbf{F}^{h+1,i-1}_{sp}$ and $\textbf{F}^{h+1,i}_{vit}$ to be used in the calculation of subsequent self-attention features, where $h =1, 2, ..., H$. The cascaded process continues until the feature from the last head is included in the computation. Finally, the features obtained from these heads are concatenated along the channel dimension and projected through a $3 \times 3$ convolution layer before being outputted as the output of the $i$-th cascaded MEA injector. Besides, since the MEA block has only one output, $\hat{\textbf{F}}^{h,i}_{sp} = \hat{\textbf{F}}^{h,i}_{vit}$ in our cascaded MEA injector.
+
+% -------------------------------
+\subsection{Cascaded MEA Extractor}
+\label{sec:3:4}
+% -------------------------------
+As illustrated in Figure~\ref{fig1} (c), following~\citep{marouf2024mini,chen2022adaptformer,dong2024efficient},
+% the extractor is to extract general features for the ViT block and to interact with the features output by the injector before inputting them into the injector of the next block~\citep{marouf2024mini,chen2022adaptformer,dong2024efficient}. Therefore, the 
+our $i$-th cascaded MEA extractor of the $h$-th head takes the $\hat{\textbf{F}}^{h,i}_{sp}$ generated by the injector and $\textbf{F}^{h,i}_{vit}$ as input, where $\hat{\textbf{F}}^{h,i}_{sp}$ is used as the query, $\textbf{F}^{h,i}_{vit}$ is used as the key and value. The output of the $i$-th cascaded MEA extractor is $\textbf{F}^{h,i}_{sp}$. Similarly, the cascaded mechanism is applied following the cascaded MEA injector until the feature from the last head is included in the computation.
+% -------------------------------
+\iffalse
+\begin{small} 
+\begin{equation*} 
+\left| \frac{1}{n}\sum_{i=1}^{n}\phi_2(x_i) - \frac{1}{m}\sum_{j=1}^{m}\phi_2(y_j) \right|^2 > \left| \frac{1}{n}\sum_{i=1}^{n}\phi_1(x_i) - \frac{1}{m}\sum_{j=1}^{m}\phi_1(y_j) \right|^2 
+\end{equation*}
+\end{small}
+
+\begin{small} 
+\begin{equation*} 
+\small
+\frac{1}{n^2}\sum_{i=1}^{n}\sum_{i'=1}^{n}\langle\phi_2(x_i),\phi_2(x_{i'})\rangle - \frac{2}{nm}\sum_{i=1}^{n}\sum_{j=1}^{m}\langle\phi_2(x_i),\phi_2(y_j)\rangle + \frac{1}{m^2}\sum_{j=1}^{m}\sum_{j'=1}^{m}\langle\phi_2(y_j),\phi_2(y_{j'})\rangle > 
+\end{equation*} 
+\end{small}
+\begin{small} 
+\begin{equation*}
+\frac{1}{n^2}\sum_{i=1}^{n}\sum_{i'=1}^{n}\langle\phi_1(x_i),\phi_1(x_{i'})\rangle - \frac{2}{nm}\sum_{i=1}^{n}\sum_{j=1}^{m}\langle\phi_1(x_i),\phi_1(y_j)\rangle + \\
+\frac{1}{m^2}\sum_{j=1}^{m}\sum_{j'=1}^{m}\langle\phi_1(y_j),\phi_1(y_{j'})\rangle 
+\end{equation*} 
+\end{small}
+
+\begin{small} 
+\begin{equation*}
+\frac{1}{n^2}\sum_{i=1}^{n}\sum_{i'=1}^{n}k(x_i, x_{i'}) - \frac{2}{nm}\sum_{i=1}^{n}\sum_{j=1}^{m}k(x_i, y_j) + \frac{1}{m^2}\sum_{j=1}^{m}\sum_{j'=1}^{m}k(y_j, y_{j'}) > 
+\end{equation*} 
+\end{small} 
+\begin{small} 
+\begin{equation*}
+\frac{1}{n^2}\sum_{i=1}^{n}\sum_{i'=1}^{n}k(x_i, x_{i'}) - \frac{2}{nm}\sum_{i=1}^{n}\sum_{j=1}^{m}k(x_i, y_j) + \frac{1}{m^2}\sum_{j=1}^{m}\sum_{j'=1}^{m}k(y_j, y_{j'})  
+\end{equation*}
+\end{small} 
+
+\begin{small} 
+\begin{equation*}
+-\frac{2}{nm}\sum_{i=1}^{n}\sum_{j=1}^{m}\left(k(x_i, y_j) - \frac{1}{n}\sum_{i'=1}^{n}k(x_i, x_{i'}) - \frac{1}{m}\sum_{j'=1}^{m}k(y_j, y_{j'}) + \frac{1}{nm}\sum_{i'=1}^{n}\sum_{j'=1}^{m}k(x_{i'}, y_{j'})\right) > 0 
+\end{equation*} 
+\end{small} 
+
+\begin{small} 
+\begin{equation*}
+\frac{1}{nm}\sum_{i=1}^{n}\sum_{j=1}^{m}\left(k(x_i, y_j) - \frac{1}{n}\sum_{i'=1}^{n}k(x_i, x_{i'}) - \frac{1}{m}\sum_{j'=1}^{m}k(y_j, y_{j'}) + \frac{1}{nm}\sum_{i'=1}^{n}\sum_{j'=1}^{m}k(x_{i'}, y_{j'})\right) < 0 
+\end{equation*} 
+\end{small}
+\fi

@@ -1,0 +1,76 @@
+\section{Method}
+\label{sec:meth}
+
+This section outlines the components of our approach, \emph{SAM2} and the \emph{Overseer} model, before describing our inference pipeline for video segmentation.
+
+\subsection{SAM2: Segment Anything in Images and Videos}
+Given a video sequence $V := \{v_t\}_{t=1}^{T}, v_t \in \mathbb{R}^{3 \times H \times W}$, the \emph{SAM2} model $F(v)$ encodes the first frame $v_1$ into a latent representation by a hierarchical \emph{image encoder} network. Various prompts in the form of anchor points, bounding boxes or segmentation masks are equally encoded by a \emph{prompt encoder}. Both representations are then fed into the model's \emph{mask decoder} to produce the segmentation mask $\Bar{m}_1$, which is then again encoded by the \emph{memory encoder}. Encoded masks and frames are added to a \emph{memory bank}. For subsequent frames $v_t$ of the sequence $V$, entries from that memory bank are conditioning the current frame encoding in a \emph{memory attention} module before feeding it into the \emph{mask decoder} to predict $\Bar{m}_t$. We refer to Ravi et al. \cite{ravi2024sam} for further details.
+
+\begin{figure}[htbp]
+    \centering
+    \if\usepng1
+        \includegraphics[width=\textwidth]{figures/inference_scheme_v2.png}
+    \else
+        \includegraphics[width=\textwidth]{figures/inference_scheme_v2.eps}
+    \fi
+    \caption{\textbf{SASVi Inference Scheme.} Our frame-wise \emph{Overseer} model (\includegraphics[height=0.25cm]{figures/binocular.png}) captures time points at which previously untracked entities enter the scene or tracked objects leave. At that moment, it re-prompts \emph{SAM2} with predictions from that frame.}
+    \label{fig:sasvi}
+\end{figure}
+
+\subsection{Object Detection Overseer Model}
+To serve as an \emph{Overseer} model for \emph{SAM2} \cite{ravi2024sam}, we pre-train \emph{Mask R-CNN} \cite{he2017mask}, \emph{DETR} \cite{carion2020end} and \emph{Mask2Former} \cite{cheng2022masked} on the scarcely annotated datasets. Given an image frame $v_t$, the methods' \emph{Region Proposal Network} (RPN) predicts \emph{Regions of Interest} (ROIs), from which the \emph{Object Detection Stream} predicts bounding boxes $t := (x_\text{min}, x_\text{max}, y_\text{min}, y_\text{max}) \in [0,1]^{N_\text{bb} \times 4}$ for $N_\text{bb}$ objects and class probabilities $p \in [0,1]^{N_\text{cls} \times C}$ for $N_\text{cls}$ objects and the $C$ classes of the dataset. In parallel, the models' \emph{Segmentation Stream} predicts probability masks $m \in [0,1]^{N_\text{mask} \times H' \times W'}$ for $N_\text{mask}$ objects, where $(H',W')$ are the ROI dimensions. Example predictions of both streams of \emph{Mask R-CNN} are visualised in Figure \ref{fig:frame_qual}.
+
+The models are trained by minimising
+\begin{equation}
+    \mathcal{L} = \frac{1}{N_\text{cls}} \sum_{i=1}^{N_\text{cls}} \mathcal{L}_\text{cls}(i) + \frac{1}{N_\text{bb}} \sum_{i=1}^{N_\text{bb}} \mathcal{L}_\text{box}(i) + \frac{1}{N_\text{mask}} \sum_{i=1}^{N_\text{mask}} \mathcal{L}_\text{mask}(i)
+\end{equation}
+with
+\begin{align}
+    %\mathcal{L}_\text{cls}(i) &=  - \sum_{k=1}^C c^*_{ik}\log(p_{ik}) \\
+    %\mathcal{L}_\text{box}(i) &=  \text{smooth}_{L_1}(t_i - t^*_i) \\
+    \mathcal{L}_\text{cls}(i) &=  - \sum_{k=1}^C c^*_{ik}\log(p_{ik}) \text{,}\quad \mathcal{L}_\text{box}(i) = \text{smooth}{L_1}(t_i - t^*_i) \quad\text{and}\\
+    \mathcal{L}_\text{mask}(i) &=  \frac{1}{H \times W} \sum_{x=1,y=1}^{H,W} - [m^*_{c^*_i,x,y}\log(m_{c^*_i,x,y}) + (1-m^*_{c^*_i,x,y} ) \log(1-m_{c^*_i,x,y})]
+\end{align}
+
+where $c^*$, $t^*$ and $m^*$ are the ground-truth class probabilities, bounding box coordinates and segmentation masks, respectively.
+
+Unlike traditional segmentation models, our \emph{Overseers} can catch new instances of the same class, which the former would predict in a single mask. As further analysed in Supplementary Section \ref{sec:app_compute}, their lightweight design allows for efficient monitoring of the surgical videos in parallel to \emph{SAM2}.
+
+\subsection{Segment Any Surgical Video}
+Given a video sequence $V$, our method operates as follows:
+
+In the initial frame $v_{t=1}$, we query the pre-trained \emph{Overseer} model $M(v)$ to predict a segmentation mask $m_{t=1} = M(v_{t=1})$.
+Given this prediction, we store the current entities in a buffer as $B := \{c_1\}$, where $c_1 \leq C$ are the currently predicted classes.
+The mask is used to prompt the \emph{SAM2} model $F(v_{t=1},m_{t=1})$, predicting the segmentation mask $\Bar{m}_{t=1}$. 
+Subsequent frames $\{v_t\}_{t=2}^{T}$ are equally segmented with $F(v_t)$, producing temporally smooth segmentations.
+In parallel, the \emph{Overseer} $M(v_t)$ predicts the classes $c_t$ and adds them to the buffer $B$. 
+
+Once we reach a frame $v_t'$ where the class predictions in $B$ changed for more than $n_t$ time-steps, we perform the following: We track back the time point $t'-n_t$ where the change in classes first happened. We then sample anchor prompting points $a_{t'-n_t}$ from the \emph{Overseer} mask $m_{t'-n_t}$ and use these prompts in conjunction with mask $m_{t'-n_t}$ to continue the segmentation from that point in time. The threshold $n_t$ is introduced to minimise the impact of wrong predictions from $M(v_t)$ and is empirically set to $n_t = 4$. Further, the temporal back-tracking allows for correcting potential mistakes from $F(v)$ in the last $n_t$ time steps, smoothing out the predictions. This process is repeated until the full video $V$ is segmented as $\Bar{M} := \{\Bar{m}_t\}_{t=1}^T$.
+
+The overall inference process is visualised in Figure \ref{fig:sasvi} and summarised as a pseudo-code formulation in Algorithm \ref{alg:pseudocode}.
+
+\begin{algorithm}[htbp]
+    \caption{\textbf{SASVi Inference Pseudocode.}}
+    \label{alg:pseudocode}
+    \begin{algorithmic}
+        \Require Pre-trained \emph{Overseer} model $M(v_t)$, \emph{SAM2} model $F(v_t,a_t)$, surgical video sequence $\{v_t\}_{t=1}^T$, temporal buffer $B$ of size $n_t \geq 1$, anchor sampling size $n_a \geq 1$
+        \State $m_1,c_1 \gets M(v_t)$ \textit{ // Predict the first frame using the Overseer.}
+        %\State $a_1 \gets \text{sample}(m_1, n_a)$
+        \State $B \gets \{c_1\}$
+        \State $\Bar{m}_1 \gets F(v_1,m_1)$ \textit{ // Prompt SAM2 with the predicted mask.}
+        \State $t \gets 2$
+        \While{$t \leq T$}
+        \State $m_t, c_t \gets M(v_{t})$ \textit{ // Predict the current frame using the Overseer.}
+        \State $B \gets B + \{c_t\}$
+        \If{$t - n_t \geq 0 \text{ and new class in all of } B$}
+            \State $a_{t-n_t} \gets \text{sample}(m_{t-n_t}, n_a)$ \textit{ // Sample anchor points for new entity.}
+            \State $\Bar{m}_{t-n_t} \gets F(v_{t-n_t}, a_{t-n_t}, m_{t-n_t})$ \textit{ // Re-prompt SAM2.}
+            \State $t \gets t-n_t+1$
+        \Else
+            \State $\Bar{m}_{t} \gets F(v_{t})$ \textit{ // Continue segmenting with SAM2.}
+            \State $t \gets t+1$
+        \EndIf
+        \EndWhile    \\   
+        \Return $\{\Bar{m}_1, ..., \Bar{m}_T\}$
+    \end{algorithmic}
+\end{algorithm}

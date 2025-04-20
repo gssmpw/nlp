@@ -1,0 +1,983 @@
+\pdfoutput=1
+
+\PassOptionsToPackage{dvipsnames, table}{xcolor}
+
+\documentclass[11pt]{article}
+
+\usepackage[]{acl}
+
+\usepackage{times}
+\usepackage{latexsym}
+
+\usepackage[T1]{fontenc}
+
+\usepackage[utf8]{inputenc}
+
+\usepackage{microtype}
+
+\usepackage{inconsolata}
+
+\usepackage{graphicx}
+
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{CJK}
+\usepackage{enumitem}
+\usepackage{makecell}
+\usepackage{multirow}
+\usepackage{soul}
+\usepackage{subcaption}
+\usepackage{xurl}
+
+
+\newcommand{\result}[2]{#1\textsubscript{\,\textcolor{gray}{#2}}}
+
+\newcommand{\chinese}[1]{\begin{CJK}{UTF8}{gbsn}#1\end{CJK}}
+
+
+\title{Compressing Language Models for Specialized Domains}
+
+\author{Miles Williams$^{\diamondsuit \spadesuit}$ \quad George Chrysostomou$^{\spadesuit}$ \quad Vitor Jeronymo$^{\spadesuit}$ \quad Nikolaos Aletras$^{\diamondsuit}$ \\ $^{\diamondsuit}$University of Sheffield\\$^{\spadesuit}$Enterprise AI Services, AstraZeneca\\ \texttt{\{mwilliams15, n.aletras\}@sheffield.ac.uk}}
+
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Compression techniques such as pruning and quantization offer a solution for more efficient deployment of language models (LMs), albeit with small performance drops in benchmark performance. However, general-purpose LM compression methods can negatively affect performance in specialized domains (e.g. biomedical or legal). Recent work has sought to address this, yet requires computationally expensive full-parameter fine-tuning. To this end, we propose cross-calibration, a novel training-free approach for improving the domain performance of compressed LMs. Our approach effectively leverages Hessian-based sensitivity to identify weights that are influential for both in-domain and general performance. Through extensive experimentation, we demonstrate that cross-calibration substantially outperforms existing approaches on domain-specific tasks, without compromising general performance. Notably, these gains come without additional computational overhead, displaying remarkable potential towards extracting domain-specialized compressed models from general-purpose LMs.\footnote{\url{https://github.com/mlsw/domain-compression}}%
+\end{abstract}
+
+\section{Introduction}
+
+Language models (LMs) have demonstrated remarkable performance across tasks from a range of domains \citep{grattafiori-etal-2024-llama3, groeneveld-etal-2024-olmo, yang-etal-2024-qwen2}. Behind this success lies a recipe with two key ingredients: highly parameterized models and extensive training. However, the vast scale of these models presents substantial challenges in their deployment and application \citep{treviso-etal-2023-efficient, zhu-etal-2024-survey-model}. \citet{luccioni-etal-2024-power} suggest that the trend towards \emph{general-purpose} models has introduced substantial yet potentially unnecessary inference costs.
+
+Model compression techniques, such as quantization and pruning, are foundational approaches aimed at reducing the computational footprint of LMs during inference \citep{zhu-etal-2024-survey-model}. Quantization represents weights (and/or activations) with lower precision, while pruning removes less important weights. Notably, recent work has shown the successful application of quantization \citep{frantar-etal-2023-optq, lin-etal-2024-awq} and pruning \citep{frantar-alistarh-2023-sparsegpt, sun-etal-2024-simple} to general-purpose LMs without any additional training.
+
+\begin{figure}
+\centering
+\includegraphics[scale=0.58]{figures/diagram.pdf}
+\caption{Compressing large general-purpose LMs into smaller domain-specific models.}
+\label{fig:diagram}
+\end{figure}
+
+LM compression studies typically focus on preserving general-purpose performance, i.e. language modeling and commonsense reasoning capabilities \citep{frantar-alistarh-2023-sparsegpt, ma-etal-2023-llm, sun-etal-2024-simple}. 
+However, in practice, LMs may be deployed within only one particular domain, e.g. biomedical or legal \citep{labrak-etal-2024-biomistral, colombo-etal-2024-saullm, ling-etal-2024-domain, chen-etal-2024-survey}. This scenario unlocks new paths towards improving inference efficiency by extracting domain-specific LMs from general-purpose models (Figure \ref{fig:diagram}).
+
+Recently, \citet{zhang-etal-2024-pruning} proposed D-Pruner, a pruning method aiming to preserve weights that are influential to both domain-specific and general capabilities. 
+To identify such weights, D-Pruner leverages the gradient information from a composite loss function which incorporates general weight importance scores. However, this requires full-parameter fine-tuning of the LM, thus incurring substantial computational costs.
+
+The majority of post-training LM compression methods rely upon \textit{calibration data}, a small amount of data used to aid the analysis of layer activations. Recent work has shown that calibration data can impact task performance \citep{williams-aletras-2024-impact}, although \citet{bandari-etal-2024-c4} find that task-specific calibration data does not necessarily benefit performance. Inspired by this line of work, we investigate how to effectively leverage domain-specific data for calibration, aiming to maximize in-domain performance without sacrificing general capabilities.
+Our main contributions are as follows:
+
+\begin{enumerate}[left=0pt,partopsep=0em]
+
+\item In contrast to previous work, we find that in-domain calibration data can play an important role in pruning, maximizing performance retention on domain-specific tasks.
+
+\item We propose cross-calibration, a novel calibration method for Hessian-based compression, enabling the effective use of in-domain calibration data. Our approach is robust, with little computational overhead, yet outperforms existing general and domain-specific pruning methods.
+
+\end{enumerate}
+
+\section{Related Work}
+
+\paragraph{Quantization.}
+
+The objective of quantization is to represent weights (and optionally activations) using fewer bits. This reduction in precision reduces memory requirements, and typically enables inference speedups \citep{gholami-etal-2021-survey}. Beyond their scale, contemporary LMs pose unique challenges for effective quantization, including the existence of high-magnitude outlier features \citep{bondarenko-etal-2021-understanding, dettmers-etal-2022-gpt3}. Recent directions include: holding outlier weights in higher precision \citep{dettmers-etal-2022-gpt3}, Hessian-based weight sensitivity \citep{frantar-etal-2023-optq}, searching for optimal clipping thresholds \citep{wei-etal-2023-outlier}, or combinations of these approaches \citep{lin-etal-2024-awq, dettmers-etal-2024-spqr}.
+
+\paragraph{Pruning.}
+
+The aim of neural network pruning is to remove less important weights, therefore reducing the overall model size \citep{lecun-etal-1989-optimal}. Pruning can be performed at the level of individual weights (unstructured), within groups of weights (semi-structured), or entire dimensions (structured) \citep{han-etal-2015-learning, mishra-etal-2021-accelerating, ma-etal-2023-llm}. In particular, 2:4 semi-structured sparsity (i.e. pruning two weights in every block of four), enables enhanced inference performance on NVIDIA GPUs \citep{mishra-etal-2021-accelerating}. However, the extensive size of LMs presents challenges in pruning them optimally \citep{hassibi-etal-1993-optimal}. Recent work has instead decomposed LM pruning into a sequential layer-wise approach, demonstrating remarkable performance retention, even at high sparsity levels \cite{frantar-alistarh-2023-sparsegpt, sun-etal-2024-simple, yin-etal-2024-outlier}.
+
+\paragraph{Domain-specific pruning.}
+
+Early work focused on pruning deep neural networks for specific tasks \citep{han-etal-2015-learning, molchanov-etal-2017-pruning}. This trend continued \citep{sanh-etal-2020-movement, lagunas-etal-2021-block, kwon-etal-2022-fast} following the advent of BERT \citep{devlin-etal-2019-bert}. However, the shift towards general-purpose LMs \citep{brown-etal-2020-language, dredze-etal-2024-academics} has led to a focus on preserving general performance \citep{frantar-alistarh-2023-sparsegpt, ma-etal-2023-llm, sun-etal-2024-simple}, i.e. language modeling and reasoning. Most recently, \citet{zhang-etal-2024-pruning} proposed D-Pruner for domain-specific pruning, leveraging general weight importance to form a domain-specific training loss. However, this requires computationally expensive full-parameter fine-tuning, yet does not consistently outperform general-purpose pruning methods.
+
+\paragraph{Calibration data.}
+
+In a post-training setting, model compression typically relies upon calibration data \citep{wan-etal-2024-efficient}. Calibration data consists of a small number of unlabeled examples, for the generation of layer activations \citep{nagel-etal-2020-up, hubara-etal-2021-accurate}. Typically, these examples are randomly sampled from web text or pre-training datasets (e.g. C4; \citealp{raffel-etal-2020-exploring}). However, recent work has illustrated the influential role that calibration data can play, impacting the downstream performance of compressed models \citep{williams-aletras-2024-impact}. Most recently, \citet{bandari-etal-2024-c4} suggest that pruning with calibration data based on downstream tasks does not necessarily benefit performance over generic data.
+
+
+\section{Cross-calibration}
+
+\subsection{Preliminaries}
+
+The Optimal Brain Surgeon (OBS) \citep{hassibi-etal-1993-optimal} algorithm leverages second-order derivatives to accurately prune weights from a neural network. These second-order derivatives, which indicate the curvature of the loss function with respect to the weights, are organized in a square matrix known as the Hessian. Based on the Hessian $\mathbf{H}$, the OBS algorithm iteratively removes the weight $w_m$ with the lowest saliency $\varepsilon_m$, followed by applying the optimal update for the remaining weights $\boldsymbol{\delta}_m$:
+\begin{equation*}
+\varepsilon_m = \frac{1}{2}\frac{w^2_m}{[\mathbf{H}^{-1}]_{mm}}, \quad \boldsymbol{\delta}_m = -\frac{w_m}{[\mathbf{H}^{-1}]_{mm}}\cdot\mathbf{H}^{-1}_{:,m}
+\end{equation*}
+
+\citet{frantar-alistarh-2022-optimal} reformulate pruning as a case of the layer-wise compression problem, while retaining the OBS weight update procedure. Given a layer $\ell$ and input activations $\mathbf{X}_\ell$, the objective is to minimize the error between the original weights $\mathbf{W}_\ell$ and newly compressed weights $\mathbf{\widehat{W}}_\ell$:
+\begin{equation*}
+\text{argmin}_{\mathbf{\widehat{W}}} ||\mathbf{X}_\ell\mathbf{W}_\ell - \mathbf{X}_\ell\mathbf{\widehat{W}}_\ell||^2_2
+\end{equation*}
+As the layer input activations are derived from a fixed set of calibration data, the layer outputs (i.e. $\mathbf{Y}=\mathbf{XW}$) are also fixed. Consequently, the layer Hessian is computed as:
+\begin{equation*}
+\mathbf{H} = 2\mathbf{X}^\mathrm{T}\mathbf{X}
+\end{equation*}
+
+\subsection{Motivation}
+
+A key assumption of OBS is that the original model has been sufficiently optimized, i.e. its training error is minimal. This is usually the case for LMs, which are extensively trained over large and varied corpora. Consequently, a small random sample of generic data (i.e. calibration data) proves sufficient to accurately approximate the Hessian for model compression \citep{frantar-alistarh-2023-sparsegpt}.
+
+However, while the model weights have converged to best fit the diverse pre-training data, they also encode specialized domain-specific knowledge \citep{singhal-etal-2023-large}.
+We therefore question whether generic calibration data alone is sufficient to effectively isolate the weights that are crucial for domain-specific performance. As illustrated in Figure \ref{fig:hessian_structure}, certain features may be highly sensitive within a specific domain yet appear unimportant in broader, generic samples. Conversely, generic data can play a beneficial role in maintaining general capabilities like reasoning \citep{bandari-etal-2024-c4}.
+
+We hypothesize that extracting domain-specific LMs while retaining general performance requires identifying weights that are influential in both cases. To this end, we propose \emph{cross-calibration} (Algorithm \ref{alg:cross-calibration}), a method for Hessian-based compression that maximizes both general and in-domain performance. Our approach is twofold: (1) identifying features that are influential for specific domains, and (2) regularizing these with respect to the model, which is not converged for domain-specific data.
+
+\subsection{Mixture of Hessians}
+
+We first decompose the Hessian $\mathbf{H}$ into two distinct components: one for domain-specific features, $\mathbf{H}_d$, and the other, $\mathbf{H}_g$, for general (i.e. domain-agnostic) features. We then propose the introduction of a domain-specific calibration set $\mathcal{D}_d$ to approximate $\mathbf{H}_d$. In contrast to \citet{zhang-etal-2024-pruning}, we use in-domain data directly for assessing weight sensitivity, rather than as training data for a separate fine-tuning phase. Finally, we use a conventional generic calibration set $\mathcal{D}_g$ to approximate $\mathbf{H}_g$.
+
+\begin{figure}[t]
+\centering
+\includegraphics[scale=1.0]{figures/hessian_heatmap.pdf}
+\caption{The Hessian at layer 16 of Mistral NeMo 12B, computed with (a) generic calibration data, and (b) domain-specific calibration data. For clarity, we present the magnitude of the elements for the first 32 features.}
+\label{fig:hessian_structure}
+\end{figure}
+
+However, this decomposition presents two key challenges: (1) the matrix inversion required for weight updates via OBS (i.e. $\textbf{H}^{-1}$) is computationally expensive, and (2) retaining multiple Hessians substantially increases the memory requirements of compression. To address the first issue, we merge both Hessians such that matrix inversion need only be performed once. Specifically, we introduce a regularization hyperparameter $\alpha \in [0, 1]$ to modulate feature influence:
+\begin{equation*}
+\mathbf{H} = \alpha\mathbf{H}_d + (1-\alpha)\mathbf{H}_g
+\end{equation*}
+To address the second issue, we reformulate our approach as an iterative procedure, following \citet{west-1979-updating}. This enables the numerically stable computation of the Hessian while retaining only one matrix. Concretely, we consider each calibration example as a pair $(\mathbf{X}_n, \alpha_n)$, consisting of the input example and the regularization hyperparameter associated with the calibration set it is sampled from. This allows us to compute the Hessian iteratively as follows, where $\text{A}_n=\sum^n_{i=1} \alpha_i$ and $n = |\mathcal{D}_g \cup \mathcal{D}_d|$:
+\begin{equation*}
+\mathbf{H}_n = \mathbf{H}_{n-1} + \frac{\alpha_n}{\text{A}_n}(2\mathbf{X}_n^\mathrm{T}\mathbf{X}_n-\mathbf{H}_{n-1})
+\end{equation*}
+
+To validate our approach, we integrate cross-calibration (CC) with SparseGPT \citep{frantar-alistarh-2023-sparsegpt}, a popular Hessian-based pruning algorithm. However, we note that cross-calibration is not tied to any specific compression algorithm (see Figure \ref{fig:quantization-results} in Appendix \ref{app:4-bit-quant} for GPTQ-M results).
+
+
+\section{Experimental Setup}
+
+\subsection{Compression Methods}
+\label{subsec:experimental_setup_pruning_methods}
+
+Pruning methods can be formulated as a function that computes a saliency score $\mathbf{S}_{ij}$ for each weight $\mathbf{W}_{ij}$ in a given layer. They optionally use the layer input activations $\mathbf{X}$, derived from calibration data. We adopt the following methods as baselines.
+
+\paragraph{Magnitude \normalfont{\citep{janowsky-1989-pruning, han-etal-2015-learning}.}}
+
+Based on the assumption that removing the smallest weights will have the least effect, magnitude pruning simply uses the weight magnitude for saliency:
+\begin{equation*}
+\mathbf{S}_{ij} = |\mathbf{W}_{ij}|
+\end{equation*}
+
+\paragraph{SparseGPT \normalfont{\citep{frantar-alistarh-2023-sparsegpt}.}}
+
+Building upon the OBS procedure, SparseGPT offers an efficient iterative approximation. The saliency metric is computed as follows, where $\lambda$ is a dampening factor to enable inversion of the Hessian:
+\begin{equation*}
+\mathbf{S}_{ij} = \left[ |\mathbf{W}|^2/\text{diag} \left((\mathbf{X}^\mathrm{T}\mathbf{X} + \lambda \mathbf{I})^{-1} \right) \right]_{ij}
+\end{equation*}
+
+\paragraph{Wanda \normalfont{\citep{sun-etal-2024-simple}.}}
+
+Improving upon the computational efficiency of SparseGPT, the Wanda pruning metric approximates the diagonal of the inverse Hessian via the $\ell_2$ norm of the activations:
+\begin{equation*}
+\mathbf{S}_{ij} = \|\mathbf{W}_{ij}| \cdot ||\mathbf{X}||_2
+\end{equation*}
+
+\paragraph{D-Pruner \normalfont{\citep{zhang-etal-2024-pruning}.}} D-Pruner is a domain-specific pruning method. The first step of D-Pruner is to compute the general importance $\mathbf{G}_{ij}$ using a general dataset $\mathcal{D}_{g}$, similar to SparseGPT. Secondly, it uses  a composite loss function $\mathcal{L}$ to identify weights that are important for both general and domain-specific knowledge. This consists of the cross-entropy loss $\mathcal{L}_\text{CE}$ with a regularization term controlled by hyperparameter $\lambda_g$, where $\mathbf{W}'$ is the updated weight matrix:
+\begin{equation*}
+\mathcal{L} \approx \mathcal{L}_\text{CE} + \lambda_g \sum_{i,j} \mathbf{G}_{ij} (\mathbf{W}'_{ij}-\mathbf{W}_{ij})^2
+\end{equation*}
+This is computed via stochastic gradient descent (i.e fine-tuning following \citealt{lv-etal-2024-full}). The final saliency score is computed as follows, where $\mathcal{D}_d$ is a domain-specific dataset:
+\begin{equation*}
+\mathbf{S}_{ij} \approx \left| \frac{\partial \mathcal{L}(\mathcal{D}_d)}{\partial\mathbf{W}_{ij}}\mathbf{W}_{ij} + \frac{1}{2} \left[ \frac{\partial \mathcal{L}(\mathcal{D}_d)}{\partial\mathbf{W}_{ij}}\mathbf{W}_{ij} \right]^2 \right|
+\end{equation*}
+
+\paragraph{GPTQ-M \normalfont{\citep{frantar-etal-2024-marlin}.}}
+
+GPTQ adopts a Hessian-based weight sensitivity metric for quantization \citep{frantar-etal-2023-optq}. We select this method to enable a fair comparison with SparseGPT, which uses GPTQ for joint sparsification and quantization. We include improvements to the original algorithm suggested by \citet{frantar-etal-2024-marlin}. Specifically, this identifies optimal group-wise clipping thresholds, similar to AWQ \citep{lin-etal-2024-awq}. For clarity, we refer to this improved method as GPTQ-M.
+
+\begin{algorithm}[t]
+\small
+\caption{Cross-calibration (CC) - simplified.}
+\begin{algorithmic}
+\Require Generic dataset $\mathcal{D}_g$, domain dataset $\mathcal{D}_d$, regularization $\alpha$, embedding matrix $\mathbf{U}$, and weight matrices $\mathcal{W}$.
+\State $\mathcal{D} \gets \{ (x, \alpha) \mid x \in \mathcal{D}_d \} \cup \{ (x, 1 - \alpha) \mid x \in \mathcal{D}_g \}$
+\For{$i \gets 1$ to $|\mathcal{D}|$}
+    \State $(x_i, \alpha_i) \gets \mathcal{D}_i$
+    \State $\mathbf{X}_i \gets x_i \mathbf{U}$
+\EndFor
+
+\For{$\mathbf{W} \in \mathcal{W}$}
+    \State $\mathbf{H} \gets \mathbf{0}$, $A \gets 0$
+
+    \For{$i \gets 1$ to $|\mathcal{D}|$}
+        \State $A \gets A + \alpha_i$
+        \State $\mathbf{H} \gets \mathbf{H} + \frac{\alpha_i}{A} (2 \mathbf{X}_i^\mathrm{T} \mathbf{X}_i - \mathbf{H})$
+    \EndFor
+    \State $\mathbf{W} \gets \text{Compress}(\mathbf{W}, \mathbf{H})$ \Comment{E.g. via SparseGPT.}
+    \For{$i \gets 1$ to $|\mathcal{D}|$}
+        \State $\mathbf{X}_i \gets \mathbf{X}_i \mathbf{W}$
+    \EndFor
+\EndFor
+\end{algorithmic}
+\label{alg:cross-calibration}
+\end{algorithm}
+
+\paragraph{Compression configurations.}
+
+Guided by prior work \citep{sun-etal-2024-simple, frantar-etal-2024-marlin}, we focus our experiments on the following settings: 
+\begin{itemize}[left=0pt]
+    \item \textbf{50\% (unstructured) sparsity}. First, we experiment with individually pruning half of all layer weights, offering the highest possible granularity.
+    \item \textbf{2:4 (semi-structured) sparsity}. We then examine pruning at the granularity of two weights in every group of four, enabling enhanced GPU inference performance \citep{mishra-etal-2021-accelerating}. 
+    \item \textbf{4-bit quantization with 2:4 sparsity}. Finally, we combine 2:4 sparsity with 4-bit quantization of the remaining weights, enabling up to 5.3$\times$ GPU inference speedups \citep{frantar-etal-2024-marlin}.
+\end{itemize}
+
+\begin{figure*}
+\centering
+\includegraphics[scale=1.0]{figures/pruning_results.pdf}
+\caption{The average benchmark accuracy when pruning to 50\% sparsity, relative to the original model.}
+\label{fig:pruning-results}
+\end{figure*}
+
+\subsection{Domains and Tasks}
+\label{sec:tasks_and_domains}
+
+To assess the efficacy of our approach on downstream tasks, we experiment with what are arguably the two most extensively explored domains in NLP, the \emph{biomedical} \citep{lee-etal-20190-biobert, gu-etal-2021-domain, luo-etal-2022-biogpt, singhal-etal-2023-large, singhal-etal-2023-expert} and \emph{legal} \citep{ chalkidis-etal-2019-neural, zheng-etal-2021-when, henderson-etal-2022-pile, t-y-s-s-etal-2024-beyond, niklaus-etal-2024-multilegalpile} domains. See Appendix \ref{app:datasets} for task examples.
+
+ 
+\paragraph{Biomedical.}
+
+We use the MultiMedQA benchmark \citep{singhal-etal-2023-large}, specifically the PubMedQA \citep{jin-etal-2019-pubmedqa}, MedQA \citep{jin-etal-2021-disease}, MedMCQA \citep{pal-etal-2022-medmcqa} tasks, and relevant subsets from MMLU \citep{hendrycks-etal-2021-measuring} (anatomy, clinical knowledge, college medicine, medical genetics, professional medicine, college biology). To assess language modeling performance, we use the BioLaySumm PLOS dataset \citep{goldsack-etal-2022-making, goldsack-etal-2023-biolaysumm} comprising biomedical articles.
+
+\paragraph{Legal.}
+
+We follow \citet{colombo-etal-2024-saullm} in using Legal-MMLU, covering jurisprudence, professional law, and international law specialties \citep{hendrycks-etal-2021-measuring}. We also use the CaseHOLD \citep{zheng-etal-2021-when} and ECtHR (Task A) \citep{chalkidis-etal-2019-neural} datasets from the LexGLUE benchmark \citep{chalkidis-etal-2022-lexglue}, comprising US Supreme Court opinions and European Court of
+Human Rights cases, respectively. To evaluate language modeling performance, we use the BillSum dataset \citep{kornilova-eidelman-2019-billsum} of US Congressional and California state bills.
+
+\paragraph{General.}
+
+To assess general performance, we use all commonsense reasoning tasks adopted by \citet{frantar-alistarh-2023-sparsegpt} and \citet{sun-etal-2024-simple}: ARC \citep{clark-etal-2018-think}, BoolQ \citep{clark-etal-2019-boolq}, HellaSwag \citep{zellers-etal-2019-hellaswag}, LAMBADA \citep{paperno-etal-2016-lambada}, OpenBookQA \citep{banerjee-etal-2019-careful}, PIQA \citep{bisk-etal-2020-piqa}, RTE \citep{dagan-etal-2006-pascal}, StoryCloze \citep{mostafazadeh-etal-2016-corpus}, and WinoGrande \citep{sakaguchi-etal-2021-winogrande}. We use WikiText-2 \citep{merity-etal-2017-pointer} to assess language modeling.
+
+\subsection{Calibration Data}
+
+\paragraph{Data sources.}
+
+To create our general-purpose calibration sets, we follow \citet{dettmers-etal-2024-spqr} in using RedPajama \citep{weber-etal-2024-redpajama}, an open reproduction of the LLaMA training data. For the domain-specific calibration sets, we use MultiMedQA (biomedical) and LexGLUE (legal). In all cases, we sample data from the training splits only.
+
+\paragraph{Data quantity.}
+
+For a fair comparison between compression methods, we use 1024 calibration examples. As D-Pruner consists of two distinct stages to identify general and domain-specific weight importance, we allow 1024 examples from each dataset to better match the original work \citep{zhang-etal-2024-pruning}. For our own method, we simply select half of the examples (i.e. 512) from each dataset.
+
+\paragraph{Sampling.}
+
+We randomly sample segments of 2048 tokens following \citet{frantar-etal-2023-optq}, avoiding any selection bias. In the case of the domain-specific datasets, which may contain shorter examples, we follow \citet{touvron-etal-2023-llama2} in concatenating examples for a consistent length. We repeat the sampling process to create five distinct calibration sets, used to assess the variance in performance.
+
+\subsection{Models}
+\label{sec:experimental_setup_models}
+
+We experiment with popular open-weights LMs, covering different model families and sizes: (1) \textbf{Llama 3.2 3B} and \textbf{3.1 8B} \citep{grattafiori-etal-2024-llama3}, (2) \textbf{Gemma 2 2B} and \textbf{9B} \citep{riviere-etal-2024-gemma2}, and (3) \textbf{Mistral NeMo 12B} (2407) \citep{jiang-etal-2024-mistral}.
+
+
+\section{Results \& Discussion}
+
+\subsection{Pruning}
+\label{sec:results-pruning}
+
+Figure \ref{fig:pruning-results} presents the benchmark accuracy when pruning to 50\% sparsity, relative to the original (dense) model.\footnote{The D-Pruner \citep{zhang-etal-2024-pruning} implementation only supports models with the Llama architecture. See \hyperref[sec:limitations]{Limitations}.} We report the mean value and standard deviation across five calibration sets. For brevity, we present the general performance across domain-specific models. We additionally present complete results across all models in Appendix \ref{app:full_results}.
+
+\paragraph{A note on hyperparameters.}
+
+To maximize the performance of the D-Pruner baseline, we perform an extensive hyperparameter search across $\lambda \in \{0.1, 0.01, 0.001\}$ and group size $\in \{\text{None}, 128\}$ for each model and domain. We then present results for only the best performing combinations. We present complete results across all hyperparameters in Appendix \ref{app:full_results}. In contrast, we do not optimize $\alpha$ for cross-calibration (ours) and simply opt to use $\alpha = 0.8$ across all models and domains. We ablate the impact of this hyperparameter in Appendix \ref{app:varying_alpha}.
+
+\paragraph{Cross-calibration benefits domain performance.} 
+
+We observe that across both biomedical and legal domains, our approach consistently outperforms all other compression methods. For example, we observe that cross-calibration achieves an average relative accuracy of 91.3\% on the legal benchmark for Llama 3.1 8B. In comparison, SparseGPT and D-Pruner achieve 72.9\% and 77.2\%, respectively. For the biomedical benchmark, a similar trend can be observed. Cross-calibration achieves 88.4\%, while SparseGPT and D-Pruner achieve 81.0\% and 75.3\%, respectively. This highlights that cross-calibration is effective at isolating weights that are influential for strong in-domain performance.
+
+
+\begin{figure}[t]
+\centering
+\includegraphics[scale=1.0]{figures/joint_results.pdf}
+\caption{Average accuracy when applying 4-bit quantization and 2:4 sparsity, relative to the dense model.}
+\label{fig:joint-results}
+\end{figure}
+
+\paragraph{General performance is comparable in all cases.}
+
+In addition to substantial improvements in domain-specific performance, general performance remains similar to the general-purpose pruning baselines. With Llama 3.1 8B, cross-calibration achieves 91.8\% relative accuracy for general tasks on average. In comparison, SparseGPT achieves a slightly higher value of 92.2\%, while D-Pruner reaches only 85.7\%. Intriguingly, for the Gemma family of models, we note that cross-calibration achieves higher performance than even the general-purpose methods. For example, cross-calibration achieves 94.3\% on average with Gemma 2 9B, while SparseGPT reaches 93.7\%. This suggests that cross-calibration is able to effectively incorporate domain-specific features without sacrificing general performance.
+
+\paragraph{Performance gains are generally model-agnostic.}
+
+
+Finally, we observe that the performance benefits of cross-calibration are similar irrespective of the model size and family. For example, we consider two similarly sized models, Llama 3.1 8B and Gemma 2 9B. In the biomedical benchmark, we observe a 13.1 and 8.7 point increase in relative accuracy over SparseGPT, respectively. For the legal benchmark, we observe an 18.4 and 16.3 point increase, respectively. Our findings indicate that cross-calibration and the resulting performance gains are agnostic to the model size and family.
+
+\paragraph{Language modeling follows a similar trend.}
+
+Table \ref{tab:full_results_pruning} (Appendix \ref{app:full_results}) presents perplexity results. Similar to the downstream task experiments, we note that cross-calibration achieves the best performance on in-domain language modeling. Using Llama 3.1 8B, cross-calibration achieves a perplexity of 5.9 compared to 6.7 from D-Pruner in the legal domain. For the biomedical domain, cross-calibration has a perplexity of 11.0, compared to 15.1 from D-Pruner. The datasets used to evaluate perplexity are not used for calibration, suggesting that cross-calibration succeeds at identifying domain-specific features.
+
+\paragraph{Cross-calibration appears to generalize beyond specific tasks.}
+
+
+Across all models and domains, we observe that the performance benefits of cross-calibration continue to tasks not included in the calibration data. In Table \ref{tab:full_results_analytical_bio_legal} (Appendix \ref{app:full_results}), we present complete per-task results. We consider the MMLU tasks, which notably do not have training data, and are therefore not represented in the calibration data. For Llama 3.1 8B, cross-calibration achieves an absolute increase in accuracy of 8.6 points over SparseGPT in the biomedical domain. In the legal domain, cross-calibration achieves an additional 3.3 points in accuracy. This suggests that it identifies features that are domain-relevant, rather than relevant to only a specific task.
+
+\subsection{Joint Pruning and Quantization}
+\label{sec:results_joint_compression}
+
+We further examine the performance of our approach when jointly applying pruning and quantization by reusing the same inverse Hessian \citep{frantar-alistarh-2023-sparsegpt}. This has the advantage of allowing pruning and quantization decisions to influence each other and  enables quantization at almost no extra cost. Figure \ref{fig:joint-results} presents benchmark accuracy when jointly applying 2:4 sparsity with 4-bit quantization, relative to the original model.
+
+
+\paragraph{Cross-calibration improves in-domain performance while sustaining general performance.}
+
+Cross-calibration achieves substantially greater domain performance than SparseGPT for 2:4 sparsity. For example, it sees a relative accuracy of 79.9\% on the biomedical benchmark for Gemma 2 9B, versus 58.2\% with SparseGPT. For general performance, we observe a similar trend to the pruning results, with cross-calibration performing comparably to SparseGPT. This illustrates that cross-calibration can be reliably used with quantization.
+
+\subsection{Compression Efficiency}
+
+\paragraph{Cross-calibration does not sacrifice efficiency.}
+
+Figure \ref{fig:runtime-statistics} presents the time and memory requirements of each method, which are often limiting factors in practice. First, we observe that cross-calibration does not increase the duration of compression over SparseGPT, both at 0.8 hours. This is considerably faster than D-Pruner, which on average takes 9.3 hours, 11 times longer than our approach. We also observe that cross-calibration does not increase the memory required for compression over SparseGPT, with both using up to 20 GB of memory. In contrast, D-Pruner uses up to 65.6 GB of memory, over three times more than our approach. Consequently, this suggests that cross-calibration is more practical than D-Pruner, with lower computational requirements.
+
+\begin{figure}[t]
+\centering
+\includegraphics[scale=1.0]{figures/runtime_statistics.pdf}
+\caption{The average duration and peak memory allocated when pruning Llama 3.1 8B with each method, as measured using an NVIDIA A100 80GB GPU.
+}
+\label{fig:runtime-statistics}
+\end{figure}
+
+\section{Analysis}
+
+\subsection{Ablating Cross-calibration}
+\label{subsec:ablation}
+
+To better understand the role that in-domain data plays in pruning, we conduct an ablation study on cross-calibration. Table \ref{tab:ablation-results} presents the performance impact versus a SparseGPT baseline. Namely, we examine the in-domain and general performance when (1) employing domain-specific calibration data, and (2) incorporating a mixture of Hessians (i.e. cross-calibration). 
+
+\paragraph{Domain-specific data benefits in-domain performance, however harms general performance.}
+
+
+
+We observe that using domain-specific calibration data can substantially improve in-domain performance. For example, Llama 3.1 8B sees an average increase in accuracy of 8.1 and 10.2 points for the biomedical and legal domains, respectively. However, these improvements come at the cost of general performance. For example, general performance drops by 1.0 and 2.2 points when employing biomedical and legal calibration data, respectively.
+
+\paragraph{Hessian mixing maximizes overall performance.}
+
+We observe that by using a mixture of Hessians, overall performance is higher than using domain-specific calibration data alone.
+This comes at almost no cost to in-domain performance, with a negligible reduction in both the biomedical and legal domains. 
+This suggests that the addition of Hessian mixing can enable an optimal balance between domain-specific and general performance.
+
+
+\subsection{Performance in Other Languages}
+
+To explore whether cross-calibration generalizes beyond English, we further experiment with a Chinese-language model and benchmarks. We select the Chinese language as it is morphologically distinct from English and well-resourced in terms of models and domain-specific evaluation tasks.
+
+\begin{table}[t]
+\scriptsize
+\centering
+\begin{tabular}{lccc}
+\toprule
+Method & In-domain & General & Average \\
+
+\midrule
+\multicolumn{4}{c}{Biomedical} \\ 
+\midrule
+
+SparseGPT + CC (Ours) & \result{53.7}{0.5} & \result{63.0}{0.3} & \result{\textbf{58.4}}{0.3} \\
+$-$ Hessian Mixing & \result{53.9}{0.5} & \result{61.6}{0.3} & \result{57.7}{0.3} \\
+$-$ In-domain Data & \result{45.8}{1.4} & \result{62.6}{0.2} & \result{54.2}{0.7} \\
+
+\midrule
+\multicolumn{4}{c}{Legal} \\
+\midrule
+
+SparseGPT + CC (Ours) &  \result{50.2}{0.4} & \result{61.6}{0.2} & \result{\textbf{55.9}}{0.2} \\
+$-$ Hessian Mixing & \result{50.3}{0.3} & \result{60.4}{0.4} & \result{55.3}{0.1} \\
+$-$ In-domain Data & \result{40.1}{0.6} & \result{62.6}{0.2} & \result{51.3}{0.4} \\
+
+\bottomrule
+\end{tabular}
+\caption{Average benchmark accuracy when pruning Llama 3.1 8B. Ablations are presented cumulatively.}
+\label{tab:ablation-results}
+\end{table}
+
+\paragraph{Experimental setup.}
+
+We select the Yi 1.5 6B model \citep{young-etal-2024-open} as it (1) uses the Llama architecture, enabling experiments with D-Pruner, and (2) achieves strong performance on standard benchmarks. To assess biomedical performance, we use the Comprehensive Medical Benchmark (CMB; \citealp{wang-etal-2024-cmb}). For legal performance, we use the Chinese AI
+and Law (CAIL2018) challenge dataset \citep{xiao-etal-2018-cail2018}. Similar to our experimental setup in English, we sample in-domain calibration data from the training split of each benchmark. For general-purpose data, we follow \citet{kurz-etal-2024-investigating} in using mC4 \citep{xue-etal-2021-mt5}. We use a mixture of Chinese and English to reflect the model pre-training data \citep{young-etal-2024-open}.
+
+\paragraph{Cross-calibration appears language-agnostic.}
+
+Figure \ref{fig:yi_results_pruning} presents the relative benchmark accuracy when pruning to 50\% sparsity, similar to earlier experiments (\S \ref{sec:results-pruning}).
+The results indicate that cross-calibration outperforms other pruning approaches for domain performance, while maintaining comparable general performance to SparseGPT. 
+For example, cross-calibration achieves a relative accuracy of 86.8\% in the biomedical domain, compared to 70.0\% and 79.6\% from SparseGPT and D-Pruner, respectively.
+In the legal domain, the performance retention from cross-calibration (92.7\%) is substantially greater than both SparseGPT (47.1\%) and D-Pruner (76.2\%).
+These findings are in-line with the English language tasks, indicating that in-domain performance benefits from cross-calibration transfer to the Chinese language. This indicates that our proposed approach is language agnostic.
+
+
+\begin{figure}[t]
+\centering
+\includegraphics{figures/pruning_results_zh.pdf}
+\caption{The mean accuracy for Yi 1.5 6B on Chinese benchmarks, relative to the original model.}
+\label{fig:yi_results_pruning}
+\end{figure}
+
+\section{Conclusion}
+
+In this paper, we proposed cross-calibration as a solution for creating compressed LMs for specialized domains. We empirically validated cross-calibration using a plethora of pre-trained models and evaluation tasks. Our approach represents a substantial advancement over earlier work such as D-Pruner, offering consistent performance improvements with a smaller computational footprint. We hope that our study will inspire further work towards the efficient deployment of LMs in specialized domains. As future work, we are interested in exploring the role that continual pre-training could play in further enhancing the performance of compressed domain-specific LMs \citep{cheng-etal-2024-adapting, xie-etal-2024-efficient}.
+
+\section*{Limitations}
+\label{sec:limitations}
+
+\paragraph{Model selection in the D-Pruner experiments.}
+
+The D-Pruner \citep{zhang-etal-2024-pruning} implementation supports only the Llama model architecture.\footnote{\url{https://github.com/psunlpgroup/D-Pruner}} Consequently, we are limited to offering comparisons for only the models using the Llama architecture (i.e. Llama 3.2 3B, Yi 1.5 6B and, Llama 3.1 8B). We emphasize that our approach substantially outperforms D-Pruner across all tested models and domains. Therefore, we expect that this trend would continue for the models not supported by D-Pruner.
+
+\section*{Ethical Considerations}
+
+Our work enables the efficient and effective compression of LMs for specialized domains. We note that this poses dual-use concerns, as it may enable misuse at a lower cost \citep{weidinger-etal-2022-taxonomy}. However, we emphasize that our approach is unlikely to enhance or introduce new harmful abilities, as the performance of compressed models is constrained by the the capabilities of the original.
+
+
+
+\bibliography{anthology,custom}
+
+\appendix
+
+\section{Additional Ablation Studies}
+
+\subsection{4-bit Quantization}
+\label{app:4-bit-quant}
+
+We further examine the performance and transferability of our approach when using quantization. Figure \ref{fig:joint-results} presents the benchmark accuracy when applying 4-bit quantization with GPTQ-M and GPTQ-M + CC (Ours), relative to the original model. 
+
+\paragraph{Cross-calibration generalizes to quantization.}
+
+Figure \ref{fig:quantization-results} (Appendix \ref{app:4-bit-quant}) shows the performance of cross-calibration in quantization. This uncovers the extent to which cross-calibration benefits each method independently in the joint sparsification and quantization experiments (\S\ref{sec:results_joint_compression}).
+We find that cross-calibration performs better than vanilla GPTQ-M for in-domain performance across the board (4 out of 5 in the legal domain and 5 out of 5 models in the biomedical domain). General performance remains also unaffected, with cross-calibration performing equally or better than GPTQ-M across all models. This suggests that the benefits to in-domain performance are transferable across Hessian-based compression methods.
+
+
+\paragraph{Cross-calibration improves domain performance, yet sustains general performance.}
+
+We observe that cross-calibration can achieve greater domain performance than GPTQ-M alone. For example, cross-calibration sees a relative accuracy of 97.4\% on the biomedical benchmark for Llama-3.1 8B, versus 94.7\% with GPTQ-M. We note that the performance improvements for quantization are smaller than in the pruning experiments. This is expected, as quantization is less sensitive to calibration data \citep{williams-aletras-2024-impact}. Considering general performance, we observe a similar trend to the pruning results, with cross-calibration performing comparably to GTPQ-M. This illustrates that cross-calibration can be reliably used in quantization.
+
+\subsection{Performance Across Sparsity Levels}
+
+In Figure \ref{fig:performance_sparsity}, we examine how cross-calibration (Ours) performs comparatively to the other pruning methods across different sparsity levels. We report the average benchmark accuracy (legal and biomedical) with standard deviation for each sparsity levels shown by the shaded regions.
+
+We first observe that in-domain performance with cross-calibration remains consistently higher than other approaches even beyond 50\% sparsity. For example, the legal benchmark accuracy at 60\% sparsity is at 46\% with cross-calibration compared to less than 30\% with SparseGPT. Similarly, performance in generic reasoning tasks remains comparable to SparseGPT up to 90\% sparsity levels. This suggests that cross-calibration can effectively isolate domain-specific features without sacrificing generic performance.
+
+
+
+\subsection{Cross-calibration Hyperparameter}
+\label{app:varying_alpha}
+
+In Figure \ref{fig:performance_across_alphas}, we examine how different regularization of the Hessian (by modifying $\alpha$) impacts in-domain and general performance at 50\% unstructured sparsity. The relative improvement over SparseGPT is presented, with dashed lines representing the general performance. The continuous lines represent biomedical (Figure \ref{subfig:legal_performance_across_alpa}) and legal (Figure \ref{subfig:bio_performance_across_alpa}) performance.
+
+\begin{figure}[t]
+\centering
+\includegraphics{figures/quantization_results.pdf}
+\caption{Average accuracy when applying 4-bit quantization, relative to the dense model.}
+\label{fig:quantization-results}
+\end{figure}
+
+
+\paragraph{Increasing $\boldsymbol{\alpha}$ generally increases in-domain performance.}
+
+First, we observe that in-domain performance (i.e. biomedical or legal) increases by increasing the contribution of the in-domain computed Hessian. Considering Gemma 2 2B in the biomedical domain, we observe that $\alpha=0.1$ results in a 1.25$\times$ relative improvement compared to SparseGPT, whilst $\alpha=0.9$ leads to approximately a 1.30$\times$ relative improvement in average task accuracy. Surprisingly, we find that even a small contribution from the in-domain Hessian ($\alpha=0.1$) is enough to offer improvements for in-domain performance. For example, in the Legal domain with Llama 3.2 3B and $\alpha=0.1$ we observe a relative improvement of approximately 1.14$\times$ .
+
+\paragraph{Reasoning performance remains relatively consistent, until $\mathbf{\boldsymbol{\alpha} = 1}$.}
+
+We first observe that reasoning performance for all models (dashed lines), largely remains competitive with $\alpha=0$ across almost all balance levels. 
+Our findings translate across all models tested, with some models benefiting more than others. On average, we found $\alpha = 0.7$ to strike a good balance between in-domain and general performance. This suggests that $\alpha$ could be treated as an optimizable hyper-parameter, however this is not essential.
+
+\begin{table}[t]
+\scriptsize
+\centering
+\begin{tabular}{llc}
+\toprule
+Method & Hyperparameter & Value \\
+\midrule
+\multirow{3}{*}{D-Pruner} & Loss Regularization & \{0.001, 0.01, 0.1\} \\ 
+& Group Size & \{None, 128\} \\
+& Learning Rate & 0.03 \\
+\midrule
+\multirow{4}{*}{GPTQ-M}  & Bits per Weight & 4 \\
+& Dampening & 0.01 \\
+& Group Size & 128 \\
+& Symmetric Quantization & Yes \\
+\midrule
+\multirow{3}{*}{SparseGPT} & Dampening & 0.01 \\
+& Group Size & 128 \\
+& Sparsity & 2:4 \\
+\midrule
+\multirow{2}{*}{Wanda} & Group Size & 1 \\
+& Sparsity & 2:4 \\
+\bottomrule
+\end{tabular}
+\caption{Hyperparameters used for all compression methods evaluated in our experiments.}
+\label{tab:hyperparameters}
+\end{table}
+
+\begin{table}[t]
+\scriptsize
+\centering
+\begin{tabular}{lrrr}
+\toprule
+Name                         & Train  & Val.   & Test \\ \midrule
+\multicolumn{4}{c}{Biomedical} \\ \midrule
+BioLaySumm PLOS             & 24,773  & 1,376  & 256  \\
+CMB (Chinese)                        & 231,902 &  228 & 9,325  \\
+PubMedQA                     & 450    & 50    & 500  \\
+MedMCQA                      & 182,822 & 4,183  & 4,183 \\
+MedQA                        & 10,178  & 1,272  & 1,273 \\
+MMLU Anatomy                &        &       & 135  \\
+MMLU Clinical Knowledge    &        &       & 265  \\
+MMLU College Medicine      &        &       & 173  \\
+MMLU Medical Genetics      &        &       & 100  \\
+MMLU Professional Medicine &        &       & 272  \\
+MMLU College Biology       &        &       & 144  \\ \midrule
+\multicolumn{4}{c}{Legal} \\ \midrule
+BillSum                      & 18,949  &       & 256  \\
+CAIL2018 (Chinese)                   & 110,905 & 14,147 & 27,484 \\
+MMLU International Law     &        &       & 121  \\
+MMLU Jurisprudence          &        &       & 108  \\
+MMLU Professional Law      &        &       & 1,534 \\
+LexGLUE CaseHOLD            & 45,000  & 3,900  & 3,600 \\
+LexGLUE ECtHR (Task A)      & 6838   & 802  & 808 \\ \midrule
+\multicolumn{4}{c}{General} \\ \midrule
+ARC (Easy)                    & 2,251   & 570   & 2,376 \\
+ARC (Challenge)               & 1,119   & 299   & 1,172 \\
+BoolQ                        & 9,427   & 3,270  &      \\
+HellaSwag                    & 39,905  & 10042 &      \\
+LAMBADA (Standard)            &        & 4,869  & 5,153 \\
+OpenBookQA                   & 4,957   & 500   & 500  \\
+PIQA                         & 16,113  & 1,838  &      \\
+RTE                          & 2,490   & 277   &      \\
+WinoGrande                   & 40,398  & 1,267  &      \\
+StoryCloze                 & 360    & 1,511  &      \\ \bottomrule
+\end{tabular}
+\caption{Number of examples in each evaluation task.}
+\label{tab:tasks_splits}
+\end{table}
+
+\begin{figure*}[t]
+    \centering
+    \begin{subfigure}[t]{0.48\linewidth}
+        \includegraphics[width=\linewidth,height=0.4\textheight,keepaspectratio]{figures/legal_sparsity}
+        \caption{Legal}
+        \label{subfig:legal_sparsity}
+    \end{subfigure}
+    \hfill %
+    \begin{subfigure}[t]{0.48\linewidth}
+        \includegraphics[width=\linewidth,height=0.4\textheight,keepaspectratio]{figures/bio_sparsity}
+        \caption{Biomedical}
+        \label{subfig:bio_sparsity}
+    \end{subfigure}
+
+    \caption{Average task accuracy (standard deviation denoted by the shaded region) when pruning Llama 3.1 8B using each method. Dashed lines denote general performance, while continuous lines denote legal (Figure \ref{subfig:legal_sparsity}) and biomedical (Figure \ref{subfig:bio_sparsity}) in-domain performance.}
+    \label{fig:performance_sparsity}
+\end{figure*}
+
+\begin{figure*}[t]
+    \centering
+    \begin{subfigure}[t]{0.48\linewidth}
+        \includegraphics[width=\linewidth,height=0.4\textheight,keepaspectratio]{figures/legal_performance_across_alpa}
+        \caption{Legal}
+        \label{subfig:legal_performance_across_alpa}
+    \end{subfigure}
+    \hfill %
+    \begin{subfigure}[t]{0.48\linewidth}
+        \includegraphics[width=\linewidth,height=0.4\textheight,keepaspectratio]{figures/bio_performance_across_alpa}
+        \caption{Biomedical}
+        \label{subfig:bio_performance_across_alpa}
+    \end{subfigure}
+
+    \caption{Relative improvement on average task accuracy (standard deviation denoted by the shaded region) when pruning using cross-calibration. Dashed lines denote general performance, while continuous lines denote legal (Figure \ref{subfig:legal_performance_across_alpa}) and biomedical (Figure \ref{subfig:bio_performance_across_alpa}) in-domain performance. Relative improvement measured against SparseGPT.}
+    \label{fig:performance_across_alphas}
+\end{figure*}
+
+\section{Hyperparameters}
+
+Table \ref{tab:hyperparameters} presents the hyperparameters of all the compression methods in our experiments. In general, we adopt the optimal hyperparameters used for each method in the original work. For completeness, we also present results for every tested D-Pruner hyperparameter combination in Table \ref{tab:full_results_dpruner}.
+
+\section{Data \& Processing}
+\label{app:datasets}
+
+Table \ref{tab:tasks_splits} shows the splits for the datasets used in our experiments, split by category. For the domain-specific tasks, we also show examples of how these are formatted for zero-shot LM evaluation. Namely, in Table \ref{tab:legal_task_examples_a} we show examples for all tasks that form the legal domain benchmark and in Table \ref{tab:biomedical_task_examples_a} for the tasks that form the biomedical domain benchmark.
+
+In the majority of cases, we use the task datasets exactly as implemented by the EleutherAI LM Evaluation Harness \citep{gao-etal-2024-framework}. We highlight exceptions where additional preprocessing was required, below:
+
+\begin{itemize}[left=0pt]
+\item \textbf{CaseHOLD} and \textbf{ECtHR (Task A)}. We adopt the versions of these datasets as provided by the LexGLUE benchmark \citep{chalkidis-etal-2022-lexglue}. To enable evaluation in a zero-shot setting, we adapt the prompts from \citet{chalkidis-etal-2023-chatgpt}.
+\item \textbf{ECtHR (Task A)}, \textbf{CAIL2018}, and \textbf{CMB}. We additionally filter examples with multiple labels from these datasets, following prior work towards adapting existing tasks for few-shot LM evaluation \citep{guha-etal-2023-legalbench}.
+\item \textbf{CAIL2018} and \textbf{CMB}. For Chinese-language evaluation tasks, we use the Chinese-language prompts shown in Table \ref{tab:chinese_language_examples}, Appendix \ref{app:datasets}.
+\item \textbf{BillSum} and \textbf{BioLaySumm PLOS}. Due to the extensive size of the test split in these datasets, we follow \citet{frantar-etal-2023-optq} in using the first 256 examples to assess perplexity. We highlight that perplexity is a stable metric which can be assessed using only a small number of examples \citep{dettmers-etal-2023-case}.
+\end{itemize}
+
+\section{Infrastructure}
+
+We implement all experiments using PyTorch \citep{paszke-etal-2019-pytorch} with the model implementation from Hugging Face Transformers \citep{wolf-etal-2020-transformers}. We additionally use Hugging Face Datasets \citep{lhoest-etal-2021-datasets} for all dataset manipulation, including for tasks implemented via the EleutherAI LM Evaluation Harness \citep{gao-etal-2024-framework}. Finally, we conduct all experiments using a single NVIDIA A100 (SXM4 80GB) GPU.
+
+\begin{table*}[t]
+    \small
+    \centering
+    \begin{tabular}{p{2cm}|p{10cm}p{2cm}}
+        \toprule
+         \textbf{Task} & \textbf{Prompt} & \textbf{Answer}  \\ \midrule
+         
+        \multirow{18}{*}{CaseHOLD} & \textit{Given the following excerpt from a United States court opinion:} & \multirow{18}{*}{Holding B} \\
+         & & \\
+          & \textbf{Citing Text:} & \\
+          & ... Warner-Lambert Co., 427 Mass. at 49 (“ [Confidential and proprietary business information may be entitled to protection, even if such information cannot claim trade secret protection”); see, e.g., Augat, Inc., 409 Mass. at 173 (\underline{<HOLDING>}). “Matters of public knowledge or of general... \\
+         & \textit{Given the following excerpt from a United States court opinion:} \\ 
+         & \\ 
+         & \textit{ Which one of the following options should replace the <HOLDING> placeholder?}\\
+         & \\
+         & \textbf{Holdings:} \\ 
+         & A. Recognizing that even if a plaintiff claims certain information constitutes trade secrets its claim may not depend on that  determination. \\
+          & B. Holding that included among trade secrets employee may not appropriate from employer is certain information such as lists of customers. \\ 
+        & C. ... & \\ & \\ \midrule
+         
+         \multirow{15}{*}{ECtHR Task A} & \textit{Given the following facts from a European Court of Human Rights (ECtHR) case:} & \multirow{15}{*}{Choice K} \\
+         & & \\
+        & \textbf{Articles: } \\ 
+        & 2. On 8 May 1996 the applicant was arrested in New York (USA) and placed in detention on the basis of a extradition request  from the authorities of the Netherlands Antilles where ... \\
+        & 3. In a document dated 18 June 1996 bearing the applicant’s ... \\ & \textit{Which article of the European Convention on Human Rights (ECHR) has been violated?} \\ 
+        & \textit{A. Article 2} \\ 
+        & \textit{B. Article 3} \\ 
+        & \textit{C. Article 5} \\
+        & ... \\
+        & \textit{K. None of the above} & \\ & \\ \midrule
+
+        \multirow{10}{*}{Jurisprudence} & \textit{The following are multiple choice questions (with answers) about jurisprudence:} & \multirow{10}{*}{Choice B} \\
+         & & \\
+        & \textbf{Question: } \\ 
+      &  Which statement best explains the purpose of Hart's distinction between 'being obliged' and 'having an obligation'? \\ 
+       & \\
+         & \textbf{Choices:} \\ 
+        & A. It demonstrates the difference between the internal and the external aspect of a rule.\\ 
+        & B. It refutes the natural lawyer' ... \\ 
+        & C. ... & \\ & \\ \midrule
+
+        \multirow{10}{*}{\makecell[l]{International / \\ Professional \\ Law}} & \textit{The following are multiple choice questions (with answers) about professional / international law:} & \multirow{10}{*}{Choice B} \\
+         & & \\
+        & \textbf{Statement: } \\ 
+      &  One afternoon, a pilot was flying a small airplane when it suddenly ran out of gas. As he was coming in for an emergency landing ... The attorney's testimony is: \\ 
+       & \\
+         & \textbf{Choices:} \\ 
+        & A. admissible, because the...\\ 
+        & B. inadmissible because ... \\ 
+        & C. ... & \\ & \\ \bottomrule
+         
+    \end{tabular}
+    \caption{Representative task examples from the English-language legal benchmark. \textit{Emphasized text} indicates that which is used for the prompt either by the evaluation harness framework or our own implementation.}
+    \label{tab:legal_task_examples_a}
+\end{table*}
+
+
+\begin{table*}[t]
+    \small
+    \centering
+    \begin{tabular}{p{2cm}|p{10cm}p{2cm}}
+        \toprule
+         \textbf{Task} & \textbf{Prompt} & \textbf{Answer}  \\ \midrule
+         
+        \multirow{10}{*}{\makecell[l]{\textbf{MMLU Tasks}: \\ Clinical \\ Knowledge; \\ \\ College \\ Medicine; \\ \\ College \\ Biology; \\ \\ Professional \\ Medicine; \\ \\ Anatomy;  \\ \\ Medical \\ Genetics. }} & \textit{The following are multiple choice questions (with answers) about <TASK>.} & \multirow{18}{*}{Choice A} \\
+         & & \\
+          & \textbf{Question:} & \\
+          & What size of cannula would you use in a patient who needed a rapid blood transfusion (as of 2020 medical knowledge)? \\ 
+         & \\ 
+         & \textbf{Choices:} \\ 
+         & A. 18 gauge \\
+         & B. 20 gauge \\
+         & C. ... \\
+         & \\
+         & \\
+         & \\& \\ & \\ & \\ & \\
+         & & \\ \midrule
+
+         \multirow{14}{*}{\makecell[l]{PubMed QA}} & \textit{Abstract} & \multirow{14}{*}{Choice A - Yes} \\
+          & To evaluate the degree to which histologic chorioamnionitis, a frequent finding in placentas submitted for histopathologic evaluation, correlates with clinical indicators of infection in the mother. A retrospective review was performed on 52 cases with a histologic diagnosis of acute chorioamnionitis from 2,051 ... \\ 
+         & \\ 
+         & \textit{Question} & \\
+         & Does histologic chorioamnionitis correspond to clinical chorioamnionitis? \\
+        & \\
+         & \textit{Choices:} \\ 
+         & A. Yes \\
+         & B. No \\
+         & C. Maybe \\  & \\ \midrule
+
+         \multirow{9}{*}{\makecell[l]{MedMC QA}} & \textit{Question:}  & \multirow{9}{*}{Choice D} \\
+          & All of the following are surgical options for morbid obesity except -: \\ 
+         & \\ 
+         & \textit{Choices:} \\ 
+         & A. Adjustable gastric banding  \\
+         & B. Biliopancreatic diversion \\
+         & C. Duodenal Switch \\
+         & D. ... \\ & \\ \midrule
+
+         \multirow{10}{*}{\makecell[l]{Med QA}} & \textit{Question:} & \multirow{10}{*}{Choice A} \\
+          & A 5-year-old girl is brought to the clinic by her mother for excessive hair growth. Her mother reports that for the past 2 months she has noticed ... studies demonstrates an elevated level of estrogen. What is the most likely diagnosis? \\ 
+         & \\ 
+         & \textit{Choices:} \\ 
+         & A. Granulosa cell tumor  \\
+         & B. Idiopathic precocious puberty \\
+         & C. ... \\ & \\ \bottomrule
+
+         
+    \end{tabular}
+    \caption{Representative task examples from the English-language biomedical benchmark. \textit{Emphasized text} indicates that which is used for the prompt either by the evaluation harness framework or our own implementation.}
+    \label{tab:biomedical_task_examples_a}
+\end{table*}
+
+\begin{table*}[t]
+    \small
+    \centering
+    \begin{tabular}{p{2cm}|p{10cm}p{2cm}}
+        \toprule
+         \textbf{Task} & \textbf{Prompt} & \textbf{Answer}  \\ \midrule
+         
+        \multirow{12}{*}{CAIL2018} & \chinese{根据以下法律案件的事实:} & \multirow{12}{*}{Choice A.} \\
+         & & \\
+          & <FACT> & \\
+         & \\ 
+         & \chinese{请问中华人民共和国刑法中的哪一条适用于本案?} \\ 
+         & A. \chinese{第} <ARTICLE 1> \chinese{条} \\
+         & B. \chinese{第} <ARTICLE 2> \chinese{条} \\
+         & C. \chinese{第} <ARTICLE 3> \chinese{条} \\
+         & D. \chinese{第} <ARTICLE 4> \chinese{条} \\
+         & \\
+         & \chinese{答案:} \\
+         & & \\ \midrule
+
+          \multirow{10}{*}{CMB} & \chinese{问题}: <QUESTION> & \multirow{10}{*}{Choice A.} \\
+         & & \\
+        &  A. <OPTION 1> \\
+        &  B. <OPTION 2> \\
+        &  C. <OPTION 3> \\
+        &  D. <OPTION 4> \\
+        &  E. <OPTION 5> \\
+         & \\
+         & \chinese{答案:} \\
+         & & \\ \bottomrule
+
+         
+    \end{tabular}
+    \caption{Example format of tasks in Chinese-language evaluation (CAIL2018 for legal and CMB for biomedical).}
+    \label{tab:chinese_language_examples}
+\end{table*}
+
+
+
+\section{Full Results}
+\label{app:full_results}
+
+\subsection{50\% Sparsity}
+\label{app:complementary_results}
+
+Table \ref{tab:full_results_pruning} presents the full results (benchmark accuracy and perplexity) included in Figure \ref{fig:pruning-results} across all domains (legal and biomedical) and general performance across all models. For D-Pruner, we show results using the iterative approach and a loss regularization of 0.001, as we found no substantial differences across hyperparameters (reported in Table \ref{tab:full_results_dpruner}). \textbf{Bold} values represent the best performing compression method columns wise (higher is better for accuracy; lower is better for perplexity). Finally, in Table \ref{tab:full_results_analytical_bio_legal} we further decompose benchmark results into their constituent tasks for completeness.
+
+\begin{table*}[t]
+    \centering
+    \scriptsize
+    \begin{tabular}{lllcc|cc|cc}
+\toprule
+
+\multirow{2}{*}{Model} & \multirow{2}{*}{Method} & Target & \multicolumn{2}{c|}{General} & \multicolumn{2}{c|}{Legal} & \multicolumn{2}{c}{Medical} \\
+& & Domain & Accuracy & Perplexity & Accuracy & Perplexity & Accuracy & Perplexity \\
+\midrule
+
+
+\multirow{8}{*}{Llama 3.2 3B} & - & - & \result{61.6}{0.0} & \result{9.3}{0.0} & \result{45.5}{0.0} & \result{5.2}{0.0} & \result{53.3}{0.0} & \result{9.4}{0.0} \\ \cmidrule(lr){2-9}
+ & Magnitude & - & \result{44.2}{0.0} &  \result{50.7}{0.0} &  \result{17.4}{0.0} & \result{24.9}{0.0} & \result{30.1}{0.0} & \result{62.2}{0.0} \\
+ & Wanda & - & \result{54.4}{0.2} & \result{15.4}{0.1} & \result{26.0}{0.2} & \result{8.9}{0.0} & \result{35.5}{0.1} & \result{15.5}{0.0} \\
+ & SparseGPT & - & \cellcolor{green!20}\result{\textbf{57.5}}{0.4} & \cellcolor{green!20}\result{\textbf{13.8}}{0.1} & \result{28.6}{0.7} & \result{8.2}{0.1} & \result{38.2}{1.1} & \result{14.7}{0.1} \\ \cmidrule(lr){2-9}
+ & \multirow{2}{*}{D-Pruner} & Legal & \result{52.1}{0.1} & \result{16.6}{0.1} & \result{27.2}{0.6} & \result{8.2}{0.0} & - & - \\
+ &  & Medical & \result{52.0}{0.3} & \result{18.9}{0.2} & - & - & \result{39.2}{0.5} & \result{16.2}{0.1} \\ \cmidrule(lr){2-9}
+& \multirow{2}{*}{SparseGPT + CC (Ours)} & Legal & \result{56.8}{0.2} & \result{14.0}{0.0} & \cellcolor{green!20}\result{\textbf{38.4}}{0.2} & \cellcolor{green!20}\result{\textbf{7.6}}{0.1} & - & - \\
+ &  & Medical & \result{56.7}{0.4} & \result{13.9}{0.0} & - & - & \cellcolor{green!20}\result{\textbf{45.2}}{0.3} & \cellcolor{green!20}\result{\textbf{13.7}}{0.1} \\ \midrule
+ 
+\multirow{8}{*}{Llama 3.1 8B} & - & - & \result{67.8}{0.0} &  \result{7.3}{0.0} & \result{55.1}{0.0} & \result{4.2}{0.0} & \result{60.8}{0.0} & \result{8.0}{0.0} \\ \cmidrule(lr){2-9}
+ & Magnitude & - & \result{47.6}{0.0} &  \result{57.7}{0.0} & \result{20.9}{0.0} & \result{65.7}{0.0} & \result{35.4}{0.0} & \result{55.7}{0.0} \\
+ & Wanda & - & \result{60.6}{0.1} & \result{11.7}{0.0} & \result{35.0}{0.3} & \result{6.8}{0.0} & \result{42.4}{0.2} & \result{11.9}{0.0} \\
+ & SparseGPT & - & \result{62.6}{0.2} & \cellcolor{green!20}\result{\textbf{10.7}}{0.1} & \result{40.1}{0.6} & \result{6.3}{0.1} & \result{45.8}{1.4} & \result{11.5}{0.1} \\ \cmidrule(lr){2-9}
+ & \multirow{2}{*}{D-Pruner} & Legal & \result{57.1}{0.3} &  \result{13.0}{0.2} & \result{40.6}{2.6} & \result{6.7}{0.1} & - & - \\
+ &  & Medical & \result{58.1}{1.2} &  \result{14.3}{0.9} & - & - & \result{47.8}{1.7} & \result{15.1}{0.6} \\ \cmidrule(lr){2-9}
+ & \multirow{2}{*}{Ours} & Legal & \result{61.6}{0.2} &  \result{11.0}{0.0} & \cellcolor{green!20}\result{\textbf{50.2}}{0.4} & \cellcolor{green!20}\result{\textbf{5.9}}{0.0} & - & - \\
+ &  & Medical & \cellcolor{green!20}\result{\textbf{63.0}}{0.3} & \result{10.9}{0.0} & - & - & \cellcolor{green!20}\result{\textbf{53.7}}{0.5} & \cellcolor{green!20}\result{\textbf{11.0}}{0.0} \\ \midrule
+
+ 
+
+\multirow{6}{*}{Gemma 2 2B} & - & - & \result{63.3}{0.0} & \result{13.1}{0.0} & \result{27.1}{0.0} & \result{6.2}{0.0} & \result{44.2}{0.0} & \result{15.0}{0.0} \\ \cmidrule(lr){2-9}
+ & Magnitude & - & \result{48.2}{0.0} &  \result{172.5}{0.0} & \result{21.7}{0.0} & \result{34.7}{0.0} & \result{26.8}{0.0} & \result{825.8}{0.0} \\
+ & Wanda & - & \result{54.2}{0.2} & \result{25.0}{0.2} &  \result{20.1}{1.5} & \result{10.7}{0.0} & \result{29.6}{0.7} & \result{33.0}{0.5} \\
+ & SparseGPT & - & \result{56.6}{0.2} &  \result{20.9}{0.4} & \result{20.8}{1.4} & \result{9.2}{0.1} & \result{30.4}{1.3} & \result{26.6}{0.3} \\ \cmidrule(lr){2-9}
+ & \multirow{2}{*}{Ours} & Legal & \result{57.4}{0.5} &  \cellcolor{green!20}\result{\textbf{20.3}}{0.1} & \cellcolor{green!20}\result{\textbf{25.6}}{0.8} & \cellcolor{green!20}\result{\textbf{8.3}}{0.0} & - & -   \\
+ &  & Medical & \cellcolor{green!20}\result{\textbf{58.0}}{0.2} & \result{21.0}{0.1} & - & -  & \cellcolor{green!20}\result{\textbf{40.3}}{0.2} & \cellcolor{green!20}\result{\textbf{23.8}}{0.1} \\ \midrule
+
+\multirow{6}{*}{Gemma 2 9B} & - & - & \result{70.2}{0.0} & \result{10.6}{0.0} &  \result{56.2}{0.0} & \result{4.8}{0.0} & \result{62.8}{0.0} & \result{12.0}{0.0} \\ \cmidrule(lr){2-9}
+& Magnitude & - & \result{60.6}{0.0} & \result{33.5}{0.0} &\result{33.7}{0.0}& \result{11.0}{0.0} & \result{47.8}{0.0} & \result{57.4}{0.0} \\
+& Wanda & - & \result{63.5}{0.2} & \result{16.6}{0.1} & \result{41.8}{1.2} & \result{6.7}{0.0} & \result{48.8}{0.4} & \result{20.8}{0.2} \\
+& SparseGPT & - & \result{65.8}{0.2} &      \result{15.2}{0.2} &  \result{43.7}{0.8} & \result{6.4}{0.0} & \result{52.8}{0.5} & \result{19.3}{0.2} \\ \cmidrule(lr){2-9}
+& \multirow{2}{*}{Ours} & Legal & \result{66.1}{0.2} & \cellcolor{green!20}\result{\textbf{14.8}}{0.0} & \cellcolor{green!20}\result{\textbf{52.9}}{0.4} & \cellcolor{green!20}\result{\textbf{5.9}}{0.0} & - & -   \\
+&  & Medical & \cellcolor{green!20}\result{\textbf{66.3}}{0.2} & \result{15.1}{0.0} & - & -  & \cellcolor{green!20}\result{\textbf{58.3}}{0.3} & \cellcolor{green!20}\result{\textbf{17.4}}{0.1} \\ \midrule
+
+
+\multirow{6}{*}{Mistral Nemo 12B} & - & - & \result{69.4}{0.0} &  \result{7.1}{0.0} &  \result{57.5}{0.0} & \result{4.3}{0.0} & \result{58.4}{0.0} & \result{7.6}{0.0} \\  \cmidrule(lr){2-9}
+ & Magnitude & - & \result{41.8}{0.0} & \result{465.5}{0.0} & \result{24.5}{0.0} & \result{3.6$\times10^3$}{0.0} & \result{35.0}{0.0} & \result{10.3$\times10^3$}{0.0} \\
+ & Wanda & - & \result{63.2}{0.2} & \result{10.3}{0.0} & \result{42.3}{0.8} & \result{6.0}{0.0} & \result{45.3}{0.3} & \result{10.6}{0.0} \\
+ & SparseGPT & - & \result{65.4}{0.4} &\cellcolor{green!20}\result{\textbf{9.4}}{0.0} &  \result{44.5}{1.8} & \result{5.6}{0.0} & \result{46.4}{0.6} & \result{9.8}{0.0} \\  \cmidrule(lr){2-9}
+ & \multirow{2}{*}{Ours} & Legal & \result{64.8}{0.2} & \result{9.7}{0.0} &  \cellcolor{green!20}\result{\textbf{51.7}}{1.0} &  \cellcolor{green!20}\result{\textbf{5.5}}{0.0} & - & - \\
+ &  & Medical &  \cellcolor{green!20}\result{\textbf{65.9}}{0.1} & \result{9.7}{0.0} & - & -  &  \cellcolor{green!20}\result{\textbf{54.1}}{0.4} &  \cellcolor{green!20}\result{\textbf{9.7}}{0.0} \\
+\bottomrule
+\end{tabular}
+    \caption{Average performance for the general and in-domain (biomedical and legal) benchmarks, at 50\% sparsity. Standard deviation is denoted in subscript. \textbf{Bold} highlighted values denote the best performing method column-wise. For reference, the top row of each model shows the original (dense) model performance.}
+    \label{tab:full_results_pruning}
+\end{table*}
+
+\begin{table*}[t]
+    \centering
+    \scriptsize
+    \begin{tabular}{lllcc|cc|cc}
+\toprule
+
+\multirow{2}{*}{Model} & \multirow{2}{*}{Method} & Target & \multicolumn{2}{c|}{General} & \multicolumn{2}{c|}{Legal} & \multicolumn{2}{c}{Medical} \\
+& & Domain & Accuracy & Perplexity & Accuracy & Perplexity & Accuracy & Perplexity \\
+\midrule
+\multirow{6}{*}{Llama 3.2 3B} & - & - & \result{61.6}{0.0} & \result{9.3}{0.0} & \result{45.5}{0.0} & \result{5.2}{0.0} & \result{53.3}{0.0} & \result{9.4}{0.0} \\ \cmidrule(lr){2-9}
+ & SparseGPT & - & \cellcolor{green!20}\result{\textbf{49.6}}{0.2} & \cellcolor{green!20}\result{\textbf{22.6}}{0.2} & \result{21.7}{1.0} & \result{14.6}{0.2} & \result{27.3}{0.4} & \result{25.7}{0.2} \\
+ & \multirow{2}{*}{SparseGPT + CC (Ours)} & Legal & \result{48.1}{0.3} & \result{24.5}{0.1} & \cellcolor{green!20}\result{\textbf{32.3}}{1.1} & \cellcolor{green!20}\result{\textbf{12.2}}{0.2} & - & - \\
+ &  & Medical & \result{48.6}{0.1} & \result{25.2}{0.2} & - & - & \cellcolor{green!20}\result{\textbf{38.9}}{0.5} & \cellcolor{green!20}\result{\textbf{23.8}}{0.2} \\ \cmidrule(lr){2-9}
+ & SparseGPT + GPTQ-M & - & \cellcolor{cyan!20}\result{\textbf{47.6}}{0.4} & \cellcolor{cyan!20}\result{\textbf{24.5}}{0.4} & \result{20.7}{0.7} & \result{16.8}{0.5} & \result{27.7}{1.0} & \result{28.6}{0.2} \\ 
+ & \multirow{2}{*}{Ours + GPTQ-M} & Legal & \result{45.8}{0.3} & \result{26.8}{0.3} & \cellcolor{cyan!20}\result{\textbf{29.2}}{2.4} & \cellcolor{cyan!20}\result{\textbf{13.3}}{0.1} & - & - \\
+ &  & Medical & \result{46.1}{0.3} & \result{27.6}{0.2} & - & - & \cellcolor{cyan!20}\result{\textbf{37.6}}{0.4} & \cellcolor{cyan!20}\result{\textbf{25.9}}{0.4} \\ \midrule
+
+\multirow{6}{*}{Llama 3.2 8B} & - & - & \result{67.8}{0.0} & \result{7.3}{0.0} & \result{55.1}{0.0} & \result{4.2}{0.0} & \result{60.8}{0.0} & \result{8.0}{0.0} \\ \cmidrule(lr){2-9}
+ & SparseGPT & - & \cellcolor{green!20}\result{\textbf{54.5}}{0.2} & \cellcolor{green!20}\result{\textbf{17.9}}{0.1} & \result{22.1}{1.2} & \result{10.7}{0.2} & \result{34.8}{0.3} & \result{19.3}{0.2} \\
+ & \multirow{2}{*}{Ours} & Legal & \result{52.3}{0.1} & \result{19.3}{0.1} & \cellcolor{green!20}\result{\textbf{44.2}}{0.2} & \cellcolor{green!20}\result{\textbf{9.4}}{0.1} & - & -\\
+ &  & Medical & \result{54.3}{0.2} & \result{19.6}{0.1} & - & - & \cellcolor{green!20}\result{\textbf{44.5}}{0.6} & \cellcolor{green!20}\result{\textbf{17.6}}{0.1} \\ \cmidrule(lr){2-9}
+ & SparseGPT + GPTQ-M & - & \cellcolor{cyan!20}\result{\textbf{54.2}}{0.3} & \cellcolor{cyan!20}\result{\textbf{19.3}}{0.6} & \result{20.7}{1.4} & \result{12.0}{0.2} & \result{33.9}{0.5} & \result{20.9}{0.2} \\
+ & \multirow{2}{*}{Ours + GPTQ-M} & Legal & \result{51.0}{0.4} & \result{20.4}{0.1} & \cellcolor{cyan!20}\result{\textbf{41.9}}{1.5} & \cellcolor{cyan!20}\result{\textbf{10.4}}{0.1} & - & - \\
+ &  & Medical & \result{53.1}{0.2} & \result{21.3}{0.2} & - & -  & \cellcolor{cyan!20}\result{\textbf{43.4}}{0.1} & \cellcolor{cyan!20}\result{\textbf{18.8}}{0.2} \\ \midrule
+
+
+\multirow{6}{*}{Gemma 2 2B} & - & - & \result{63.3}{0.0} & \result{13.1}{0.0} & \result{27.1}{0.0} & \result{6.2}{0.0} & \result{44.2}{0.0} & \result{15.0}{0.0} \\ \cmidrule(lr){2-9}
+ & SparseGPT & - & \result{47.1}{0.6} & \result{40.0}{1.7} & \result{16.3}{0.0} & \result{17.1}{0.7} & \result{30.4}{0.8} & \result{57.9}{2.4} \\
+ & \multirow{2}{*}{Ours} & Legal & \result{47.9}{0.1} & \cellcolor{green!20}\result{\textbf{37.4}}{0.4} & \cellcolor{green!20}\result{\textbf{21.0}}{1.0} & \cellcolor{green!20}\result{\textbf{12.9}}{0.1} & - & -  \\
+ & & Medical & \cellcolor{green!20}\result{\textbf{49.1}}{0.3} & \result{41.9}{0.6} & - & -  &\cellcolor{green!20} \result{\textbf{34.2}}{0.6} & \cellcolor{green!20}\result{\textbf{42.3}}{0.4} \\ \cmidrule(lr){2-9}
+ & SparseGPT + GPTQ-M& - & \result{45.8}{0.5} & \result{45.2}{2.0} & \result{16.3}{0.1} & \result{19.2}{0.8} & \result{30.4}{2.1} & \result{68.3}{5.8} \\
+ & \multirow{2}{*}{Ours + GPTQ-M} & Legal & \result{47.0}{0.5} & \cellcolor{cyan!20}\result{\textbf{41.9}}{0.8} & \cellcolor{cyan!20}\result{\textbf{19.9}}{0.8} & \cellcolor{cyan!20}\result{\textbf{14.3}}{0.2} & - & -  \\
+ &  & Medical & \cellcolor{cyan!20}\result{\textbf{47.7}}{0.2} & \result{49.1}{0.7} & - & - & \cellcolor{cyan!20}\result{\textbf{34.1}}{0.9} & \cellcolor{cyan!20}\result{\textbf{49.3}}{0.9} \\ \midrule
+
+
+\multirow{6}{*}{Gemma 2 9B} & - & - & \result{70.2}{0.0} & \result{10.6}{0.0} & \result{56.2}{0.0} & \result{4.8}{0.0} & \result{62.8}{0.0} & \result{12.0}{0.0} \\ \cmidrule(lr){2-9}
+ & SparseGPT & - & \result{56.9}{1.0} & \result{22.2}{0.5} & \result{32.1}{2.9} & \result{9.6}{0.1} & \result{38.9}{0.9} & \result{30.0}{0.7} \\
+ & \multirow{2}{*}{Ours} & Legal & \result{57.5}{0.6} & \cellcolor{green!20}\result{\textbf{21.8}}{0.1} & \cellcolor{green!20}\result{\textbf{47.0}}{1.1} & \cellcolor{green!20}\result{\textbf{7.8}}{0.0} & - & -  \\
+ &  & Medical & \cellcolor{green!20}\result{\textbf{59.6}}{0.3} & \result{23.0}{0.2} & - & -  & \cellcolor{green!20}\result{\textbf{51.3}}{0.6} & \cellcolor{green!20}\result{\textbf{24.6}}{0.2} \\ \cmidrule(lr){2-9}
+ & SparseGPT + GPTQ-M& - & \result{56.1}{0.4} & \result{24.3}{0.4} & \result{27.5}{2.8} & \result{10.4}{0.1} & \result{36.5}{1.4} & \result{33.8}{0.6} \\
+ & \multirow{2}{*}{Ours + GPTQ-M} & Legal & \result{55.7}{0.5} & \cellcolor{cyan!20}\result{\textbf{24.0}}{0.1} & \cellcolor{cyan!20}\result{\textbf{46.5}}{0.5} & \cellcolor{cyan!20}\result{\textbf{8.2}}{0.1} & - & -  \\
+ &  & Medical & \cellcolor{cyan!20}\result{\textbf{58.5}}{0.4} & \result{25.1}{0.1} & - & - & \cellcolor{cyan!20}\result{\textbf{50.2}}{0.9} & \cellcolor{cyan!20}\result{\textbf{27.2}}{0.1} \\ \midrule
+
+\multirow{6}{*}{Mistral Nemo 12B} & - & - & \result{69.4}{0.0} & \result{7.1}{0.0} & \result{57.5}{0.0} & \result{4.3}{0.0} & \result{58.4}{0.0} & \result{7.6}{0.0} \\ \cmidrule(lr){2-9}
+ & SparseGPT & - & \cellcolor{green!20}\result{\textbf{57.4}}{0.4} & \cellcolor{green!20}\result{\textbf{15.6}}{0.1} & \result{24.9}{1.4} & \result{9.1}{0.1} & \result{33.1}{1.2} & \result{16.2}{0.1} \\
+ & \multirow{2}{*}{Ours} & Legal & \result{55.5}{0.3} & \result{17.1}{0.1} & \cellcolor{green!20}\result{\textbf{39.6}}{2.5} & \cellcolor{green!20}\result{\textbf{8.0}}{0.1} & - & -  \\
+ &  & Medical & \result{57.1}{0.3} & \result{17.1}{0.1} & - & -  & \cellcolor{green!20}\result{\textbf{45.4}}{0.6} & \cellcolor{green!20}\result{\textbf{15.2}}{0.1} \\ \cmidrule(lr){2-9}
+ & SparseGPT + GPTQ-M& - & \cellcolor{cyan!20}\result{\textbf{56.1}}{0.2} & \cellcolor{cyan!20}\result{\textbf{17.3}}{0.3} & \result{22.2}{1.5} & \result{10.2}{0.2} & \result{32.0}{2.3} & \result{17.9}{0.3} \\
+ & \multirow{2}{*}{Ours + GPTQ-M} & Legal & \result{53.7}{0.3} & \result{19.6}{0.4} & \cellcolor{cyan!20}\result{\textbf{34.3}}{5.7} & \cellcolor{cyan!20}\result{\textbf{9.0}}{0.1} & - & - \\
+ &  & Medical & \result{55.6}{0.5} & \result{19.6}{0.4} & - & -  & \cellcolor{cyan!20}\result{\textbf{43.9}}{0.3} & \cellcolor{cyan!20}\result{\textbf{16.7}}{0.2} \\ \bottomrule
+
+\end{tabular}
+    \caption{Average performance for the general and in-domain (biomedical and legal) benchmarks, with 2:4 sparsity. Standard deviation is denoted in subscript. Rows using the GPTQ-M method additionally employ 4-bit quantization. \textbf{Bold} highlighted values denote the best performing method column-wise, for (1) pruning, and (2) joint pruning and quantization. For reference, the top row of each model shows the original (dense) model performance.}
+    \label{tab:full_results_pruning_gptqm}
+\end{table*}
+
+\begin{table*}[t]
+    \centering
+    \scriptsize
+    \begin{tabular}{llll|cc|cc|cc}
+\toprule
+
+\multirow{2}{*}{Group Size} & \multirow{2}{*}{Model} & Target & \multirow{2}{*}{$\lambda$} & \multicolumn{2}{c|}{General} & \multicolumn{2}{c|}{Legal} & \multicolumn{2}{c}{Medical} \\
+& & Domain &  & Accuracy & Perplexity & Accuracy & Perplexity & Accuracy & Perplexity \\
+\midrule
+
+\multirow{12}{*}{{\rotatebox[origin=c]{90}{None}}}& \multirow{6}{*}{Llama 3.2 3B} & Legal &  0.1 & \result{\textbf{\underline{52.4}}}{0.2} & \result{16.0}{0.0} & \result{27.3}{0.4} & \result{8.2}{0.0} & - & - \\
+& & Medical &  0.1 & \result{50.9}{0.6} & \result{18.0}{0.0} & - & - & \result{38.7}{1.3} & \result{\textbf{\underline{16.1}}}{0.1} \\ \cmidrule(lr){3-10}
+& & Legal &  0.01 & \result{52.2}{0.4} & \result{16.0}{0.0} & \result{27.3}{0.5} & \result{8.2}{0.0} & - & - \\
+& & Medical &  0.01 & \result{51.0}{0.6} & \result{17.9}{0.1} & - & - & \result{\textbf{\underline{39.2}}}{0.9} & \result{16.2}{0.1} \\ \cmidrule(lr){3-10}
+& & Legal &  0.001 & \result{52.2}{0.2} & \result{16.0}{0.1} & \result{\textbf{\underline{27.8}}}{0.6} & \result{8.2}{0.0} & - & - \\
+& & Medical &  0.001 & \result{50.9}{0.5} & \result{17.8}{0.1} & - & - & \result{38.9}{1.1} & \result{\textbf{\underline{16.1}}}{0.1} \\  \cmidrule(lr){2-10}
+
+& \multirow{6}{*}{Llama 3.1 8B} & Legal &  0.1 & \result{57.0}{0.3} & \result{\textbf{\underline{12.5}}}{0.1} & \result{42.2}{2.5} & \result{\textbf{\underline{6.6}}}{0.0} & - & - \\
+& & Medical &  0.1 & \result{57.6}{0.7} & \result{14.0}{0.4} & - & - & \result{47.4}{0.3} & \result{\underline{15.0}}{0.5} \\ \cmidrule(lr){3-10}
+& & Legal &  0.01 & \result{57.2}{0.3} & \result{12.6}{0.2} & \result{\textbf{\underline{42.5}}}{1.8} & \result{6.7}{0.0} & - & - \\
+& & Medical &  0.01 & \result{\underline{58.8}}{0.2} & \result{13.3}{0.1} & - & - & \result{\underline{48.8}}{0.8} & \result{15.1}{0.4} \\ \cmidrule(lr){3-10}
+& & Legal &  0.001 & \result{57.0}{0.4} & \result{12.6}{0.2} & \result{41.7}{2.2} & \result{6.7}{0.1} & - & - \\
+& & Medical &  0.001 & \result{57.7}{1.2} & \result{14.2}{1.0} & - & - & \result{47.5}{1.8} & \result{15.5}{0.5} \\ \midrule
+
+
+\multirow{12}{*}{{\rotatebox[origin=c]{90}{128}}}& \multirow{6}{*}{Llama 3.2 3B}  & Legal & 0.1 & \result{52.0}{0.2} & \result{16.7}{0.1} & \result{27.3}{0.7} & \result{8.2}{0.0} & - & -  \\
+ & & Medical &  0.1 & \result{52.0}{0.2} & \result{18.9}{0.2} & - & -  & \result{\textbf{\underline{39.2}}}{0.7} & \result{16.3}{0.1} \\ \cmidrule(lr){3-10}
+ & & Legal & 0.01 & \result{52.0}{0.3} & \result{16.6}{0.1} & \result{\underline{27.4}}{0.6} & \result{8.2}{0.0} & - & - \\
+ & & Medical &  0.01 & \result{\textbf{\underline{52.1}}}{0.1} & \result{19.0}{0.2} & - & -  & \result{39.0}{0.6} & \result{16.3}{0.1} \\ \cmidrule(lr){3-10}
+ & & Legal & 0.001 & \result{\textbf{\underline{52.1}}}{0.1} & \result{16.6}{0.1} & \result{27.2}{0.6} & \result{8.2}{0.0} & - & -  \\
+ & & Medical &  0.001 & \result{52.0}{0.3} & \result{18.9}{0.2} & - & - & \result{\textbf{\underline{39.2}}}{0.5} & \result{\underline{16.2}}{0.1} \\ \cmidrule(lr){2-10}
+ 
+& \multirow{6}{*}{Llama 3.1 8B}  & Legal & 0.1 & \result{57.3}{0.3} & \result{12.9}{0.1} & \result{42.0}{2.0} & \result{\textbf{\underline{6.6}}}{0.0} & - & -  \\
+&  & Medical &  0.1 & \result{58.1}{0.8} & \result{14.2}{0.4} & - & - & \result{47.8}{0.8} & \result{\textbf{\underline{14.7}}}{0.5} \\ \cmidrule(lr){3-10}
+&  & Legal & 0.01 & \result{57.4}{0.3} & \result{12.9}{0.2} & \result{\underline{42.1}}{1.3} & \result{\textbf{\underline{6.6}}}{0.0} & - & - \\
+&  & Medical &  0.01 & \result{\textbf{\underline{59.1}}}{0.2} & \result{13.5}{0.1} & - & -  & \result{\textbf{\underline{49.2}}}{0.4} & \result{\textbf{\underline{14.7}}}{0.3} \\ \cmidrule(lr){3-10}
+&  & Legal & 0.001 & \result{57.1}{0.3} & \result{13.0}{0.2} & \result{40.6}{2.6} & \result{6.7}{0.1} & - & -  \\
+&  & Medical &  0.001 & \result{58.1}{1.2} & \result{14.3}{0.9} & - & - & \result{47.8}{1.7} & \result{15.1}{0.6} \\ 
+\bottomrule
+\end{tabular}
+    \caption{Average D-Pruner performance for general and in-domain (biomedical and legal) benchmarks. We vary the group size (i.e. iterative blocking) and $\lambda$ hyperparameters. \textbf{Bold values} denote best performing factor across model and approach, whilst underlined the best across model for each approach.}
+    \label{tab:full_results_dpruner}
+\end{table*}
+
+
+
+\begin{table*}[t]
+    \centering
+    \scriptsize
+    \begin{tabular}{ll|cccc|cccc}
+\toprule
+
+\multirow{2}{*}{Model} & \multirow{2}{*}{Method} & \multicolumn{4}{c|}{Biomedical} & \multicolumn{3}{c}{Legal}\\
+
+& & MedMCQA & MedQA (4) & PubMedQA & Bio. MMLU & CaseHOLD & ECtHR & Legal MMLU \\
+\midrule
+
+
+\multirow{6}{*}{Llama 3.2 3B} & -  & \result{49.5}{0.0} & \result{51.5}{0.0} & \result{72.8}{0.0} & \result{61.1}{0.0} & \result{42.7}{0.0} & \result{49.6}{0.0} & \result{44.2}{0.0} \\\cmidrule(lr){2-9}
+& Magnitude   & \result{28.8}{0.0} & \result{28.8}{0.0} & \result{50.6}{0.0} & \result{27.5}{0.0} & \result{20.6}{0.0} & \result{4.5}{0.0} & \result{27.2}{0.0} \\
+& Wanda & \result{30.4}{0.2} & \result{35.6}{0.6} & \result{63.6}{0.5} & \result{41.8}{0.3} & \result{28.9}{0.7} & \result{13.7}{0.7} & \result{35.4}{0.4} \\
+& SparseGPT  & \result{33.6}{1.9} & \result{35.4}{1.4} & \result{69.5}{1.2} & \result{45.1}{1.2} & \result{32.9}{0.6} & \result{15.8}{1.6} & \result{37.1}{0.5} \\
+& D-Pruner  & \result{35.3}{0.8} & \result{39.2}{0.3} & \result{66.8}{1.2} & \result{41.5}{0.6} & \result{22.9}{1.3} & \result{25.6}{0.1} & \result{33.1}{0.7} \\  \cmidrule(lr){2-9}
+& SparseGPT + CC (Ours) & \cellcolor{green!20}\result{\textbf{41.6}}{0.3} & \cellcolor{green!20}\result{\textbf{42.1}}{0.2} & \cellcolor{green!20}\result{\textbf{71.0}}{0.7} & \cellcolor{green!20}\result{\textbf{50.9}}{0.4} & \cellcolor{green!20}\result{\textbf{41.8}}{0.8} & \cellcolor{green!20}\result{\textbf{31.9}}{1.1} & \cellcolor{green!20}\result{\textbf{41.7}}{0.5} \\ \midrule
+
+
+
+\multirow{6}{*}{Llama 3.1 8B} & - & \result{56.4}{0.0} & \result{60.1}{0.0} & \result{75.8}{0.0} & \result{71.7}{0.0} & \result{51.9}{0.0} & \result{60.9}{0.0} & \result{52.4}{0.0} \\\cmidrule(lr){2-9}
+ & Magnitude & \result{32.4}{0.0} & \result{34.2}{0.0} & \result{59.6}{0.0} & \result{37.0}{0.0} & \result{20.4}{0.0} & \result{10.0}{0.0} & \result{32.2}{0.0} \\
+ & Wanda & \result{38.5}{0.3} & \result{38.0}{0.9} & \result{66.8}{0.5} & \result{51.3}{0.6} & \result{29.4}{0.7} & \result{35.9}{0.3} & \result{39.7}{0.3} \\
+ & SparseGPT & \result{41.0}{1.8} & \result{43.2}{1.0} & \result{70.7}{1.0} & \result{55.7}{1.1} & \result{38.5}{1.5} & \result{38.0}{1.5} & \result{43.9}{0.5} \\
+ & D-Pruner & \result{43.4}{1.5} & \result{45.1}{2.1} & \result{69.9}{2.8} & \result{57.5}{2.0} & \result{37.1}{2.4} & \result{41.4}{6.6} & \result{43.4}{0.8} \\ \cmidrule(lr){2-9}
+ & Ours & \cellcolor{green!20}\result{\textbf{49.6}}{0.5} & \cellcolor{green!20}\result{\textbf{50.5}}{0.6} & \cellcolor{green!20}\result{\textbf{73.7}}{1.0} & \cellcolor{green!20}\result{\textbf{64.3}}{0.6} &  \cellcolor{green!20}\result{\textbf{47.8}}{0.6} & \cellcolor{green!20}\result{\textbf{55.7}}{1.7} & \cellcolor{green!20}\result{\textbf{47.2}}{0.6} \\ \midrule
+ 
+\multirow{5}{*}{Gemma 2 2B} &  - & \result{40.9}{0.0} & \result{35.3}{0.0} & \result{74.0}{0.0} & \result{53.8}{0.0} & \result{32.5}{0.0} & \result{8.5}{0.0} & \result{40.4}{0.0} \\ \cmidrule(lr){2-9}
+& Magnitude& \result{22.5}{0.0} & \result{24.1}{0.0} & \result{56.4}{0.0} & \result{32.9}{0.0} & \result{21.2}{0.0} & \cellcolor{green!20}\result{\textbf{17.9}}{0.0} & \result{25.9}{0.0} \\
+& Wanda & \result{25.8}{0.9} & \result{24.4}{0.9} & \result{57.4}{0.6} & \result{37.6}{1.0} & \result{19.8}{0.1} & \result{12.2}{4.8} & \result{28.3}{0.6} \\
+& Sparsegpt & \result{26.0}{2.1} & \result{27.7}{2.0} & \result{60.4}{1.9} & \result{36.9}{1.2} & \result{24.0}{2.1} & \result{6.2}{2.4} & \result{32.3}{1.7} \\ \cmidrule(lr){2-9}
+& Ours & \cellcolor{green!20}\result{\textbf{37.9}}{0.2} & \cellcolor{green!20}\result{\textbf{33.0}}{0.8} & \cellcolor{green!20}\result{\textbf{68.7}}{1.1} & \cellcolor{green!20}\result{\textbf{44.6}}{0.9} & \cellcolor{green!20}\result{\textbf{33.0}}{1.5} & \result{6.5}{1.2} & \cellcolor{green!20}\result{\textbf{37.3}}{0.3} \\ \midrule
+
+
+\multirow{5}{*}{Gemma 2 9B}& - & \result{57.9}{0.0} & \result{60.5}{0.0} & \result{78.6}{0.0} & \result{77.2}{0.0} & \result{51.7}{0.0} & \result{60.1}{0.0} & \result{56.8}{0.0} \\ \cmidrule(lr){2-9}
+& Magnitude & \result{43.7}{0.0} & \result{46.3}{0.0} & \result{71.8}{0.0} & \result{54.5}{0.0} & \result{37.1}{0.0} & \result{19.9}{0.0} & \result{44.1}{0.0} \\
+& Wanda  & \result{45.0}{0.5} & \result{44.7}{1.5} & \result{71.4}{0.7} & \result{57.7}{0.7} & \result{43.6}{1.6} & \result{36.1}{2.1} & \result{45.8}{1.0} \\
+& SparseGPT & \result{48.0}{0.5} & \result{48.6}{0.9} & \result{74.4}{1.1} & \result{66.1}{0.4} & \result{45.8}{1.5} & \result{36.2}{0.9} & \result{49.2}{0.9} \\ \cmidrule(lr){2-9}
+& Ours & \cellcolor{green!20}\result{\textbf{53.7}}{0.4} & \cellcolor{green!20}\result{\textbf{55.0}}{0.4} &\cellcolor{green!20}\result{\textbf{77.6}}{0.8} & \cellcolor{green!20}\result{\textbf{71.2}}{0.7} & \cellcolor{green!20}\result{\textbf{49.1}}{0.3} & \cellcolor{green!20}\result{\textbf{56.4}}{1.2} & \cellcolor{green!20}\result{\textbf{53.2}}{0.2} \\ \midrule
+
+\multirow{5}{*}{Mistral NeMo 12B} & - & \result{52.4}{0.0} & \result{60.6}{0.0} & \result{74.4}{0.0} & \result{71.9}{0.0} & \result{55.8}{0.0} & \result{62.0}{0.0} & \result{54.8}{0.0} \\ \cmidrule(lr){2-9}
+ & Magnitude  & \result{30.0}{0.0} & \result{33.0}{0.0} & \result{67.0}{0.0} & \result{42.3}{0.0} & \result{25.8}{0.0} & \result{9.8}{0.0} & \result{37.9}{0.0} \\
+ & Wanda  & \result{39.7}{0.4} & \result{45.5}{0.3} & \result{60.6}{0.1} & \result{59.7}{0.4} & \result{44.0}{0.5} & \result{37.4}{2.8} & \result{45.4}{0.5} \\
+ & SparseGPT& \result{40.0}{0.5} & \result{46.5}{0.9} & \cellcolor{green!20}\result{\textbf{72.0}}{0.7} & \result{59.2}{1.5} & \result{40.5}{3.1} & \result{49.3}{3.4} & \result{43.8}{0.9} \\ \cmidrule(lr){2-9}
+ & Ours & \cellcolor{green!20}\result{\textbf{48.6}}{0.5} & \cellcolor{green!20}\result{\textbf{54.6}}{0.5} & \result{71.9}{0.5} & \cellcolor{green!20}\result{\textbf{66.9}}{0.5} & \cellcolor{green!20}\result{\textbf{49.3}}{1.2} & \cellcolor{green!20}\result{\textbf{55.7}}{2.1} & \cellcolor{green!20}\result{\textbf{50.2}}{0.7} \\
+ 
+\bottomrule
+\end{tabular}
+    \caption{Average performance across calibration sets for the biomedical and legal domain tasks. \textbf{Bold} values denote the best performing method column-wise for each model.}
+    \label{tab:full_results_analytical_bio_legal}
+\end{table*}
+
+
+\end{document}

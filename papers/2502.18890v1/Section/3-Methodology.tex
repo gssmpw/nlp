@@ -1,0 +1,111 @@
+\begin{figure*}[t!]
+    \centering
+    \includegraphics[width=\linewidth]{Figure/TokenSwift.pdf}
+    % \vskip -0.1 in
+    \caption{\textbf{Illustration of \ours Framework.} First, target model (LLM) with partial KV cache and three linear layers outputs 4 logits in a single forward pass. Tree-based attention is then applied to construct candidate tokens. Secondly, top-$k$ candidate $4$-grams are retrieved accordingly. These candidates compose draft tokens, which are fed into the LLM with full KV cache to generate target tokens. The verification is performed by checking if draft tokens match exactly with target tokens (\cref{alg:algorithm}). Finally, we randomly select one of the longest valid draft tokens, and update $n$-gram table and KV cache accordingly.}
+    \label{fig:frame}
+    % \vskip -0.15 in
+\end{figure*}
+
+\section{\ours}
+\label{sec:method}
+To achieve \textbf{lossless acceleration in generating ultra-long sequences}, we propose tailored solutions for each challenge inherent to this process. These solutions are seamlessly integrated into a unified framework, \ie \ours.
+
+\subsection{Overview}
+\label{sec:overall}
+The overall framework is depicted in \cref{fig:frame}. \ours 
+% is highly lightweight and conceptually similar to \ac{sd}. It 
+generate a sequence of draft tokens with self-drafting, which are then passed to the target (full) model for validation using a tree-based attention mechanism (See \cref{app:tree_attn} for more tree-based attention details). This process ensures that the final generated output aligns with the target model’s predictions, effectively achieving lossless acceleration.
+
+\ours is lightweight because the draft model is the target model itself with a partial KV cache. This eliminates the need to train a separate draft \ac{llm}; instead, only $\gamma$ linear layers need to be trained, where $\gamma + 1$\footnote{The target model itself can also predict one logit, making the total number of logits $\gamma+1$. We take $\gamma=3$.} represents the number of logits predicted in a single forward pass. In addition, during the verification process, once we obtain the target tokens from the target model with full KV cache, we directly compare draft tokens with target tokens sequentially to ensure that the process is lossless~\citep{rest}.
+
+\subsection{Multi-token Generation and Token Reutilization}
+\label{sec:multi_token}
+\paragraph{Multi-token Self-Drafting} 
+% Inspired by Medusa~\citep{medusa}, we propose a modification where the final output of \ac{llm} is used as input to train $3$ linear layers, enabling the model to generate multiple draft tokens in a single forward pass. However, we argue that the generated draft tokens should not be independent of each other. Unlike Medusa, where the linear layers operate entirely independently, we introduce a simple adjustment to this structure. 
+Inspired by Medusa~\citep{medusa}, we enable the \ac{llm} to generate multiple draft tokens in a single forward pass by incorporating $\gamma$ additional linear layers. However, we empirically note that \textbf{the additional linear layers should not be independent of each other}. Specifically, we propose the following structure:
+\begin{equation}
+\label{equ:ours}
+% \small
+% \resizebox{.9\hsize}{!}{
+% $
+    \begin{aligned}
+    h_1=f_1(h_0) + h_0,\quad{}h_2=&f_2(h_1) + h_1,\quad{}h_3=f_3(h_2) + h_2,\\
+l_0,~l_{1},~l_{2},~l_{3}=&~g(h_0),~g(h_1),~g(h_2),~g(h_3),
+    \end{aligned}
+% $
+% }
+\end{equation}
+where $h_0$ denotes the last hidden state of \ac{llm}, $f_i(\cdot)$ represents the $i$-th linear layer, $h_i$ refers to the $i$-th hidden representation, $g(\cdot)$ represents the LM Head of target model, and $l_i$ denotes output logits.
+% By comparing \cref{equ:medsua} (Medusa) and \cref{equ:ours} (\ours), it is evident that in \ours, the generation of each token depends on the previously generated token, which aligns more closely with the \ac{ar} nature of the model. Moreover, this adjustment incurs no additional computational cost.
+This structure aligns more closely with the \ac{ar} nature of the model. Moreover, this adjustment incurs no additional computational cost.
+\vspace{-0.05 in}
+\paragraph{Token Reutilization} 
+% Given the relatively low acceptance rate of using linear to approximate the entire \ac{llm} for generating draft tokens, we propose a method named \textbf{token reutilization}  to further reduce the frequency of model reloads. 
+Given the relatively low acceptance rate of using linear layers to generate draft tokens, we propose a method named \textbf{token reutilization} to further reduce the frequency of model reloads. The idea behind token reutilization is that some phrases could appear frequently, and they are likely to reappear in subsequent generations.
+
+% Specifically, we define $(\mathcal{G}, \mathcal{F})$, where $\mathcal{G}=\{x_{i+1}, ..., x_{i+n}\}$ represents an $n$-gram and $\mathcal{F}$ denotes its corresponding frequency $\mathcal{F}$ within the generated token sequence $S=\{x_0, x_1, ..., x_{t-1}\}$ by time step $t$ ($t \geq n$). At subsequent time steps, we use the token generated by target model as the first token to select top-$k$ most frequent $n$-grams $\{\mathcal{G}_1, \mathcal{G}_2,...,\mathcal{G}_k\}$ and incorporate them as additional draft tokens. These selected draft tokens, along with the newly generated ones, are then fed to the \ac{llm} for parallel validation. 
+Specifically, we maintain a set of tuples $\{(\mathcal{G}, \mathcal{F})\}$, where $\mathcal{G}=\{x_{i+1}, ..., x_{i+n}\}$ represents an $n$-gram and $\mathcal{F}$ denotes its corresponding frequency $\mathcal{F}$ within the generated token sequence $S=\{x_0, x_1, ..., x_{t-1}\}$ by time step $t$ ($t \geq n$). After obtaining $\{p_0,\ldots, p_3\}$ as described in \S \ref{sec:penalty}, we retrieve the top-$k$ most frequent $n$-grams beginning with token $\arg\max p_0$ to serve as additional draft tokens.
+
+Although this method can be applied to tasks with long prefixes, its efficacy is constrained by the limited decoding steps, which reduces the opportunities for accepting $n$-gram candidates. Additionally, since the long prefix text is not generated by the \ac{llm} itself, a distributional discrepancy exists between the generated text and the authentic text~\citep{detectgpt}. As a result, this method is particularly suitable for generating ultra-long sequences.
+ 
+% \subsection{Dynamic and Memory-Saving KV Pruning}
+\subsection{Dynamic KV Cache Management}
+\label{sec:kv_update}
+\paragraph{Dynamic KV Cache Updates}
+Building upon the findings of~\citet{stram_llm}, we preserve the initial $|S|$ KV pairs within the cache during the drafting process, while progressively evicting less important KV pairs. Specifically, we enforce a fixed budget size $|B|$, ensuring that the KV cache at any given time can be represented as:
+\begin{equation}
+    \nonumber
+    % \resizebox{\hsize}{!}{$
+    \mathbf{KV}=\{(\mathbf{K}_0,\mathbf{V}_0), ..., (\mathbf{K}_{|S|},\mathbf{V}_{|S|}), (\mathbf{K}_{|S|+1},\mathbf{V}_{|S|+1}),..., (\mathbf{K}_{|B|-1},\mathbf{V}_{|B|-1})\},
+   % $},
+\end{equation}
+where the first $|S|$ pairs remain fixed, and the pairs from position $|S|$ to $|B|-1$ are ordered by decreasing importance. 
+As new tokens are generated, less important KV pairs are gradually replaced, starting from the least important ones at position $|B|-1$ and moving towards position $|S|$. Once replacements extend beyond the $|S|$ position, we recalculate the \textit{importance scores} of all preceding tokens and select the most relevant $|B|-|S|$ pairs to reconstruct the cache. 
+This process consistently preserves the critical information required for ultra-long sequence generation. 
+\vspace{-0.05 in}
+% \paragraph{Memory-Saving Top-K Pruning} 
+% To implement dynamic updates efficiently, we employ a simple yet effective Top-K pruning strategy. Specifically, we rank the KV pairs based on the importance scores derived from the dot product between the query ($\mathbf{Q}$) and key ($\mathbf{K}$), \ie $\mathbf{Q}\mathbf{K}^T$. 
+\paragraph{Importance Score of KV pairs} 
+We rank the KV pairs based on the \textit{importance scores} derived from the dot product between the query ($\mathbf{Q}$) and key ($\mathbf{K}$), \ie $\mathbf{Q}\mathbf{K}^T$. 
+
+In the case of Group Query Attention (GQA), since each $\mathbf{K}$ corresponds to a group of $\mathcal{Q}=\{\mathbf{Q}_0, ..., \mathbf{Q}_{g-1}\}$, direct dot-product computation is not feasible. Unlike methods such as SnapKV~\citep{snapkv}, we do not replicate the $\mathbf{K}$. Instead, we partition the $\mathcal{Q}$, as shown in \cref{equ:gqa}:
+\begin{equation}
+    \label{equ:gqa}
+    \vspace{-2mm}
+    \text{importance score}_i = \sum_{j=i\cdot g}^{((i+1)\cdot g)-1}\mathbf{Q}_j \cdot \mathbf{K}_i,
+        % \vspace{-2mm}
+\end{equation}
+where for position $i$, $\mathbf{Q}_j$ in the group $\mathcal{Q}_i$ are dot-product with the same $\mathbf{K}_i$, and their results are aggregated to obtain the final \textit{importance score}. This approach enhances memory saving while preserving the quality of the attention mechanism, ensuring that each query is effectively utilized without introducing unnecessary redundancy.
+
+\subsection{Contextual Penalty and Random N-gram Selection}
+\label{sec:penalty}
+% \paragraph{Contextual Length Penalty} 
+\paragraph{Contextual Penalty} 
+% To mitigate repetition in generated text, we have explored various sampling strategies. However, with the significantly larger sequence length, the likelihood of repetition increases compared to generating shorter texts (\cref{sec:repeat}). As a result, we decided to apply an additional penalty to the generated tokens to further mitigate repetition.
+To mitigate repetition in generated text, we have explored various sampling strategies. However, with the significantly larger sequence length, the likelihood of repetition increases significantly (\S \ref{sec:repeat}). As a result, we decided to apply an additional penalty to the generated tokens to further mitigate repetition.
+
+The penalized sampling approach proposed in \citep{penalty} suggests applying a penalty to all generated tokens. However, when generating ultra-long sequences, the set of generated tokens may cover nearly all common words, which limits the ability to sample appropriate tokens. Therefore, we propose an improvement to this method. 
+
+Specifically, we introduce a fixed \emph{penalty window} $W$ and apply \emph{penalty value} $\theta$ to the most recent $W$ tokens, denoted as $\mathbb{W}$, generated up to the current position, as illustrated in \cref{equ:repeat}: 
+\begin{equation}
+% \small
+    \label{equ:repeat}
+% \vspace{-3mm}
+    \begin{aligned}
+        p_i &= \frac{\exp \big(l_i/(t\cdot I(l_i))\big)}{\sum_j \exp \big(l_j/(t\cdot I(l_j))\big)},\\
+    I(l)=\theta\,\,&\text{if}\,\,l \in \mathbb{W}\,\text{else}\,\,1.0,\quad \theta \in (1, \infty),
+    \end{aligned}
+    % \vspace{-1mm}
+\end{equation}
+where $t$ denotes temperature, $l_i$ and $p_i$ represent the logit and probability of $i$-th token. This adjustment aims to maintain diversity while still mitigating repetitive generation.
+\input{Section/algo}
+\vspace{-0.05 in}
+\paragraph{Random $n$-gram Selection}
+% In the process of reutilizing generated $n$-grams as draft tokens and applying repetition penalty, there exists an inherent trade-off. Meanwhile, 
+
+In our experiments, we observe that the draft tokens provided to the target model for parallel validation often yield multiple valid groups. Building on this observation, we randomly select one valid $n$-gram to serve as the final output. By leveraging the fact that multiple valid $n$-grams emerge during verification, we ensure that the final output is both diverse and accurate.
+
+% we observe that the draft tokens provided to the target model for parallel validation can yield multiple valid groups.
+
+In summary, the overall flow of our framework is presented in \cref{alg:algorithm}. 

@@ -1,0 +1,46 @@
+\section{Background}\label{sec:background}
+
+With the explosive growth of LLM sizes in recent years, numerous techniques specific to generative LLMs have emerged to reduce memory requirements and improve output speeds. In this work, we focus on the large-batch serving environment often found in data centers, where multiple requests for LLM inference run simultaneously under power constraints at both the rack and data center levels.
+
+Various methods have been proposed to improve LLM serving efficiency, with quantization being one of the most widely studied. However, a key challenge in LLM quantization is the presence of activation outliers.
+Transformer models often contain large outlier values in their activations, which, if not properly addressed during quantization, can lead to substantial quality degradation \citep{sun2024massive}. To mitigate this issue, several quantization techniques have been developed, aiming to improve robustness and accuracy while maintaining computational efficiency.
+
+
+\subsection{Weight-only quantization}
+Due to the quantization difficulties posed by activation outliers, many studies have proposed several weight-only quantization (WoQ) methods\citep{MLSYS2024_42a452cb, frantar2023optq, flexround}, while retaining activations in BF16 or FP16 format.
+However, these approaches often suffer from low throughput at larger batch sizes.
+To enable computations, quantized weights must be converted into the same data type as activations (\textit{e.g.} BF16), requiring online dequantization. This is handled by CUDA cores on NVIDIA GPUs and TPC cores on Gaudi HPUs, which operate an order of magnitude slower than their respective matrix multiplication units. Therefore, dequantization frequently becomes a bottleneck even at moderate batch sizes. Also, because GEMM computations are conducted at higher precisions, WoQ methods are fundamentally limited to having the same throughput as unquantized GEMMs at best.
+
+Even when high throughput is achieved, kernel implementations often need to be re-implemented for different devices, including those from the same vendor. 
+For instance, the Marlin kernel \citep{frantar2024marlin}, optimized for int4-weight and float16-activations on the A100, is suboptimal for the H100. As a result, the Machete kernel \citep{machete} was developed specifically to leverage the new features of the Hopper architecture, employing different design trade-offs. 
+These challenges arise due to variations in cache sizes, hardware features, and compute-to-memory bandwidth ratios, all of which necessitate different optimizations to achieve high performance. Consequently, adapting WoQ methods across different accelerators imposes significant implementation overhead and increases development costs.
+
+\subsection{INT8 quantization}
+
+The INT8 quantization format described in \citet{xiao2024smoothquantaccurateefficientposttraining} is closely related to our work, requiring quantization of both weights and activations to leverage INT8 tensor cores to accelerate computations. 
+While INT8 quantization has been widely adopted in fields such as computer vision, its limited dynamic range presents challenges in achieving full accuracy for LLM inference.
+FP8 thus has an advantage over INT8 as integer representations are inherently less robust to outliers compared to floating-point numbers \citep{MLSYS2024_dea9b4b6, kurtic2024givebf16deathaccuracyperformance}.
+
+\subsection{FP8 quantization}
+
+The FP8 format can be categorized into two variants based on the allocation of bits to the exponent and mantissa: the E4M3 format and the E5M2 format. E4M3 offers higher precision compared to the E5M2 format, which instead has a higher dynamic range.
+To address the smaller dynamic range of FP8 compared to BF16, scaling factors are employed to adjust the inputs before casting to FP8. This ensures that the values fit within the FP8 range, maximizing the utilization of its limited dynamic range.
+Per-tensor scaling, which computes a single scaling factor for each matrix. For more granular control, per-token scaling can be applied to activations, while per-channel scaling is used for weights, enabling finer adjustments. Group-wise scaling factors \citep{deepseekai2024deepseekv3technicalreport} have also been proposed.
+
+
+\subsection{Scaling factor computation}
+
+A critical consideration for activation quantization is the overhead of converting activations to lower precision. While non-linear operations require 16-bit or even 32-bit precision, activations must be quantized online immediately before GEMM computations utilize low-precision compute units. This introduces non-trivial overhead, limiting the throughput gains from reduced precision. Activation quantization also requires estimating input statistics to determine appropriate scaling factors. A direct approach, measuring statistics for each activation before quantization, would necessitate two memory accesses: one for collecting statistics and another for quantization, incurring high latency. To mitigate this, many libraries use a calibration set to precompute scaling factors based on a representative sample of activations.
+
+A key limitation of static scaling is that it typically enforces per-tensor scaling of activations, as token-wise variations are unknown in advance. For instance, altering the order of sequences during batched decoding would shift token positions. Moreover, using position-dependent scaling factors would require fixed input sizes. While per-channel scaling \citep{xiao2024smoothquantaccurateefficientposttraining} is possible, the same scaling factors are still applied to all tokens, potentially reducing accuracy.
+
+In contrast, dynamic scaling is more efficient when applied separately to each token as measurement and quantization can be combined in a single memory access. It also enables group-wise quantization, as implemented in \citet{deepseekai2024deepseekv3technicalreport} with a group size of 128, improving output quality through finer-grained scaling factors.
+
+A potential optimization for both scaling methods is to merge quantization with other memory-bound operations. In Pre-LN Transformers \citep{pre_ln_transformers}, activation quantization can be fused with RMSNorm. Similarly, element-wise multiplication in SwiGLU \citep{shazeer2020gluvariantsimprovetransformer} can also be fused. Frameworks such as TensorRT-LLM \citep{TensorRT_LLM} v0.16.0 have already implemented these optimizations for FP8 activation quantization. 
+They have yet to be implemented for Gaudi HPUs as of the time of writing.
+
+\subsection{LLM evaluation}
+
+LLM evaluation has grown in importance as new LLMs compete for prominence. Traditionally, WikiText-2 perplexity \citep{merity2017pointer} has been widely used due to its ease of measurement and relationship with the training loss. More recently, Massive Multitask Language Understanding (MMLU) \citep{hendrycks2021measuring} has emerged as the \textit{de facto} standard to assess LLM quality, evaluating knowledge in a wide range of domains. However, multiple-choice benchmarks may fail to capture the full impact of quantization. For instance, the Llama v3 405B model \citep{grattafiori2024llama3herdmodels} applies max-absolute (maxabs) clipping when calculating scaling factors despite there being no effect in standard evaluation metrics because the model may generate corrupted outputs for high-perplexity tokens, such as dates, without maxabs clipping.
+
+Moreover, evaluation should extend beyond pre-trained base models to instruction-tuned models that have undergone alignment. If quantization is applied after pre-training but before alignment, the alignment process must be quantization-aware, requiring each quantization algorithm to be integrated with each alignment method while maintaining alignment quality, significantly increasing complexity. For this reason, we conduct all evaluations on instruction-tuned models, where quantization effects are more representative of real-world deployment scenarios.

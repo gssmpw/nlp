@@ -1,0 +1,203 @@
+\begin{figure*}[t!]
+    \centering
+    \includegraphics[height=.7\textwidth]{syntriever_v2.pdf}
+    \caption{Overview of Syntriever. \textbf{Stage-1 (Distillation Stage).} Given a query, Syntriever uses LLMs to synthesize (i) related sub-queries (prompt $\mathcal P_\text{cot}$), (ii) relevant passages  ( $\mathcal P_+$) which are self-verified for hallucination ( $\mathcal P_\text{Relabel}$), (iii) plausibly irrelevant passages ( $\mathcal P_-$). The retriever is trained with the synthetic positive and negative passages. \textbf{Stage-2 (Alignment Stage).} The retriever is aligned with the LLM preferences. LLM compares passage pairs from top-$K$ retrieved passages. If LLM prefers $y_w$ over $y_l$, we write $y_w\succ y_l$. We propose \emph{partial Plackett-Luce ranking} to combine preference modeling and contrastive learning for the retriever to learn $y_w\succ y_l \succ$ \{in-batch negatives\}.
+    }
+    \label{fig:model}
+\end{figure*}
+
+\section{Training Retrievers through Passage Synthesis}
+
+\subsection{Problem Statement and Notation}
+
+Neural retrieval is a task of searching for top-$K$ relevant passages $\mathcal{C}$ given query $q$ using encoder $E$ from knowledge source $\mathcal{Z}$: 
+\begin{equation}
+    \mathcal{C} = \mathrm{Retrieval}(q, \mathcal{Z}, K, E)
+\end{equation}
+The retrieval system (retriever in short) is used for retrieval-augmented generations (RAG)~\cite{lewis2020retrieval,guu2020retrieval}.
+Our goal is to train/fine-tune a (pre-trained) text encoder $E$ which outputs embeddings for semantic representations of queries and passages.
+The semantic similarity of query $q$ and passage $p$ is measured by \[
+s_\tau(q,p) := \frac{\text{sim}(E(q),E(p))}{\tau}
+\]
+where $\text{sim}(a,b)$ stands for the cosine similarity of vectors $a$ and $b$, and $\tau$ is the temperature hyperparameter which controls the concentration of (normalized) embeddings on the unit hypersphere.
+
+In the training dataset, each query $q_i$ is paired with passage $p_i$ manually labeled as relevant or the answer to $q_i$. We will denote a batch of samples during training by $B$, where $B$ is a set of indices of batch samples. A typical method to train a retriever is metric learning with \emph{contrastive loss} such as InfoNCE \cite{oord2018representation, izacard2021unsupervised}:
+\[
+\mathcal{L}_\text{InfoNCE}=-\log\,\bigg[\frac{\exp(s_\tau(q_i,p_i))}{\sum\limits_{j\in B}\exp(s_\tau(q_i,p_j))}\bigg]
+\]
+That is, manually labeled $p_i$ is regarded as a \emph{positive} passage for $q_i$, and the embeddings of $q_i$ and $p_i$ are pulled closer in the embedding space. The other passages in batch $B$ are considered irrelevant to $q_i$, and as \emph{negative} passages whose embeddings are pushed away from that of $q_i$.
+
+Next, we outline the proposed method, dubbed \emph{Syntriever}, which consists of two stages. In Stage 1 (Sec.\ \ref{stage1}), we use LLM-generated synthetic data to distill their parametric knowledge into the retriever. In Stage 2 (Sec.\ \ref{stage2}), we align the retriever with  LLM preferences. The two-stage process of Syntriever is analogous to the training of LLMs, i.e., supervised fine-tuning (SFT) followed by alignment with human preferences \cite{ouyang2022training}.  
+An overview of Syntriever is depicted in Fig. \ref{fig:model}.
+
+
+
+\subsection{Stage-1. Distillation of LLM's knowledge through Synthesis}\label{stage1}
+
+Given query $q$, our goal is to assimilate  $q$ to a set of positive documents, and to disassimilate $q$ from negative documents. We synthesize a variety of positive and negative passages so as to distill the vast knowledge of LLMs into the retriever.
+
+\noindent\textbf{Decomposing query to easier sub-queries.} Neural retrievers struggle with challenging queries \cite{li2024retrieval}, e.g., if a query requires {multi-step reasoning}, or is {too complex to understand}. LLMs are capable of decomposing a complex query into multiple easier sub-queries which contain fine-grained planning to answer the query. We leverage the decomposition capability by applying the original query with prompts generating chain-of-thoughts~(CoT)~\cite{wei2022chain}, e.g., ``\texttt{Let's think step-by-step}'' proposed by \cite{kojima2022large}. Specifically, given query $q_i$, we generate augmented query $q^\mathrm{cot}_i$ given by
+\begin{equation}
+    q^\mathrm{cot}_i = \mathcal{M}(\mathcal{P}_\mathrm{cot}(q_i))
+\end{equation}
+where $\mathcal{M}$($\cdot$) denotes the LLM operation, and $\mathcal{P}_\mathrm{cot}$ denotes the prompt operator to generate CoT (see Appendix \ref{appendix:prompts} for prompt details). $q^\mathrm{cot}_i$ contains sub-queries relevant to the original query, which are carefully planned out with clarification and details necessary to retrieve relevant documents. We will use $q^\mathrm{cot}_i$ as a positive document for $q_i$. This helps the retriever with understanding diverse contexts associated with related queries in the future. 
+
+\noindent\textbf{Synthesizing positive and hard-negative passages.}  
+We generate synthetic \emph{positive} and \emph{hard-negative} passages from query $q$.  Although there exist positive passages manually labeled for $q$ in the dataset, the synthesis of positive passages can distill a broader range of knowledgeable contexts from LLM to the retriever, and provide different perspectives on the query, which prevents overfitting to specific keywords or contexts. We generate synthetic positive passage $p_i^+$ related to query $q_i$ with prompt $\mathcal{P}_+$:
+\begin{equation}
+p^+_i = \mathcal{M}(\mathcal{P}_+(q_i))
+\end{equation}
+
+In addition, contrastive learning can be made more robust using \emph{hard-negatives}  \cite{robinson2021contrastive} where hard-negatives are samples that are difficult to distinguish from positive samples. For the retriever, hard negatives are plausible but irrelevant answers to query $q$. We synthesize hard-negative passage $p_i^-$ with prompt $\mathcal{P}_-$ given by
+\begin{equation}
+p^-_i = \mathcal{M}(\mathcal{P}_-(q_i))
+\end{equation}
+
+\noindent\textbf{Hallucination as Hard-negatives.} We take a step to verify whether synthetic positive passages are indeed relevant to the given query. Using LLMs to generate answers runs a risk of \emph{hallucinations}. Hallucination is a non-factual but seemingly plausible passage. The synthetic positive $p_i^+$ can potentially be a hallucination. However, \emph{the plausible irrelevance of hallucination fits the definition of hard-negatives.} Thus, we re-use hallucination as hard negative passages, which differs from prior works \cite{weng2023large,  madaan2024self} 
+which simply discards hallucination outputs.  
+
+To that end, once positive passage $p_i^+$ is synthesized, LLM checks the passage for hallucination. LLMs are known to have self-verification ability \cite{weng2023large}, i.e., they can re-verify the inferred answer. If $p_i^+$ is decided as hallucination, we label $p_i^+$ as a hard-negative, which we call \emph{Relabeling} step. Specifically,
+\begin{equation}
+     \hat p_i = \mathcal{M}(\mathcal{P}_{\mathrm{Relabel}}(q_i, p_i^+))
+\end{equation}
+where $\mathcal{P}_{\mathrm{Relabel}}$ denote the prompting for relabeling.
+If $p_i^+$ is relabeled as a hard-negative,  query $q_i$ will have two hard-negatives (synthetic and relabeled) and two positives (manually labeled and CoT).
+
+In summary, given query $q_i$, positive passages are manually labeled passage $p_i$, CoT $q_i^\text{cot}$, and synthetic positive $p_i^+$ (if not relabeled as negative). The negative passages are $p_i^-$ (and relabeled passages, if any) and in-batch samples. An example of synthesized passages is shown in Fig.~\ref{fig:synthetic}.
+
+\begin{figure}[t!]
+\centering
+    \includegraphics[width=.5\textwidth]{synthetic.png}
+    \caption{Example of LLM synthesis. The correct answer to the query is shown in red font.} 
+    \label{fig:synthetic}
+\end{figure}
+
+
+\noindent\textbf{Putting positives together: modified Soft-Nearest Neighbor Loss.}
+Next, we train the retriever with synthesized passages. Considering that there are multiple positives for a given query, we propose to use a loss inspired by soft-nearest neighbor (SNN) loss \cite{frosst2019analyzing}. SNN loss is used in metric learning for supervised classification as follows. Consider batch $B$ from a labeled dataset and a sample $x_i$ in  $B$ with label $y_i$.  The ``nearest'' neighbor (NN) to $x_i$ is selected from $B$ in a randomized fashion: the probability of $x_j$ being selected as the NN is $\propto \exp(-d_T(x_i,x_j))$ where $d_T$ is the distance metric with temperature parameter $T$. SNN loss is the negative logarithm of the probability that the NN of $x_i$ is in the same class as $x_i$:
+\[
+\mathcal L_{\text{SNN}}(x_i)=-\log\,\left(\dfrac{\sum_{j\in B:y_j=y_i}\exp(-d_T(x_i,x_j))}{\sum_{j\in B}\exp(-d_T(x_i,x_j))}\right)
+\]
+ The goal of loss $\mathcal L_{\text{SNN}}$ is \emph{entanglement} \cite{frosst2019analyzing} which is to closely cluster the sample embeddings from the same class.  
+
+We consider a loss inspired by SNN loss. In our case, the set of points we want to cluster is a group of 4 samples ($q_i$, $p_i$, $p_i^+$, $q^\mathrm{cot}_i$). Although these groups do not represent individual classes as in SNN loss, we still want the group to be ``entangled''. Thus, similar to SNN loss, we propose a loss $\mathcal{L}_\mathrm{distill}(q_i)$ for query $q_i$ 
+given by
+\begin{align*}
+&\mathcal{L}_\mathrm{distill}(q_i) =-\log\big(\\&  \frac{e^{s_{\tau}(q_i, p_i)}+e^{s_{\tau}(q_i, p^+_i)}+e^{s_{\tau}(q_i, q^\mathrm{cot}_i)}}
+{\sum\limits_{j\in B} e^{s_{\tau}(q_i, p_j)}+e^{s_{\tau}(q_i, p^+_j)}+e^{s_{\tau}(q_i, q^\mathrm{cot}_j)}+e^{s_{\tau}(q_i, p^-_j)}}\bigg)
+\end{align*}
+where the similarity metric $(s_\tau)$ is used instead of the negative distance $(-d_T)$.
+Another difference between $\mathcal{L}_\mathrm{distill}(q_i)$ and SNN loss is that there is no attraction term for synthetic hard-negatives ($p_i^-$) in $\mathcal{L}_\mathrm{distill}(q_i)$, i.e., they are used only for repulsion from other samples. 
+\subsection{Stage-2. Retriever Alignment from LLM Feedback}\label{stage2}
+
+Alignment is a process of aligning language models with human preferences~\cite{ouyang2022training, rafailov2024direct}. Alignment provides LMs with a pair of answer candidates for a question, where the preference between the pair is labeled by humans. We propose to align the retriever with LLM preferences as follows. Given a query, the retriever trained in the distillation stage is asked to retrieve top-$K$ passages. Next, a pair of passages is sampled from top-$K$ passages, and LLM is asked to provide the preference between the pair. Since $K$ passages are top passages from a retriever trained through the distillation stage, deciding the preference between the pair is likely to be challenging (for moderately small $K$, e.g., $K=5$). The retriever is continually trained based on the preference feedback from LLMs. The details of the alignment process are outlined as follows.
+
+\noindent{\textbf{Step 1: Retrieve top-$K$ passages.}} Given query $q_i$, we retrieve top-$K$ passages using encoder $\hat{E}$ trained through the distillation stage:
+\begin{align*}
+    \hat{\mathcal{C}}_i = \mathrm{Retrieval}(q_i, \mathcal{Z}, K, \hat{E}) = \{c_{i,1}, c_{i,2}, ..., c_{i,K}\}
+\end{align*}
+
+\noindent{\textbf{Step 2: Pair-wise Comparison.}} A pair of passages, $c_{i,j}$ and $c_{i,k}$, is sampled from $\hat{\mathcal{C}}_i$. We probe LLM to decide which passage is more relevant to answer query $q_i$ using prompt $\mathcal{P}_{\mathrm{Compare}}$:
+\begin{equation}    \label{eq:placket}
+    (q_i,c_i^+,c_i^-)= \mathcal{M}(\mathcal{P}_{\mathrm{Compare}}(q_i, c_{i,j}, c_{i,k}))
+\end{equation}
+where LLM labels the more (resp. less) preferred passage as $c_i^+$ (resp. $c_i^-$). We compute the pairwise preferences of $N$ distinct passage pairs sampled from $\hat{\mathcal C}_i$ where $N\leq {K \choose 2}$ is a hyperparameter.
+
+
+\noindent{\textbf{Step 3: Partial Plackett-Luce ranking.}} Consider batch $B$ of triples $(q_i, c_i^+, c_i^-)$ obtained in \textbf{Step 2} where $q_i$'s in the batch are distinct. Encoder $\hat E$ is fine-tuned with the following loss function:
+ \begin{align}
+        &\mathcal{L}_{\mathrm{align}}(q_i) = 
+        -\log\Bigg[\dfrac{e^{s_{\tau}(q_i, c_i^+)}}{\sum\limits_{j\in B} \left(e^{s_{\tau}(q_i, c_j^+)} + e^{s_{\tau}(q_i, c_j^-)}\right)}\nonumber\\&\times\dfrac{e^{s_{\tau}(q_i, c_i^-)}}{e^{s_{\tau}(q_i, c_i^-)}+\sum\limits_{j\in B, j\neq i} \left(e^{s_{\tau}(q_i, c_j^+)} + e^{s_{\tau}(q_i, c_j^-)}\right)}\Bigg] \label{eq:ppl-loss}
+    \end{align}
+
+We refer to the training under loss (\ref{eq:ppl-loss}) as \emph{partial Plackett-Luce ranking}. The method is explained in detail as follows.  
+
+\noindent\textbf{From Bradely-Terry to Plackett-Luce model.} Preference modeling has been used for aligning language models with human preferences~\cite{ouyang2022training, rafailov2024direct}. Bradley-Terry (BT) model \cite{bradley1952rank} is widely adopted for modeling preference over two choices.  Consider a pair of answer passages $y_w$ and $y_l$ given query $q$. If $y_w$ is preferred over $y_l$ by a human annotator, the preference relation is denoted as $y_w\succ y_l\, |\, q$. In preference modeling, it is typically assumed that there exists some (implicit) reward function $r(q,y)$ for query $q$ and answer $y$. Given query $q$ and two answers $y_1$ and $y_2$,  BT model is defined by the distribution
+\begin{align}\label{eq:pair}
+     p(y_1 \succ y_2 \, |\, q) = \dfrac{e^{r(q, y_1)}}{e^{r(q, y_1)} + e^{r(q, y_2)}} 
+\end{align}
+The fitting of BT model involves either explicitly formulating and optimizing reward $r(\cdot,\cdot)$ \cite{ziegler2019fine,ouyang2022training}, or implicitly doing so by policy optimization through parameterization \cite{rafailov2024direct}.
+
+Plackett-Luce (PL) model~\cite{plackett1975analysis, luce1959individual} generalizes BT model to ranking $M\geq 2$ choices. Suppose $\pi:[M]\to[M]$ is a permutation. Given query $q$ and  answers $y_1,...,y_M$, we define the notation: 
+\begin{align*}
+p(\pi\,|\,q):=p(y_{\pi(1)}\succ y_{\pi(2)} \succ ... \succ y_{\pi(M)}\,|\,q).
+\end{align*}
+The PL model defines distribution $p(\pi\,|\,q)$ as
+\begin{align}\label{eq:pl}
+   p(\pi \, |\, q) = \prod_{m=1}^M \left(\dfrac{e^{r(q, y_{\pi(m)})}}{\sum_{j=m}^M e^{r(q,y_{\pi(j)})}}\right)
+\end{align}
+where the $m$-th term in the product of (\ref{eq:pl}) is the soft-max probability of the reward for the choice of rank $m$, $r(q,y_{\pi(m)})$, along with the rewards of choices of lower preferences.
+
+\noindent\textbf{Partial Ranking through Marginalization.} The key idea of our method is to include in-batch samples in preference modeling. Consider triple $(q_i, c_i^+, c_i^-)$ from batch $B$. Our goal is to model the following preference relation:
+\begin{align}
+c_i^+ \succ c_i^- \succ \{\text{in-batch samples}\}\,|\, q_i\label{eq:pref}
+\end{align}
+where the preference ordering of in-batch samples can be arbitrary or ``don't care''. Relation (\ref{eq:pref}) is explained as follows. Firstly, $c_i^+$ is preferred over $c_i^-$ by LLM given $q_i$. Secondly, since $c_i^+$ and $c_i^-$ are in top-$K$ passages obtained from a retriever trained through the distillation stage, it is highly likely that \emph{both $c_i^+$ and $c_i^-$ are preferred over irrelevant samples in the batch.} We call this relation \emph{partial ranking}, since the ranking of the samples is incompletely specified.
+
+The preference relation in (\ref{eq:pref}) can be modeled by \emph{marginalization} of Plackett-Luce distribution given by (\ref{eq:pl}) as follows. Suppose we want to model the preference relation
+\begin{align}
+y_{\pi(1)} \succ y_{\pi(2)} \succ \{y_{\pi(3)},\ldots,y_{\pi(M)}\}\,|\, q\label{eq:y}
+\end{align}
+where the top-two choices ($\pi(1)$ and $\pi(2)$) are preferred over the rest ($\pi(3),\ldots,\pi(M)$), and the ordering of the rest can be arbitrary.  Since $p(\pi|q)$ is a distribution over $\pi$, the distribution modeling (\ref{eq:y}) can be obtained by marginalizing $p(\pi|q)$ over the components of $\pi$ except top-two choices, $\pi(1)$ and $\pi(2)$. Specifically, we have  that
+\begin{align}
+&\sum_{\pi(3),\pi(4),...,\pi(M)}p(\pi \, |\, q) =\dfrac{e^{r(q, y_{\pi(1)})}}{\sum_{j=1}^M e^{r(q,y_j)}} \nonumber \\ &\times \dfrac{e^{r(q, y_{\pi(2)})}}{e^{r(q, y_{\pi(2)})}+\sum\limits_{j\neq\pi(1),\pi(2)} e^{r(q,y_j)}}\label{eq:ml}
+\end{align}
+The derivation of (\ref{eq:ml}) is provided in Appendix \ref{appendix:proof}.
+Thus, if we set $q=q_i$, $y_{\pi(1)} = c_i^+$,  $y_{\pi(2)} = c_i^-$ and the rest of $y$'s as in-batch samples with $M=|B|$ and the reward $r(\cdot,\cdot)$ as the similarity metric $s_\tau(\cdot,\cdot)$, then (\ref{eq:ml}) models the partial relation (\ref{eq:pref}).
+
+
+In conclusion, the proposed loss (\ref{eq:ppl-loss}) is the negative log-likelihood of the marginalized PL model representing partial ranking given by (\ref{eq:pref}), which makes our training a maximum likelihood estimation under distribution (\ref{eq:ml}). The key question is: \emph{why should we include in-batch samples in the preference modeling?}
+
+\noindent\textbf{Combining Preference Modeling {and} Contrastive Learning.} Our observation is that, the training objective for preference modeling invariably takes the form of a \emph{contrastive loss}. For example, the BT model is trained with the loss which is the negative log of (\ref{eq:pair}). Suppose we use the BT model, in which case $y_1$ and $y_2$ in (\ref{eq:pair}) are replaced by $c_i^+$ and $c_i^-$ respectively. From a contrastive learning perspective, (\ref{eq:pair}) attracts $c_i^+\,(y_1)$ to $q$, but repels $c_i^-\,(y_2)$ from $q$. But this may unintentionally move $c_i^+$ and $c_i^-$ closer to samples irrelevant to $q_i$. This is undesirable, because $c_i^+$ and $c_i^-$ are among top-$K$ documents retrieved by the model trained through the distillation stage, and thus should be regarded as relatively ``positive'' and kept away from irrelevant in-batch negatives. Conventional preference modeling, such as  BT model, lacks perspective on learning with negative (irrelevant) samples.
+
+
+The proposed loss directly addresses the problem: it not only captures the LLM's preferences but also maintains separation among irrelevant documents. Thus, \emph{our loss combines preference modeling and contrastive learning.} It can be seen that (\ref{eq:ppl-loss}) is simply a sum of two contrastive-type losses.
+By having a similar form of contrastive loss as that from the distillation stage, e.g., positive embeddings keeping distances from in-batch negatives, our alignment loss serves as \emph{regularization}. 
+That is, the model is prevented from excessively deviating from that trained in the distillation stage.
+Regularization is deemed important in the alignment of LLMs as well \cite{ouyang2022training}. In addition, it is reported that the larger number of negatives leads to better performance in contrastive learning~\cite{he2020momentum}. 
+In the Experiments section, we show that partial PL ranking model achieves robust performances across datasets, whereas BT model occasionally suffers from poor alignment.
+
+
+
+\begin{table*}[t!]
+\begin{adjustbox}{width=1.\textwidth,center}
+\begin{tabular}{ccccccccccc}
+\hline
+\textbf{Method}   & BM-25 & DPR  & CoCondenser & RocketQA & Contriever & E5            & BGE-M3-EN & Nomic-Embed   & \textbf{Syntriever}             \\\hline
+\textbf{MSMARCO}  & 22.8  & 36.8 & 37.4        & 30.2     & 40.3       & \textbf{42.4} & 41.3      & 37.1                     & \textbf{\underline{50.3}} \\
+\textbf{HotpotQA} & 60.1  & 48.9 & 56.3        & 53.3     & 61.2       & 63.4          & 64.2      & \textbf{66.3}             & \textbf{\underline{70.2}} \\
+\textbf{FiQA}     & 23.5  & 21.4 & 27.6        & 30.2     & 31.4       & 37.9          & 39.1      & \textbf{40.9}            & \textbf{\underline{41.9}} \\
+\textbf{Fever}     &  \underline{\textbf{75.3}}  & 50.7    &      51.8   &   52.3   &    53.7   &   57.1  &     54.3  &    53.5  &    \textbf{60.3} \\
+\textbf{SciFact}  & 66.5  & 63.3 & 48.7        & 56.8     & 64.9       & 73.7          & 75.4      & \textbf{79.1}             & \textbf{\underline{80.5}} \\
+\textbf{NFCorpus} & 32.5  & 35.4 & 32.5        & 29.3     & 31.7       & 35.8          & \textbf{38.2}      & 36.8             & \textbf{\underline{43.3}} \\
+\textbf{NQ}       & 32.9  & 41.2 & 43.3        & 42.1     & 42.5       & 49.3          & 46.3      & \textbf{50.1}             & \textbf{\underline{52.1}} \\\hline
+\end{tabular}
+\end{adjustbox}
+\caption{Supervised fine-tuning results on seven BeIR benchmark with training datasets (nDCG@10). The best scores are highlighted in \underline{\textbf{bold with underline}} and, the second best scores are emphasized in \textbf{bold}.}
+\label{tab:main_results}
+\end{table*}
+
+\begin{table*}[t!]
+\begin{adjustbox}{width=1.\textwidth,center}
+\begin{tabular}{ccccccccccc}
+\hline\textbf{Method}        & BM-25 & DPR   & CoCondenser & RocketQA & Contriever & BGE-M3-EN & E5 & Nomic-Embed  & \textbf{Syntriever} \\\hline
+\textbf{MSMARCO}       & 22.8  & 17.7  & 24.3       & 23.2     & 40.7       &    35.2  & \textbf{43.1}    &   26.4           &    \underline{\textbf{50.1}}              \\
+\textbf{Trec-covid}    & 65.6  & 33.2  & \textbf{71.2}       & 67.5     & 59.6       & 44.6   & 61.7  & 67.1 &    \underline{\textbf{75.3}}              \\
+\textbf{HotpotQA}      & 60.3  & 39.1  & 56.3       & 35.6     & 63.8       &  \textbf{68.3} & 52.4   & \textbf{\underline{69.1}}          &    60.2              \\
+\textbf{FIQA}          & 23.6  & 11.2 & 27.6       & 30.2     & 32.9       & 28.3 & \textbf{37.9}   & 37.8             &   \underline{\textbf{39.5}}               \\
+\textbf{Arguana}       & 31.5  & 17.5  & 29.9       & 45.1     & 44.6       & \underline{\textbf{61.5}}  & 51.4   & \textbf{54.2}          &   38.8              \\
+\textbf{Touche-2020}   & \underline{\textbf{36.7}}  & 13.1  & 19.1       & 24.7     & 23.0       & 13.5 & \textbf{28.3}   & 19.0          &   19.9              \\
+\textbf{Quora}         & 78.9  & 24.8  & 30.5       & 31.2     & 86.5       & \textbf{88.7 }& 87.9   &  88.4         &    \underline{\textbf{88.9}}             \\
+\textbf{CQADupstack}       &   29.9  &  15.3  &    17.2    &   19.3   &  34.5   &   40.2  &  28.3   &      \underline{\textbf{49.6}}     &      \textbf{41.4}           \\
+\textbf{DBPedia}       & 31.3  & 26.3  & 36.3       & 35.6     & 41.3   & 19.0    & 33.8   & \textbf{39.4}          &     \underline{\textbf{39.8}}            \\
+\textbf{Climate-Fever} & 21.3  & 14.8  & 14.4       & 18.0     & \textbf{23.7}       & 18.3  & 15.4  &   \underline{\textbf{27.0}}            &     13.1            \\
+\textbf{SciDocs}       & 15.8  & 7.7   & 13.7       & 13.1     & 16.5       & 9.6  & 19.0   & \textbf{19.2}         &    \underline{\textbf{19.7}}             \\
+\textbf{SciFact}       & 66.5  & 31.8  & 61.5       & 56.8     & 69.3       &  71.5 &   \underline{\textbf{73.1}}   &  \textbf{71.8}           &   64.2              \\
+\textbf{NFCorpus}      & 32.5  & 18.9  & 32.5       & 29.3     & 32.8       & 32.7   &  35.1 &    \textbf{35.5}             &  \underline{\textbf{36.6}}          \\
+\textbf{Fever}         & \textbf{75.3}  & 56.2  & 49.5       & 67.6     & \underline{\textbf{75.8}}       & 64.3   & 58.2 & 60.3           &     60.2            \\
+\textbf{NQ}            & 32.9  & 47.4  & 48.7       & 59.5     & 49.8       & 29.8  & \textbf{60.0}   & 51.2          &   \underline{\textbf{62.2}} \\\hline              
+\end{tabular}
+\end{adjustbox}
+\caption{Zero-shot transfer results on  BeIR benchmark datasets (nDCG@10). The best scores are highlighted in \underline{\textbf{bold with underline}}, and the second best scores are emphasized in  \textbf{bold}.}
+\label{tab:main_zeroshot}
+\end{table*}

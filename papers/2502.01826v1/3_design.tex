@@ -1,0 +1,327 @@
+\section{Design of \ourSystem}\label{sec_design}
+
+\begin{figure*}[t]
+\centering
+{\includegraphics[width=.95\textwidth]{figs/workflow.pdf}}
+\caption{Illustration of the \ourSystem architecture, trained end-to-end, consisting of three main building blocks.}
+  \Description[]{}
+	\label{fig_workflow}
+  \vspace{-10pt}
+\end{figure*}
+
+
+
+Figure~\ref{fig_workflow} illustrates \ourSystem, which synthesizes the received signal at a specific receiver for a transmitter positioned at any location in the scene. 
+\textit{i)~Gaussian-based RF scene representation} models the scene with 3D Gaussians, each storing geometric and RF-related attributes.  
+\textit{ii)~Gradient-guided attribute learning} optimizes these attributes via gradients while dynamically adjusting the number of Gaussians.  
+\textit{iii)~RF-customized CUDA for ray tracing} computes the received signal by emitting rays from the receiver, identifying ray-Gaussian intersections via orthographic projection-based splatting, and aggregating RF attributes along each ray.
+
+
+\subsection{Gaussian-Based Scene Representation}
+
+Each customized 3D Gaussian distribution carries four attributes:  
+i)~mean \(\boldsymbol{\mu}\) and ii)~covariance matrix \(\boldsymbol{\Sigma}\), which define its geometric properties, including position, size, shape, and orientation;
+iii)~emission \(\boldsymbol{\psi}\) and iv)~attenuation \(\boldsymbol{\rho}\), which characterize the Gaussian's influence on RF signal propagation.
+
+
+\textbf{i)~Mean~\(\boldsymbol{\mu}\) and ii)~Covariance Matrix~\(\boldsymbol{\Sigma}\):}  
+A 3D Gaussian  distribution resembles an ellipsoid, representing a probability distribution in 3D space, as defined by the probability density function~(PDF) in Equation~(\ref{eqn_gaussian}).
+The center of the distribution is a 3D position (mean \(\boldsymbol{\mu}\)), indicating the peak location, while the spread and orientation in space are determined by a full~\(3 \times 3\) covariance matrix \(\boldsymbol{\Sigma}\):
+\begin{equation}
+\label{eqn_gaussian}
+    P\left(\mathbf{x}\right) = e^{-\frac{1}{2} \left(\mathbf{x} - \boldsymbol{\mu}\right)^\text{T} \boldsymbol{\Sigma}^{-1} \left(\mathbf{x} - \boldsymbol{\mu}\right)}
+\end{equation}
+
+
+
+
+
+
+\textbf{iii)~Emission~\(\boldsymbol{\psi}\):}
+Each point on a wavefront serves as a source of wavelets, according to the Huygens–Fresnel principle~\cite{born2013principles}.
+Analogously, when an RF signal from a transmitter encounters a 3D Gaussian, the Gaussian acts as a scattering point, re-emitting an RF signal termed emission \(\boldsymbol{\psi}\). 
+This emission is characterized by \(\boldsymbol{\psi} = \left|\boldsymbol{\psi}\right| e^{j \angle \boldsymbol{\psi}}\), where \(\left|\boldsymbol{\psi}\right|\) represents the amplitude and \(\angle \boldsymbol{\psi}\) denotes the phase.
+
+
+
+Emission \(\boldsymbol{\psi}\) varies due to factors such as surface orientation relative to the incident signal and the material properties at the Gaussian's position.  
+Moreover, the transmitter position influences \(\boldsymbol{\psi}\) by altering the incident angle.  
+Thus, \(\boldsymbol{\psi}\) depends on both the direction and the transmitter position.
+To this end, we employ a small neural network, \(f_\Theta\), within each Gaussian to encode the directional emission signal:
+\begin{equation}
+\label{eqn_radiance_mlp}
+\boldsymbol{\psi} = f_\Theta \left(x_{\text{tx}}, y_{\text{tx}}, z_{\text{tx}}, \alpha, \beta\right)
+\end{equation}
+where \(f_\Theta\) takes the transmitter position \(\left\{x_{\text{tx}}, y_{\text{tx}}, z_{\text{tx}}\right\}\) and the direction \(\left\{\alpha, \beta\right\}\) as inputs and outputs the corresponding emission \(\boldsymbol{\psi}\). 
+Here, \(\left\{\alpha, \beta\right\}\) represents the direction from the 3D Gaussian's position to the receiver.  
+Since \(f_\Theta\) models only its own Gaussian's emission, it has a small number of parameters,~\ie~two fully connected layers with ReLU activation.
+
+
+
+\textbf{iv) Attenuation~\(\boldsymbol{\rho}\):}
+An RF signal passing through a 3D Gaussian undergoes attenuation \(\boldsymbol{\rho}\), resulting in an amplitude reduction \( \left|\boldsymbol{\rho}\right| \) and a phase shift \( \angle \boldsymbol{\rho} \).  
+According to Maxwell's equations~\cite{maxwell1873treatise}, attenuation depends on material properties.  
+Thus, the attenuation \(\boldsymbol{\rho}\) of a 3D Gaussian is primarily determined by the material properties at its location.
+
+
+
+\subsection{Gradient-Guided Attribute Learning}  
+We initialize the number of Gaussians and their attributes, then optimize both with gradient-based strategies. 
+Gradients are calculated after computing the loss in §\ref{sec_training_loss}.  
+Finally, we discuss the efficiency of using 3D Gaussians.
+
+
+\subsubsection{Cube-Based Initialization}
+We partition the scene into equal-sized cubes, each with a side length \( L_{\text{cube}} \), empirically set to six times the wavelength.  
+The center of each cube is assigned as a Gaussian's mean.  
+The covariance matrix is initialized based on the average distance to the \( N_{\text{cube}} \) nearest cube centers, where \( N_{\text{cube}} \) is set to three, while attenuation and emission are assigned randomly.
+Compared to random initialization, this cube-based strategy ensures that the Gaussians cover the entire scene, leading to faster convergence.
+
+
+
+\subsubsection{Gradient-Based Updating}
+The following two strategies are employed to update the number of Gaussians and their attributes for flexible and efficient scene representation.
+
+
+\textbf{i)~Attribute Updating:}
+Each 3D Gaussian explicitly stores its own attributes and updates them using SGD~\cite{amari1993backpropagation}:
+\begin{equation}
+\label{eqn_updating}
+w^{\left(j+1\right)} = w^{\left(j\right)} - \eta_{w} \cdot \nabla_{w} \mathcal{L}\left(w^{\left(j\right)}\right)
+\end{equation}
+where \(w\) represents any attribute of a Gaussian, each with its own learning rate \(\eta_{w}\).  
+The term \(\nabla_{w} \mathcal{L}\left(w^{(j)}\right)\) denotes the gradient of the loss function \(\mathcal{L}\), defined in Equation~(\ref{eqn_loss}), with respect to \(w\) at iteration \(j\).  
+For emission \(\boldsymbol{\psi}\), the updated parameters belong to the network \(f_\Theta\).
+
+The covariance matrix \(\boldsymbol{\Sigma}\) is physically meaningful only when positive semi-definite~\cite{de2011strict}, but the update equation above does not guarantee this property.  
+To address this, we adopt the solution proposed in \cite{kerbl20233d}, which represents \(\boldsymbol{\Sigma}\) as \(\Sigma = R S S^{T} R^{T}\), where \(R\) is a rotation matrix and \(S\) is a scaling matrix.  
+Updates are applied independently to \(R\) and \(S\), ensuring that \(\boldsymbol{\Sigma}\) remains positive semi-definite.
+
+
+
+\textbf{ii)~Number of Gaussian Updating:}
+The initial number of Gaussians is set by cube-based initialization.  
+However, this number is suboptimal, as some areas require more Gaussians~(\eg object regions), while others need fewer~(\eg free space) to model RF signal propagation effectively.
+We observe that such cases lead to large gradients for the Gaussian's mean~\(\boldsymbol{\mu}\), as the existing 3D Gaussians do not adequately capture the area's effect on RF signal propagation.  
+The mean~\(\boldsymbol{\mu}\) exhibits larger gradients than other attributes because it represents the position with the highest probability, making it crucial for modeling RF signal behavior.
+
+
+
+To this end, we employ a gradient-threshold-based strategy: 
+\textit{First}, every \(N_{\boldsymbol{\mu}}\) iterations, we compute the average gradient of the mean \(\boldsymbol{\mu}\) for all Gaussians and select those with a mean gradient exceeding a threshold \(\epsilon_{\boldsymbol{\mu}}\).  
+\textit{Second}, we determine the radius of each selected Gaussian, approximated as the average of the diagonal values of its covariance matrix.  
+A radius threshold \(\epsilon_{r}\) classifies them as small or large Gaussians.
+\textit{Third}, small Gaussians are cloned by duplicating them and shifting the copies in the direction of the gradient.
+Large Gaussians are split into two new Gaussians, reducing their scaling matrix \(R\) by a factor of \(\phi\) and initializing their positions by sampling from the original Gaussian's PDF.
+
+Additionally, every \(N_{\boldsymbol{\rho}}\) iterations, we remove Gaussians with attenuation~\(\boldsymbol{\rho}\) below a threshold \(\epsilon_{\boldsymbol{\rho}}\), as they minimally impact signal propagation, \eg in free space.  
+A single 3D Gaussian distribution can represent a large free space.
+
+
+
+
+\subsubsection{Efficiency of 3D Gaussian}\label{sec_design_gaussian}
+
+
+Unlike fixed voxel grids, which require numerous voxels to capture the entire scene's effects on signal propagation, 3D Gaussians adjust their position, shape, size, and orientation to represent these effects.  
+This adaptability enables 3D Gaussians to achieve similar representation quality with far fewer voxels, improving computational efficiency and reducing training data requirements.
+For example, a typical conference room~\cite{matlab_conference_room} requires learning the attributes of 31,257,628 voxels~(Section~\ref{sec_theoretical_ana}).  
+In contrast, only 393,920 Gaussians may be needed, an \(\mathord{\sim}80\)-fold reduction, assuming the optimal count matches the number of points in the conference room's point cloud data. 
+
+
+
+
+
+\subsection{RF-Customized CUDA for Ray Tracing}
+
+The emitted rays from the receiver are formalized, followed by an orthographic projection-based splatting module, which identifies Gaussians intersected by each ray.  
+Next, the complex-valued blending algorithm computes the received signal based on these intersections.  
+Finally, computation is parallelized using customized CUDA kernels.
+
+
+\subsubsection{Definition of Rays}
+Rays extend from the receiver in various directions, \eg ray \(\gamma\) in Figure~\ref{fig_blending}:
+\begin{equation}
+\label{eqn_ray_define}
+\gamma(d) = \mathbf{l}_{\text{rx}} + d \hat{\mathbf{v}}, \quad \text{where} \quad d \geq r_{\text{rx}}
+\end{equation}
+where \(d\) is the distance from the receiver to a point \(r(d)\) on the ray, \(\mathbf{l}_{\text{rx}} = \left(x_{\text{rx}}, y_{\text{rx}}, z_{\text{rx}}\right)\) denotes the receiver position, and the unit vector \(\hat{\mathbf{v}} = \left(\cos\alpha \cos\beta, \sin\alpha \cos\beta, \sin\beta\right)^\top\) defines the ray direction, with \(\alpha\) and \(\beta\) as the azimuthal and elevation angles, respectively.  
+The condition \(d \geq r_{\text{rx}}\) indicates that the ray starts at a distance \(r_{\text{rx}}\) from the receiver.
+Thus, \(360 * 90\) rays are emitted from a spherical surface centered at the receiver with radius \(r_{\text{rx}}\).
+We refer to this surface as the Ray Emitting Spherical Surface~(RESS).
+
+
+
+\subsubsection{Orthographic Projection-Based Splatting}\label{sec_ortho}
+The uniform voxel grid structure allows straightforward identification of the voxels a ray passes through.  
+However, the irregular and discrete placement of 3D Gaussians complicates determining which Gaussians a ray intersects.  
+Intuitively, each ray must be checked against all Gaussians, resulting in a computational complexity of \(O(M \times N)\), where \(M\) is the total number of rays and \(N\) is the total number of Gaussians.
+
+
+In 3DGS, to accelerate the determination of which Gaussians affect each ray~(pixel), 3D Gaussians are projected~(or "splatted") onto a 2D image plane.  
+This splatting process utilizes the View Matrix, Projection Matrix, and Jacobian Matrix~\cite{takikawa2021neural} to form 2D Gaussians on the image plane.  
+Each projected 2D Gaussian is represented as a circle centered at its mean, with a radius determined by the 2D covariance matrix.  
+Pixels~(rays) within this circle are considered affected by the original 3D Gaussian.  
+This splatting reduces computational complexity to \(O(N)\) by localizing each Gaussian’s influence to a specific region on the image plane.
+
+ 
+\begin{figure}[!tp]	{\includegraphics[width=.47\textwidth]{figs/bleding.pdf}}
+    \caption{Illustration of the complex-valued blending algorithm, which calculate the received signal in direction \(\gamma\). Four 3D Gaussians are shown, where \(\boldsymbol{\psi}\) and \(\boldsymbol{\rho}\) denote the emission and attenuation of each Gaussian. Each emission \(\boldsymbol{\psi}_i\) is attenuated by \(\boldsymbol{\rho}_m\) from Gaussians \(m\) (from \(1\) to \(i - 1\)). The final received signal in direction \(\gamma\) is the sum of these attenuated emissions.}
+\label{fig_blending}
+ \Description[]{}
+\end{figure}
+
+
+\textbf{2D RF Plane:}  
+The above splatting is not applicable in the RF domain without an image plane.   
+Instead, the received signal is measured on the RESS.
+To enable splatting, the RESS is transformed into a 2D RF plane.  
+Specifically, the Cartesian coordinates \((x, y, z)\) of each point on the RESS are converted to spherical coordinates \((\zeta, \alpha, \beta)\), with \((\alpha, \beta)\) rounded to the nearest integers to achieve one-degree resolution:
+\begin{equation}
+\label{eqn_projection}
+\begin{aligned}
+\begin{pmatrix}
+\zeta \\
+\alpha \\
+\beta
+\end{pmatrix}
+&=
+\begin{pmatrix}
+\sqrt{x^2 + y^2 + z^2} \\
+\arctan2\left(y, x\right) \\
+\arccos\left(\frac{z}{\sqrt{x^2 + y^2 + z^2}}\right)
+\end{pmatrix} \\
+x' &= \lfloor \alpha \rfloor, \quad y' = \lfloor \beta \rfloor
+\end{aligned}
+\end{equation}
+where \(\zeta\) is the radial distance, \(\alpha\) the azimuthal angle, \(\beta\) the elevation angle, and \(\lfloor \cdot \rfloor\) the floor function.  
+\(\left(x', y'\right)\) represents the projected coordinates in the 2D RF plane.
+
+
+\textbf{Splatting:}  
+Each 3D Gaussian is splatted onto the RF plane, forming a 2D Gaussian represented as a circle.  
+Gaussian mean \(\boldsymbol{\mu}\) is projected onto the 2D plane using Equation~(\ref{eqn_projection}), defining the circle's center.  
+Jacobian matrix~\cite{takikawa2021neural} maps the \(3 \times 3\) covariance matrix into a \(2 \times 2\) covariance matrix, whose eigenvalues determine the circle's radius.  
+Rays within this circle are considered influenced by the original 3D Gaussian.
+
+
+\subsubsection{Complex-Valued Blending Algorithm}\label{sec_complex_blending}  
+We introduce a complex-valued blending algorithm to process a given ray and its identified intersected Gaussians.  
+First, the Gaussians are sorted by their distance to the receiver.  
+Then, the received signal for the ray is computed by aggregating their RF attributes, incorporating both amplitude and phase channels:
+\begin{equation}
+\label{eqn_blending}
+S = \sum_{i=1}^{N_{\text{intr}}}  \left|\boldsymbol{\psi_i}\right| e^{j \angle \boldsymbol{\psi_i}} \cdot \prod_{m=1}^{i-1} \left( 1 - \left|\boldsymbol{\rho_m}\right| e^{j \angle \boldsymbol{\rho_m}} \right)
+\end{equation}
+where \(S\) is the received signal for a ray, \(N_{\text{intr}}\) denotes the number of Gaussians intersecting the ray, and \(\boldsymbol{\psi}_i\) and \(\boldsymbol{\rho}_m\) represent the emission and attenuation of the \(i\)-th and \(m\)-th Gaussians, respectively.  
+Emission \(\boldsymbol{\psi}_i\) is attenuated by \(\boldsymbol{\rho}_m\) from preceding Gaussians.
+The received signal is the sum of these attenuated emissions.
+Figure~\ref{fig_blending} illustrates a ray intersecting four Gaussians, represented as follows:
+\begin{equation}
+\begin{aligned}
+S = & \ \boldsymbol{\psi_1} + 
+\boldsymbol{\psi_2} \cdot (1 - \boldsymbol{\rho_1}) + \boldsymbol{\psi_3} \cdot (1 - \boldsymbol{\rho_2}) \cdot (1 - \boldsymbol{\rho_1}) \\
+& + \boldsymbol{\psi_4} \cdot (1 - \boldsymbol{\rho_3}) \cdot (1 - \boldsymbol{\rho_2}) \cdot (1 - \boldsymbol{\rho_1})
+\end{aligned}
+\end{equation}
+
+
+\textbf{Impact of Gaussian Geometry:}  
+In a voxel-based ray tracing algorithm, a ray is assumed to pass through the center of each voxel.  
+However, this assumption does not hold in Gaussian-based scene representation.  
+For example, in Figure~\ref{fig_blending}, both G2 and G3 intersect the ray, but the intersection point on G2 is closer to its mean than that on G3.  
+Even if G2 and G3 share the same emission and attenuation attributes, their contributions to the final received signal differ due to the varying distances of their intersection points from their means.  
+These distances affect the probability of each Gaussian influencing the ray.  
+Therefore, the blending process in Equation~(\ref{eqn_blending}) should account for Gaussian geometry.
+
+
+
+
+To achieve this, the intersection point is first determined by solving the ray equation~(Equation~\ref{eqn_ray_define}) and the ellipsoid equation~(Equation~\ref{eqn_gaussian}).  
+If two solutions exist, their midpoint is taken as the intersection point.  
+Next, the distance between the intersection point and the Gaussian’s mean is calculated.  
+The intersection probability \(p_{\text{intr}}\) is then determined by evaluating the Gaussian’s PDF at this distance.
+Finally, the emission is adjusted by multiplying it by \(p_{\text{intr}}\): \(\boldsymbol{\psi} = p_{\text{intr}} \cdot \boldsymbol{\psi}\).
+
+
+
+
+\subsubsection{CUDA Kernel}
+We develop two CUDA kernels for the forward and backward computations in ray tracing.
+
+
+\textbf{Forward Kernel:}  
+Algorithm~\ref{alg_cuda} outlines the forward kernel.  
+The inputs include the number of rays in azimuth and elevation, the means, covariance matrices, emissions, and attenuations of all 3D Gaussians, as well as the positions of the receiver and transmitter.  
+The output is the received signal computed for all \(360 * 90\) rays.
+
+
+
+Specifically, Line 2 projects 3D Gaussians onto the 2D RF plane.  
+Line 3 partitions all rays into multiple grids, each containing \(N_{\text{rays}}\) rays in the azimuth and elevation directions, to accelerate processing.  
+Line 4 applies the splatting process to identify which Gaussians influence each grid.  
+Line 5 records the sorted Gaussians within each grid.  
+Finally, Lines 7–12 compute the received signal for each ray in parallel using the complex-valued blending algorithm.
+
+
+
+\textbf{Backward Kernel:}
+Since the Forward Kernel is invoked for ray tracing forward computation, PyTorch cannot automatically compute the corresponding computation graph gradients.
+After computing the received signal \(S\) and the loss \(\mathcal{L}\), PyTorch calculates the gradient \(\frac{\partial \mathcal{L}}{\partial S}\), which is then passed to the Backward Kernel.  
+This kernel reverses the computations of the Forward Kernel to compute the gradients for each Gaussian attribute.
+
+
+
+
+\subsection{Training Loss}\label{sec_training_loss}
+After calculating the received signal for each ray, the choice of loss function depends on the type of receiver antenna.
+
+
+\begin{algorithm}[!tp]
+\caption{Forward CUDA Kernel for Ray Tracing}
+\label{alg_cuda}
+\KwIn{$w, h$: numbers of rays in azimuth and elevation}
+\KwIn{$M, C$: means \& covariances of all Gaussians}
+\KwIn{$E, A$: emissions \& attenuations of all Gaussians}
+\KwIn{$L$: positions of receiver and transmitter}
+\KwOut{$O$: received signals for all rays}
+\SetKwFunction{FMain}{RayTracing}
+\SetKwProg{Fn}{Function}{:}{}
+
+\Fn{\FMain{w, h, M, C, E, A, L}}{
+    $M'$, $C'$ $\gets$ \text{sphericalGaussian}($M$, $C$, $L$)  \\
+    \text{Grids} $\gets$ \text{buildGrid}($w$, $h$) \\
+    \text{Idx}, \text{Kys} $\gets$ \text{sphericalSplatting}($M'$, \text{Grids})  \\
+    \text{Ranges} $\gets$ \text{computeGridRange}(\text{Idx}, \text{Kys}) \\
+    $O$ $\gets$ 0  \\
+    \ForAll{grid G in Grids}{
+        \ForAll{ray i in G}{
+            ra $\gets$ \text{getGridRange}(\text{Ranges}, $g$) \\
+            $O$[$i$] $\gets$ \text{Blend}($i$, \text{Idx}, \text{ra} \text{Kys}, $M$', $C'$, $E$, $A$) \\
+        }
+    }
+    \Return $O$
+}
+\end{algorithm}
+
+
+\textbf{i) Antenna Array:}
+When the receiver is an antenna array, it captures signal power from all directions, represented as a~\((360, 90)\) ground-truth matrix, where 360 and 90 correspond to azimuth and elevation angles, respectively, each with one-degree resolution~\cite{zhao2023nerf}.  
+Each matrix entry represents a single real-valued signal power for its corresponding direction.  
+The loss function \(\mathcal{L}\) combines the \(\mathcal{L}_{1}\) loss and the Structural Similarity Index Measure (\(\mathcal{L}_{\text{SSIM}}\)) loss: 
+\begin{equation}
+\label{eqn_loss}
+\mathcal{L} = (1 - \lambda) \mathcal{L}_{1} + \lambda \mathcal{L}_{\text{SSIM}}
+\end{equation}
+where \(\mathcal{L}_{1}\) measures the average difference between the actual and predicted signal power across all rays.  
+Since the~\((360, 90)\) matrix can be viewed as an image~(Figure~\ref{fig_vis_d1}), \(\mathcal{L}_{\text{SSIM}}\) evaluates the structural similarity between the predicted and ground-truth "images," helping \ourSystem learn spatial patterns across rays.  
+The parameter \(\lambda\) balances these two losses.
+
+
+
+\textbf{ii) Single Antenna:}  
+For a single antenna, the ground-truth received signal is either a single real-valued signal power or a complex-valued number containing both amplitude and phase, assumed to be the sum of signals from all directions~\cite{zhao2023nerf}.  
+Thus, \ourSystem computes the predicted signal by summing the signals from all rays.  
+If the received signal is real-valued, the \(\mathcal{L}_{1}\) loss is applied.  
+For a complex-valued signal, the \(\mathcal{L}_{1}\) loss is computed separately for amplitude and phase, then averaged to obtain the final loss.
+ 

@@ -1,0 +1,216 @@
+In this section, we describe the \CAP and \DANISH frameworks for carbon-aware scheduling in data processing clusters.  Each framework operates on a distinct level of abstraction that lends itself to different implementation scenarios.
+
+
+
+
+\subsection{\CAP framework} \label{sec:cap-design}
+
+\begin{figure}[h]
+    \centering \vspace{-1em}
+    \includegraphics[width=\linewidth]{figures/CAPfig.png}
+    \caption{The \CAP (Carbon-Aware Provisioning) module interacts directly with the \textit{cluster manager} (e.g., YARN, Kubernetes) to specify the \textit{amount of resources} (e.g., number of executors) that should be used at any given time, based on a \textit{carbon intensity signal}.  Note that the \CAP framework can be implemented in a way that avoids changes to an existing scheduling policy and/or the cluster manager.}
+    \label{fig:cap-diagram}
+\end{figure}
+
+\CAP (Carbon-Aware Provisioning) is a module that complements any arbitrary scheduling policy -- i.e., it is \textit{scheduling policy-agnostic}.  \CAP's main idea is to define a time-varying resource cap that specifies a maximum number of machines that can be used at any given time step.  To decide this number of machines, \CAP takes inspiration from the literature on online threshold-based algorithms to define a set of carbon-aware decision rules.  In what follows, we detail the design of \CAP alongside analytical results characterizing the trade-off between carbon stretch factor and carbon savings.
+
+\smallskip
+\noindent\textbf{Design space \& modeling. } Given a cluster with $K$ machines, the design space for modulating the maximum number of machines (resp. executors) is given by the integer set $\{0, 1, \dots, K\}$.  Recall intuition \textbf{ii)} from \autoref{sec:theory} -- in what follows, we consider a subset such that $B \in \{1, \dots, K\}$ defines the minimum resource cap for any time step -- i.e., \CAP will always allow the cluster to use $B$ machines.
+With this modification to ensure continuous progress on jobs, the decision variable for \CAP is $r(t) \in \mathcal{R} \coloneqq \{B, \dots, K\}$ for any time step $t \geq 0$; $r(t)$ describes the maximum number of active machines during time $t$.  
+
+For ease of implementation, we assume that $r(t)$ is only enforced during task assignment -- namely, if $r(t)+1$ machines are active shortly after the cap decreases, tasks are not preempted.  Instead, when a machine becomes available (finishes a task), \CAP only allows a new task assignment as long as the current cap $r(t)$ is greater than or equal to the number of active machines.  Otherwise, the newly-available machine is inactive until the resource cap is increased.
+
+In the online algorithms literature, the design space defined above aligns with the $k$-search problem~\cite{Lorenz:08}, where an online player must choose when to ``purchase'' a total of $k$ items over a deadline-constrained sequence of time-varying prices, with the objective of minimizing their cost.  If they do not purchase all items before the deadline, they are %
+forced to purchase the remainder at the final price in the sequence.
+
+The $k$-search problem does not directly model the intended behavior of \CAP in the setting of carbon-aware data processing, owing to the presence of a deadline and discrete time steps.
+However, we propose to cast the problem of determining \textit{how many machines} to use at each time step as \textit{repeated rounds} of $(K-B)$-search, where the notion of a ``compulsory purchase'' is omitted due to the lack of a concrete deadline.  Instead, the minimum cap $B$ takes its place (i.e., by enforcing that some work is always being completed).
+
+The primary advantage of leveraging this connection with the $k$-search problem is the existence of a rigorous (threshold-based) framework that exactly quantifies a trade-off between executing at the current carbon intensity and waiting for better carbon intensities.  From the solution to the $k$-search problem, we have $K-B$ threshold values given by:
+\[
+\Phi_{i+B} = \begin{cases}
+    U , & i=0;\\
+    U - \left(U - \frac{U}{\alpha} \right) \left( 1 + \frac{1}{\left(K-B\right)\alpha} \right)^{i-1} \kern-1em, & i \in \{1, \dots, K-B\}
+\end{cases},
+\]
+where $\alpha$ is the solution to the equation $\left( 1 + \frac{1}{\left(K-B\right)\alpha} \right)^{\left(K-B\right)} \kern-1em = \frac{U-L}{U(1 - \frac{1}{\alpha})}$.  Each of these threshold values corresponds to a carbon intensity, and the resource cap is set based on how many of these values are \textit{above} the current carbon intensity $c(t)$.  Formally, the \CAP algorithm is given as follows:
+
+\begin{algorithm}[h]
+	\caption{\CAP (Carbon-aware provisioning) resource cap algorithm}
+	\label{alg:cap}
+	\begin{algorithmic}[1]
+		\STATE \textbf{parameters:} minimum cap $B$, value $\alpha$, threshold set $\{ \Phi_i \}_{i \in \mathcal{R}}$
+        \STATE \textbf{initialize:} resource cap $r(0) = K$
+        \WHILE{cluster active at time $t \ge 0$} 
+        \IF{carbon intensity $c(t)$ unchanged}
+        \STATE \textbf{pass}
+        \ELSE
+        \STATE $r(t) \gets \arg \max_{i\in \mathcal{R}} \Phi_i : \Phi_i \le c(t)$
+        \STATE \textbf{broadcast:} new resource cap $r(t)$
+        \ENDIF
+        \ENDWHILE
+	\end{algorithmic}
+\end{algorithm}	
+
+We note that although the carbon signal $c(t)$ is defined in continuous time, carbon intensity values and/or carbon prices are empirically reported in discrete time intervals~\cite{electricity-map, watttime} -- this is the reason for the check in line 4.
+
+All together, \CAP as given by \autoref{alg:cap} fits into a broader system according to the diagram of \autoref{fig:cap-diagram} -- it acts as a pluggable component that interacts with the cluster manager (e.g., YARN or Kubernetes), translating real-time carbon intensity signals into a control action in the form of a resource cap that is enforced by the cluster manager.
+
+
+\smallskip
+\noindent\textbf{Analytical results. }
+In what follows, we analyze the \textit{carbon stretch factor} (\sref{Def.}{dfn:csf}) and \textit{carbon savings} (\sref{Def.}{dfn:carbonsavings}) of \CAP.
+We let $\texttt{NCA}$ denote a \textit{non-carbon-aware} baseline scheduler.
+For the sake of analysis, in the following results we assume that the scheduling of tasks (i.e., in both \CAP and \texttt{NCA}) is given by Graham's list scheduling algorithm~\cite{Graham:66}, which is known to produce a schedule that is a $(2 - \nicefrac{1}{K})$-approximation for the optimal makespan on $K$ identical machines.
+
+
+
+
+
+
+Suppose that for a job $\mathcal{J}$, \CAP's schedule completes it at time $T \geq 0$.
+Note that if $c(t) \approx L$ for all time steps, the schedule of \CAP is identical to that of \texttt{NCA} because \CAP always sets $r(t) = K$.  %
+Otherwise, let $\OPT_{K}(\mathcal{J})$ denote the optimal makespan on $K$ machines, and let $\mathcal{M}(B, \mbf{c})$ denote the minimum resource cap specified by \CAP at any point in its schedule (note this depends on the carbon signal $\mbf{c}$).  Formally, we let: $\mathcal{M}(B, \mbf{c}) = \arg \max_{i\in[K]} \Phi_i : \Phi_i \le c(t) \ \forall t \in [0, T]$.
+
+\begin{thm}\label{thm:ksMakespan}
+    \CAP's makespan is at most $\frac{K}{\mathcal{M}(B, \mbf{c})} \left( 2 - \frac{1}{\mathcal{M}(B, \mbf{c})} \right)$ times the optimal makespan.  Compared to a non-carbon-aware baseline, the carbon stretch factor is $\left(\frac{K}{\mathcal{M}(B, \mbf{c})}\right)^2 \frac{2\mathcal{M}(B, \mbf{c})-1}{2K-1}$.
+\end{thm}
+
+We defer the proof of \autoref{thm:ksMakespan} to \autoref{apx:ksMakespan}.  Opposing the increase in makespan, in what follows we analyze the \textit{carbon savings} (in terms of e.g., emissions or price) yielded by \CAP.  Since the carbon signal empirically arrives in discrete time intervals, for ease of analysis we consider a \textit{discretized time model}: namely, assuming that new carbon intensity values arrive at integers in continuous time, we may define a discretized carbon signal for any discrete time step $t$ as $c_{t} \coloneqq c(t') : t' \in [t, t+1)$, where note that $c(t')$ does not change on the interval $t \in [t, t+1)$.
+
+Slightly abusing notation, we let $C_{\CAP}(t)$ denote the carbon emissions of $\CAP$'s schedule during discrete time step $t$, and let $C_{\texttt{NCA}}(t)$ denote the carbon emissions of $\texttt{NCA}$ at discrete time step $t$, respectively.  
+Schedules generated by $\CAP$ and $\texttt{NCA}$ each use a certain number of machines during any discrete time interval -- to capture this, we let $E^\CAP_t \leq r(t') : t' \in [t, t+1)$ denote the number of active machines during discrete time step $t$ in \CAP's schedule.  Note that  $r(t')$ is constant on the interval $t \in [t, t+1)$, and that $E^\CAP_t$ \textit{need not be} an integer -- i.e., if an executor is active for only half of the discrete time interval, that executor contributes fractionally to $E^\CAP_t$.  We let $E^\texttt{NCA}_t \leq K$ denote the same quantity for \texttt{NCA}'s schedule.
+
+On a per-job basis, let $T$ denote the makespan of $\texttt{NCA}$ (i.e., $T = \texttt{NCA}_K(\mathcal{J})$), and let $T' \ge T$ denote the makespan of \CAP.  In what follows, we use $W$ as shorthand to denote the \textit{excess work} that \CAP must complete after time $T$ (i.e., after $\texttt{NCA}$ has completed).  Formally, $W = \sum_{i=0}^T E^\texttt{NCA}_t - E^\CAP_t$.
+
+On average, we let $\rho_{\texttt{NCA}} \in [0,1)$ denote the average cluster utilization of $\texttt{NCA}$, and we let $\rho_{\texttt{CAP}} \in [0,1)$ denote the average cluster  utilization of \CAP.  In general, since \CAP allows jobs to use less than or equal the amount of resource that \texttt{NCA} allows, we expect $\rho_{\texttt{NCA}} \leq \rho_{\texttt{CAP}}$ as for the same number of jobs submitted (e.g., during a given period), jobs will take up a greater proportion of the resources that \CAP allows.
+
+\begin{thm}\label{thm:ksCarbonSavings}
+   On a per-job basis, \CAP yields carbon savings compared to a non-carbon-aware baseline of $W \left( \overline{s}^{(0,T)} - \overline{c}^{(T, T')} \right)$, where $\overline{s}^{(0,T)}$ and $\overline{c}^{(T, T')}$ are weighted averages based on a combination of the carbon intensity and schedules of \texttt{NCA} and \CAP, respectively. %
+
+   In a setting with continuously arriving jobs, the average carbon savings of \CAP at any given discrete time step $t$ is given by $(\rho_{\texttt{NCA}} K - \rho_{\CAP} r_t ) \Phi_{r_t + B}$. %
+\end{thm}
+
+We defer the proof of \autoref{thm:ksCarbonSavings} to \autoref{apx:ksCarbonSavings}. 
+The quantities $\overline{s}^{(0,T)}, \overline{c}^{(T,T')}$ can be interpreted as the realization of carbon intensities that \CAP ``waited for'' -- in other words, it deferred some work in between time $0$ and time $T$ (saving $\overline{s}^{(0,T)} $ amount of carbon), so it must make up the difference after time $T$.  
+We note that an adversary could construct instances such that \CAP  uses more carbon than a non-carbon-aware baseline -- for instance, consider the case where the carbon intensity at each time step is strictly increasing over time.  In such a scenario, the ``carbon-optimal'' solution simply finishes the job as soon as it can.  Note that such a scenario implies that $\overline{c}^{(T,T')} > \overline{s}^{(0,T)}$, meaning that \CAP's carbon savings are negative.  However, we note that such scenarios for the carbon intensity on the grid are unrealistic.  In reality, grid carbon intensity exhibits \textit{diurnal (i.e., daily) patterns} that mediate this effect -- see \autoref{fig:CI-traces} for a motivating example. 
+
+\autoref{fig:cap-tradeoff} plots the upper bound of $\CAP$'s carbon stretch factor and its carbon footprint (w.r.t. a non-carbon-aware baseline) for several settings of $B$ on a snapshot of time-varying carbon intensities from the German power grid (see \autoref{sec:carbon-traces}).  The simulated job is one comprised of $50$ 1-hour-long tasks, which are perfectly parallelizable (i.e., there are no precedence constraints).  $K = 25$ executors, and $\OPT_K(\mathcal{J}) = 2$ hours.  We observe a ``smooth trade-off'' between the relative worst-case increase in makespan, indicated by the red dotted curve, and the carbon footprint as compared to an agnostic solution, indicated by the blue dashed curve.
+
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.8\linewidth]{figures/cap-tradeoff.png} 
+    \caption{Per \autoref{thm:ksMakespan} and \autoref{thm:ksCarbonSavings}, plotting the trade-off between the upper bound of the carbon stretch factor (red dotted line) and the carbon footprint (blue dashed line) for $\CAP$ with varying parameter $B$ during a 24-hour period in the DE grid (see \autoref{sec:carbon-traces}).  $K$ is 25, and the ``simulated job'' $\mathcal{J}$ is one with 50 perfectly parallelizable tasks that each take $1$ hour, with no precedence constraints.  $\OPT_K(\mathcal{J}) = 2$ hours.  As $K-B$ increases, the flexibility of $\CAP$ to control executors is increased, resulting in a lower overall carbon footprint. \adaml{keep this figure, relegate most of \CAP theory to appendix - keep the important insights}}
+    \label{fig:cap-tradeoff}
+\end{figure}
+
+
+\subsection{\DANISH framework} \label{sec:danish-design}
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=\linewidth]{figures/danishfig.png}
+    \caption{\DANISH (Decarbonization Advanced by Node Importance ScHeduling) adds an interpretable \textit{carbon-awareness layer} on top of any probability-based (\texttt{PB}) scheduler. Interfacing directly with a probability distribution over nodes \textcircled{1}, \DANISH computes a \textit{relative importance} score \textcircled{2} that is used to determine which nodes should run based on the current carbon intensity \textcircled{3} -- e.g., bottleneck nodes impeding job completion run regardless of carbon \textcircled{4}, while less important nodes can be deferred for future, lower carbon periods \textcircled{5}.}
+    \label{fig:danish-diagram}
+\end{figure}
+
+Although \CAP is simple to implement, its scheduling-policy-agnostic nature means that it treats the actual scheduling of tasks as a \textit{black box}.  For carbon-awareness, this may manifest as a slight inefficiency in practice -- since \CAP cannot ``see'' into the inter-task dependencies that exist in a typical data processing workload, it loses the ability to make carbon-aware scheduling decisions on a granular task-specific level.
+
+Motivated by this, we introduce \DANISH (Decarbonization Advanced by Node Importance ScHeduling), a configurable carbon-awareness layer that can be placed on top of any \textit{probability-based} scheduler, with a particular regard for modern ML-based schedulers such as Decima~\cite{Hongzi:2019:Decima}.  \DANISH's main idea is to define a %
+metric of \textit{relative importance} that is implicitly embedded in the probability distributions generated by the underlying scheduler.  Using this metric combined with the current carbon intensity, \DANISH employs a configurable threshold function that %
+defers tasks when the current carbon intensity is high, while %
+continuing to schedule high-importance ``bottleneck'' tasks. %
+In what follows, we detail the design of \DANISH and give analytical results.  
+
+\smallskip
+\noindent \textbf{Design space \& modeling. \ }
+We first formally define a class of \textit{probability-based schedulers} that \DANISH is designed to interface with, giving a concrete example of one such ML-based approach.
+
+\begin{dfn}[Probability-Based Scheduler (\texttt{PB})] \label{dfn:pb}
+In a probability-based scheduler (henceforth denoted by \texttt{PB}), the assignment of tasks to machines is governed by a probability distribution over valid tasks.  
+
+Formally, at each \textbf{scheduling event}, \texttt{PB} generates a distribution $\{ p_{v,t} : v \in \mathcal{A}_t\}$, where $\mathcal{A}_t$ denotes the set of tasks that are ready to be executed at time $t$.  Scheduling events include a new job arriving, a task completing, or executors becoming available.
+The next task to be scheduled is sampled from $\{ p_{v,t} : v \in \mathcal{A}_t\}$ and assigned to the available executor.
+\end{dfn}
+
+As one example of a probability-based scheduler, in our experiments we consider Decima~\cite{Hongzi:2019:Decima}, a GNN+RL learning-based technique for scheduling data processing workloads.  Decima uses a score-based paradigm, where per-node, per-job, and global embeddings are learned using a GNN and fed into an RL policy network that learns \textit{actions} in the form of scores for each task.  Both models are invoked at each scheduling event.
+In Decima's design, a masked softmax operation is applied over these scores to obtain a probability distribution over tasks that can be scheduled next, which is used to make scheduling decisions according to \sref{Def.}{dfn:pb}.
+
+Recall the motivation behind \DANISH: 
+the scheduler should scale down during high-carbon periods and run as much as possible during low-carbon periods, but bottleneck tasks (i.e., tasks with a large score) should be scheduled even if the carbon intensity is high.  To this end, we define a notion of \textit{relative importance} that relates probability mass assigned to a single task $v$ w.r.t. the other tasks in the available set $\mathcal{A}_t$.
+
+\begin{dfn}[Relative Importance] \label{dfn:rel-imp}
+Given a time $t \geq 0$ and node $v \in \mathcal{A}_t$, the relative importance $r_{v,t}$ is defined:
+    $$r_{v,t} \coloneqq \frac{p_v}{\max_{u \in \mathcal{A}_t} p_u} \in [0,1]$$
+\end{dfn}
+
+Intuitively, if this quantity is closer to $1$, the task is relatively \textit{more important}, and a value closer to $0$ implies the opposite.
+Note that if $\vert \mathcal{A}_t \vert =1$ (i.e., only one task is available), the relative importance of that task is automatically $1$.  Leveraging a similar connection with threshold-based algorithms that we used for \CAP, we introduce a threshold function $\Psi_\gamma$ that takes the relative importance of a task as an input and maps to the domain of possible carbon intensities.  
+
+$\gamma \in [0,1]$ is a carbon-awareness parameter that controls the relative ``strictness'' of the function, where $\gamma = 0$ recovers the actions of a non-carbon-aware baseline, while $\gamma = 1$ is maximally restrictive for tasks with low scores/probabilities.  We define $\Psi_\gamma$ as follows:
+{\small
+\begin{equation}
+    \Psi_\gamma(r) \coloneqq \left( \gamma L + (1-\gamma) U \right) + \left[ U - \left( \gamma L + (1-\gamma) U \right)\right] \frac{\exp (\gamma r) -1 }{\exp (\gamma) -1}. \label{eq:Psi}
+\end{equation}
+}
+
+$\Psi_\gamma$ exhibits an exponential dependence on $r$, the relative importance of a task.  This is inspired by in literature on one-way trading and related online problems~\cite{ElYaniv:01, Zhou:08}, where such an exponential trade-off is derived by balancing the marginal reward of the current price against the risk that better prices may arrive in the future.  For the DAG scheduling problem, we interpret relative importance in an analogous way: tasks with high importance have a substantial negative impact if they are not scheduled, so they are almost always scheduled at the current ``price'' (i.e., carbon intensity).  On the other hand, tasks with low relative importance (e.g., short tasks) may not significantly affect the DAG's completion time if they are deferred to start later, so they can ``wait'' for better carbon intensities.
+$\Psi_\gamma$ is used in a \textit{carbon-awareness filter} that executes after a task is sampled by \texttt{PB} but before it is sent to an executor.  We formalize this in \autoref{alg:danish} below:
+
+\begin{algorithm}[h]
+	\caption{\DANISH carbon-aware scheduling layer}
+	\label{alg:danish}
+	\begin{algorithmic}[1]
+		\STATE \textbf{parameters:} hyperparameter $\gamma$, threshold function $\psi_\gamma(\cdot)$, probability-based scheduler \texttt{PB}
+        \WHILE{cluster active at time $t \ge 0$} 
+        \IF{\texttt{PB} invoked or carbon intensity $c(t)$ changes}
+        \STATE Sample task $v \in \mathcal{A}_t$ and probabilities $p^i_v : v \in \mathcal{A}_t$ from \texttt{PB}
+        \STATE Compute relative importance $r_v^{j(v)} = \frac{p_v^{j(v)}}{\max_{u \in \mathcal{A}_t} p_u^{j(u)}}$
+        \IF{$\Psi_\gamma(r^i_v) \geq c(t)$ \textbf{or} no executors currently busy}
+        \STATE Send task $v$ to available executor at time $t$
+        \ELSE
+        \STATE Idle executor until (either) next \texttt{PB} invocation or carbon intensity $c(t)$ changes
+        \ENDIF
+        \ENDIF
+        \ENDWHILE
+	\end{algorithmic}
+\end{algorithm}	
+
+This construction accomplishes two goals -- first, it schedules those tasks first that have the most importance in the DAG (in terms of precedence constraints).  Second, it allows the scheduler to pause execution for some time if carbon intensity is high, without deferring bottleneck tasks that have a high score.  Note that since $\Psi_\gamma$ is an exponentially increasing threshold on the interval $[0,1]$, we have that $\Psi_\gamma(1) = U$ (i.e., tasks with high relative importance are always scheduled) and $\Psi_\gamma(0) = \gamma L + (1-\gamma) U$.  When $\gamma = 0.5$, $\Psi_\gamma(0)$ is exactly the average of $U$ and $L$ -- this implies that as long as the carbon intensity is \textit{below-average}, tasks will always be scheduled.  
+In \autoref{fig:rel-imp}, we illustrate this high-level idea behind \DANISH's carbon-awareness filter using two illustrative job DAGs found in our experimental data sets~\cite{TPCH:18, Alibaba:18}.
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=\linewidth]{figures/rel-imp.png}
+    \caption{We illustrate the concept of \textit{relative importance} w.r.t. \DANISH's carbon-awareness filter defined by $\Psi_\gamma$.  Job A and job B are representative DAGs found in TPC-H queries and Alibaba traces, respectively~\cite{TPCH:18, Alibaba:18}.  The highlighted nodes elucidate two outcomes after task sampling.  In job A, the highlighted (sampled) node has low relative importance, so it is blocked from being scheduled by the filter.  in contrast, job B's sampled node is a \textit{bottleneck} task that has high relative importance -- even when the current carbon intensity is high, such tasks pass through the filter and are scheduled so as to avoid increasing job completion time.}
+    \label{fig:rel-imp}
+\end{figure}
+
+
+\smallskip
+\noindent\textbf{Analytical results. }
+In what follows, we analyze the \textit{carbon stretch factor} (\sref{Def.}{dfn:csf}) and \textit{carbon savings} (\sref{Def.}{dfn:carbonsavings}) of \DANISH.
+We henceforth let $\texttt{PB}$ denote any \textit{non-carbon-aware probability-based} baseline scheduler.
+
+\begin{thm}\label{thm:danishMakespan}
+    Compared to a non-carbon-aware probability-based baseline (\texttt{PB}), the carbon stretch factor in the makespan of \DANISH is $1 + \frac{\mathcal{D}(\gamma, \mbf{c}) K}{2 - \frac{1}{K}}$, where $\mathcal{D}(\gamma, \mbf{c}) \in [0,1]$ is a function that depends on the expected amount of deferrals (i.e., the number of tasks that $\DANISH$ prevents from being scheduled) and the carbon intensity trace $\mbf{c}$.
+\end{thm}
+
+We defer the proof of \autoref{thm:danishMakespan} to \autoref{apx:danishMakespan}.
+Intuitively, $\mathcal{D}(\gamma, \mbf{c}) \in [0,1]$ is a quantity that describes the fraction of tasks (in terms of total runtime) that are deferred by \DANISH when scheduling with a given value of $\gamma$ and given carbon trace $\mbf{c}$.  It is $\leq 1$ for any value of $\gamma$, and $\mathcal{D}(0, \mbf{c}) = 0$ for any $\mbf{c}$.  As $\gamma$ grows and \DANISH becomes ``more carbon-aware'',  $\mathcal{D}(\gamma, \mbf{c})$ grows (in expectation) and the worst-case carbon stretch factor increases accordingly.
+
+
+
+We also analyze the \textit{carbon savings} (in terms of e.g., emissions or price) yielded by \DANISH.  Recall that since the carbon signal arrives in discrete time intervals, we consider a \textit{discretized time model}.
+Slightly abusing notation, we let $C_{\DANISH}(t)$ denote the carbon emissions of $\DANISH$'s schedule during discrete time step $t$, and let $C_{\texttt{PB}}(t)$ denote the carbon emissions of $\texttt{PB}$ at discrete time step $t$, respectively.  
+The schedules generated by $\DANISH$ and $\texttt{PB}$ each use a certain number of machines during any discrete time interval -- to capture this, we let $E^\DANISH_t : t' \in [t, t+1)$ denote the number of active machines during discrete time step $t$ in \DANISH's schedule, and $E^\texttt{PB}_t \leq K$ denotes the same for \texttt{PB}'s schedule.  In what follows, we use $W$ as shorthand to denote the \textit{excess work} that \DANISH must ``make up'' with respect to \texttt{PB}'s schedule (i.e., due to deferral actions). Formally, $W = \sum_{i=0}^T \left( E^\texttt{PB}_t - E^\DANISH_t \right)^+$.
+
+\begin{thm}\label{thm:danishCarbonSavings}
+   On a per-job basis, \DANISH yields carbon savings of $W \left( \overline{s}_{-}^{(0,T)} - \overline{s}_{+}^{(0,T)} - \overline{c}^{(T, T')} \right)$ compared to a non-carbon-aware baseline, where $\overline{s}_{-}^{(0,T)}, \overline{s}_{+}^{(0,T)}$ and $\overline{c}^{(T, T')}$ are weighted averages based on the time-varying carbon intensity and schedules of \texttt{PB} $(\overline{s}_{-}^{(0,T)})$ and \DANISH $(\overline{s}_{+}^{(0,T)}, \overline{c}^{(T, T')})$, respectively. %
+
+   In a setting with continuously arriving jobs, 
+   the average carbon savings of \DANISH at any given discrete time step $t$ is given by $\left(\rho_{\texttt{PB}} K - \rho_{\DANISH}(c_t) K \right) c_t$, where $\rho_{\DANISH}(c)$ is $\DANISH$'s  average cluster utilization when the carbon intensity is $c$.
+\end{thm}
+
+We defer the proof of \autoref{thm:danishCarbonSavings} to \autoref{apx:danishCarbonSavings}.  As with \CAP, the quantities $ \overline{s}_{-}^{(0,T)}, \overline{s}_{+}^{(0,T)}, \overline{c}^{(T,T')}$ are interpreted as the realization of carbon intensities that \DANISH's carbon-aware actions ``waited for''.  \DANISH adds one term compared to \CAP; the term $\overline{s}_{-}^{(0,T)}$ describes any carbon savings due to deferrals between time $0$ and time $T$, but $\overline{s}_{+}^{(0,T)}$ describes the extra carbon incurred by \DANISH (with respect to \texttt{PB}) between time $0$ and time $T$.  This accounts for the fact that \DANISH operates on a \textit{task-level granularity}, as opposed to \CAP's global resource quota that simply prevents the underlying scheduler from using executors during high-carbon periods.

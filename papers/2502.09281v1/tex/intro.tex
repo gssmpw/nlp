@@ -1,0 +1,106 @@
+%!TEX root = paper.tex
+\section{Introduction}
+\label{sec:intro}
+
+Distributed applications running in data centers (e.g., distributed data stores, stream processing engines, caching systems, backends of productivity software) are hungry for fast inter-server communication~\cite{PRISM, Chardonnay2023OSDI, farm, kv-driect}.
+When the developers of these applications look into kernel-bypass ("userspace") networking, a well-studied approach to reduce intra-machine networking latency, they often surprisingly realize that existing systems fail to meet their needs.
+
+While userspace networking has been successful in large real-world deployments (e.g., with userspace TCP at Alibaba~\cite{luna}, Remote Direct Memory Access in Microsoft~\cite{Bai:nsdi23}, and Pony Express RPCs at Google~\cite{snap}), the successes have been limited to specialized internal services.
+These systems require privileged access to specific hardware features and careful integration with target applications, such as hypervisors, remote storage, and bare-metal applications.
+However, they are not generally compatible with the most common deployment model—virtual machines (VMs) in public clouds.
+Even internal workloads at large companies like Amazon and Microsoft often run as guests on the public cloud (with a few exceptions) and, thus, cannot use these networking services~\cite{microsoft-on-azure}.
+Even though many userspace networking systems (called "stacks" in this paper) have been made publicly available, such as  mTCP~\cite{mtcp}, libvma~\cite{libvma}, eRPC~\cite{erpc}, TAS~\cite{tas}, and Demikernel~\cite{demi-kernel}, they have not seen widespread adoption.
+What discourages application developers from using one of the many open-source userspace stacks?
+
+%% Table of unsupported features
+\begin{table*}[!t]
+\centering
+\resizebox{\textwidth}{!}{%
+\small
+\begin{tabular}{llll}
+\textbf{NIC feature} & \textbf{Description} & \textbf{Approximate year of introduction} & \textbf{Network stacks that used the feature} \\
+\toprule
+% Flow steering & Redirect matching packets to a specific receive queue & 2011 (ConnectX3) & eRPC~\cite{erpc}, Snap~\cite{snap}, Shinjuku~\cite{shinjuku} \\
+Flow steering & Redirect matching packets to a specific receive queue & 2009 (Intel 82599ES) & eRPC~\cite{erpc}, Snap~\cite{snap}, R2P2~\cite{kogias2019r2p2} \\
+% RSS reconfiguration & Query/modify the RSS key or redirection table & 2011 (ConnectX3) & IX~\cite{belay2014ix}, TAS~\cite{tas}, RSS++~\cite{rssplusplus}, mTCP~\cite{mtcp} \\
+RSS reconfiguration & Query/modify the RSS key or redirection table & 2009 (Intel 82599ES) & TAS~\cite{tas}, RSS++~\cite{rssplusplus}, mTCP~\cite{mtcp} \\
+\midrule
+TX DMA from app memory & Transmit packets directly from DMA-registered user memory & 2009 (Mellanox ConnextX2) & Cornflakes~\cite{cornflakes}, eRPC~\cite{erpc} \\
+Remote DMA & Access remote server memory without involving remote CPU & 2009 (Mellanox ConnextX2) & SocksDirect~\cite{socksdirect}, mRPC~\cite{mrpc} \\
+% Multi-packet RQs & Receive multiple packets with one RX queue descriptor & 2014 (ConnectX4) & eRPC~\cite{erpc}, Virtuoso~\cite{virtuoso}, Junction~\cite{junction:nsdi24} \\
+\midrule
+Deep RX queues & RX queues with thousands of entries, to prevent host-side packet drops & 2009 (Mellanox ConnectX2) & eRPC~\cite{erpc}) \\
+Multi-packet RQs & Receive multiple packets with one RX queue descriptor & 2014 (Mellanox ConnectX4) & eRPC~\cite{erpc}, Virtuoso~\cite{virtuoso}  \\
+% \midrule
+% Poll Event Queue & Generate interrupts through PCI-e that allows for efficient polling & 2014 (ConnextX4) & Junction~\cite{junction:nsdi24} \\
+\bottomrule
+\end{tabular}
+}
+\caption{LCD model has not changed in the past 15 years, long slack between hardware support and Cloud adoption. Examples of NIC features that are \textit{not exposed} to MVs created in public clouds of major providers. Existing solutions heavily rely on them since some of these features have been available for more than a \textit{decade} to this date.}
+\label{table:unsupported_features}
+\vspace{-0.1in}
+\end{table*}
+
+First, we find that virtual network interfaces (vNICs) used by cloud VMs, the standard environment for deploying modern applications, lack many features these stacks need.
+Their restricted feature set stems from the public clouds' need to support (a) network virtualization and (b) a consistent interface across a decade of deployed NIC generations.
+Notably, we find that no vNIC offered by leading cloud providers supports "flow steering," crucial for mapping network flows to CPU cores, a standard feature in bare-metal interfaces since 2009~\cite{intel-82599}. 
+Other missing functionalities in vNICs include configurable support for receive-side scaling (RSS), RDMA, and multi-packet receive queues~(Table~\ref{table:unsupported_features}).
+Although newer NIC models may support all these features, the financial impracticality of replacing older, widely deployed models prevents their universal availability in the near future~\cite{nic-purchase}.
+
+Second, we identify that the architectural complexity of userspace stacks is also a limiting factor.
+These stacks are based on either the library operating system (libOS)~\cite{erpc, mtcp} or sidecar~\cite{tas, snap} model.
+The libOS model integrates the network stack directly into applications, leading to challenges such as the inability to enforce congestion control policies~\cite{shinjuku} and the need for applications to be written in low-level systems languages~\cite{belay2014ix, demi-kernel}.
+The sidecar model addresses some of these issues by running the stack as a separate process, allowing greater flexibility.
+Existing sidecars, though, co-design the components like CPU scheduler, queue management, and networking stack to squeeze the last drops of performance out of CPUs~\cite{shenango, snap, caladan}.
+The complexities of these models and their extreme performance objectives—processing tens of millions of packets per second—are not only overkill for typical public cloud environments~\cite{twitter-trace} but also increase the deployment challenges for users who are not cloud infrastructure experts.
+For instance, these bespoke systems often optimize using knowledge of application service time~\cite{demi-kernel, shenango, kogias2019r2p2}.
+It is challenging to apply such configuration in a cloud environment by non-expert developers, and misconfiguration may result in wasted computing resources.
+% \ga{we shall say something on what those complexities are. Otherwise this seems a bit weak as you make me think that those systems are good, provide awesome performance, even more than the one I need}
+
+To work on the VMs across the major cloud providers and to enable easy adoption by non-expert cloud users, we have created a novel userspace network stack called \mt{}, built explicitly for cloud VMs.
+We started by modeling a common vNIC to understand the features \mt{} can rely upon.
+We created the Least Common Denominator (LCD) NIC model, the minimal feature set supported by all kernel-bypass vNICs.
+%A key contribution of our work is a new \pg{simple} conceptual Least Common Denominator (LCD) NIC model, the minimal feature set supported by all kernel-bypass Ethernet NICs.
+Developers of userspace stacks who want to target broad applicability should use this model.
+Our experiments show that this includes only plain Ethernet packet I/O, opaque RSS (e.g., without key inspection or modification), only as many NIC TX/RX queues as the number of CPU cores, and at most 256 descriptors per NIC queue.
+To allow flexibility in application execution, \mt{} uses a simplified sidecar design where the stack process mediates access to the NIC from applications.
+Our results show that due to the large size of cloud networks, the inter-process communication overhead of sidecars adds only 10\% to the p99 latency compared to a less flexible library OS design~(\S\ref{subsec:microbenchm}).
+
+Our work's key challenge is to architect a performant stack while adhering to the constraints of the LCD NIC model.
+For example, to scale \mt{} over multiple CPU cores, we design a new flow-to-core mapping technique called \rssminus{} that requires only the LCD NIC's opaque RSS functionality.
+The academic community has long ignored the limited LCD feature set as even recent kernel bypass systems explicitly targeting cloud deployment, such as Junction~\cite{junction:nsdi24}, depend on non-LCD features.
+These systems, built for cloud providers rather than users, require direct access to the NIC and, as a result, are unusable by application developers in the public cloud today.
+We show that \mt{} performs well on the three major public clouds and evaluate its performance on two production-level applications: a key-value store and state-machine replication. \mt{} is currently open-sourced\footnote{https://github.com/microsoft/machnet}, and we will release the link if accepted.
+
+The main contributions of this paper are:
+\begin{itemize}
+\item We make the case for a new userspace network stack specifically built for cloud VMs.
+\item We build \mt{}, the first low-latency userspace network stack designed for cloud VMs and applications. \mt{} (1) relies on only the common set of NIC features available in all major clouds and (2) supports a flexible execution model that allows multiple processes and many threads sharing the same NIC, interrupt-based execution, and bindings for high-level languages.
+\item We demonstrate the system in the wild on public clouds and evaluate a production-level key-value store and state-machine replication application. % For the key-value store application, \mt{} achieves 80\% lower latency and 75\% lower CPU utilization compared to Linux TCP/IP.
+\end{itemize}
+
+% The rest of the paper is organized as follows.
+% \S\ref{sec:background}  motivates the need for a userspace network stack designed specifically for virtualized cloud environments.
+% \S\ref{sec:design-principles} and \S\ref{sec:overview} discuss the design of \mt{}.
+% \S\ref{sec:implementation} and \S\ref{sec:evaluation} present implementation and a thorough quantitative evaluation while \S\ref{sec:discussion} addresses potential concerns.
+
+%% Commented parts
+
+
+% Second, most of these stacks are based on the library operating system (libOS) model, where the stack is statically linked to the application.
+% \pg{Are there some approaches that are not based on the libOS model? If yes, then this paragraph might be weak.}\as{I agree here we should kind of kill Shenango if possible.}
+% Although drawbacks of such libOS approaches have been previously studied, such as the inability to enforce congestion control policies~\cite{tas}, or the need for per-application busy-polling~\cite{snap}, we find other drawbacks that are particularly problematic for the developers of non-infrastructure applications (i.e., not storage or hypervisor).
+% For example, libOS approaches constrain the application's execution model by restricting it to only one process that ``takes over'' the NIC and only one thread per NIC queue.
+%%PG: It seems this paragraph aims to make the flexibility limitation of the existing work.
+
+% We find other drawbacks that are particularly problematic for the developers of non-infrastructure applications (i.e., not storage or hypervisor).
+% For example, libOS approaches constrain the application's execution model by restricting it to only one process that ``takes over'' the NIC and only one thread per NIC queue.
+
+%\mt{} will be open-sourced.
+% Precisely,
+% Moreover, the key-value store application can sustain over 2M messages per second with 4 \mt{} CPU cores.
+% Further, \mt{} achieves 6.8x better tail (99.9\%) latency than Linux TCP/IP stack.
+
+% \kk{Should we mention more contributions here? E.g., that we support diverse execution models, blocking/non-blocking without sacrificing performance, and that we support more languages beyond C/C++/Rust?}
+%Our evaluation shows how the userspace networking via \mt{} can reduce p99 latency by XXX\% compared to the Linux kernel.
+

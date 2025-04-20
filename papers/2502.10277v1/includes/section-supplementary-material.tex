@@ -1,0 +1,110 @@
+\section{AI System Pipeline and Training}
+\label{sec:ai-system-pipeline}
+
+In this study, our AI system followed a three-stage pipeline:
+\begin{enumerate*}[label=(\alph*)]
+    \item the finding localization module,
+    \item the tooth index classification module, and
+    \item the post-processing module.
+\end{enumerate*}
+The first two modules utilized convolutional neural networks (CNNs), while the post-processing module employed a probabilistic approach to integrate the outputs from the prior modules and produce the final AI assessment scores.
+
+\subsection{Finding Localization Module}
+The finding localization problem was formulated as an \emph{object detection} task in computer vision. 
+We employed the YOLOv8 model~\citep{varghese2024yolov8}, a state-of-the-art CNN architecture for object detection.
+YOLOv8 improved upon its predecessors with enhanced efficiency and accuracy, supporting high-resolution inputs (1024×1024) and complex segmentation tasks, making it particularly suitable for medical image analysis.
+Specifically, we used the medium variant of the YOLOv8 model family.
+
+The model was initialized with pre-trained weights from the Common Objects in Context (COCO) challenge~\citep{lin2014microsoft}.
+Training was conducted on the Netherlands data of \num{4044} DPRs, split into 70\% for training and 30\% for validation.
+The training spanned up to \num{50} epochs, using a batch size of 1 and an image size of 1024×1024 to retain high-resolution details essential for accurate localization.
+A cosine decay learning rate schedule was applied, starting at \num{0.01} and decreasing gradually to stabilize performance.
+
+To accelerate convergence, a warm-up phase of 3 epochs linearly increased the learning rate.
+Momentum was set to 0.937 for a balance between stability and speed, while weight decay at 0.0005 prevented overfitting.
+Data augmentation strategies, including random scaling (0.5), translation (0.1), and rotation (15 degrees), were applied to improve generalization.
+
+During testing time (\ie, inference, or, case reading), the module generated a list of candidate objects. Each object instance $i$ included:
+\begin{enumerate}
+    \item an objectness score $\objness_i\in\zeroOne$;
+    \item an finding probability vector $\objProb_i\in\zeroOne^C$, where $C=8$ is the number of finding types;
+    \item a bounding box; and
+    \item a probabilistic contour (mask) $\objMap_i\in\zeroOne^{H \times W}$, where $H$ and $W$ denote the image height and width. 
+\end{enumerate}
+
+The object list was sorted in descending order of objectness, and non-maximum suppression was applied to remove overlapping objects exceeding 50\% area overlap.
+A maximum of \num{300} objects with objectness scores as low as \num{0.0001} were retained.
+
+\subsection{Tooth Index Classification Module}
+The tooth index classification module aimed to associate each image pixel with a specific FDI (World Dental Federation) index using a \emph{semantic segmentation} approach.
+This module employed the DeepLabv3 model~\citep{chen2017rethinking}, which integrates a 101-layer backbone for feature extraction and an Atrous Spatial Pyramid Pooling (ASPP) module to capture multi-scale contextual information via atrous convolutions at varying rates.
+
+We implemented the model using Detectron2~\citep{wu2019detectron2}, enabling efficient large-scale segmentation.
+Input images were resized to 512×512, with dilated convolutions applied at rates of 6, 12, and 18 to expand the receptive field while preserving spatial resolution.
+High-resolution low-level features from earlier backbone layers were projected via the DeepLabv3 head configuration for fine-grained segmentation.
+
+Contours corresponding to the 32 full-dentition teeth were extracted and flattened onto maps matching the input image dimensions.
+The model was trained for \num{100000} steps with a batch size of 3 images.
+A linear learning rate warmup phase over the first \num{1000} iterations ensured stable optimization, after which the learning rate decayed via a cosine schedule to near-zero values.
+A base learning rate of \num{0.001} was used, combined with momentum (0.9) and weight decay (\num{0.0001}) to reduce overfitting.
+Gradient clipping at 1.0 prevented exploding gradients.
+Each training iteration processed input images resized dynamically between 768×1024 and 1280×2048 to introduce variability and enhance generalization.
+
+During inference, the module produced a dense probability map with 33 channels (32 tooth classes and 1 background class), denoted as $\semMap_j\in\zeroOne^{H \times W}$, where $j$ runs over $J=33$ classes, and $H$ and $W$ are the image dimensions.
+
+\subsection{Post-Processing Module}
+The post-processing module integrated outputs from the finding localization and tooth index classification modules.
+Specifically, we obtained:
+\begin{equation}
+    \paral{\objness_i, \objProb_i, \objMap_i}_{i=1}^I \quad \text{and} \quad \paral{\semMap_j}_{j=1}^J.
+\end{equation}
+
+The correlation $\corr_{ij}$ between a finding object (instance) $i$ and a tooth index (semantic class) $j$ was defined as:
+\begin{equation}
+    \corr_{ij} \equiv \frac{\paraa{\objMap_i, \semMap_j}}{\sqrt{\paraa{\objMap_i, \objMap_i}}} \in \zeroOne,
+\end{equation}
+where $\paraa{\cdot, \cdot}$ denotes the inner product of probability maps, summing over the pixel-wise probability products over the whole image.
+
+Following~\citet{ardila2019end}, we applied a \emph{soft-or} strategy to aggregate the contributions of all objects $i$ with detection scores $\objness_i$ and correlations $\corr_{ij}$.
+The presence probability of finding $c$ in tooth index $j$, denoted $\para{\semProb_j}_c$, was calculated as:
+\begin{equation}
+    1 - \para{\semProb_j}_c \equiv \prod_i \param{ 1 - \func_c\para{\objness_i, \corr_{ij}; \paral{r}} }^{\para{\objProb_i}_c},
+\end{equation}
+where $\paral{r}$ is the set of all correlations, and $\func_c$ is a finding-dependent function defined as:
+\begin{equation}
+    \func_c\para{s_i, r_{ij}; \paral{r}} \equiv
+    \begin{cases}
+        \frac{r_{ij}}{\sum_{j\neq\text{background}} r_{ij}}, & \text{if } c = \text{missing}; \\
+        s_i \cdot \frac{r_{ij}}{\sum_{j\neq\text{background}} r_{ij}}, & \text{for other findings}.
+    \end{cases}
+\end{equation}
+
+The final output consisted of a set of probabilities:
+\begin{equation}
+    \paral{\semProb_j}_{j\neq\text{background}},
+\end{equation}
+where $\semProb_j \in \zeroOne^C$ provided the scores for $C = 8$ findings per tooth index $j$.
+For 32 tooth indices, the system produced a total of 256 floating-point scores per DPR.
+
+\newpage
+
+\section{AI Performance -- Detailed Results}
+\label{sec:performance-comparison-detailed}
+\input{./includes/tbl-ai-multinational}
+
+\newpage
+
+\section{Consistency of Human Reader Performance}
+\label{sec:consistency-of-human}
+\input{./includes/fig-reader-agreement}
+
+We inspected the mutual agreement among four readers (G1, G2, S1, and S2) involved in the study using Cohen's Kappa.
+Kappa was calculated between every possible pair of human readers, and the overall average of agreements was strong~\citep{mchugh2012interrater} for the following findings: crown/bridges at 95.4\% (95\% CI: 92.9\% -- 97.8\%), implants at 92.3\% (95\% CI: 83.0\% -- 100.0\%), root canal fillings at 92.1\% (95\% CI: 86.8\% -- 97.4\%), and missing teeth at 90.1\% (95\% CI: 81.9\% -- 98.2\%).
+Agreement for fillings was moderate, at 74.9\% (95\% CI: 69.8\% -- 80.0\%).
+Residual roots and caries exhibited weak agreement, at 56.2\% (95\% CI: 35.6\% -- 76.8\%) and 46.5\% (95\% CI: 34.8\% -- 58.1\%), respectively.
+The lowest mean agreement occurred for periapical radiolucencies, at 37.6\% (95\% CI: 14.7\% -- 60.6\%).
+
+To further analyze the data, we categorized the readers into two expertise groups: general dentists (G1 and G2) and specialized dentists (S1 and S2).
+Average agreement metrics were computed by taking the average Kappa value over reader pairs with specific criteria: \emph{same-expertise} pairs (G1-G2 and S1-S2) and \emph{different-expertise} pairs (G1-S1, G1-S2, G2-S1, and G2-S2), respectively.
+Notably, for residual roots, a statistically significant difference in agreement was observed between the same-expertise and different-expertise average Kappa values, with a difference of 30.3\% (95\% CI: 1.6\% -- 58.9\%, $p = .039$).
+No significant differences were found in agreement levels between same-expertise average and different-expertise average for other findings.

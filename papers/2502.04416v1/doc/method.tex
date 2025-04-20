@@ -1,0 +1,377 @@
+\section{Methodology}
+
+% In this section, we describe the framework of CMoE from an overview to the details of experts and router construction.
+
+% \footnote{***A major concern is that the motivation is not clearly described at the beginning of presenting CMoE in detail. In the previous section, you mention the sparsity observation in FFNs. But why MoE can utilize the sparsity and thus improve inference efficiency is not discussed. In addition, you directly mention the shared experts and routed experts and their functionalities. However, the motivation for introducing these two types of experts is NOT discussed. Below is my suggestion about the organization of the first few paragraphs in the section: 1. Describe why MoE can be applied to FFN to potentially utilize the sparsity of activations to improve inference efficiency. 2. Discuss why existing MoE is not good enough, and explain why propose the two types of experts to address the limitation of MoE for improving LLM inference. 3. Give an overview of CMoE, highlight key components, and mention which following section they will be presented in detail. You can move the first paragraph of the following section here.}
+
+% \subsection{Overview of CMoE}
+
+CMoE transforms a dense LLM into a sparsely activated MoE architecture through two key phases: efficient expert grouping and training-free router construction, followed by optional lightweight adaptation.
+As illustrated in \Cref{fig:cmoe}, the framework operates as follows:
+    \wcircled{A} \textbf{Neuron Activation Profiling} (\Cref{sec:expert_cons}).
+    Given an FFN layer, CMoE profiles neurons' activation patterns with a small calibration dataset to categorize the neurons into shared experts (high-activation, task-agnostic) and routed experts (sparsely activated, task-specific).
+    \wcircled{B} \textbf{Expert Grouping} (\Cref{sec:expert_cons}).
+    \textit{Shared Experts}: Neurons with the highest activation rates are directly grouped into shared experts, which are always activated during inference. 
+    \textit{Routed Experts}: Remaining neurons are partitioned into routed experts via balanced clustering, formulated as a linear assignment problem.
+    \wcircled{C} \textbf{Router Construction} (\Cref{sec:router_cons}).
+    The routing mechanism is analytically derived from the activation statistics of representative neurons in each expert cluster, bypassing the need for end-to-end training.
+    % \item \textbf{Lightweight Adaptation}: A differentiable routing function with learnable scaling factors and auxiliary-loss-free load balancing enables rapid fine-tuning ($<$1 hour) for performance recovery.\footnote{***what section corresponds to this step? Section 4.4? If yes, it would be better to rename the section title ``lightweight adaptation'' and describe what you mean by ``lightweight'' and ``optional'' adaptation in that section.}
+Additionally, we make the routing function differentiable in \Cref{sec:diff} for further alignment and performance recovery.
+
+\begin{figure}[t!]
+    \centering
+    \includegraphics[width=0.85\columnwidth]{./figs/cmoe}\vspace{-2mm}
+    \caption{
+    The overview of our proposed CMoE.
+    }
+    \label{fig:cmoe}\vspace{2mm}
+\end{figure}
+
+\iffalse
+By reusing the dense model’s parameters and activation patterns, 
+CMoE achieves parameter preservation without retraining and dynamic sparsity, making it both efficient and practical for deployment.
+\fi
+
+
+\subsection{Shared and Routed Experts Grouping}
+\label{sec:expert_cons}
+
+CMoE starts with grouping neurons in FFN into experts.
+Shared experts are expected to process common knowledge instead of specialization. Thus, the key idea is to group neurons that are always activated during FFN inference.
+For routed expert grouping, as described in previous works~\cite{zhang2021moefication}, the key idea is to cluster the neurons that are always activated simultaneously.
+CMoE carries forward these ideas but comes up with a detailed and analytical perspective.
+In this section, we construct $N$ experts of size $m = \frac{d_h}{N}$ (assuming $d_h$ is a multiple of $N$, i.e., $N \mid d_h$), including $N_s$ shared experts and $N_r$ routed experts $(N_s + N_r = N)$.
+% \footnote{***what is the meaning of $\mid$ here?}
+
+We begin with analyzing the isolated contribution of each neuron to the output of FFN.
+Consider the $i$-th element of $\mathbf{h} \in \mathbb{R}^{d_h}$:
+    $h_i = \text{Swish}(\mathbf{x} \cdot \mathbf{w}_{gate,i})\cdot  (\mathbf{x}\cdot\mathbf{w}_{up,i})$,
+where $\mathbf{w}_{gate,i} \in \mathbb{R}^{d}$ and $\mathbf{w}_{up,i} \in \mathbb{R}^{d}$ are the $i$-th column of $\mathbf{W}_{gate}$ and $\mathbf{W}_{up}$, respectively.
+It shows that the value of $h_i$ only depends on the input $\mathbf{x}$ and the corresponding $i$-th weights, which implies the independence between neurons.
+On the other hand, the output of FFN can be written as:
+\begin{equation}
+\label{eq:sum}
+    F(\mathbf{x}) = \sum_{i=1}^{d_h} h_i \mathbf{w}_{down,i},
+\end{equation}
+where $\mathbf{w}_{down,i} \in \mathbb{R}^{d}$ is the $i$-th row of $\mathbf{W}_{down}$.
+When we revisit the FFN process, we can regard each $h_i$ as the score to be multiplied to the split vector $\mathbf{w}_{down,i}$, whose product contributes to part of the output $F(\mathbf{x})$. 
+As a finding of some structured pruning research~\cite{song2024sleb,chen2024compressing}, the norm of $F(\mathbf{x})$ is always small due to the residual connection. Such phenomenon implies the high sparsity existed in FFN, and by \eqref{eq:sum} we relate it to $h_i$, whose value decides how large an isolated neuron contributes to the output.
+Therefore we make a hypothesis:
+\begin{align}
+\label{eq:hypo}
+    \arg\min_i |h_i \mathbf{w}_{down,i}| \approx \arg\min_i |h_i|,
+\end{align}
+which is reasonable since when $h_i$ is extremely small, the product $h_i \mathbf{w}_{down,i}$ will also vanish.
+It is expected that the hidden state $\mathbf{h}$ should be highly sparse, which means $|h_i|$ is often extremely small.
+To verify it, we hack into the FFN and draw the distribution of $\mathbf{h}$.
+\begin{figure}[tb!]
+    \centering
+    \includegraphics[width=0.75\linewidth]{./pdfplot/hs/hs}\vspace{-2mm} 
+    \caption{The histogram of FFN hidden state $\mathbf{h}$ for the $3$-th block and the $1,000$-th token.
+    }
+    \label{fig:hs}\vspace{1mm}
+\end{figure}
+As demonstrated in \cref{fig:hs}, the distribution is sharply peaked at $0$ and constrained within a small range, indicating that most $h_i$ are concentrated near zero and confirming the sparsity.
+And it exhibits symmetry, suggesting a near-normal distribution centered around the mean.
+Based on what we discuss and observe above, the hidden state values work well as the basis for judgment of neuron activation, because of its high differentiation and independence across different neurons.
+Therefore, we propose a new metric, called absolute TopK (ATopK), to determine the activation status of a neuron with index $i$:
+\begin{equation}
+    a_i = \left\{ \begin{array}{rl}
+        1, & \lvert h_i \rvert \in \text{TopK}(\{ \lvert h_j \rvert \ | 1\leq j\leq d_h\}, K_a),  \\ 
+        0, & \text{otherwise},
+    \end{array}\right.
+\end{equation}
+where we choose neurons with $K_a$ highest absolute value among the hidden state values, and assign their labels in the activation marker $\mathbf{a} = \left[a_1, a_2, \cdots, a_{d_h}\right]$ with $1$.
+
+
+To further evaluate the activation information, we make samples in the training set to record their activation markers.
+Given a batched input tensor $\mathbf{X} \in \mathbb{R}^{b\times s\times d}$, with $b$ the batch size and $s$ the sequence length, we obtain the batched hidden state $\mathbf{H} \in \mathbb{R}^{b\times s\times d_h}$ as follows:
+\begin{align}
+\label{eq:h_matrix}
+    \mathbf{H} = \text{Swish}(\mathbf{X}\mathbf{W}_{gate})\odot(\mathbf{X}\mathbf{W}_{up}).
+\end{align}
+Note that in practical implementation, we normalize $\mathbf{X}$, $\mathbf{W}_{gate}$ and $\mathbf{W}_{up}$ before the calculation to eliminate the influence of their magnitudes on the output.
+We then calculate the activation markers for the hidden state of all the tokens, which is reshaped as an activation feature matrix $\mathbf{A} \in \mathbb{R}^{q \times d_h}, q = b\cdot s$.
+Denote the $i$-th column of $\mathbf{A}$ as the feature vector $\mathbf{c}_i \in \mathbb{R}^{q}$, 
+i.e., $\mathbf{A} =[ \mathbf{c}_1\; \mathbf{c}_2 \; \cdots \; \mathbf{c}_{d_h}]$
+which represents the $i$-th neuron's activation status on the sampled $q$ tokens.
+By calculating the expected value of each $\mathbf{c}_i$, we can obtain the vector of activated rates $\boldsymbol{\mu}$ as:
+% \begin{figure}
+    \begin{equation}\label{eq:mu}
+        % \mathbf{A} &= \begin{bmatrix} \mathbf{a}_1 \\ \mathbf{a}_2 \nonumber \\ \vdots \\ \mathbf{a}_q \end{bmatrix} = \begin{bmatrix} \mathbf{c}_1 & \mathbf{c}_2 & \cdots & \mathbf{c}_{d_h} \end{bmatrix}, \\
+            \boldsymbol{\mu} = [ \mu_1,\mu_2, \cdots, \mu_{d_h}], \mbox{ with } 
+            \mu_i =\frac{1}{q} \sum_{j=1}^{q} c_{j,i},
+    \end{equation}
+% \end{figure}
+where $c_{j,i}$ indicates the $j$-th element of $\mathbf{c}_i$.
+We draw the histogram of $\boldsymbol{\mu}$ as in \Cref{fig:rates}. 
+\begin{figure}[tb!]
+    \centering
+    \includegraphics[width=0.85\linewidth]{./pdfplot/rates/rates}\vspace{-2mm}
+    \caption{The histogram of activation rates $\boldsymbol{\mu}$ for the $3$-th block with $K_a = 1,000$.
+    }
+    \label{fig:rates}\vspace{1mm}
+\end{figure}
+The histogram reveals a highly skewed distribution of activation rates, where the majority of neurons exhibit low activation rates (below 0.1), with a sharp peak near 0.07.
+However, the distribution also features a long tail, indicating the presence of a subset of neurons with significantly higher activation rates extending up to 1.
+These high-activation neurons are likely active across a wide range of input tokens, making them suitable for processing common knowledge rather than task-specific specialization.
+Therefore, we construct shared experts by grouping these high-activation neurons.
+Given the total number of shared experts as $N_s$ and the expert size $m$, we get the selection indices set $S_{N_s}$ by selecting  $N_s\cdot m$ neurons with highest activation rates:
+\begin{equation}
+    S_{N_s} =\{ i\ :\ \mu_i \in \text{TopK}(\{ \mu_j \mid 1 \leq j \leq d_h \}, N_s\cdot m) \}.
+\end{equation}
+Since the independency across neurons, as we discussed, we build the experts using the same architecture as the original FFN and assign the expert parameters to the neurons of selected indices.
+Since all shared experts are always activated, we just construct them together for convenience:
+\begin{equation}
+\begin{aligned}
+\label{eq:expert_w}
+    \mathbf{W}_{up}^{s} &= \mathbf{W}_{up}[:,S_{N_s}],  \\ 
+    \mathbf{W}_{gate}^{s} &= \mathbf{W}_{gate}[:,S_{N_s}], \\
+    \mathbf{W}_{down}^{s} &= \mathbf{W}_{down}[S_{N_s},:],
+\end{aligned}
+\end{equation}
+where $\mathbf{W}_{up}^{s} \in \mathbb{R}^{d\times N_s \cdot m}$, $\mathbf{W}_{gate}^{s} \in \mathbb{R}^{d\times N_s \cdot m}$ and $\mathbf{W}_{down}^{s} \in \mathbb{R}^{N_s \cdot m \times d}$ are the weights of linear layers of the shared experts $E^{s}$.
+Given the input embedding $\mathbf{x}$, the output of $E^s$ is obtained via
+\begin{equation*}
+\begin{aligned}
+     E^{s}(\mathbf{x}) \!=\! \mathbf{h}^{s}\mathbf{W}_{down}^{s}, \mbox { with }
+     \mathbf{h}^{s}   \!=\! \text{Swish} (\mathbf{x}\mathbf{W}_{gate}^{s}) \!\odot\! (\mathbf{x}\mathbf{W}_{up}^{s}).
+\end{aligned}
+\end{equation*}
+
+The majority of low activation rates also encourage us to construct routed experts, which are not always activated but are specialized for tokens encountered.
+To construct $N_r$ routed experts, we develop a customized balanced K-means clustering algorithm.
+We first identify $N_r$ centroids as the neurons (excluding those assigned to shared experts) with the highest activation rates, and group their feature vectors into a centroid set $C = \{ \mathbf{c}_i: \mu_i \in \text{TopK}(\{ \mu_j \mid 1 \leq j \leq d_h, j\notin S_{Ns} \}, N_r)  \} = \{ \hat{\mathbf{c}}_1,\dots,\hat{\mathbf{c}}_{N_r} \}$, 
+% \begin{align}
+%     C &= \{ \mathbf{c}_i: \mu_i \in \text{TopK}(\{ \mu_j \mid 1 \leq j \leq d_h, j\notin S_{Ns} \}, N_r)  \}, \nonumber \\
+%     &= \{ \hat{\mathbf{c}}_1,\dots,\hat{\mathbf{c}}_{N_r} \},
+% \end{align}
+where, for convenience, we re-label the centroids with $\hat{\mathbf{c}}$.
+
+
+By selecting these centroids, we ensure that the clusters are initialized around meaningful and prominent activation patterns, providing a strong starting point for clustering.
+Using the centroids selected, we will construct clusters with remaining neurons.
+We pay attention to their correlation to the centroids, i.e. we study the distances of their feature vectors to the centroids'.
+The feature vector $\mathbf{c}$ individually contains the activation status of a specific neuron, and we expect that neurons with similar functionalities will have similar patterns on the activation status, i.e. they are often activated and deactivated together during inference.
+Therefore, we compute the $L_2$ distance of each feature vector $\mathbf{c}$ to each centroid $\hat{\mathbf{c}}$.
+Define a distance matrix $\mathbf{D} \in  \mathbb{R}^{ N_r\cdot m \times N_r}$, whose element $d_{i,j}$ is the $L_2$ distance between the $i$-th feature vector $\mathbf{c}_i$ and the $j$-th centroid $\hat{\mathbf{c}}_j$:
+%\begin{align}
+%    \mathbf{D} &= \begin{bmatrix} d_{1,1} & \dots & d_{1,N_r} \nonumber \\ 
+%    d_{2,1} & \ddots &  \\
+%    \vdots  &  & d_{N_r\cdot m,N_r} \end{bmatrix}, \\
+%    d_{i,j} &= \| \mathbf{c}_i - \hat{\mathbf{c}}_j \|_2 = \sqrt{\sum_{k=1}^q (c_{k,i} - \hat{c}_{k,j})^2},
+%\end{align}
+\begin{equation}
+    d_{i,j} = \| \mathbf{c}_i - \hat{\mathbf{c}}_j \|_2 = \sqrt{\sum_{k=1}^q (c_{k,i} - \hat{c}_{k,j})^2},
+\end{equation}
+where, for convenience, we also include the original feature vectors of centroids inside the set to be grouped.
+
+To group the neurons into routed experts, with the centroids designed above at $t = 0$, the constrained balanced $K$-means clustering algorithm works as follows~\cite{malinen2014balanced}. Given $N_r\cdot m$ vectors $\mathbf{c}$, the cluster membership value $m$ and cluster centroids $\hat{\mathbf{c}}_1^{t}, \hat{\mathbf{c}}_2^{t}, \dots, \hat{\mathbf{c}}_{N_r}^{t}$ at iteration $t$, compute $\hat{\mathbf{c}}_1^{t+1}, \hat{\mathbf{c}}_2^{t+1}, \dots, \hat{\mathbf{c}}_{N_r}^{t+1}$ at iteration $t+1$ with the following $2$ steps: 
+
+\minisection{Cluster Assignment}
+Let $T_{i,p}^{t}$ be a solution to the following linear program with $\hat{\mathbf{c}}_{p}^{t}$ fixed:
+\begin{align}
+    \min_{T} &\sum_{i=1}^{N_r\cdot m} \sum_{p=1}^{N_r} T_{i,p}\cdot d_{i,p} \\
+    \text{s.t.} &\sum_{i=1}^{N_r\cdot m} T_{i,p} = m, p = 1, \dots N_r \label{eq:con_1} \nonumber \\
+    &\sum_{p=1}^{N_r} T_{i,p}, i = 1, \dots,N_r\cdot m \nonumber \\
+    &T_{i,p} \geq 0, i = 1, \dots,N_r\cdot m, p = 1, \dots N_r. \nonumber
+\end{align}
+
+\minisection{Cluster Update}
+Update $\hat{\mathbf{c}}_{p}^{t+1}$ as follows:
+\begin{equation}
+    \hat{\mathbf{c}}_{p}^{t+1} = \left\{ 
+    \begin{array}{ll}
+        \frac{\sum_{i=1}^{N_r\cdot m} T_{i,p}^{t}\cdot \mathbf{c}_i}{\sum_{i=1}^{N_r\cdot m}T_{i,p}^{t}},  
+        &\text{if} \sum_{i=1}^{N_r\cdot m} T_{i,p}^{t}> 0,  \\ 
+        \hat{\mathbf{c}}_{p}^{t},  
+        &\text{otherwise}.
+    \end{array}\right.
+\end{equation}
+The steps are terminated until $\hat{\mathbf{c}}_{p}^{t+1} = \hat{\mathbf{c}}_{p}^{t}$, $\forall p = 1,\dots,N_r$.
+
+We include the distance value $d_{i,j}$ into the cost function so that the balanced $K$-means clustering makes the intra-expert distances low and inter-expert distances high.
+However, the cluster assignment we defined above is an unbalanced assignment problem ($N_r\cdot m > m$) and cannot directly be solved by existing algorithms for balanced assignment.
+Therefore, we reduce it to a balanced assignment by extending the distance matrix $\mathbf{D}$ as follows:
+\begin{align*}
+    \mathbf{D}^{ext} &= \big[ 
+\underbrace{\mathbf{d}_1, \dots, \mathbf{d}_1}_{m \text{ times}}, 
+\underbrace{\mathbf{d}_2, \dots, \mathbf{d}_2}_{m \text{ times}}, 
+\dots, 
+\underbrace{\mathbf{d}_{N_r},  \dots, \mathbf{d}_{N_r}}_{m \text{ times}} 
+\big],
+\end{align*}
+where we repeat every column $\mathbf{d}$ of $\mathbf{D}$ $m$-times to obtain the extended matrix $\mathbf{D}^{ext} \in \mathbb{R}^{N_r\cdot m \times N_r\cdot m}$.
+Then the reduced balanced assignment problem is formulated as:
+
+\minisection{Balanced Assignment}
+Let $T_{i,p'}^{',t}$ be a solution to the following linear program with $\hat{\mathbf{c}}_{p}^{t}$ fixed:
+\begin{align}
+    \min_{T'} &\sum_{i=1}^{N_r\cdot m} \sum_{p'=1}^{N_r\cdot m} T'_{i,p'}\cdot d_{i,p'}^{ext} \\
+    \text{s.t.} &\sum_{i=1}^{N_r\cdot m} T'_{i,p'} = 1, p' = 1, \dots N_r\cdot m \nonumber \\
+    &\sum_{p'=1}^{N_r\cdot m} T'_{i,p'}=1, i = 1, \dots,N_r\cdot m \nonumber \\
+    &T'_{i,p'} \geq 0, i = 1, \dots,N_r\cdot m, p' = 1, \dots N_r \cdot m, \nonumber
+\end{align}
+where $d_{i,p'}^{ext} = d_{i,p}$ if $p\cdot m < p' \leq (p+1)\cdot m$.
+
+And the \textbf{balanced cluster} $\hat{\mathbf{c}}_{p}^{t+1}$ can be updated as follows:
+%\begin{equation}
+%    \hat{\mathbf{c}}_{p}^{t+1} = \scriptstyle\left\{ 
+%    \begin{aligned}
+%        \frac{\sum\limits_{k =m(p-1)+1}^{mp}\sum\limits_{i=1}^{N_r\cdot m} T_{i,k}^{',t}\cdot \mathbf{c}_i}{\sum\limits_{k =m(p-1)+1}^{mp}\sum\limits_{i=1}^{N_r\cdot m}T_{i,k}^{',t}},  \quad 
+%        &\text{if} \scriptstyle\sum\limits_{k =m(p-1)+1}^{mp} \sum\limits_{i=1}^{N_r\cdot m}T_{i,k}^{',t} > 0,  \\ 
+%        \hat{\mathbf{c}}_{p}^{t},  
+%        \quad 
+%        &\text{otherwise}.
+%    \end{aligned}\right.
+%\end{equation}
+\begin{equation}
+    \hat{\mathbf{c}}_{p}^{t+1} = \scriptstyle\left\{ 
+    \begin{array}{ll}
+        \frac{\sum\limits_{k = k_0}^{mp}\sum\limits_{i=1}^{N_r\cdot m} T_{i,k}^{',t}\cdot \mathbf{c}_i}{\sum\limits_{k = k_0}^{mp}\sum\limits_{i=1}^{N_r\cdot m}T_{i,k}^{',t}}, 
+        &\text{if} \scriptstyle\sum\limits_{k =k_0}^{mp} \sum\limits_{i=1}^{N_r\cdot m}T_{i,k}^{',t} > 0,  \\ 
+        \hat{\mathbf{c}}_{p}^{t},   
+        &\text{otherwise},
+    \end{array}\right.
+\end{equation}
+where $k_0=m(p-1)+1$. Drawing on the Jonker-Volgenant algorithm~\cite{jonker1988shortest}, this problem can be addressed as a reduced assignment problem in each step of the $K$-means algorithm, with a complexity of $O(n^3)$. 
+
+The final solution $T'$ gives us the optimized strategy to group the routed experts. We get the selection indices set $S_{N_r,p}$, $p = 1, \dots, N_r$, for each routed expert $E^{r}_{p}$:
+\begin{equation*}
+    S_{N_r,p} =\{ i\ : \exists \ T'_{i,k} = 1, \ \text{for} \ \forall k \in \{m(p-1)+1,\dots,m\}  \}.
+\end{equation*} 
+We then build the weights $\mathbf{W}_{up}^{r,p} \in \mathbb{R}^{d\times m}$, $\mathbf{W}_{gate}^{r,p} \in \mathbb{R}^{d\times m}$ and $\mathbf{W}_{down}^{r,p} \in \mathbb{R}^{m \times d}$ of each routed expert $E_{p}^{r}$ as in \Cref{eq:expert_w}.
+And the output of $E_{p}^{r}$ is given by:
+\begin{equation*}
+     E^{r}_{p}(\mathbf{x}) \!=\! \mathbf{h}^{r}_{p}\mathbf{W}_{down}^{r,p}, \mbox{ with }
+     \mathbf{h}^{r}_{p}  \!=\! \text{Swish} (\mathbf{x}\mathbf{W}_{gate}^{r,p}) \odot (\mathbf{x}\mathbf{W}_{up}^{r,p}).
+\end{equation*}
+
+Suppose the MoE activates $N_k$ experts out of the $N_r$ routed experts. We expect the router to choose the routed experts with top $N_k$ scores.
+Therefore, we modify the MoE-version FFN as in \eqref{eq:moe_1},
+% \begin{figure}
+\begin{align}
+\label{eq:moe_1}
+    F_{MoE}(\mathbf{x}) &= E^s(\mathbf{x}) + \sum^{N_r}_{i=1} g_i E_i^{r}(\textbf{x}), \nonumber \\
+    g_i &= \left\{ \begin{array}{rl}
+        1, &s_i \in \text{TopK}(\{s_i | 1\leq j\leq N_r\}, N_k),  \\ 
+        0, & \text{otherwise},
+    \end{array}\right. \nonumber \\
+    \textbf{s} &= \left[s_1,s_2,\cdots, s_{N_r}\right] = G(\textbf{x}),
+\end{align}
+% \end{figure}
+where we make the expert score $g_i\in \{0,1\}$ to enable an un-scaled version of the expert output to avoid biases.
+
+\subsection{Training-free Router Construction}
+\label{sec:router_cons}
+
+We now present the training-free router network $G$ for CMoE.
+Unlike previous works, which either built the router from scratch or intuitively used hidden features as initialization, we formulate the router construction as a minimization problem and then develop an algorithm with analysis to construct the router by approximating the optimal solution.
+
+Given the same input embedding $\mathbf{x}$, the output of original output of the dense FFN, i.e. $F(\mathbf{x})$ in \eqref{eq:ori_ffn}, is equivalent to the sum of the output of all the experts in $F_{MoE}$:
+\begin{align}\label{eq:denseFFN}
+    F(\mathbf{x}) &= E^s(\mathbf{x}) + \sum^{N_r}_{i=1} E_i^{r}(\textbf{x}). 
+\end{align}
+The only difference between \eqref{eq:denseFFN} and $F_{MoE}(\mathbf{x})$ in \eqref{eq:moe_1} is the expert score $\mathbf{g}$, which is obtained from the TopK selection of the output of $G$.
+Therefore, to preserve important knowledge captured by the original dense FNN,
+$G$ can be constructed to enforce $F_{MoE}(\mathbf{x})$ to be close to $F(\mathbf{x})$ by solving the minimization problem \eqref{eq:prob}, 
+% \footnote{***how to get the first equation is not clear. what is the form of $F(x)$? if it is referred to the $F(x)$ in Related Work or (4) in Section 4.1, it is not straightforward to get the equation. Some explanations are needed.}
+% \begin{figure}
+\begin{eqnarray}
+\label{eq:prob}
+    \lefteqn{\arg\min_{G} | F_{MoE}(x; G) - F(x)|} \nonumber \\
+    % = &\min_{G} | (E^s(\mathbf{x}) + \sum^{N_r}_{i=1} g_i E_i^{r}(\textbf{x})) - (E^s(\mathbf{x}) + \sum^{N_r}_{i=1} E_i^{r}(\textbf{x})) | \\
+    & = \!&\! \arg\min_{G} | \sum^{N_r}_{i=1} (g_i-1) E_i^{r}(\textbf{x})| 
+    = \! \! \arg\min_{G} |\sum^{i \in S_{de}} E_i^r(\mathbf{x}) |, \nonumber
+\end{eqnarray}
+% \end{figure}
+where $S_{de} \!=\! \{i: s_i \!\notin\! \text{TopK}(\{s_i | 1 \!\leq\! j \!\leq\! N_r\}, N_k)\}$ and $|S_{de}| \!=\! N_r \!-\! N_k$, and the problem becomes constructing the $G$ to minimize the absolute sum of the output of deactivated routed experts.
+Note that we have made a hypothesis in \eqref{eq:hypo} that the output/sparsity of $F(x)$ is highly related to the norm/sparsity of $\mathbf{h}$, which is the same for the expert outputs.
+Based on \eqref{eq:sum} and \eqref{eq:hypo}, we reformulate~\eqref{eq:prob} as in \eqref{eq:reduced}:
+% \begin{figure}
+\begin{eqnarray}
+\label{eq:reduced}
+    \lefteqn{\arg\min_{G} |\sum^{i \in S_{de}} E_i^r(\mathbf{x}) |} \nonumber \\
+     & \overset{\text{by}\ \eqref{eq:sum}}{=} \!&\! \arg\min_{G} |\sum^{i \in S_{de}} \sum_{j\in S_{N_r,i}} h_j \mathbf{w}_{down,j} | \nonumber \\
+     & \overset{\text{by}\ \eqref{eq:hypo}}{\approx} \!&\! \arg\min_{G} | \sum^{i \in S_{de}} (\sum_{j\in S_{N_r,i}} |h_j|) | \nonumber \\
+    % = &\min_{G(x)}|\sum^{i \in S_{de}}\mathbb{E}[|\mathbf{h}^r_i|_1]| \\
+     & = \!&\! \arg\min_{G} \mathbb{E}_{\mathbf{h}}\left[ \| \mathbf{h}^r_i \|_1 \mid i \in S_{de} \right].
+\end{eqnarray}
+% \end{figure}
+The problem becomes constructing $G$ that can minimize the expected hidden states $\mathbf{h}$ of deactivated routed experts.
+Note that $G$ controls the de-/activation of routed experts by outputting the token-to-expert affinity $\mathbf{s} = [s_1,\dots,s_{N_r}]$.
+Therefore, a solution for the above problem is to construct the $G$ such that matching the sorting indices of the set $\{s_1, \dots, s_{N_r} \}$ and the set $\{\bar{\mathbf{h}}^r_1, \dots, \bar{\mathbf{h}}^r_{N_r}\}$ ($\bar{\mathbf{h}}^r_i = \mathbb{E}_{\mathbf{h}}\left[ || \mathbf{h}^r_i ||_1\right]$), i.e. $\exists\ \text{permutation}\ \sigma \ $ such that:
+\begin{align}
+\label{eq:permu}
+    &s_{\sigma(1)} \leq s_{\sigma(2)} \leq \dots \leq s_{\sigma(N_r)} \mbox{ and}\nonumber \\
+    & \bar{\mathbf{h}}^r_{\sigma(1)} \leq \bar{\mathbf{h}}^r_{\sigma(2)} \leq \dots \leq \bar{\mathbf{h}}^r_{\sigma(N_r)},
+\end{align}
+by which we can verify that the minimum of \eqref{eq:reduced} is:
+% \footnote{***what is the target variable for the following minimization problem? $\mathbf{h}$ has been integrated or summed out through the expectation operator. \revise{it should just be the $G$.}}
+\begin{align}
+    \min_{G}\ &\mathbb{E}_{\mathbf{h}}\left[ \| \mathbf{h}^r_i \|_1 \mid i \in S_{de} \right] = \frac{1}{N_r-N_k}\!\!\sum_{i=1}^{N_r-N_k} \bar{\mathbf{h}}^r_{\sigma(i)},
+\end{align}
+which is obtained by setting $G(\mathbf{x})$ as:
+\begin{align}
+    S_{de} &= \{\sigma(1), \dots , \sigma(N_r-N_k)\} \nonumber\\
+           &= \{i: s_i \notin \text{TopK}(\{s_i | 1\leq j\leq N_r\}, N_k)\}.
+\end{align}
+
+Finally, we pay attention to the hidden state $\mathbf{h}^{r}$ of any routed expert, which is the output by the neurons that we grouped in \Cref{sec:expert_cons}, where the cluster is centered to the centroid $\hat{\mathbf{c}}$.
+We denote the neuron in each cluster that has the lowest $L_2$ distance to the centroid as the representative neuron:
+\begin{equation}
+    R_j = i, \mbox{ if } \|\mathbf{c}_i-\hat{\mathbf{c}}_j\|_2 \leq \|\mathbf{c}_k-\hat{\mathbf{c}}_j\|_2, \forall k \in S_{N_r,j}.
+\end{equation}
+Therefore, when we regard the hidden state value $h^r_{R_j}$ as feature of the representative neuron and assume that $h^r_{R_j} \approx \bar{\mathbf{h}}^r_j$, where $\bar{\mathbf{h}}^r_j$ refers to the expected hidden state value, we can construct the router by grouping the representative neurons of all the routed experts:
+\begin{align}
+    G(\mathbf{x}) &= \text{Swish} (\mathbf{x}\mathbf{W}_{gate}^{R}) \odot (\mathbf{x}\mathbf{W}_{up}^{R}),  
+\end{align}
+where $\mathbf{W}_{gate}^{R} = \mathbf{W}_{gate}[:,S_{R}]$, $\mathbf{W}_{up}^{R} = \mathbf{W}_{up}[:,S_{R}]$, and $S_R = \{R_1, \dots,R_{N_r}\}$. This leads to  
+\begin{align}
+    G(\mathbf{x}) 
+    &= \left[s_1,s_2,\cdots, s_{N_r}\right] 
+    = \left[h^r_{R_1},h^r_{R_2},\cdots, h^r_{R_{N_r}}\right] \nonumber \\
+    &\approx \left[\bar{\mathbf{h}}^r_1,\mathbf{h}^r_2,\cdots, \mathbf{h}^r_{N_r}\right],
+\end{align}
+which is hence an approximate solution for the original problem introduced in \eqref{eq:prob}. 
+
+% which approximately achieves the permutation in \Cref{eq:permu} and hence is an approximate solution for the original problem \Cref{eq:prob}.
+% which is deduced by the fact that the neurons grouped in the same routed expert should have similar activation status:
+% \begin{align}
+%     R_j &=  \argmin_{i} ||\mathbf{c_i-\hat{c}_j}||_2 \\
+%     &= \argmin_{i} ||\mathbf{c_i-\hat{c}_j}||_2
+% \end{align}
+
+
+
+
+\subsection{Differentiable Routing and Load-balancing}
+\label{sec:diff}
+
+Though we have constructed a well-designed router in \Cref{sec:router_cons}, it is not differentiable since each expert score $g_i$ is a constant, as shown in \eqref{eq:moe_1}, hindering further alignment and performance recovery.
+Therefore, we introduce a learnable parameter $\mathbf{u}$ when computing the expert scores as follows,
+\begin{align}
+    g_i \!&\!=\! \left\{ \begin{array}{ll}
+        \!\!1 + s'_i\cdot u_i, &s'_i \in \text{TopK}(\{s'_i | 1\leq j\leq N_r\}, N_k), \nonumber \\ 
+        \!\!0, & \text{otherwise},
+    \end{array}\right. \nonumber \\
+    \mathbf{s}' &= \text{Softmax}(\mathbf{s}),\ \textbf{u} = [u_1, u_2,\dots,u_{N_r}] 
+    % \textbf{s} &= G(\textbf{x}),
+\end{align}
+where the scale $\mathbf{u}$ is initialized as zero to avoid perturbation.
+
+For MoE models, load-balancing is crucial to guarantee computational efficiency, especially expert parallelism in LLMs serving.
+As in DeepSeek-V3~\cite{liu2024deepseek}, we use the auxiliary-loss-free load balancing by introducing a bias term $\mathbf{b}$ before the TopK selection:
+% \footnote{***hyperparameter? if yes, you need to mention how to set its values.} 
+\begin{align}
+    g_i \!&\! =\! \left\{ \begin{array}{ll}
+        \!\!1 + s'_i\cdot u_i, &s'_i +b_i \in \text{TopK}(\{s'_i | 1\leq j\leq N_r\}, N_k), \\ 
+        \!\!0, & \text{otherwise},
+    \end{array}\right. \nonumber \\
+    \mathbf{b} &= [b_1, b_2, \dots, b_{N_r}].
+\end{align}
+Here, $\mathbf{b}$ is initialized as zero and updated based on the expert load status during each step of training, as in DeepSeek-V3.
+The hyper-parameter update speed $\gamma$ is used to update the bias term $\mathbf{b}$ at the end of each step, i.e. decreasing/increasing the bias term by $\gamma$ if the corresponding expert is overloaded/underloaded.
+
+% \input{table/ppl}
+% \input{table/zero-shot}

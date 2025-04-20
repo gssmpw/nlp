@@ -1,0 +1,170 @@
+\section{Approach}
+
+\begin{figure*}[!t]
+\begin{minipage}[!t]{1\linewidth}
+\begin{subfigure}[b]{0.57\textwidth}
+\centering
+\includegraphics[width=1\textwidth]{fig/approach/ART_autoencoder.pdf}
+\vspace{-3mm}
+\caption{Multi-Layer Transparent Image Autoencoder}
+\label{fig:framework_a}
+\end{subfigure}
+\hfill
+\begin{subfigure}[b]{0.39\textwidth}
+\centering
+\includegraphics[width=1\textwidth]{fig/approach/ART_Transformer.png}
+\vspace{-3mm}
+\caption{\footnotesize{Anonymous Region Transformer}}
+\label{fig:framework_b}
+\end{subfigure}
+\end{minipage}
+\vspace{-2mm}
+\caption{\footnotesize{
+(a)~\textbf{Multi-layer Transparent Image Autoencoder} directly encodes each layer of the multi-layer image, accompanied by the entire composed image, into latent space and jointly decodes the multi-layer latent tokens into RGBA transparent image layers.
+(b)~\textbf{Anonymous Region Transformer (ART)} performs denoising diffusion on the noisy multi-layer latents corresponding to a variable number of transparent layers jointly.
+}}
+\label{fig:framework}
+\vspace{-2mm}
+\end{figure*}
+
+The conventional text-to-image model~\cite{podell2023sdxl,esser2024scaling,betker2023improving,saharia2022photorealistic, flux} supports only a single, unified image generation from a global prompt. Our approach enables diffusion transformer-based models to jointly generate images with multiple transparent layers conditioned on an anonymous region layout provided by the user or predicted by an LLM. The entire framework consists of three key components: the \emph{Multi-layer Transparent Autoencoder} (\Cref{sec:method:ml_vae}), which jointly encodes and decodes multi-layer images and their corresponding latent representations; the \emph{Anonymous Region Transformer} (\Cref{sec:method:mmdit}), which concurrently generates a global reference image, a background image, and multiple RGBA transparent foreground image layers from a sequence of layout-guided noisy tokens; and the \emph{Anonymous Region Layout Planner} (\Cref{{sec:method:planner}}), which predicts a set of anonymous bounding boxes given the user-provided text prompt. The technical details are presented as follows.
+
+\subsection{Multi-Layer Transparent Image Autoencoder} \label{sec:method:ml_vae}
+
+A multi-layer transparent image consists of an RGB background layer $\mathbf{I}_\text{bg} \in \mathbb{R}^{H \times W \times 3}$, and a variable number $K$ of RGBA foreground layers, $\{\mathbf{I}_\text{fg}^{i} \in \mathbb{R}^{H_i \times W_i \times 4}\}_{i=1}^K$. The corresponding merged image $\mathbf{I}_{\text{mg}} \in \mathbb{R}^{H \times W \times 3}$ can be obtained by integrating $\mathbf{I}_\text{bg}$ as the base layer and overlaying all $\mathbf{I}_\text{fg}^{i}$ layers according to a predefined layout. We use $\mathbf{L}=\{x_c^i, y_c^i, H_i, W_i\}_{i=1}^K$ to represent the anonymous region layout of all $K$ foreground layers. Here, ${x_c^i, y_c^i}$ and ${H_i, W_i}$ denote the center coordinates and the height and width of the bounding box that encapsulates the $i$-th transparent foreground layer. It is worth noting that the anonymous region layout $\mathbf{L}$ is inherently encoded in the alpha channel of each foreground layer. Thus, $\{x_c^i, y_c^i, H_i, W_i\}$ can be obtained by computing the bounding box of the non-transparent, or opaque, region from the alpha channel of $\mathbf{I}_\text{fg}^{i}$.
+
+\vspace{1mm}
+\noindent\textbf{Transparency Encoding.}
+Our method integrates the transparency in alpha channel $\mathbf{I}_{\text{fg},\alpha}^{i}$ directly into the RGB channels $\mathbf{I}_{\text{fg},\text{RGB}}^{i}$. Specifically, we compute $\hat{\mathbf{I}}_\text{fg}^{i}=(0.5\mathbf{I}_{\text{fg},\alpha}^{i} + 0.5) \times \mathbf{I}_{\text{fg},\text{RGB}}^{i}$, converting the transparent-background image $\mathbf{I}_\text{fg}^{i}$ into a gray-background image $\hat{\mathbf{I}}_\text{fg}^{i}$. All channel values are normalized to range between $-1$ to $1$. Empirically, we found that this gray background sufficient to ensure accurate transparency decoding in subsequent stages.
+
+\vspace{1mm}
+\noindent\textbf{Multi-Layer Transparency Encoder.}
+In the encoder part of the Multi-layer Transparency Encoder (\Cref{fig:framework_a}), the merged reference image $\mathbf{I}_{\text{mg}}$, the background layer $\mathbf{I}_{\text{bg}}$, and all the padded gray-background image layers $\{\hat{\mathbf{I}}_\text{fg}^{i}\}_{i=1}^{K}$ are all concatenated along the batch dimension, and then fed into the VAE encoder $\mathcal{E}_{\text{VAE}}$. This encoder~\cite{flux} downsamples the spatial dimension with a factor of 8 while obtaining a 16-channel feature dimension.
+The extracted latent representations of the merged reference image $\mathbf{I}_{\text{mg}}$ and the background image $\mathbf{I}_{\text{bg}}$ are flattened into sequence of tokens:
+\begin{align}
+\hspace{-0.5em}
+    \mathbf{z}_{\text{mg}}=\mathsf{Flatten}(\mathcal{E}_{\text{VAE}}(\mathbf{I}_\text{mg})),
+    \mathbf{z}_{\text{bg}}=\mathsf{Flatten}(\mathcal{E}_{\text{VAE}}(\mathbf{I}_\text{bg})).
+\end{align}
+\noindent
+The pre-processed foreground image layers are first subjected to a ceiling-aligned tight crop and then flattened into latent tokens with different lengths:
+\begin{align}
+	\mathbf{z}_{\text{fg}}^{i} = \mathsf{Flatten}(\mathsf{Crop}(\mathcal{E}_{\text{VAE}}(\hat{\mathbf{I}}_\text{fg}^{i}), \mathbf{L}_i)), \quad i=1,\cdots,K,
+\end{align}
+where $\mathbf{L}_i$ denotes the foreground area position of layer $\mathbf{I}_\text{fg}^{i}$. The ceiling-aligned tight crop is performed by identifying the tightest bounding box with a height and width divisible by $16$ to adapt to the VAE downsample rate of $8$ and diffusion transformer patch size $2$.
+Finally, the compressed multi-layer image latent $\mathbf{z}$ is obtained by concatenating the latent of the merged reference image, the background image, and the transparent foreground layers:
+\begin{align}
+	\mathbf{z}   &= \mathsf{Concatenate}(\mathbf{z}_{\text{mg}}, \mathbf{z}_{\text{bg}}, \mathbf{z}_{\text{fg}}^{1}, \mathbf{z}_{\text{fg}}^{2}, \cdots, \mathbf{z}_{\text{fg}}^{K}).
+\end{align}
+
+\vspace{1mm}
+\noindent\textbf{Multi-Layer Transparency Decoder.}
+The detailed design of our novel multi-layer transparency decoder is illustrated on the right in \Cref{fig:framework_a}, which supports the direct decoding of a variable number of transparent layers at varying resolutions from a sequence of concatenated visual tokens in a single forward pass.
+We implement the multi-layer transparent image decoder based on a standard ViT architecture.
+The mathematical formulations are shown as follows:
+
+\begin{align}
+\vspace{-2mm}
+	&\mathbf{v}   = \text{ViT}(\text{Linear}_{\text{in}}(\mathbf{z})), \\
+	&\mathbf{t}   = \mathsf{Reshape}(\text{Linear}_{\text{out}}(\mathbf{v}), \mathbf{L}),
+\end{align}
+where $\text{ViT}(\cdot)$ represents the ViT model, $\text{Linear}_{\text{in}}(\cdot)$ denotes a linear projection that transforms the channel dimension of the latent representation, \ie 16, to the hidden dimension size of ViT, especially 768, $\mathbf{v}$ represents the output representation of the ViT, $\text{Linear}_{\text{out}}(\cdot)$ denotes a linear projection that transforms the output dimension from 768 to 256, where each token can be reshaped to form an RGBA patch of size $8\times8\times4$. Another key modification in our design is the replacement of the original absolute position embedding with 3D RoPE, which is explained in the following discussion.
+We simply apply $\mathcal{L}_1$ loss to optimize the parameters of the multi-layer transparency decoder while freezing the parameters of the multi-layer transparency encoder.
+
+The advantages of our multi-layer transparency decoder are twofold, including improved efficiency and enhanced transparency predictions compared to the previous single-layer transparent decoder~\cite{zhang2024transparent}. We present the qualitative comparison results in the experimental section.
+
+\subsection{Anonymous Region Transformer} \label{sec:method:mmdit}
+The Anonymous Region Transformer (ART) generates the visual tokens of a global reference image, a background image and all foreground layers simultaneously. The purpose of generating reference images is twofold: to better leverage the original capabilities of the existing text-to-image generation model and to ensure overall visual harmonization by preventing conflicts and inconsistency across layers.
+Generating all layers simultaneously also avoids the need for inpainting algorithms to complete missing parts of the occluded layers. We choose the latest multimodal diffusion transformer (MMDiT), \eg, FLUX.1[dev]~\cite{flux}, to build our variable multi-layer image generation model, ART.
+
+MMDiT is an improved variant of DiT framework~\cite{esser2024scaling} that uses two different sets of model weights to process text tokens and image tokens separately. 
+The original MMDiT model, which only supports single image generation from a global prompt.
+We transform it into a multi-layer generation model by modifying the input visual tokens to encode the anonymous region layout information with a novel 3D RoPE design.
+We present the overall framework of ART in Figure~\ref{fig:framework} (b).
+The input consists of an anonymous region layout $\mathbf{L}$ and a global prompt $\mathbf{T}$. The noisy input is computed by adding Gaussian noise to a sequence of clean multi-layer latents $\mathbf{z}$ that encodes the reference image, background image, and all the transparent layers. We extract $\mathbf{z}$ with our multi-layer transparency encoder.
+
+\vspace{1mm}
+\noindent\textbf{Layout Conditional Multi-Layer 3D RoPE.}
+Rotary Position Embedding (RoPE)~\cite{su2024roformer} is a specific type of position embedding that applies a rotation operation to key and query in self-attention layers as channel-wise multiplications. The advantage of RoPE is that it allows the model to handle sequences of varying lengths, making it more flexible and efficient. The key design of our ART is to use a layout conditional multi-layer 3D RoPE to encode the accurate relative position information for all visual tokens, which is also utilized in the multi-layer transparency decoder.
+We first extract the layer-wise 3D indexing for the given noisy latents according to the anonymous region layout, \ie $\mathbf{p}_n=\{p_n^x, p_n^y, p_n^l\}$ represent the width index, height index, and layer index of the $n$-th latents, respectively. Then, denoted $n$-th query and $m$-th key as $\mathbf{q}_n$ and $\mathbf{k}_m \in \mathbb{R}^{d_{\text{head}}}$, respectively, we split both query and key into 3 parts along channel dimensions, \ie $\mathbf{q}_n=\{\mathbf{q}_n^x, \mathbf{q}_n^y, \mathbf{q}_n^l\}$ and $\mathbf{k}_m=\{\mathbf{k}_m^x, \mathbf{k}_m^y, \mathbf{k}_m^l\}$. Thus, the $(n, m)$ component of the attention matrix is calculated as:
+\begin{equation}
+	\mathbf{A}_{(n, m)} = \sum_{c\in \{x, y, l\}}{\text{Re}[\mathbf{q}_n^c{(\mathbf{k}_m^c)}^* e^{i(p_n^c-p_m^c)\theta}]},
+\end{equation}
+where $\text{Re}[\cdot]$ is the real part of a complex number and $(\mathbf{k}_m^c)^*$ represents the conjugate complex number of $\mathbf{k}_m^c$. $\theta \in \mathbb{R}$ is a preset non-zero constant. The detailed implementation can be found in the supplementary material.
+
+\subsection{Anonymous Region Layout Planner} \label{sec:method:planner}
+
+We propose an anonymous region layout planner, which predicts a set of bounding boxes based on the text input. This planner is implemented by fine-tuning an LLM model on our layout dataset, specifically using the pre-trained LLaMa-3.1-8B~\cite{dubey2024llama}. An example of prompts as input and the corresponding predicted layouts is given below. Unlike conventional layout definitions~\cite{kong2022blt,jiang2023layoutformer++,jia2023cole,inoue2024opencole} that specify both position and content, our anonymous region layout planner avoids assigning specific semantic labels to regions. In addition, it refrains from asking users to provide explicit layout details by users, offering greater flexibility.
+
+\begin{contentagnosticlayout}
+	\textbf{Input}: The image is a vibrant Ramadan-themed ad featuring a rich blue background with Islamic art-inspired designs and three lit golden lanterns. The white text in the center announces a ``special offer Ramadan big sale", with a subtitle that states ``Discount up to $30\%$ off''.
+	\textbf{Output}:  [\{
+		``layer": 0,
+		``x": 512,
+		``y": 512,
+		``width": 1024,
+		``height": 1024
+	\},
+	\{
+		``layer": 1,
+		``x": 744,
+		``y": 496,
+		``width": 496,
+		``height": 256
+	\},
+	\{
+		``layer": 2,
+		``x": 856,
+		``y": 704,
+		``width": 240,
+		``height": 96
+	\},
+	\{
+		``layer": 3,
+		``x": 792,
+		``y": 640,
+		``width": 368,
+		``height": 64
+	\},
+	\{
+		``layer": 4,
+		``x": 840,
+		``y": 336,
+		``width": 272,
+		``height": 64
+	\}]
+\end{contentagnosticlayout}
+
+\subsection{Multi-Layer Transparent Design Dataset}
+We have collected a private, high-quality, multi-layered transparent design (MLTD) dataset that consists of approximately 1 million instances considering their high-quality alpha channels and coherent spatial arrangements. Each instance comprises multiple transparent layers with variable resolutions. The resolutions of the merged images range from $1024\times1024$ to $1500\times1500$.
+The average number of layers is $11$, and $99.9\%$ of designs have fewer than $50$ layers. The average number of visual tokens is $11.38$K, which is significantly smaller than $20 \times 32 \times 32 = 20.48$K. This indicates that the area of most foregrounds is relatively small.
+
+\begin{table}[!t]
+\begin{minipage}[t]{1\linewidth}
+\centering
+\tablestyle{2pt}{1.1}
+\resizebox{1.0\linewidth}{!}
+{
+\begin{tabular}{l|c|c|c|c}
+\multirow{1}{*}{Dataset} & \multirow{1}{*}{\# Samples} & \multirow{1}{*}{\# Layers} & \multirow{1}{*}{Source Data} & \multirow{1}{*}{Alpha Quality} \\
+\shline
+MAGICK~\cite{burgert2024magick} & $\sim150$ K & $1$ & generated & good \\
+Multi-layer Dataset~\cite{zhang2024transparent} & $\sim1$ M & $2$ & commercial, generated & good  \\
+LAION-L\textsuperscript{2}I~\cite{zhang2023text2layer} & $\sim57$ M & $2$ & LAION & normal \\
+MuLAn~\cite{tudosiu2024mulan} & $\sim44$ K & $2\sim 6$ & COCO, LAION & poor  \\
+MLCID~\cite{huang2024layerdiff} & $\sim2$ M & [$2$,$3$,$4$] & LAION & poor  \\
+Crello~\cite{yamaguchi2021canvasvae} & $\sim20$ K & $2\sim50$ & Graphic design website & normal  \\ \hline
+MLTD (ours) & $\sim1$ M & $2\sim50$ & Graphic design website & good  \\
+\end{tabular}
+}
+\vspace{-3mm}
+\caption{
+\small{Comparison with existing multi-layer datasets.}}
+\label{tab:dataset_compare}
+\end{minipage}
+\vspace{-5mm}
+\end{table}
+
+\vspace{1mm}
+\noindent\textbf{Comparison with Existing Multi-Layer Data}
+Table~\ref{tab:dataset_compare} provides a comparison between previously existing multi-layer datasets and our proposed Multi-Layer-Design dataset. Our MLTD dataset is the first large-scale dataset that includes a wide range of transparent layers with high-quality alpha channels. We also verified in the experimental section that our method can achieve sufficiently good results with only $8$K high-quality data, making our method easy to replicate.

@@ -1,0 +1,163 @@
+%-------------------------------------------------------------------------------
+\section{Introduction}
+%-------------------------------------------------------------------------------
+Large language models~(LLMs), a recent advancement in deep learning, 
+have revolutionized multiple computing domains, including content generation~\cite{content1, content2, content3}, 
+data analysis~\cite{dataanalyse1, dataanalyse2, dataanalyse3},  
+language translation~\cite{translation1, translation2, translation3},  
+and code development~\cite{code1, code2, code3, code4}, 
+thanks to their ability to perform various complex tasks with remarkable accuracy. 
+
+However, a key challenge to democratizing LLM is to meet its immense memory demand during inference.  
+%
+Modern LLMs often come with tens to hundreds of billions of parameters 
+with serving requests often involving long prompts and/or large batch sizes.   
+%
+The memory demand is further exacerbated by emerging deployment scenarios, 
+like multi-round conversation~\cite{cachedattention} and long-form text generation\cite{longform}.  
+%
+As a result, serving modern LLMs typically demands hundreds of gigabytes of 
+memory, far exceeding the memory capacity of even advanced GPUs like NVIDIA A100~\cite{A100}. 
+%
+To meet the memory demands, the current industry practice involves deploying 
+a model on multiple GPUs to use their aggregate memory. 
+%
+However, this approach incurs significant operational costs. 
+
+A promising approach~\cite{lorazerooffload} to meet the memory demands is to offload part of 
+the LLM state to host memory~(\ie, those used by CPU) during serving and 
+transfer the offloaded state back to GPU when needed. 
+State-of-the-art offloading mechanisms are \deepspeed Inference~(\deepspeed afterwards)~\cite{zero-infer} and \flexgen~\cite{flexgen}. 
+%
+Both mechanisms leverage the fact that modern LLM serving performs computation on 
+one decoder layer~(layer afterwards) at a time before moving to the next layer. 
+%
+Specifically, \deepspeed only keeps the minimal necessary
+LLM state in GPU memory, namely the state of the current layer, while offloading all other LLM states to host memory. 
+%
+\flexgen, instead, offloads a fixed portion of the state across all layers to the host memory. 
+%
+This portion is determined by factors like model size, batch size, and sequence length, and the decision is made statically using metrics like peak GPU performance, without executing the serving requests on the GPU.
+%
+%
+To mitigate the performance impact incurred by offloading, both 
+systems prefetch the state of the next layer during the computation of the current layer. 
+
+A key limitation of both \deepspeed and \flexgen is that their design 
+does not consider an important factor: the request serving must meet 
+certain latency service level objectives~(SLOs).  
+%
+The latency SLOs exist because many LLM deployment scenarios, such as
+chatbots~\cite{chatbot1, chatbot2} and virtual assistants~\cite{virtualassist}, involve frequent interaction of users.  
+%
+In this case, the serving must be highly responsive, and any single SLO 
+violation incurs severe economic losses~\cite{SLOeconomy}, since this harms the user experience, increasing the likelihood of users switching to competing services. 
+%
+
+As a result, both \deepspeed and \flexgen become highly ineffective when latency SLOs must be considered.  
+%
+\deepspeed significantly increases the serving time~(9.5\X as shown in 
+Figure~\ref{fig:moti1} (a)), resulting in frequent SLO violations. 
+%
+This limitation is due to the design choice of only keeping the current layer 
+in GPU memory, and if the layer transfer time exceeds its computation time, 
+which is often the case with modern LLMs, the serving latency significantly 
+increases.
+%
+Unfortunately, as discussed above, SLO violations incur a significant economic loss, defeating the purpose of offloading to reduce operational costs. 
+
+On the other hand, while one can fine-tune input factors in \flexgen to 
+meet latency SLOs, its static decision process forces users to account for the worst case by offloading a theoretical lower bound of memory to the 
+host.  
+%
+A direct consequence of such memory underutilization is that \flexgen only allows for a smaller batch size than necessary, leading to a 1.85\X drop in throughput. 
+%
+We identified two key factors which, when estimated statically, contribute to memory underutilization:
+%
+1) use the peak GPU performance to estimate the model
+execution time; and 2) upon PCIe bandwidth contention, where 
+$n$ GPUs sharing a single bus, assuming each GPU always only gets $1/n$ of the memory bandwidth. 
+
+
+This paper presents \sys, an effective latency-SLO-aware memory offloading system for LLM inference. 
+%
+The overarching design goal of \sys is to maximize host memory usage 
+while guaranteeing the latency SLOs. 
+%
+To meet this goal, the design of \sys exploits a unique characteristic of LLM 
+serving: the computation time on each layer is deterministic~(\ie, 
+always the same). 
+%
+This is because each layer consists of the same structure and always performs the same set of operations with the input of identical size. 
+
+At the core of \sys is \interval, 
+an internal tunable knob that effectively captures the tension between meeting SLOs and maximizing host memory usage. 
+%
+An \interval of $i$, means, during serving, for every $i$ layer, \sys offloads the last layer of the interval to the host memory. 
+%
+Importantly, unlike \deepspeed and \flexgen which only prefetch the offloaded state when the computation reaches the previous layer, \sys prefetches 
+the offloaded layer much earlier, 
+when it starts to compute the first layer in the \interval. 
+%
+This enables \sys to use a larger \interval to handle stricter SLOs since it keeps more state in GPU, thereby using 
+additional computation to cover state transfer latency.   
+%
+On the other hand, with a looser SLO, \sys uses a small \interval to maximize 
+host memory usage. 
+%
+Crucially, the tradeoff can be made by adjusting the \interval because the deterministic execution time of LLM layers ensures that the computation time for all layers, 
+whether within the same iteration or across different iterations, remains the same. 
+
+Following the above setup, meeting the design goals of \sys is simplified 
+to choosing an optimal \interval, \ie, the smallest possible one that meets the SLO, for each serving request. 
+%
+\sys achieves this in two steps and, unlike \flexgen, performs them dynamically based on the actual execution.  
+%
+The first step decides the optimal \interval assuming no PCIe bandwidth contention. 
+%
+This step is performed once for each new LLM deployed and is conducted on a dedicated offline server. 
+%
+In this step, unlike \flexgen, which estimates the serving time based on the GPU's peak performance, 
+\sys again leverages the deterministic execution time of the LLM to execute a stream of prompts on the model to generate a performance record. 
+%
+The \record stores, for each valid combination of target SLOs, batch sizes, and sequence lengths, the optimal \interval.  
+%
+Therefore, upon receiving a request, \sys directly obtains the optimal 
+\interval from the record, avoiding any extra latency from online measurements. 
+%
+
+
+Finally, to handle PCIe bandwidth contention, the second step is performed on the actual servers that handle user requests. 
+%
+In this case, a per-bus coordinator constantly 
+monitors the bandwidth utilization of all GPU sharing the PCIe bus 
+and, based on the \interval obtained from the first step, 
+adjusts the \interval of each GPU accordingly to ensure each does not violate SLOs, while maximizing the total host memory usage.  
+%
+Our extensive experiments demonstrate that, unlike \deepspeed, \sys can 
+always correctly maintain latency SLOs across a range of setups. 
+%
+In addition, given the same latency SLOs, \sys uses 2.37\X more host memory than \flexgen, leading to a throughput increase of 1.85\X. 
+%
+
+In summary, we make the following contributions. 
+\squishlist
+%
+\item{\textbf{\Interval.}}
+%
+We propose \interval, a simple yet effective abstraction that captures the 
+tension between serving latency and memory saving, leveraging a unique characteristic of LLM: the computation time of each layer is
+deterministic. 
+
+\item{\textbf{Offline performance analyzing.}}
+%
+We propose an effective offline performance analysis technique, again leveraging the determinism in LLM computation time. 
+
+\item{\textbf{\sys.}}
+%
+We design and implement \sys, a complete and, to our knowledge, the first 
+latency-SLO-aware memory offloading system for LLM serving. 
+%
+\squishend
+
+We are committed to open-sourcing \sys. 

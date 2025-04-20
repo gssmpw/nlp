@@ -1,0 +1,74 @@
+\section{\disco{} Policies}
+\label{sec:disco_policy}
+
+\disco{} optimizes both QoE and cost through (1) dispatch control that determines where to initiate token generation, and (2) migration control that enables dynamic handoff during generation. The dispatch controller optimizes TTFT by strategically routing requests, while the migration controller maintains consistent TBT while reducing costs.
+
+\subsection{Problem Formulation}
+\label{subsec:model}
+We propose a unified cost model combining both monetary bills from on-server inference and energy bills from on-device inference. Let $c^p_s$ and $c^d_s$ denote the per-token monetary costs for server prefill and decode phases respectively, while $c^p_d$ and $c^d_d$ represent the per-token energy costs for device prefill and decode phases. Converting between energy and monetary costs is done by a dynamic exchange rate $\lambda$, adjusted by users to reflect their preferences. We offer a user-friendly tunable budget ratio $b \in [0,1]$, representing the additional cost allowance beyond baseline costs. Our optimization objectives focus on: (1) minimizing both mean and tail TTFT, and (2) maintaining consistent token delivery at a specified pace (i.e., stable TBT).
+
+\subsection{Dispatch Controller: Cost-Aware Request Routing}
+\label{subsec:ttft_opt}
+Based on our analysis in \S\ref{sec:characteristics}, server-side TTFT shows weak correlation with prompt length due to various factors (network delay, request queueing, etc.). We model server TTFTs as a known distribution, obtained either from server-provided information or device-side profiling. In contrast, device-side TTFT exhibits a linear relationship with prompt length, with the coefficient determined through offline profiling. 
+
+Our key insight is that the optimization problem naturally decomposes into two scenarios based on dominant cost factors: device-constrained scenarios where energy consumption is the primary bottleneck, and server-constrained scenarios where API monetary costs dominate. This decomposition enables efficient solutions. Pseudocode for the dispatch controller is in Appendix~\ref{appendix:pseudocode_scheduling}.
+
+\paragraph{Device-Constrained Optimization.} 
+
+When device costs dominate ($\min(c^p_d, c^d_d) > \max(c^p_s, c^d_s)$), we need to carefully manage device resource usage under a budget constraint $\mathbb{E}[I_d(l)l] \leq b \cdot \mathbb{E}[l]$, where $l$ is the prompt length and $I_d(l)$ indicates device execution. The key challenge is balancing between two goals: leveraging device execution to bound worst-case latency while conserving energy on shorter prompts where possible.
+
+Our solution uses a wait-time strategy: for each prompt of length $l$, we first try server execution and wait for time $w(l)$ before potentially starting device execution. This conserves device energy when the server responds quickly. We determine the optimal wait time through a two-phase approach:
+
+\begin{denseitemize}
+    \item \textbf{Phase 1 (Tail Protection):} We reserve budget portion $\alpha$ for worst-case scenarios by setting a maximum wait time $w_{tail} = F^{-1}(1-\min(\alpha,b))$, where $F(\cdot)$ is the server TTFT distribution. This ensures we have device resources ready when server latency exceeds its $(1-\min(\alpha,b))$-th percentile.
+    
+    \item \textbf{Phase 2 (Average Case):} With the remaining budget $(b-\alpha)$, we set length-dependent wait times:
+    \begin{equation}
+        w(l) = \begin{cases}
+            0 & \text{if } l \leq l_{th} \\
+            \min(\beta l, w_{tail}) & \text{otherwise}
+        \end{cases}
+    \end{equation}
+    where $l_{th}$ is a threshold below which we start device execution immediately, and $\beta$ is chosen to satisfy:
+    \begin{equation}
+        \int_{l_{th}}^{\infty} (1-F(\beta l)) \cdot c^p_d \cdot l \cdot p(l)dl = (b-\alpha) \cdot \mathbb{E}[l]
+    \end{equation}
+\end{denseitemize}
+
+This design guarantees worst-case TTFT through $w_{tail}$ while optimizing average performance by adaptively adjusting wait times based on prompt length. Whichever endpoint (server or device) generates the first token continues to the decode phase, while the other terminates.
+
+\paragraph{Server-Constrained Optimization.}
+When server costs dominate ($\max(c^p_s, c^d_s) > \min(c^p_d, c^d_d)$), we need to carefully manage server resource usage under a budget constraint $\mathbb{E}[I_s(l)l] \leq b \cdot \mathbb{E}[l]$, where $I_s(l)$ indicates server execution. Our analysis in \S\ref{sec:characteristics} shows that device TTFT scales linearly with prompt length as $T_d(l) = kl + c$, while server TTFT has minimal length correlation. This suggests a length-based routing strategy: short prompts run on device to conserve server budget, while long prompts use both endpoints to minimize TTFT.
+
+We determine the length threshold $l_{th}$ by:
+\begin{equation}
+  \int_0^{l_{th}} l \cdot p(l) dl = (1-b) \cdot \mathbb{E}[l]
+\end{equation}
+This ensures prompts shorter than $l_{th}$ consume exactly $(1-b)$ fraction of total expected tokens through device-only execution, leaving the remaining longer prompts with sufficient server budget for concurrent execution on both endpoints.
+
+\subsection{Migration Controller: Cost-Efficient Token Delivery}\label{sec:migration}
+When both endpoints process a request, the constrained endpoint may win the prefill phase but incur higher decode costs. In such cases, we can migrate token generation to the other endpoint to reduce total cost while maintaining quality.
+
+\paragraph{Efficient Token Transfer.}
+
+When endpoints share the same vocabulary, we transmit token IDs rather than complete token representations. Additionally, we avoid transferring intermediate states (e.g., attention key-value cache) for two practical reasons: (1) endpoints often employ different model architectures optimized for their respective hardware, making state transfer incompatible, and (2) intermediate state transfer would incur significant network overhead. Migration triggers when projected cost savings exceed overhead:
+\begin{equation}
+    C_{migration} = \Delta c^d_{decode} \times l_{remaining}
+\end{equation}
+where $\Delta c^d_{decode} = |c^d_s - c^d_d|$ and $l_{remaining}$ denote the per-token decode cost difference between endpoints, and the expected remaining sequence length, respectively.
+
+\paragraph{Buffer-Based Migration Protocol.}
+To ensure smooth token delivery during migration, we introduce a token buffer that leverages the natural gap between token generation speed ($r_g$ tokens/s) and human consumption rate ($r_c$ tokens/s, typically $r_g > r_c$). The buffer size is set to:
+\begin{equation}
+    B = r_c \times t_m
+\end{equation}
+where $t_m$ is the estimated migration overhead time. Migration begins only when the buffer contains enough tokens ($B$) to mask the migration latency.
+
+As shown in Figure~\ref{fig:cost_saving}, this design enables seamless handoff: the source endpoint (Row A) continues generation until the target endpoint (Row B) is ready, ensuring uninterrupted token delivery to users despite the underlying endpoint transition.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.45\textwidth]{figs/migration.pdf}
+    \caption{Token generation migration between endpoints. Row A shows the original sequence on the source endpoint, while Row B shows the sequence after migration to the target endpoint, maintaining consistent token delivery while reducing cost.}
+    \label{fig:cost_saving}
+\end{figure}

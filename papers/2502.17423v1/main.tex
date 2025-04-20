@@ -1,0 +1,2003 @@
+\documentclass{article}
+
+\usepackage[table,dvipsnames]{xcolor}
+
+\usepackage[margin=1.0in]{geometry}
+\usepackage{amsmath,amsthm,amssymb, mathtools, thmtools,amsfonts,bm}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{multirow}
+
+\hypersetup{
+colorlinks=true,
+linkcolor=Cerulean,
+filecolor=magenta,      
+urlcolor=Cyan,
+citecolor=Cerulean
+}
+
+\urlstyle{same}
+\usepackage{enumitem}
+\usepackage[round,sort&compress]{natbib}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{tikz}
+\usepackage{thm-restate}
+\usepackage[labelformat=simple]{subcaption}
+\renewcommand\thesubfigure{(\alph{subfigure})}
+\usepackage{mathtools}
+
+\usepackage{microtype}
+\usepackage{booktabs} %
+\usepackage{ragged2e}
+
+\usepackage{array}
+\usepackage{makecell}
+\newcolumntype{C}{>{$\displaystyle}c<{$}}
+\usepackage{float}
+
+\definecolor{lightgray}{gray}{0.9}
+\definecolor{lightred}{RGB}{255,200,200}
+\definecolor{lightorange}{RGB}{255,219,187}
+
+
+\input{macros}
+
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{assumption}[theorem]{Assumption}
+\theoremstyle{remark}
+\newtheorem{remark}[theorem]{Remark}
+
+\let\cite\citep
+
+\title{S4S: Solving for a Diffusion Model Solver}
+
+\author{Eric Frankel\thanks{University of Washington, Seattle.} \and Sitan Chen\thanks{Harvard University} \and Jerry Li$^\ast$ \and Pang Wei Koh$^\ast$\thanks{Allen Institute for AI} \and Lillian J.~Ratliff$^\ast$ \and Sewoong Oh$^\ast$}
+
+\date{} 
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+\noindent
+Diffusion models (DMs) create samples from a data distribution by starting from random noise and iteratively solving a reverse-time ordinary differential equation (ODE).
+Because each step in the iterative solution requires an expensive neural function evaluation (NFE), there has been significant interest in approximately solving these diffusion ODEs with only a few NFEs without modifying the underlying model.
+However, in the few NFE regime, we observe that tracking the true ODE evolution is fundamentally impossible using traditional ODE solvers.
+In this work, we propose a new method that learns a good solver for the DM, which we call \textbf{S}olving \textbf{for} the \textbf{S}olver (\textbf{S4S}).
+S4S directly optimizes a solver to obtain good generation quality by learning to match the output of a strong teacher solver.
+We evaluate S4S on six different pre-trained DMs, including pixel-space and latent-space DMs for both conditional and unconditional sampling.
+In all settings, S4S uniformly improves the sample quality relative to traditional ODE solvers.
+Moreover, our method is lightweight, data-free, and can be plugged in black-box on top of any discretization schedule or architecture to improve performance.
+Building on top of this, we also propose \textbf{S4S-Alt}, which optimizes both the solver and the discretization schedule.
+By exploiting the full design space of DM solvers, with 5 NFEs, we achieve an FID of 3.73 on CIFAR10 and 13.26 on MS-COCO, representing a $1.5\times$ improvement over previous training-free ODE methods.
+\end{abstract}
+
+\begin{figure}
+    \centering
+    \includegraphics[width=\linewidth]{images/new_figure1.png}
+    \caption{High-level approach of S4S-Alt. Every diffusion solver can be characterized by its choice of step schedule and the parameters used for estimating the next point in the reverse process. In low-NFE environments, vanilla ODE solvers are unable to  approximate the true diffusion ODE trajectory and produce low-quality samples. In S4S-Alt, we learn an optimal combination of solver coefficients and discretization steps that closely matches the \emph{output} of the true ODE trajectory. An example of a selected ODE solver is presented on the top, where $\{t_i\}$ is the choice of step schedule and the coefficients $(1/2,1/2)$ are the solver parameters.}
+    \label{fig:main-fig}
+\end{figure}
+
+\section{Introduction}
+Diffusion models (DMs)~\citep{sohl2015deep,ho2020denoising,song2020score} are a class of powerful models that have revolutionized generative modeling and achieve state-of-the-art performance in a wide number of domains. %
+At a high level, DMs learn a \emph{score network} that approximates the time-dependent score function of a diffusion process~\citep{song2020score,chen2022sampling}. Sampling from them often involves solving an ordinary differential equation called the \emph{diffusion ODE}, where the dynamics are determined by the score network~\citep{song2020score,song2020denoising}. 
+This ODE typically requires a large number of neural function evaluations (NFEs) to numerically solve, and consequently can be quite slow and unwieldy~\citep{ho2020denoising,karras2022elucidating}. 
+This is directly at odds with many exciting applications of DMs for which low-latency inference is essential, such as robotics~\citep{chi2024diffusionpolicy} or game engines~\citep{valevski2024diffusion}.
+Therefore, there is a tremendous amount of interest in understanding how we can decrease the number of NFEs needed without sacrificing performance.
+
+Methods for enabling DMs to use fewer NFEs generally fall under one of two categories: learning an entirely new model that distills multiple score network evaluations into a single step (\textbf{training-based}), or designing efficient diffusion ODE samplers while keeping the score network unchanged (\textbf{training-free}).
+From a practical standpoint, training-based methods, such as progressive distillation~\citep{salimans2022progressive,meng2023distillation} and consistency models~\citep{song2023consistency} 
+require access to original data samples and substantial computational resources, which may not be available or feasible. 
+Additionally, training-based methods often optimize objectives that fundamentally alter the model's interpretation as a score function, making them unsuitable for tasks that rely on score-based modeling, such as guided generation~\cite{ho2022classifier}, composition~\cite{du2023reduce}, and inverse problem solving~\cite{xu2024consistencymodeleffectiveposterior}.
+
+For these reasons,
+we focus on training-free approaches, which requires selecting a discretization of the diffusion ODE and determining both the optimal evaluation timesteps and synthesis strategy to accurately approximate the continuous trajectory.
+The majority of the literature has focused on choosing a good time-step schedule in this small NFE regime, i.e. choosing when to spend our budget of NFEs~\citep{watson2021learning,sabour2024align,tong2024learning,xue2024accelerating,pmlr-v235-chen24bm}.
+Yet, in practice, it is equally important to choose a good solver---this corresponds roughly to choosing how to synthesize these different function evaluations.
+Most works still rely on ``textbook'' ODE solvers such as single-step (SS)~\citep{lu2022dpm,lu2022dpmpp} or linear multi-step (LMS) methods~\citep{lu2022dpmpp,zhang2022fast}.
+While there is some literature that explores going beyond these solvers~\citep{zheng2023dpm,zhang2023accelerating,zhou2024fast}, these approaches only explore narrow components of the sampler design space.
+
+At their heart, off-the-shelf solvers (and much of the prior work on optimizing samplers) seek to approximate the path of the true ODE in discrete time, which can be done given a sufficiently fine discretization (i.e. many NFEs).
+These methods are carefully crafted so that each step yields an accurate low-degree Taylor approximation of the ODE solution over a small time window.
+Our key observation is that in the low NFE regime, \emph{this is the wrong thing to target}, as analytic tools such as low-degree approximation simply do not make sense in the setting where the step-size is gigantic.
+
+We propose to abandon this formalism, and rather to directly optimize a solver to improve performance of the diffusion model.
+A similar observation was made independently in~\citet{shaul2024bespoke}; however, among other issues, the method they derived seeks to completely generalize all previously known solvers. 
+As a result, their solver incorporates large amounts of irrelevant information and optimizes a very complex objective, and is thus unable to match SOTA performance in many settings.
+In contrast, we give a cleaner, more direct approach for obtaining an optimized solver and demonstrate that our method uniformly improves upon traditional solver performance in virtually all settings we tested.
+
+\subsection{Our Results}
+We introduce S4S, which learns a solver by distilling from a teacher network's samples, enhancing existing solvers without requiring access to the original training data.
+Building on this foundation, S4S-Alt achieves substantially higher image quality through an alternating optimization approach that refines both time discretization and solver coefficients.
+
+\begin{figure}[!t]
+    \centering
+    \begin{subfigure}[b]{0.24\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/panda/teacher-panda.png}
+        \caption{Teacher}
+        \label{fig:panda1}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[b]{0.24\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/panda/ipndm-panda.png}
+        \caption{Best ``Traditional''}
+        \label{fig:panda2}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[b]{0.24\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/panda/s4s-panda.png}
+        \caption{S4S}
+        \label{fig:panda3}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[b]{0.24\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/panda/s4s-alt-panda.png}
+        \caption{S4S-Alt}
+        \label{fig:panda4}
+    \end{subfigure}
+    \begin{subfigure}[b]{0.24\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/dog/teacher-dog.png}
+        \caption{Teacher}
+        \label{fig:dog1}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[b]{0.24\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/dog/traditional-dog.png}
+        \caption{Best ``Traditional''}
+        \label{fig:dog2}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[b]{0.24\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/dog/s4s-dog.png}
+        \caption{S4S}
+        \label{fig:dog3}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[b]{0.24\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/dog/s4s-alt-dog.png}
+        \caption{S4S-Alt}
+        \label{fig:dog4}
+    \end{subfigure}
+    \begin{subfigure}[b]{0.24\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/soccer/teacher-soccer.png}
+        \caption{Teacher}
+        \label{fig:soccer1}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[b]{0.24\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/soccer/traditional-soccer.png}
+        \caption{Best ``Traditional''}
+        \label{fig:soccer2}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[b]{0.24\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/soccer/s4s-soccer.png}
+        \caption{S4S}
+        \label{fig:soccer3}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[b]{0.24\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/soccer/s4s-alt-soccer.png}
+        \caption{S4S-Alt}
+        \label{fig:soccer4}
+    \end{subfigure}
+    \begin{subfigure}[b]{0.24\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/burger/teacher-burger.png}
+        \caption{Teacher}
+        \label{fig:burger1}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[b]{0.24\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/burger/traditional-burger.png}
+        \caption{Best ``Traditional''}
+        \label{fig:burger2}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[b]{0.24\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/burger/s4s-burger.png}
+        \caption{S4S}
+        \label{fig:burger3}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[b]{0.24\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/burger/s4s-alt-burger.png}
+        \caption{S4S-Alt}
+        \label{fig:burger4}
+    \end{subfigure}
+    \caption{Generations from Stable Diffusion v1.4 with text prompt ``a panda sitting in a bamboo forest''. The teacher solver \subref{fig:panda1} uses 20 NFEs, while all other solvers \subref{fig:panda2}--\subref{fig:panda4} use 5 NFEs. Compared to the teacher's generation, the best ``traditional'' ODE solver introduces visual artifacts into the image, while S4S and S4S-Alt produce generations increasingly close to that of the teacher. The prompts used for generating these images are: ``a panda sitting in a bamboo forest,'' ``a dog playing with a ball in a park,'' ``an oil painting of a soccer player playing in a stadium,'' and ''a hamburger with a side of fries.''}
+    \label{fig:fig2}
+\end{figure}
+
+\subsubsection{Solving for the Solver (S4S)}
+Our first contribution is a new method for finding numerical solvers for DMs in the low NFE regime.
+Rather than using any fixed set of pre-existing methods, we instead take the approach of \emph{learning} a good solver for the diffusion model.
+We call our approach \textbf{S}olving \textbf{For} the \textbf{S}olver, or \textbf{S4S}. 
+Crucially, we seek to find a solver that is good at approximating the overall diffusion process, rather than attempting to discretize any ODE.
+Indeed, as we demonstrate in \appref{app:ss-consistency}, any attempts at maintaining the ``standard'' invariants that guarantee that traditional solvers track the continuous-time ODE trajectory actively hurt performance.
+This reinforces our intuition that we must break from this standard approach to obtain the best results.
+
+In somewhat more detail, S4S uses a distillation-style objective for learning solver coefficients.
+Here, a base ``teacher'' ODE solver that takes small step sizes \--- and thus requires many NFEs \--- provides trajectories that give high sample quality. In turn, a ``student'' solver with learnable coefficients, given the same noise latent, learns to produce equivalent images with a smaller number of steps.
+We explain our method in more detail in Section~\ref{sec:s4s}.
+Our method has the following advantageous properties:
+
+\begin{itemize}
+    \item \textbf{Universal improved performance.} In our experiments, we demonstrate that in every setting we tried, our method \emph{universally}  improves the FID achieved compared to previous state-of-the-art solvers.
+    \item \textbf{Plug-in, black-box improvement.} Relatedly, our method can easily be plugged-in in a black-box manner on top of any discretization schedule, and for any architecture.
+    Notably, the gains we achieve from optimizing the solver are \emph{orthogonal} to the gains from optimizing these other axes, e.g. even with a carefully optimized discretization schedule, plugging in S4S will achieve a noticeable improvement in FID.
+    Thus, our method offers a simple way for any practitioner to instantly improve the performance of their generative model.
+    
+    \item \textbf{Lightweight and data-free.} Our method is lightweight, with minimal computational expense which is comparable to (and often less than) alternative methods for optimizing aspects of the solver, often taking $<1$ hour on a single A100.
+    Our method is also completely data-free, thus coming at no additional statistical cost to the user.
+\end{itemize}
+
+\subsubsection{Solving for the Full Sampler: S4S-Alt}
+
+While S4S by itself already presents uniform and substantial improvements across the board, we find that much of the power of S4S is truly revealed when it is effectively combined with methods for choosing a good discretization.
+By doing so, we are able to fully exploit the design space of the ODE sampler, something which appears to have been poorly explored in the literature previously, by finding an optimal combination of solver coefficients and discretization steps, as displayed in \Figref{fig:main-fig}.
+We propose an alternating minimization-based approach that iteratively updates either the coefficients or the discretization schedule one at a time.
+We call this approach \textbf{S4S-Alt}.
+
+While S4S already improves upon previous baselines, by using S4S-Alt to jointly optimize the discretization schedule as well as the solver, we are able to dramatically improve upon state-of-the methods across the board,  often by a $1.5-2 \times$ factor or more with respect to the FID (see e.g., \tabref{tab:s4s-alt} and the tables in the appendix); qualitative inspection of our samples, as in \Figref{fig:fig2} and in \appref{app:qual-samples}.
+For example, with only 5 NFEs, we achieve FID scores of 3.89 on AFHQ-v2, 3.73 on CIFAR-10, 6.25 on FFHQ, 4.39 on class-conditional ImageNet, and 13.26 on MS-COCO with Stable Diffusion v1.4.
+Notably, these numbers are substantially better than what can be achieved by just optimizing the discretization schedule or S4S, separately.
+
+\section{Background and Related Work}
+We review background on diffusion models and  ODEs, solvers for diffusion ODEs, and  learning-based samplers. 
+We also provide detailed comparisons with existing approaches in Appendix~\ref{app:related-work-comp}.
+
+\subsection{Background: Diffusion Models}
+Let $\x_0\in\R^d$ be a random variable from an unknown data distribution $p_0(\x_0)$. 
+Diffusion models (DMs)~\cite{ho2020denoising,song2020score} define a forward process $\{\x_t\}_{t\in[0,T]}$ with $T>0$ that starts from $\x_0$ and progressively adds Gaussian noise to converge to a marginal distribution, $p_T(\x_T)$, that approximates an isotropic Gaussian, i.e. $p_T(\x_T)\approx \mc{N}(\x_T;\bm{0}, \tilde\sigma^2\id)$ at time $T$ for some $\tilde\sigma>0$.
+Given $\x_0$, we can characterize the process of adding Gaussian noise by the transition kernel
+$p_{0t}(\x_t|\x_0)=\mc{N}\big(\x_t; \alpha_t\x_0, \sigma_t^2 \id\big)$,
+for all $t\in[0,T]$, where $\alpha_t, \sigma_t > 0$ are selected such that the \emph{signal-to-noise ratio} (SNR), $\alpha_t^2/\sigma_t^2$, decays as $t$ increases.
+Remarkably,~\citet{song2020score} demonstrated that this forward process shares the same marginal distribution $p_t$ as the \emph{probability flow ODE}, a reverse-time ODE starting at $\x_T\sim p_T(\x_T)$ given by:
+\begin{equation}
+    \label{eqn:pf-ode}
+    d\x_t = \left[f(t)\x_t - \frac{1}{2}g^2(t)\nabla_\x \log p_t(\x_t)\right] dt,
+\end{equation}
+where $f(t)={d\log\alpha_t}/{dt}$ and $g(t)= ({d\sigma_t^2}/{dt})-2({d\log \alpha_t}/{dt})\sigma_t^2$ \cite{kingma2021variational}.
+Since the score function $\nabla_\x\log p_t(\x_t)$ in \eqref{eqn:pf-ode} is unknown, DMs learn it using a \emph{noise prediction} neural network to minimize:
+\begin{equation*}
+    \mc{L}(\bm\theta)=\E_{\x_0, \bm\epsilon,t}[w(t)\|\noisemodel(\x_t,t)-\bm\epsilon\|_2^2]
+\end{equation*}
+where $\x_0\sim p_(\x_0)$, $\bm\epsilon\sim\mc{N}(\bm 0 , \id)$, $t\sim \mc{U}[0,T]$, $w(t)$ is a time-dependent weighting function, and $\x_t=\alpha_t\x_0+\sigma_t\bm\epsilon$ is a noisy sample at time $t$~\cite{ho2020denoising,lu2022dpm}.
+By Tweedie's formula, $\noisemodel(\x_t,t)$ learns to approximate $-\sigma_t\nabla_\x\log p_t(x)$, thereby defining the \emph{diffusion ODE}:
+\begin{equation}
+    \label{eqn:diff-ODE}
+    d\x_t = \left[f(t)\x_t + \frac{g^2(t)}{2\sigma_t}\noisemodel(\x_t,t)\right]dt,
+\end{equation}
+with initial condition $\x_T\sim p_T(\x_T)$.
+To exactly solve the diffusion ODE at $\x_t$ given an initial value $\x_s$, where $ t<s$,~\citet{lu2022dpm} reparametrizes \eqref{eqn:diff-ODE} in terms of the log signal-to-noise ratio $\lambda_t := \log(\alpha_t/\sigma_t)$, yielding:
+\begin{equation}
+\label{eqn:lambda-exact-soln}
+\x_{t_i}=\frac{\alpha_{t_i}}{\alpha_{t_{i-1}}}\x_{t_{i-1}} - \alpha_{t_i}\int_{\lambda_{t_{i-1}}}^{\lambda_{t_i}} e^{-\lambda} \hatnoisemodel(\hat\x_\lambda,\lambda)d\lambda,
+\end{equation}
+where $\hat\x_\lambda$ and $\noisemodel(\hat\x_\lambda,\lambda)$ denote the reparametrized forms of $\x_t$ and $\noisemodel(\x_t,t)$ in the $\lambda$ domain.
+
+\subsection{Background: Solving the Diffusion ODE}\label{sec:background-diff-ode}
+Sampling from a DM requires numerically solving the diffusion ODE in \eqref{eqn:diff-ODE}.
+Given a decreasing sequence of $N$ discretization steps $\{t_i\}_{i=0}^N$ from $t_0=T$ to $t_N=0$, we iteratively compute a sequence of estimates $\{\tilde \x_{t_i}\}_{i=0}^N$ starting from $\tilde \x_{t_0}=\x_T\sim \mc{N}(\x_T;\bm{0}, \tilde\sigma^2\id)$ such that the \emph{global} truncation error between $\tilde \x_{t_N}$ and the true solution $\x_{t_N}$ is low.
+The standard approach of controlling this error is to bound the \emph{local} truncation error between $\tilde \x_{t_i}$ and $\x_{t_i}$ at each $t_i$.
+Since \eqref{eqn:lambda-exact-soln} gives the exact solution of the diffusion ODE given an initial value $\tilde\x_{t_{i-1}}$, an accurate approximation of the integral in turn provides an accurate approximation $\tilde \x_{t_i}$ for the true solution at time $t_{i-1}$.
+One can take a Taylor expansion of $\hatnoisemodel(\hat\x_\lambda,\lambda)$ about $\lambda_{t_{i-1}}$ in \eqref{eqn:lambda-exact-soln}, yielding:
+\begin{align}
+\tilde\x_{t_i} \;\; = \;\; \frac{\alpha_{t_i}}{\alpha_{t_{i-1}}} \tilde{\x}_{t_{i-1}} 
+   - \alpha_{t_i} \sum_{n=0}^{k-1} \hatnoisemodel^{(n)}(&\hat{\x}_{\lambda_{t_{i-1}}}, \lambda_{t_{i-1}}) \psi_n(h)  
+   + \mathcal{O}(h_i^{k+1})\;, \label{eqn:lambda-taylor-soln}
+\end{align}
+for some $\psi_n(h)$ depending on $n$, $\lambda_{t_i}$, and $\lambda_{t_{i-1}}$; see \appref{app:taylor} for further details.
+Computing such $k$-th order approximation requires accurate estimates of the derivatives $\hatnoisemodel^{(n)}$ up to order $n=k-1$. 
+Existing methods use two main approaches from ODE literature: single-step methods~\citep{lu2022dpm, lu2022dpmpp, zheng2023dpm, zhao2023unipc, zhang2022fast, karras2022elucidating}, which use $k-1$ intermediate points in $(t_i, t_{i-1})$, and linear multi-step methods~\citep{lu2022dpmpp,zheng2023dpm,zhao2023unipc,zhang2022fast,liu2022pseudo}, which use information from $k-1$ previous steps. 
+For low order methods $(k\leq 4$), under appropriate regularity conditions (see \appref{app:regularity}) and when $h_{max}:=\max_{1\leq i\leq N} h_i$ is bounded by $\mc{O}(1/N)$, these methods achieve local truncation error of $\mc{O}(h_i^{k+1})$ and therefore global error of $\mc{O}(h_{max}^k)$.
+
+When the number of NFEs is large and thus $h_{max}$ is small, local truncation error control yields high quality samples   
+\cite{lu2022dpm,lu2022dpmpp,zhang2022fast}. 
+However, with few NFEs and large $h_{max}$, the higher-order Taylor errors dominate, leading to large global error.
+In contrast, our approach in \eqref{eqn:hard-objective} directly minimizes the global error.
+
+\begin{table}[t]
+\small
+\begin{tabular*}{\linewidth}{@{\extracolsep{\fill}}c|c|c|cc@{}}
+\toprule
+Solver Type & $\Delta_i(\phi)$ & $\phi$ & NFEs per Step & \# Params. \\
+\midrule
+LMS & $\displaystyle\sum_{j=1}^{k}b_{j,i} \noisemodel(\tilde{x}_{t_{i-j}}, t_{i-j})$ & $\{b_{j,i}\}$ & 1 & $k(2N + 1 - k)/2$ \\
+\midrule
+SS & $\begin{array}{c}\displaystyle\sum_{j=1}^k b_{j,i}\kappa_j, \\ \kappa_j = \noisemodel\!\left(\tilde{x}_{t_{i-1}} + \sum_{l=1}^{j-1} a_{j,i,l} \kappa_l, t_{i-1}+c_{j,i} \right)\end{array}$ & $\{b_{j,i}, a_{j,i,l}, c_{j,i}\}$ & $k$ & $(k^2+k-1)N$ \\
+\midrule
+LMS+PC & $\displaystyle\sum_{j=1}^k a_{j,i}^c \noisemodel(\tilde{x}_{t_{i-j}}, t_{i-j})$ & $\{b_{j,i}\} + \{a_{j,i}^c\}$ & 1 & $k(2N + 1 - k)$ \\
+\bottomrule
+\end{tabular*}
+\caption{We apply S4S to three types of diffusion ODE solvers; we show their increment ($\Delta_i$), learnable parameters, number of NFEs per step, and total parameter count over $N+1$ steps. By default, we use a linear multi-step predictor for the PC method, so $\{a_{j,i}^c\}$ refer to coefficients during the correction step, and the total set of learnable parameters accounts for the underlying multi-step predictor.}
+\label{table:solver-types}
+\end{table}
+
+\subsection{Related Work: Learned Samplers} 
+In practice, no single pair of ODE solver and a time discretization generates high quality samples universally across various datasets and model architectures, e.g. \appref{app:fid-tables} and \citet{tong2024learning}.
+This inspired {\em learning}-based methods for deriving ODE solvers and time discretizations adapted to the given task and architecture.
+We give a brief survey here and discuss in detail in \appref{app:related-work-comp}. 
+One popular approach exclusively learns the discretization steps ~\cite{watson2021learning,sabour2024align,xue2024accelerating,tong2024learning,pmlr-v235-chen24bm}. 
+Our approach S4S learns the solver coefficients, complementing the gains of such methods and universally improving the performance in all scenarios, as seen in \tabref{tab:s4s-coeff} and comprehensively in \appref{app:fid-tables}.
+Another line of research focuses on optimizing only the solver coefficients \cite{zheng2023dpm,zhang2023accelerating}, or jointly optimizing both solver coefficients and time discretizations \cite{zhou2024fast,zheng2023dpm,liu2023unified,shaul2023bespoke}.  
+However, these methods are designed to minimize the {\em local} approximation error through the same methods as in \eqref{eqn:lambda-taylor-soln} or by closely matching the \emph{entire trajectory} of the teacher solver.
+Instead, by minimizing the \emph{global} error by matching the \emph{end} of the teacher trajectory, as in \eqref{eqn:hard-objective}, S4S significantly improves over these approaches.
+Closest to our approach is BNS \cite{shaul2024bespoke}, which learns both the solver coefficients and time discretizations to minimize global error.
+We provide comparisons in \tabref{tab:s4s-compute-comp} and explain our improvements over BNS in \appref{app:related-bns}. 
+
+\section{Learning Diffusion Model Samplers}
+We detail our strategy for creating DM samplers that produce high-quality samples using a small number of NFEs.
+We exploit the full design space of diffusion model solvers by learning both the coefficients and discretization steps of the sampler, as both necessarily interact with one another.
+We first characterize this design space by providing a general formulation for three general types of diffusion ODE solvers: single-step (SS), linear multi-step (LMS), and predictor-corrector methods (PC).
+We then describe the objective we minimize to directly control the global error.
+Next, given a pre-specified set of discretization steps, we introduce our algorithm for learning only the solver coefficients; this uniformly improves performance over hand-crafted solvers for an equivalent number of NFEs.
+Finally, we describe our method for learning \emph{both} the solver coefficients \emph{and} the discretization steps.
+
+\begin{algorithm*}[t]
+\caption{S4S}
+\label{alg:s4s-coeff}
+\begin{algorithmic}[1]
+\Require Coefficient parameters $\coeff$, student solver $\coeffsolver$, teacher solver $\solveropt$, distance metric $d$, and $r$.
+\State $\mathcal{D} \leftarrow \{(\mathbf{x}_T', \mathbf{x}_T, \solveropt(\mathbf{x}_T)) \mid \mathbf{x}_T \sim \mathcal{N}(\bm0, \tilde\sigma^2\id), \mathbf{x}_T' = \mathbf{x}_T\}$ \Comment{Generate data $\mathcal{D}$}
+\While{not converged}
+    \State $(\mathbf{x}_T', \mathbf{x}_T, \solveropt(\mathbf{x}_T)) \sim \mathcal{D}$
+    \State $\mathcal{L}(\coeff,\x_T') = d(\coeffsolver(\mathbf{x}_T'), \solveropt(\mathbf{x}_T))$ subject to $\mathbf{x}_T' \in B(\mathbf{x}_T, r\sigma_T)$
+    \State Update $\coeff$ and $\mathbf{x}_T'$ using the corresponding gradients $\nabla\mathcal{L}(\coeff, \mathbf{x}_T')$
+    \State $\mathbf{x}_T' \leftarrow \mathbf{x}_T + \mathbf{1}[\|\mathbf{x}_T' - \mathbf{x}_T\|_2 > r] \cdot r \frac{\mathbf{x}_T' - \mathbf{x}_T}{\|\mathbf{x}_T' - \mathbf{x}_T\|_2}$ \Comment{Projected SGD}
+    \State Update $\mathcal{D}$ with the new $\mathbf{x}_T'$
+\EndWhile
+\end{algorithmic}
+\end{algorithm*}
+
+\subsection{S4S: Learning Solver Coefficients}
+\label{sec:s4s}
+For a learned score network and initial noise latent $\x_T\sim\mc{N}(\bm 0, \tilde\sigma^2\id)$, one can sample from diffusion ODE using an appropriate sequence of pre-determined discretization steps $\{t_i\}_{i=0}^N$ and an ODE solver $\Psi$ determined by its coefficients $\coeff$ and the number of steps $k$ it uses.
+For SS and LMS solvers, we write their estimate of the next step as
+\begin{equation}
+    \tilde\x_{t_i} = \frac{\alpha_{t_i}}{\alpha_{t_{i-1}}}\tilde \x_{t_{i-1}} - \sigma_{t_i} (e^{h_i} - 1) \Delta_i(\coeff), \label{eq:solver}
+\end{equation}
+where $\Delta_i(\coeff)$ represents the \emph{increment} of the solver as a function of the coefficients $\coeff$. 
+We explicitly define $\Delta_i(\coeff)$ in \tabref{table:solver-types}.
+A PC solver further refines  this initial prediction, by subsequently applying \eqref{eq:solver} again with new coefficients.  
+We provide the intuition behind this formulation in \appref{app:taylor} and equivalent examples for a data prediction model in \appref{app:solvers}.
+To denote the fact that a learned solver uses $k$ steps of information, we abuse notation and refer to it as having order $k$.
+
+We propose \textbf{S}olving \textbf{for} the \textbf{S}olver (\textbf{S4S}) in Algorithm~\ref{alg:s4s-coeff} to learn these coefficients to adapt to the problem instance of the given score network. 
+Consider the outputs from a ``teacher'' solver, $\solveropt(\x_T)$, which accurately solves the diffusion ODE. %
+We aim to minimize the {\em global error} between the sample $\coeffsolver(\x_T)$ generated by sequentially applying  $\coeffsolver$  from $t_0=T$ to $t_N=0$ and the sample from the teacher: 
+\begin{equation}
+\label{eqn:hard-objective}
+    \mathcal{L}(\coeff) = \min_{\coeff} \E_{\x_T\sim\mc{N}(\bm0,\tilde\sigma^2\id)}[d(\coeffsolver(\x_T),\solveropt(\x_T))],
+\end{equation}
+where $d(\cdot,\cdot)$ is an appropriate distance function that is differentiable, non-negative, and reflexive. %
+For now, $\{t_i\}_{i=0}^N$ is a pre-determined discretization schedule, though we also propose learning the discretizations in Section~\ref{sec:joint}. %
+We emphasize the importance of learning a solver with respect to the global error: although some existing works try to match the teacher solver's trajectory, many teacher trajectories contain pathologies that are subsequently distilled into the student; see \appref{app:beyond-local-error} for further discussion.
+While this method, as stated, already improves performance out-of-the-box, we now detail two optimizations that further improve our performance.
+
+\subsubsection{Time-Dependent Coefficients}
+Classical methods for solving ODEs (e.g. Adams-Bashforth or Runge-Kutta) are often defined by a constant set of coefficients, regardless of what time step along the ODE they are estimating.
+While this is not uniformly the case for diffusion ODE solvers, many keep coefficients fixed across steps of solving the reverse-process; see \appref{app:solv-constant-coeff}.
+This fails to fully capture the complexity of diffusion ODEs: the score network increasingly suffers from prediction error as the marginal distribution $p_t(\x_t)$ resembles Gaussian noise less and less, while estimation error that occurs at a noisy time step propagates through the estimated trajectory differently than at a ``cleaner'' step.
+Accordingly, as an additional optimization, S4S learns \emph{time-dependent} coefficients, as exemplified by the dependence on the current iteration $i$ in \tabref{table:solver-types}.
+We  ablate the design decision to use time-dependent coefficients in \appref{app:add-ablations};  time-dependent coefficients significantly outperform the use of fixed coefficients. 
+
+\subsubsection{Relaxed Objective}
+For each student solver $\coeffsolver$, the number of both NFEs and learnable parameters is determined by the type of solver, the number of discretization steps, and the step parameter $k$ of the solver, as displayed in \tabref{table:solver-types}.
+Accordingly, when the target solver uses few NFEs, the number of learnable parameters may be very low, e.g. 6 parameters for LMS when $N=k=3$.
+This can make optimizing \eqref{eqn:hard-objective} difficult: indeed, given an initial condition $\x_T$, our objective tries to ensure that $\coeffsolver(\x_T)=\solveropt(\x_T)$.
+Given the small number of learnable parameters, however, the student solver will almost always produce an output with non-trivial truncation error.
+As a result, though our learned coefficients may be successful at reducing the global error, they might nonetheless underfit the objective and fail to fully achieve the expected performance improvements.
+
+Instead, similar to~\citet{tong2024learning}, we propose a relaxation of our training objective that is easier to optimize with a limited number of parameters.
+In particular, rather than forcing the student solver to exactly reproduce the teacher's output for $\x_T$, we instead only require the existence of an input $\x_T'$ sufficiently close to $\x_T$ (i.e. within a bounded radius) such that $\coeffsolver(\x_T')=\solveropt(\x_T)$.
+As a result, so long as $\x_T'$ is appropriately close to $\x_T$, the average global error of the learned student model can still be quite low, while mitigating the difficulty of the objective.
+Concretely, our relaxed objective is expressed as
+\begin{equation}
+    \label{eqn:relaxed-obj}
+    \begin{aligned}
+    \mathcal{L}_\text{relax}(\coeff)&=\min_{\coeff} \E_{\x_T\sim\mc{N}(0,\sigma_T^2\id)}\left[J(\x_T, \x_T')\right] \\
+    J(\x_T, \x_T') & = \min_{\x_T'\in B_r(\x_T)}d(\coeffsolver(\x_T'),\solveropt(\x_T))
+    \end{aligned}
+\end{equation}
+where $B_r(\x):=\{\x'\mid \|\x-\x'\|_2\leq r\tilde\sigma\}$ is the $L_2$ ball of radius $r\tilde\sigma$ about $\x$.
+This objective has several appealing properties.
+First, in \appref{app:relaxed-obj}, we empirically verify, similar to~\citet{tong2024learning}, that this objective is easier to solve than our original objective, which we recover when $r=0$.
+Moreover, under appropriate assumptions on the solver, we can ensure that distribution generated by the learned solver, $p_{\coeff}(\x_0)$, and that of the teacher solver, $p^*(\x_0)$, are sufficient close; see \appref{app:relax-obj-kl} for  details.
+Finally, although we minimize this objective during training, at inference time, we only use the initial condition $\x_T\sim p_T(\x_T)$ rather than finding and using $\x_T'\sim B_r(\x_T)$ as an initial condition.
+
+\subsection{S4S-Alt: Coefficients \emph{and} Time Steps} \label{sec:joint}
+While learning the solver coefficients alone improves  the quality of samples, the choice of discretization steps remains crucial for achieving optimal performance.
+In that vein, we present \textbf{S4S-Alt}, which learns both solver coefficients and discretization steps by using alternating minimization over objectives for the coefficients or the discretization steps.
+
+\subsubsection{Discretization Step Parametrization}
+When sampling from a DM, the choice of discretization steps determines (1) the expected amount of signal-to-noise present in an estimated sample, (2) the error present in the score network's prediction, and (3) the amount of error propagated by using estimated trajectory points as input to the score network.
+We take these consequences into account when parametrizing a learned set of discretization steps by separating the learned steps into two parts.
+First, we use a set of time steps, $\{t_i^{\timeparams}\}_{i=0}^{N+1}$, that is parametrized by a learnable vector $\timeparams\in\R^{N+1}$ used for determining the step size and SNR parameters, thereby accounting for (1).
+We explicitly parameterize $t_i^{\timeparams}$ such that it is a monotonically decreasing sequence of parameters between 0 and $T$, i.e. $t_0^{\timeparams} = T > t_1^{\timeparams} > \dots > t_N^{\timeparams}=0$; see \appref{app:time-param} for an explicit description of this parametrization.
+Second, we use a modified set of time steps as input to the score network to mitigate (2) and (3).
+Specifically, we use a set of decoupled steps $\{t_i^c = t_i^{\timeparams} + \timeparams_i^c\}_{i=0}^N$ as input to the score network, where $\timeparams^c\in\R^{N+1}$; we describe the construction of $\timeparams^c$ in \appref{app:time-param-decouple}.
+Under this parametrization, the update step of the $k$-step LMS in \eqref{eq:solver} and \tabref{table:solver-types} is:
+\begin{equation*}
+    \tilde\x_{t_i^{\timeparams}} = \frac{\alpha_{t_i^{\timeparams}}}{\alpha_{t_{i-1}^{\timeparams}}}\tilde \x_{t_{i-1}} - \sigma_{t_i^{\timeparams}}(e^{h_i}-1)\sum_{j=0}^{p}b_{j,i} \noisemodel(\tilde\x_{t_{i-k+j}}, t_{i-k+j}^c)
+\end{equation*}
+where $h_i = t_i^{\timeparams} - t_{i-1}^{\timeparams}$.
+For simplicity, we denote the collection of learnable time parameters as $\alltimeparams:=\{\timeparams,\timeparams^c\}$.
+Consequently we represent a solver with learnable coefficients \emph{and} time steps as $\coefftimesolver$ and its outputs as $\coefftimesolver(\x_T)$.
+
+\subsubsection{Alternating Optimization}
+We next consider how to optimize both the solver as well as the discretization schedule. 
+We propose an iterative approach, \textbf{S4S-Alt}, that alternates between optimizing the time steps and the solver coefficients.
+Formally, at iteration $k$, we solve the objectives
+\begin{equation}
+    \label{eqn:alt-obj}
+    \begin{aligned}
+        \alltimeparams_k & = \argmin_{\alltimeparams} \E_{\x_T\sim\mc{N}(\bm0,\tilde\sigma^2\id)}[d(\Psi_{\coeff_{k-1},\alltimeparams_{k-1}}(\x_T),\solveropt(\x_T))], \\
+        \coeff_k & = \argmin_{\coeff} \E_{\x_T\sim\mc{N}(\bm0,\tilde\sigma^2\id)}[d(\Psi_{\coeff_{k-1},\alltimeparams_{k}}(\x_T),\solveropt(\x_T))].
+    \end{aligned}
+\end{equation}
+In the first objective, we learn only $\alltimeparams_k$ using the LD3 objective~\cite{tong2024learning} from a student solver with coefficients and time steps initialized at $\coeff_{k-1}$ and $\alltimeparams_{k-1}$, respectively.
+In the second, we learn $\coeff_k$ from a solver initialized at the newly learned time steps $\alltimeparams_{k-1}$ and coefficients $\coeff_{k-1}$.
+
+A natural alternative to this approach would be to optimize the coefficients and time steps simultaneously.
+However, in our experiments, we found that optimizing both simultaneously presents several challenges, namely that the optimization landscape becomes significantly more complex due to the interaction between the solver coefficients and time steps.
+Additionally, we found that learning both jointly has a greater risk of over-fitting.
+We found that S4S-Alt performed significantly better in practice, as seen in \tabref{tab:s4s-alt-vs-joint}.
+
+\subsection{Implementation Details}
+Below, we discuss the practical details used for S4S.
+For ease of notation, we first ground our explanation in the version of S4S that only learns coefficients before discussing details specific to our S4S-Alt.
+We direct explicit queries about hyperparameters, etc. to \appref{app:practical-implementation}.
+
+\paragraph{Practical Objective}
+Despite formulating our relaxed objective in ~\eqref{eqn:relaxed-obj}, optimizing it in practice is still unclear.
+To do so, we treat our optimization problem as jointly optimizing both $\coeff$ and $\x_T'$, using projected SGD to enforce the constraint that $\x_T'$ remain close to $\x_T$.
+Concretely, this is
+\begin{equation}
+    \label{eqn:prac-s4s-coeff-obj}
+    \begin{aligned}
+    \mc{L}_{\text{relax}}(\coeff,\x_T')&:=\E_{\x_T\sim \mc{N}(\bm 0, 
+    \tilde\sigma^2\id}\left[d(\coeffsolver(\x_T'),\solveropt(\x_T))\right],\\
+    & \text{subj. to } \x_T'\in B_r(\x_T).
+    \end{aligned}
+\end{equation}
+In practice, we use LPIPS as our distance metric, a common loss for distillation-based methods~\cite{salimans2022progressive,song2023consistency}; for other modalities, alternatively appropriate distance metrics should be used. 
+We ablate the decision to use LPIPS in Section~\ref{sec:ablations}.
+
+\paragraph{Algorithm Details}
+The algorithm for S4S learning coefficients is displayed in Algorithm~\ref{alg:s4s-coeff}.
+First, we collect a dataset from a sequence of noise latents used to create samples from the teacher solver $\solveropt(\x_T)$.
+Initially, we use the same initial condition for both the student and teacher solver, i.e. $\x_T'=\x_T$.
+At each iteration, for a given batch, we compute the loss between the output of our learned solver $\coeffsolver(\x_T')$ and $\solveropt(\x_T)$, and use backpropagation to get the gradients of this loss with respect to $\coeff$ and $\x_T'$.
+To enforce our constraint on $\x_T'$, we use projected SGD to ensure it remains inside of $B_r(\x_T)$; for coefficients, we can use an arbitrary method for applying the gradients, although momentum-based methods work best empirically.
+Notably, after we update $\x_T'$, we keep it with its original $(\x_T, \solveropt(\x_T))$ pair, and update the dataset with the new noise latent.
+We also optimize our computation of the gradient computation graph; see \appref{app:comp-graph} for more details.
+
+\paragraph{Initialization}
+A natural question to consider is how the student ODE solver coefficients may be initialized.
+Since our approach generally subsumes common diffusion ODE solvers, including the best-performing methods like DPM-Solver++~\cite{lu2022dpmpp}, iPNDM~\cite{zhang2022fast}, and UniPC~\cite{zhao2023unipc}, we can initialize $\coeff$ with the same coefficients as these methods.
+This can be interpreted as wrapping one of these classical solvers in our lightweight approach; in this setting where just coefficients are learned, we refer to this as e.g. iPNDM-S4S.
+Alternatively, we could consider initializing the coefficients according to a Gaussian.
+We ablate this decision in \appref{app:ablate-initialization}, finding that solver initialization outperforms Gaussian initialization.
+
+\paragraph{Algorithms for Learning Coefficients and Time Steps}
+In practice, when learning both time steps and solver coefficients for a student solver $\coefftimesolver$, S4S optimizes an equivalent, alternating version of \eqref{eqn:prac-s4s-coeff-obj} (and equivalently for jointly learning coefficients); likewise, the pseudocode for doing so is quite similar, which we detail in \appref{app:alt-joint-algs}.
+Nonetheless, in practice, learning $\coefftimesolver$ generally requires a larger dataset compared to just learning the coefficients, largely attributable to a larger number of parameters.
+We ablate performance with dataset size in \appref{app:ablate-dataset-size}.
+
+\begin{table}[t]
+\small
+\centering
+\begin{tabular}{ll|ccc}
+\midrule
+Schedule & Method & NFE=4 & NFE=6 & NFE=8 \\
+\midrule
+\textbf{CIFAR-10} \\
+\midrule
+\multirow{5}{*}{EDM} & UniPC & 50.63 & 19.47 & 9.68 \\
+& \cellcolor{lightgray}UniPC-S4S & \cellcolor{lightgray}\textbf{44.30} & \cellcolor{lightgray}\textbf{17.80} & \cellcolor{lightgray}\textbf{9.05} \\
+\cmidrule{2-5}
+& iPNDM & 29.50 & 9.75 & 5.24 \\
+& \cellcolor{lightgray}iPNDM-S4S & \cellcolor{lightgray}\textbf{25.74} & \cellcolor{lightgray}\textbf{8.81} & \cellcolor{lightgray}\textbf{4.98} \\
+\cmidrule{2-5}
+& DPM-v3 & 34.39 & 18.44 & 7.39 \\
+\midrule
+\multirow{5}{*}{LD3} & UniPC & 15.83 & 3.55 & 2.87 \\
+& \cellcolor{lightgray}UniPC-S4S & \cellcolor{lightgray}\textbf{13.46} & \cellcolor{lightgray}\textbf{3.17} & \cellcolor{lightgray}\textbf{2.67} \\
+\cmidrule{2-5}
+& iPNDM & 10.93 & 5.40 & 2.75 \\
+& \cellcolor{lightgray}iPNDM-S4S & \cellcolor{lightgray}\textbf{9.30} & \cellcolor{lightgray}\textbf{4.76} & \cellcolor{lightgray}\textbf{2.61} \\
+\cmidrule{2-5}
+& DPM-v3 & 29.86 & 10.69 & 3.59 \\
+\midrule
+\textbf{ImageNet} \\
+\midrule
+\multirow{4}{*}{$t$-Unif} & UniPC & 53.22 & 10.97 & 5.53 \\
+& \cellcolor{lightgray}UniPC-S4S & \cellcolor{lightgray}\textbf{45.53} & \cellcolor{lightgray}\textbf{10.09} & \cellcolor{lightgray}\textbf{5.19} \\
+\cmidrule{2-5}
+& iPNDM & 36.23 & 16.15 & 7.93 \\
+& \cellcolor{lightgray}iPNDM-S4S & \cellcolor{lightgray}\textbf{31.81} & \cellcolor{lightgray}\textbf{14.85} & \cellcolor{lightgray}\textbf{7.53} \\
+\midrule
+\multirow{4}{*}{LD3} & UniPC & 11.33 & 4.74 & 4.87 \\
+& \cellcolor{lightgray}UniPC-S4S & \cellcolor{lightgray}\textbf{10.56} & \cellcolor{lightgray}\textbf{4.54} & \cellcolor{lightgray}\textbf{4.58} \\
+\cmidrule{2-5}
+& iPNDM & 6.45 & 4.70 & 4.91 \\
+& \cellcolor{lightgray}iPNDM-S4S & \cellcolor{lightgray}\textbf{6.05} & \cellcolor{lightgray}\textbf{4.57} & \cellcolor{lightgray}\textbf{4.68} \\
+\bottomrule
+\end{tabular}
+\caption{
+FID comparison of S4S and common diffusion solvers on CIFAR-10 and ImageNet.
+iPNDM-S4S refers to S4S initialized at iPNDM coefficients, while UniPC-S4S is similarly initialized at UniPC coefficients.
+S4S uniformly improves over its un-learned counterpart, with the degree of improvement varying based on the underlying discretization schedule.
+}
+\label{tab:s4s-coeff}
+\end{table}
+
+\begin{table}[htb]
+\small
+\centering
+\begin{tabular}{l|ccc}
+\toprule
+Method & NFE=4 & NFE=6 & NFE=8 \\
+\midrule
+\textbf{CIFAR-10} \\
+\midrule
+Best DPM-v3 & 17.88 & 7.32 & 3.59\\
+Best Trad. (LD3) & 10.93 & 3.55 & 2.75 \\
+Best S4S & \cellcolor{lightgray}8.25 & \cellcolor{lightgray}3.17 & \cellcolor{lightgray}2.61 \\
+\midrule
+S4S Alt & \cellcolor{lightgray}\textbf{6.35} & \cellcolor{lightgray}\textbf{2.67} & \cellcolor{lightgray}\textbf{2.39}\\
+\midrule
+\textbf{MS-COCO} \\
+\midrule
+DPM-v3 & 23.90 & 15.22 & 12.10\\
+Best Trad. (LD3) & 20.22 & 12.33 & 11.30\\
+Best S4S & \cellcolor{lightgray}19.14 & \cellcolor{lightgray}11.97 & \cellcolor{lightgray}10.82 \\
+\midrule
+S4S Alt & \cellcolor{lightgray}\textbf{16.05} & \cellcolor{lightgray}\textbf{11.17} & \cellcolor{lightgray}\textbf{10.68}\\
+\bottomrule
+\end{tabular}
+\caption{
+S4S-Alt consistently offers significant improvements in FID over 
+best-performing alternatives at each given number of NFEs. 
+}
+\label{tab:s4s-alt}
+\end{table}
+
+\section{Experiments}
+We evaluate S4S on a number of pre-trained diffusion models trained on common image datasets.
+We use pixel-space diffusion models for CIFAR-10 (32x32), FFHQ (64x64), and AFHQv2 (64x64), each having an EDM-style backbone~\cite{karras2022elucidating}.
+We also use latent diffusion models, including LSUN-Bedroom (256x256) and class-conditional ImageNet (256x256) with a guidance scale of 2.0.
+Finally, we present both qualitative and quantitative results for Stable Diffusion v1.4 at 512$\times$512 pixels with a variety of guidance scales.
+We provide precise experimental details in \appref{app:exp-details} for all sets of experiments, including choice of teacher solver, dataset size, and selection of noise radius $r$.
+We use the Frechet Inception Distance score (FID) as a metric for image quality on all datasets using 30k samples generated from MS-COCO captions for evaluating Stable Diffusion and 50k samples for all other datasets.
+
+First, we show the benefits of \textbf{S4S} as a \emph{standalone} wrapper around learnable third-order multi-step versions of the best current ODE solvers: UniPC~\cite{zhao2023unipc} and iPNDM~\cite{zhang2022fast}.
+Here, we initialize our student solver to have the same coefficients as their unlearned counterparts before optimizing our relaxed objective.
+When possible, we also compare with DPM-Solver-v3~\cite{zheng2023dpm}, which learns coefficients, but only to attain a guarantee on local truncation error.
+We evaluate our learned solvers on seven discretization schedule methods, ranging from common heuristics to modern step-selection methods, with further details in \appref{app:disc-methods}.
+We also characterize the performance of S4S on learnable single-step methods, which can be found in \appref{app:single-step}.
+
+\begin{figure}[t]
+    \centering
+    \begin{subfigure}[b]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/pca1-redux.png}
+        \caption{PCA of learned S4S coefficients at each discretization step.}
+        \label{fig:pca1}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[b]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/pca2-redux.png}
+        \caption{PCA of learned S4S coefficients at each epoch of training.}
+        \label{fig:pca2}
+    \end{subfigure}
+    \caption{PCA of learned S4S coefficients at \subref{fig:pca1} each point of the reverse process or at \subref{fig:pca2} each training epoch; darker points refer to earlier values in the reverse process or training. We initialize S4S coefficients at iPNDM and learn a solver with 5 NFEs and order 3. In \subref{fig:pca1}, we take the PCA of the combined set of final learned coefficients $\{(b_{1,i}, b_{2,i}, b_{3,i})\}_{i=1}^5$ across the three training random seeds used. We also include the iPNDM coefficients in the PCA, using a total of 16 vectors in $\R^3$. In $\subref{fig:pca2}$, we concatenate the learned coefficient vectors at the end of each epoch, resulting in a vector of dimension $\R^{15}$ for each epoch. We again perform PCA on a collection of 16 of these vectors, again including iPNDM as a reference point.}
+    \label{fig:pca}
+\end{figure}
+
+Next, we evaluate \textbf{S4S-Alt} against several methods of \emph{learning} sampler attributes, including AMED-Plugin~\cite{zhou2024fast} and BNS~\cite{shaul2024bespoke}, in  sample quality and computational efficiency.
+We instantiate S4S-Alt as a LMS method initialized with iPNDM coefficients and LD3 discretization; this limits the amount of overfitting to the training data due to fewer parameters relative to SS and PC methods.
+Finally, we ablate key design decisions in %
+S4S in Section~\ref{sec:ablations}. %
+\begin{table}[th]
+    \small
+    \centering
+    \begin{tabular}{c|cccc|cccc}
+        \toprule
+        \multirow{2}{*}{Method} & \multicolumn{4}{c}{CIFAR} & \multicolumn{4}{c}{MS-COCO}  \\
+        \cmidrule{2-9}
+         & NFE & FID & GPU Type & Time & NFE &  FID & GPU Type & Time \\
+        \midrule
+        S4S-Alt & 7 & 2.52 & A100 & $<1$ hour & 6 & 11.17 & A100 & 4.2 hours \\
+        \midrule
+        S4S &  10 & 2.18 & A100 & $<1$ hour & 8 & 10.84 & A100 & 1.4 hours \\
+        LD3 & 10 & 2.32 & A100 & $<1$ hour & 8 & \cellcolor{lightred}12.28 & A100 & $<1$ hour \\
+        DPM-v3 &  10 & 2.32 & A40 & 28 hours & 8 & \cellcolor{lightred}12.10 & A40 & 88 hours\\
+        BNS$^\dagger$ & 8 & \cellcolor{lightred}2.73 & - & - & 12 & \cellcolor{lightred}20.67 & - & -\\
+        \midrule
+        PD$^\dagger$ & 8 & \cellcolor{lightred}2.57 & TPU & 192 hours & - &  - & - & - \\
+        ECM$^\dagger$ & 2 & 2.20 & A100 & 192 hours & - & - &  - & -\\
+        iCT-deep$^\dagger$ & 1 & 2.51 & - & - &  - & - &  - & - \\
+        \bottomrule
+    \end{tabular}
+    \caption{Number of NFEs required to match/beat S4S-Alt performance on CIFAR and MS-COCO. $\dagger$ denotes that results were taken from original papers. PD refers to Progressive Distillation~\cite{salimans2022progressive}, ECM to Easy Consistency Models~\cite{geng2024consistency}, iCT-deep to Improved Consistency Training~\cite{song2023improved}. Red cells are methods that cannot match S4S-Alt in our experiments w/ our NFE settings or in recorded experiments.}
+    \label{tab:s4s-compute-comp}
+\end{table}
+
+\subsection{Main Results}
+When used as a wrapper for learning solver coefficients, S4S almost \textbf{uniformly} improves image generation quality across datasets, solver types, and discretization methods in the few-NFE regime.
+Our full results are available in \appref{app:fid-tables}, while we present a selection of results on CIFAR-10 and ImageNet in \tabref{tab:s4s-coeff}.
+We observe that the size of the improvement that S4S provides is dependent on the underlying discretization schedule and solver type, and while S4S always improves performance for any discretization schedule, the amount of the improvement varies across different choices of schedule.
+For example, when using the LD3 discretization schedule, which has already been optimized to minimize the global error, the relative gain in FID from S4S is less than that when using a heuristic discretization schedule, such as Time EDM or Time Uniform, as seen in \tabref{tab:s4s-coeff}.
+Additionally, we visualize the dynamics of the coefficients learned by S4S by taking a PCA of the learned coefficients, as displayed in \Figref{fig:pca}.
+We find that the learned coefficients can non-trivially differ from those of iPNDM and display unique dynamics over time; however, the difference between different training runs is relatively small.
+
+When we both optimize the solver and the schedule, i.e. with S4S-Alt, we obtain \emph{significantly} greater improvements compared to prior state-of-the-art.
+We display some of these results in \tabref{tab:s4s-alt}, where we compare against methods that learn a \emph{single} dimension of the sampler: the best ``traditional'' ODE solver using the learned LD3 discretization schedule, the best DPM-Solver-v3 across all schedules, and the best S4S solver across all schedules; see \appref{app:fid-tables} for the full set of FID values across our experiments.
+S4S-Alt achieves extremely strong performance relative to simple learned methods.
+We also provide qualitative comparisons
+in \appref{app:qual-samples}.
+Finally, we provide a detailed comparison of S4S-Alt to methods that learn aspects of the solver, as well as \emph{training-based} distillation methods, in \tabref{tab:s4s-compute-comp}.
+S4S-Alt outperforms the \emph{vast majority} of learnable solver methods and achieves competitive performance to training-based methods for a fraction of the compute.
+
+
+\begin{table}[t]
+    \small
+    \centering
+    \begin{tabular}{cc|ccc}
+        \toprule
+        Method & Order & NFE=4 & NFE=6 & NFE=8 \\
+        \midrule
+        \multirow{3}{*}{S4S} & 3 & 14.24 & 5.45 & 3.55 \\
+        & 4 & 13.94 & 5.68 & 3.61 \\
+        & 6 & - & \cellcolor{lightred} 6.11 & \cellcolor{lightred} 3.89 \\
+        \midrule
+        \multirow{3}{*}{S4S-Alt} & 3 & 10.63 & 4.62 & 3.15\\
+        & 4 & 10.21 & 4.40 & 3.24 \\
+        & 6 & - & 4.83 & 3.42\\
+        \midrule
+        Baseline & 3 & 16.68 & 6.19 & 3.75\\
+        \bottomrule
+    \end{tabular}
+    \caption{Effect of solver order on FID for FFHQ. Both S4S methods are LMS initialized with iPNDM, and standalone S4S uses LD3 schedule. Cells that have \emph{worse} performance than traditional iPNDM with LD3 are highlighted in red. Excessively high order degrades quality in both versions of S4S.}
+    \label{tab:ablate-order}
+\end{table}
+
+
+\subsection{Ablations}\label{sec:ablations}
+
+\paragraph{Effect of Order on Generation Quality.}
+\tabref{tab:ablate-order} shows ablation on the solver order in learned LMS models. 
+In both versions of S4S, excessively large order tends to \emph{decrease} performance, despite setting $r$ proportionally to the larger number of parameters, using information from distant time steps hurts output sample quality.
+Additionally, using a larger number of parameters increases the risk of overfitting to the data sampled from the teacher model.
+As such, we find it judicious to use a relatively low order (i.e.~3) for the student sampler in S4S.
+
+\paragraph{Importance of Alternating Minimization.}
+We also characterize the importance of our alternating minimization objective for S4S-Alt.
+As an alternative, we consider learning both the solver coefficients and discretization steps simultaneously using the same objective; see \appref{app:s4s-joint-details} for an explicit description of this ``joint'' objective, which is similar to \eqref{eqn:prac-s4s-coeff-obj}.
+We present our results in \tabref{tab:s4s-alt-vs-joint}.
+We find that using an objective that \emph{jointly} learns the solver coefficients and discretization steps provides lower quality samples than learning them alternatively.
+This matches our intuition, as the interaction between the solver coefficients and the time steps they are used at can result in a complex optimization landscape when learning all parameters jointly.
+
+\paragraph{Enforcing Consistency in Single-Step Solvers.}
+\label{app:ss-consistency}
+Although in general we abandon the notion of maintaining notions of local error control in our diffusion solvers, we consider an additional ablation for enforcing consistency, a necessary condition for ensuring convergence, in single-step solvers.
+That is, we ablate requiring the $b_{j,i}$ in single-step solvers sum to 1 for every $i$.
+We display these results in \tabref{tab:ss-consistent} -- rather than consistency resulting in better global error, it in fact worsens our global error performance.
+
+\begin{table}[t]
+    \small
+    \centering
+    \begin{tabular}{cc|ccc}
+        \toprule
+        Method & Order & NFE=4 & NFE=6 & NFE=8 \\
+        \midrule
+        S4S-Alt & 3 & 6.35 & 2.67 & 2.39 \\
+        Joint Obj. & 3 & 6.81 & \cellcolor{lightorange}3.28 & \cellcolor{lightorange}2.91\\
+        Joint Obj. & Eq-NFE & 6.42 & \cellcolor{lightorange}3.37 & \cellcolor{lightred}3.76 \\
+        \midrule
+        iPNDM-S4S & 3 & 9.30 & 4.76 & 2.61 \\
+        iPNDM & 3 & 10.93 & 5.40 & 2.75 \\
+        \bottomrule
+    \end{tabular}
+    \caption{Using a \emph{joint} objective for learning both coefficients and time steps, and the interaction of the joint objective with the order of the underlying LMS method vs. S4S-Alt on CIFAR-10. Eq-NFE denotes having an order equal to the number of NFEs used, e.g. order 6 at 6 NFEs. Orange indicates worse performance than S4S on iPDNM; red indicates worse than traditional iPNDM.}
+    \label{tab:s4s-alt-vs-joint}
+\end{table}
+
+\begin{table}[ht]
+    \small
+    \centering
+    \begin{tabular}{cc|ccc}
+        \toprule
+        Method & Order & NFE=4 & NFE=6 & NFE=8 \\
+        \midrule
+        DPM-Solver-S4S (2S) & 2 & 66.82 & 34.91 & 24.73\\
+        Consistent DPM-Solver-S4S (2S) & 2 & 75.82 & 39.14 & 31.69 \\
+        \bottomrule
+    \end{tabular}
+    \caption{FID of SS methods initialized at DPM-Solver-S4S on FFHQ with logSNR discretization. Enforcing consistency in the single-step model \emph{decreases} performance rather than achieving better global error.}
+    \label{tab:ss-consistent}
+\end{table}
+
+\section{Conclusion}
+We introduce \textbf{S4S} (Solving for the Solver), a new method for learning DM solvers motivated by the fact that standard ODE solvers are tailored for the large NFE regime and the discrepancy between the teacher and the student model explodes in the few NFE regime of interest. 
+Our approach optimizes to directly match the output of a teacher solver, can complement any discretization schedule of the user's choice, and is lightweight and data-free. We demonstrate that S4S  uniformly improves the sample quality on six different pre-trained DMs, including pixel-space and latent-space DMs for both conditional and unconditional sampling. 
+
+Building on top of S4S, we further introduce \textbf{S4S-Alt} that alternatively optimizes the solver coefficients (using S4S) and the time discretization schedule.
+By exploiting the full design space of DM solvers, with 5 NFEs, we achieve an FID of 3.73 on CIFAR10 and 13.26 on MS-COCO, representing a $1.5\times$ improvement over previous training-free ODE methods.
+
+While we achieve improved results, there are nonetheless limitations and opportunities for future work: 1) we only experimented on ODE solvers, leaving an equivalent approach for SDE solvers as an open question, 2) the optimized choice of coefficients depends on the number of NFEs and cannot be re-used when changing the number of NFEs, and 3) we learn dataset-level coefficients rather than sample-level coefficients. We also note that our experimental comparisons are fair in the sense that we compare against the state-of-the-art methods that are data-free, i.e., do not have access to the original training data of the teacher model. However, there are state-of-the-art {\em training-based} approaches that require original training data, such as \cite{lee2024truncated}, that outperform any data-free approaches including ours.
+
+\section*{Acknowledgements} 
+
+This work is funded in part by NSF grants no. 2019844, 2112471, 2229876. EF is supported by NSF Graduate Research Fellowship Program.
+SC is supported by the Harvard Dean's Competitive Fund for Promising Scholarship.
+PWK is supported by the Singapore National Research Foundation and the National AI Group in the Singapore Ministry of Digital Development and Information under the AI Visiting Professorship Programme (award number AIVP-2024-001).
+
+\bibliographystyle{plainnat}  %
+\bibliography{ref}
+
+
+\newpage
+\appendix
+\onecolumn
+
+\section{Comparisons with Existing Works}
+\label{app:related-work-comp}
+Here, we provide a detailed discussion of similar works to our method, accentuating limitations in existing methods and noting how our approach improves upon them.
+\subsection{Upper Bounds: Comparison with AYS and DMN}
+First, we discuss our relationship with Align Your Steps (AYS)~\cite{sabour2024align} and DMN~\cite{xue2024accelerating}, two methods for learning optimized discretization schedules for DMs by minimizing upper bounds of various forms of error; however, minimizing these upper bounds provides no guarantee of actually minimizing the true global error.
+Additionally, because these methods only focus on selecting discretization schedules, they fail to fully explore the full design space of the DM sampler.
+\paragraph{DMN}
+In DMN,~\citet{xue2024accelerating} minimizes an upper bound for the global error by optimizing only over the discretization schedules without considering the influence of the ODE solver method or the neural network; this bound is constructed solely by the chosen schedules for $\sigma_t$ and $\alpha_t$ that govern the SNR.
+Moreover, it makes a strong assumption that the prediction error of the score network is uniformly bounded by a small constant, which often fails to be the case~\cite{zhang2022fast}.
+\paragraph{AYS}
+In AYS,~\citet{sabour2024align} constructs an upper bound on the KL divergence between the true diffusion SDE solution distribution and the observed sampling distribution.
+They minimize this bound through an expensive Monte Carlo procedure and require bespoke numerical solutions, such as early stopping and a large batch size, to ensure stable optimization.
+More generally, both methods optimize an upper bound to their specific notions of error, which fails to guarantee minimization of the actual global error.
+
+\subsection{Local Truncation Error: Comparison with DPM-Solver-v3, GITS, AMED-Plugin, $\Pi$A, and Bespoke Solvers}
+Here, we provide discussion of a variety of works, which learn discretization schedules~\cite{pmlr-v235-chen24bm}, solver coefficients~\cite{zheng2023dpm,zhang2023accelerating}, or a combination of both~\cite{zhou2024fast,shaul2023bespoke} by minimizing various forms of local truncation error.
+As previously discussed, we emphasize that such an optimization pattern is insufficient in ensuring that the global error is minimized, as well as method-specific differences or pathologies.
+
+\paragraph{DPM-Solver-v3}
+DPM-Solver-v3~\cite{zheng2023dpm} is descended from a remarkable family of exponential integrator-based work~\cite{lu2022dpm,zheng2023dpm}.
+Notably, DPM-Solver-v3 computes  \emph{empirical model statistics}, or EMS, that define coefficients that minimize the first-order discretization error produced from a Taylor expansion of their solver formulation.
+Interestingly, while these methods only minimize the first-order error, they are also used in higher-order versions of DPM-Solver-v3.
+Crucially, however, the EMS are calculated to ensure local truncation error control and ultimately provide global error control of the form $\mc{O}(h^{k})$ given an $k$-th order predictor and maximum step size $h$.
+As a result, DPM-Sovler-v3 suffers from the same pathologies as other traditional solvers that aim to control the local truncation error when the step size becomes large.
+Additionally,~\citet{zheng2023dpm} only learns the solver coefficients, leaving half of the sampler design space on the table.
+
+\paragraph{GITS} 
+Similarly, GITS~\cite{pmlr-v235-chen24bm}, a method that uses DP-based search to select and optimized sequence of discretization steps for a DM, seeks to minimize the local truncation error of a student sampler.
+However, as discussed in Section~\ref{sec:background-diff-ode}, minimizing the local truncation error provides no guarantees for a bound on the global error, particularly in the small NFE regime; their algorithm reflects as much, as it assumes scaling of the local truncation error in order to obtain an estimate of the global error.
+Additionally, their method of selecting the discretization steps is agnostic to the specific choice of ODE solver used by the student sampler.
+
+\paragraph{AMED-Plugin}
+AMED-Plugin~\cite{zhou2024fast} is a recently proposed approach that learns both coefficients and time step for existing solvers by selecting intermediate time steps within an existing discretization schedule and applying a learned scaling factor when using the intermediate point in an ODE solver; they do so by learning an additional ``designer'' neural network on top of the bottleneck feature extracted from a UNet-based score network.
+A reasonable interpretation of AMED-Plugin is that it learns half of the time steps used in a sampling procedure that can be used on top of many common solvers; accordingly, it does not take full advantage of the sampler design space, e.g. selecting all solver coefficients and time steps.
+Moreover, the neural network used in AMED-Plugin is also trained to minimize truncation error by matching teacher trajectories along intermediate points, resulting in the same limitations as in Section~\ref{sec:background-diff-ode}.
+It also requires longer training time, which is likely attributable to the more expressive number of parameters being learned.
+
+\paragraph{$\Pi$A}
+$\Pi$A~\cite{zhang2023accelerating} is an approach that learns specific solver coefficients of different traditional solvers by minimizing the MSE between a student trajectory, requiring relatively minimal optimization costs.
+Similar to earlier critiques, matching the teacher trajectory can still learn pathologies along the teacher trajectory that are corrected with the benefit of additional NFEs but are ill-suited for the sutdent solver.
+Moreover, this approach only learns coefficients, failing to exploit the full design space; as a result, their quantitative performance is not as good as S4S.
+
+\paragraph{Bespoke Solvers}
+Bespoke solver~\cite{shaul2023bespoke} is a solver distillation method that effectively learns both time steps and coefficients by constructing and minimizing an upper bound for the global error; in practice, this bound essentially just results in minimizing the sum of the local truncation error from a teacher solver.
+As a result, though it makes use of the full sampler design space, it also seeks to minimize a sub-optimal objective.
+
+\subsection{Minimizing Global Error: Comparison with BNS and LD3}\label{app:related-bns}
+Finally, we discuss two approaches that seek to directly minimize the global error, either by learning discretization steps~\cite{tong2024learning} or by learning both time steps and solver coefficients~\cite{shaul2024bespoke}.
+While both of these objectives are aligned with our approach, they fail to achieve optimal performance in particular ways.
+
+\paragraph{BNS}
+Bespoke Non-stationary Solvers (BNS)~\cite{shaul2024bespoke} directly minimizes the global error, in this case PSNR, based solely on the outputs of the student and teacher DM sampler.
+While this is aligned with our approach, they have three key limitations.
+First, their solvers, which are essentially learned versions of linear multi-step methods, have \emph{maximal} order; that is, they allow the earliest predictions of the diffusion model to serve as gradient information even at very late time steps.
+Essentially, these solvers are $N$-step methods that leverage information from the full trajectory.
+Past work~\cite{zheng2023dpm} and our own ablations demonstrate that attempting to use methods with too much influence from past steps can result in instability in the ODE trajectories.
+Second, in the low NFE regime, BNS still has a relatively small number of parameters, which makes their objective difficult to optimize and results in solvers that likely are underfitted; we rectify such issues with our relaxed objective.
+Third, BNS optimizes all parameters simultaneously, which results in a complex optimization landscape irrespective of the whether the student model is adequately parametrized.
+In contrast, our approach uses alternating minimization to improve the stability of our overall optimization and iteratively solve optimization problems with easier loss landscape.
+
+\paragraph{LD3}
+LD3~\cite{tong2024learning} uses a gradient-based method for learning a discretization schedule that minimizes the global error.
+Moreover, they also make use of a relaxed objective that makes their optimization problem easier when using a relatively small number of parameters.
+However, LD3 similarly fails to make use of the second half or the DM sampler design space, which yields a significant improvement in performance.
+
+\section{Local Error Control in ODE Solvers}
+For completeness, we provide some details truncation error control for traditional ODE solver methods; significantly more details can be found in~\citet{lu2022dpm}.
+\subsection{Taylor Series Derivation}
+\label{app:taylor}
+Here, we provide brief details of the derivation of the Taylor series and its low-order derivative terms, as referenced in Section~\ref{sec:background-diff-ode}.
+For further details and the most informative description of the relationship of diffusion ODE solvers to the low-order Taylor approximation, see~\citet{lu2022dpm,lu2022dpmpp}; our explanation is essentially derived from their analysis.
+Recall that an exact solution for the diffusion ODE in its $\lambda$ parametrization can be given by
+\begin{equation}\label{eqn:lambda-exact-restated}
+\x_{t_i}=\frac{\alpha_{t_i}}{\alpha_{t_{i-1}}}\x_{t_{i-1}} - \alpha_{t_i}\int_{\lambda_{t_{i-1}}}^{\lambda_{t_i}} e^{-\lambda} \hatnoisemodel(\hat\x_\lambda,\lambda)d\lambda,
+\end{equation}
+where $\hat\x_\lambda$ and $\hatnoisemodel(\hat\x_\lambda,\lambda)$ denote the reparametrized forms of $\x_t$ and $\noisemodel(\x_t,t)$ in the $\lambda$ domain.
+To compute $\x_{t_i}$, we must approximate the integral in \eqref{eqn:lambda-exact-restated}; to do so, consider a Taylor expansion of $\hatnoisemodel(\hat\x_\lambda,\lambda)$ as
+\begin{equation*}
+    \hatnoisemodel(\hat{\x}_\lambda, \lambda) = \sum_{n=0}^{k-1} \frac{(\lambda - \lambda_{t_{i-1}})^n}{n!} \hatnoisemodel^{(n)}(\hat{\x}_{\lambda_{t_{i-1}}}, \lambda_{t_{i-1}}) + \mathcal{O}((\lambda - \lambda_{t_{i-1}})^k)
+\end{equation*}
+Additionally, define the functions
+\begin{equation*}
+    \varphi_k(z) := \int_0^1 e^{(1-\delta)z} \frac{\delta^{k-1}}{(k-1)!}d\delta, \quad \varphi_0(z) = e^z,
+\end{equation*}
+which are common terms in exponential integrator methods~\cite{hochbruck2010exponential}.
+Note that we have that $\varphi_k(0)=1/k!$ with recurrence relation $\varphi_{k+1}(k)=(\varphi_k(z)-\varphi_k(0))/z$.
+Substituting the Taylor expansion into \eqref{eqn:lambda-exact-restated} and defining $h:=\lambda_{t_i}-\lambda_{t_{i-1}}$ gives:
+\begin{align*}
+    \x_{t_i}&=\frac{\alpha_{t_i}}{\alpha_{t_{i-1}}}\x_{t_{i-1}} - \alpha_{t_i}\int_{\lambda_{t_{i-1}}}^{\lambda_{t_i}} e^{-\lambda} \hatnoisemodel(\hat\x_\lambda,\lambda)d\lambda \\
+    &=\frac{\alpha_{t_i}}{\alpha_{t_{i-1}}}\x_{t_{i-1}} - \alpha_{t_i}\int_{\lambda_{t_{i-1}}}^{\lambda_{t_i}} e^{-\lambda}\left(\sum_{n=0}^{k-1} \frac{(\lambda - \lambda_{t_{i-1}})^n}{n!} \hatnoisemodel^{(n)}(\hat{\x}_{\lambda_{t_{i-1}}}, \lambda_{t_{i-1}}) + \mc{O}\left(h^{k}\right)\right)d\lambda \\
+    &=\frac{\alpha_{t_i}}{\alpha_{t_{i-1}}}\x_{t_{i-1}} - \alpha_{t_i} \left(\frac{\sigma_{t_i}}{\alpha_{t_i}}\sum_{n=0}^{k-1} h^{n+1} \varphi_{n+1}(h)\hatnoisemodel^{(n)}(\hat\x_{\lambda_{t_i-1}},\lambda_{t_{i-1}}) + \mc{O}\left(h^{k+1}\right)\right) \\
+    & = \frac{\alpha_{t_i}}{\alpha_{t_{i-1}}}\x_{t_{i-1}} - \sigma_{t_i}\sum_{n=0}^{k-1} h^{n+1} \varphi_{n+1}(h)\hatnoisemodel^{(n)}(\hat\x_{\lambda_{t_i-1}},\lambda_{t_{i-1}}) + \mc{O}\left(h^{k+1}\right)
+\end{align*}
+Taking $\psi_n(h) = h^{n+1}\varphi_{n+1}(h)$ yields the expression in \eqref{eqn:lambda-taylor-soln}.
+Moreover, note that 
+\begin{equation*}
+    \varphi_1(h) = \frac{e^h-1}{h},\quad \varphi_2(h) = \frac{e^h-h-1}{h^2},\quad \varphi_3(h) = \frac{e^h-h^2/2-1}{h^3},
+\end{equation*}
+and accordingly we factor out an $e^h-1$ to receive
+\begin{equation*}
+    \x_{t_i} = \frac{\alpha_{t_i}}{\alpha_{t_{i-1}}}\x_{t_{i-1}} - \sigma_{t_i}(e^h-1)\sum_{n=0}^{k-1}c_n(h)\hatnoisemodel^{(n)}(\hat\x_{\lambda_{t_i-1}},\lambda_{t_{i-1}}) + \mc{O}\left(h^{k+1}\right).
+\end{equation*}
+where $c(h)$ captures the appropriate coefficient of each $\hatnoisemodel^{(n)}$.
+This essentially captures the desired formulation we provide: a given ODE solver method approximates the $\hatnoisemodel^{(n)}$ terms, we capture this approximation using $\Delta_i$ and ignore the higher-order Taylor terms.
+
+\subsection{Regularity Conditions for Local Truncation Error Control}
+\label{app:regularity}
+In general, three regularity conditions~\cite{lu2022dpm,lu2022dpmpp,zheng2023dpm} are required for ensuring that the local truncation error can be bounded in common diffusion ODE solvers:
+\begin{enumerate}
+    \item The derivatives $\hatnoisemodel^{(n)}$ in \eqref{eqn:lambda-taylor-soln} exist and are continuous for all $0\leq n\leq k$.
+    \item The score network $\noisemodel$ is Lipschitz in its first parameter $\x$.
+    \item The maximum step size $h_{max}$ is $\mc{O}(1/N)$, where $N$ is the number of discretization steps.
+\end{enumerate}
+These assumptions break down in the following ways:
+\begin{enumerate}
+    \item The derivatives of the noise prediction model $\hatnoisemodel^{(n)}$ cannot be guaranteed to exist or be continuous, since neural networks trained with standard optimizers like SGD or Adam do not enforce smoothness constraints on the learned function. 
+    While techniques like spectral normalization~\cite{miyato2018spectral} can help control Lipschitz constants, they do not ensure differentiability.
+    \item The Lipschitz condition on $\noisemodel$ is typically violated in practice, as modern score networks use architectures like U-Nets that can have very large Lipschitz constants. Even with normalization techniques, these constants often scale poorly with network depth and width.
+    \item The step size restriction $h_{max}=\mc{O}(1/N)$ forces a trade-off between computational cost and numerical accuracy that may be unnecessarily conservative in many regions of the trajectory where the ODE is well-behaved.
+\end{enumerate}
+These theoretical limitations help explain why practical implementations often deviate from the idealized analysis. 
+In particular, alternative methods for local truncation error control~\cite{zhang2022fast,pmlr-v235-chen24bm} can achieve good empirical performance despite violating these assumptions, suggesting that weaker conditions may be sufficient in practice.
+
+\begin{table}[t]
+\small
+\begin{tabular*}{\linewidth}{@{\extracolsep{\fill}}c|c|c|cc@{}}
+\toprule
+Solver Type & $\Delta_i(\phi)$ & $\phi$ & NFEs per Step & \# Params. \\
+\midrule
+LMS & $\displaystyle\sum_{j=1}^{k}b_{j,i} \datamodel(\tilde{x}_{t_{i-j}}, t_{i-j})$ & $\{b_{j,i}\}$ & 1 & $k(2N + 1 - k)/2$ \\
+\midrule
+SS & $\begin{array}{c}\displaystyle\sum_{j=1}^k b_{j,i}\kappa_j, \\ \kappa_j = \datamodel\!\left(\tilde{x}_{t_{i-1}} + \sum_{l=1}^{j-1} a_{j,i,l} \kappa_l, t_{i-1}+c_{j,i} \right)\end{array}$ & $\{b_{j,i}, a_{j,i,l}, c_{j,i}\}$ & $k$ & $(k^2+k-1)N$ \\
+\midrule
+LMS+PC & $\displaystyle\sum_{j=1}^k a_{j,i}^c \datamodel(\tilde{x}_{t_{i-j}}, t_{i-j})$ & $\{b_{j,i}\} + \{a_{j,i}^c\}$ & 1 & $k(2N + 1 - k)$ \\
+\bottomrule
+\end{tabular*}
+\caption{We apply S4S to three types of diffusion ODE solvers; we show their increment ($\Delta_i$), learnable parameters, number of NFEs per step, and total parameter count over $N+1$ steps. By default, we use a linear multi-step predictor for the PC method, so $\{a_{j,i}^c\}$ refer to coefficients during the correction step, and the total set of learnable parameters accounts for the underlying multi-step predictor.}
+\label{table:data-solver-types}
+\end{table}
+
+\subsection{Local Error Control }
+\label{app:beyond-local-error}
+A number of related works~\cite{pmlr-v235-chen24bm,zhang2023accelerating,shaul2023bespoke} recommend \emph{matching} the trajectory of the teacher solver.
+In our setting, given an intermediate point $\tilde\x_i^*$ from the teacher solver, this would require optimizing an objective of the form:
+\begin{equation*}
+    \min_{\coeff} \|d(\tilde\x_i^{\coeff}, \tilde\x_i^*)\|
+\end{equation*}
+for all $i$ in $[N]$, either simultaneously or iteratively for each $i$.
+Nonetheless, across many teacher trajectories, many solvers have pathological behavior that is corrected in regimes with large numbers of NFEs.
+For example, Figure 9 in~\citet{zhou2024simple} demonstrates such an example: as the guidance scale increases, the teacher trajectories become increasingly pathological, but benefit from correcting errors made in early steps.
+However, by training a student solver with few NFEs to match such a trajectory on overlapping points with the teacher solver, it can learn these same pathologies that are resolved in the teacher by a larger number of NFEs.
+
+\section{Generalized Formulation of Diffusion ODE Solvers}
+\label{app:solvers}
+
+\subsection{Data Prediction Solver Instantiation}
+While we focus in the main paper on generalized versions of ODE solvers in terms of noise prediction, we also provide a general expression in terms of the data prediction model.
+Note that the general form of the exact solution to the diffusion ODE under parametrization by the data prediction model is
+\begin{equation*}
+    \x_t = \frac{\sigma_t}{\sigma_s}\x_s + \sigma_t\int_{\lambda_s}^{\lambda_t} e^\lambda \hat\x_\theta(\hat\x_\lambda,\lambda)d\lambda
+\end{equation*}
+Therefore, we just need to take a Taylor approximation of the integral, as we did in \appref{app:taylor}. 
+This results in a general expression for a diffusion ODE as
+\begin{equation*}
+    \tilde\x_{t_i} = \frac{\sigma_{t_i}}{\sigma_{t_{i-1}}} \tilde\x_{t_{i-1}} - \alpha_{t_i} (e^{-h_i} - 1)\Delta_i^{\x}(\coeff)
+\end{equation*}
+We display the equivalent definitions for $\Delta_i^\x(\coeff)$ in \tabref{table:data-solver-types}.
+
+\subsection{Constant Coefficients in Diffusion ODE Solvers}
+\label{app:solv-constant-coeff}
+Coefficients in diffusion model solvers are not ``inherently'' constant; whether they are constant or not depends on the choice of discretization schedule and design decisions in the solver.
+For example, the iPNDM solver~\cite{zhang2022fast} demonstrates this principle clearly - after its initial warmup period, it settles into using constant coefficients for subsequent steps. 
+This design choice provides computational efficiency while maintaining numerical stability. 
+The solver achieves this by carefully transitioning from variable coefficients during the warmup phase to fixed values that work well across the remaining time steps.
+
+Similarly, DPM-Solver++~\cite{lu2022dpmpp} multi-step methods can be viewed through the lens of constant coefficients, particularly in their higher-order variants. 
+This perspective helps explain their computational efficiency, as the coefficients don't need to be recalculated at each step, while still maintaining high-order accuracy in solving the diffusion ODE.
+
+
+\section{Relaxed Objective}
+\subsection{Theoretical Guarantee}
+\label{app:relax-obj-kl}
+Here, we briefly restate the theoretical guarantee for the relaxed objective presented in \eqref{eqn:relaxed-obj}; this guarantee was provided by~\citet{tong2024learning}.
+\begin{theorem}\label{thm:tong-kl-proof}
+Let $\Psi_{*}$ and $\coeffsolver$ be a teacher and student ODE solver each with noise distribution $\mathcal{N}(0, \sigma^2_1\mathbf{I}) \in \mathbb{R}^d$, and with, respectively, distributions $q$ and $p_{\coeff}$. Assume both $\Psi_{*}$ and $\coeffsolver$ are invertible. Let $r > 0$, if the objective from \eqref{eqn:relaxed-obj} has an optimal solution $\coeff^*$ for $r$ with objective value 0, we have
+\begin{equation}
+D_{\mathrm{KL}}(q(\mathbf{x}) \parallel p_{\coeff^*}(\mathbf{x})) \leq \frac{r^2}{2} + r\sqrt{d + 1} + \mathbb{E}_{\mathbf{x}\sim q(\mathbf{x})} \|C(\Psi_{*}(\mathbf{x})) - C(\Psi_{\coeff^*}(\mathbf{x}))\|,
+\end{equation}
+where $C(\Psi_{\coeff^*}(\mathbf{x})) = \log |\det J_{\Psi_{\coeff^*}}(\Psi^{-1}_{\coeff^*}(\mathbf{x}))|$.
+\end{theorem}
+Below, we provide a provide a brief overview of the proof; see ~\citet{tong2024learning}[A.1] for further details.
+\begin{proof}
+By assuming the invertibility of the solvers and the loss of \eqref{eqn:relaxed-obj} having an optimal (zero loss and satisfying all $r\sigma_T$-ball constraints) solution $\coeff^*$, we have for every $\mathbf{x} \sim q(\mathbf{x})$ exactly one $\mathbf{b}$ with $\Psi^{-1}_*(\mathbf{x}) = \mathbf{b}$ and exactly one corresponding $\mathbf{a}$ with $\Psi^{-1}_{\coeff^*}(\mathbf{x}) = \mathbf{a}$. Moreover, since $\mathbf{a}$ is an optimal and therefore feasible solution, we have $\mathbf{a} \in B(\mathbf{b}, r\sigma_T)$ and thus $\|\mathbf{a} - \mathbf{b}\|_2 \leq r\sigma_T$.
+Using the density function of the normal distribution, we can write:
+\begin{align*}
+\mathbb{E}_{\mathbf{x}\sim q(\mathbf{x})} \left[\log \left(\frac{q(\mathbf{x})}{p_{\coeff}(\mathbf{x})}\right)\right] 
+&= \mathbb{E}_{\mathbf{x}\sim q(\mathbf{x})} \left[\log \left(\frac{\mathcal{N}(\mathbf{b})\left|\det \frac{d\Psi_*(\mathbf{b})}{d\mathbf{b}}\right|^{-1}}{\mathcal{N}(\mathbf{a})\left|\det \frac{d\Psi_{{\coeff}^*}(\mathbf{a})}{d\mathbf{a}}\right|^{-1}}\right)\right] \\
+&= \mathbb{E}_{\mathbf{x}\sim q(\mathbf{x})} \left[\log(\mathcal{N}(\mathbf{b})) + \log\left(\left|\det \frac{d\Psi_*(\mathbf{b})}{d\mathbf{b}}\right|^{-1}\right) - \log(\mathcal{N}(\mathbf{a})) - \log\left(\left|\det \frac{d\Psi_{{\coeff}^*}(\mathbf{a})}{d\mathbf{a}}\right|^{-1}\right)\right]
+\end{align*}
+The normal distribution terms can be written explicitly:
+\begin{equation*}
+\mathbb{E}_{\mathbf{x}\sim q(\mathbf{x})} \left[\log \left(\frac{\prod_{i=1}^d \frac{1}{\sigma_T\sqrt{2\pi}} \exp\left(-\frac{1}{2}\frac{b_i^2}{\sigma_T^2}\right)}{\prod_{i=1}^d \frac{1}{\sigma_T\sqrt{2\pi}} \exp\left(-\frac{1}{2}\frac{a_i^2}{\sigma_T^2}\right)}\right)\right]
+\end{equation*}
+We rewrite $a_i = b_i + \epsilon_i$ for $\epsilon_i \in \mathbb{R}$. This gives:
+\begin{align*}
+\mathbb{E}_{\mathbf{x}\sim q(\mathbf{x})} \left[\frac{1}{2\sigma_T^2} \sum_{i=1}^d (2\epsilon_ib_i + \epsilon_i^2)\right] 
+&= \frac{1}{\sigma_T^2}\mathbb{E}_{\mathbf{x}\sim q(\mathbf{x})} \left[\sum_{i=1}^d \epsilon_ib_i\right] + \frac{1}{2\sigma_T^2}\mathbb{E}_{\mathbf{x}\sim q(\mathbf{x})} \left[\sum_{i=1}^d \epsilon_i^2\right]
+\end{align*}
+Since $\|\mathbf{a} - \mathbf{b}\|_2 \leq r\sigma_T$, we have that $\sum_{i=1}^d (a_i - b_i)^2 \leq r^2\sigma_T^2$ and with $a_i = b_i + \epsilon_i$, we have $\sum_{i=1}^d \epsilon_i^2 \leq r^2\sigma_T^2$.
+Therefore:
+\begin{equation*}
+\frac{1}{2\sigma_T^2}\mathbb{E}_{\mathbf{x}\sim q(\mathbf{x})} \left[\sum_{i=1}^d \epsilon_i^2\right] \leq \frac{1}{2\sigma_T^2}\mathbb{E}_{\mathbf{x}\sim q(\mathbf{x})} [r^2\sigma_T^2] = \frac{r^2}{2}
+\end{equation*}
+The last equality follows from the independence of random variables in the multivariate distribution. Applying the Cauchy-Schwarz inequality:
+\begin{align*}
+\frac{1}{\sigma_T^2}\mathbb{E}_{\mathbf{x}\sim q(\mathbf{x})} \left[\sum_{i=1}^d \epsilon_ib_i\right] 
+&\leq \frac{1}{\sigma_T^2}\mathbb{E}_{\mathbf{x}\sim q(\mathbf{x})} \left[\left(\sum_{i=1}^d \epsilon_i^2\right)^{1/2} \left(\sum_{i=1}^d b_i^2\right)^{1/2}\right] \\
+&\leq \frac{1}{\sigma_T^2}\mathbb{E}_{\mathbf{x}\sim q(\mathbf{x})} \left[r\sigma_T \left(\sum_{i=1}^d b_i^2\right)^{1/2}\right] \\
+&= \frac{r}{\sigma_T}\mathbb{E}_{\mathbf{b}\sim \mathcal{N}(0,\sigma_T^2\mathbf{I})} \left[\left(\sum_{i=1}^d b_i^2\right)^{1/2}\right]
+\end{align*}
+Since $b_i \stackrel{\text{i.i.d.}}{\sim} \mathcal{N}(0,\sigma_T^2)$, the sum of squares follows a Chi-squared distribution scaled by $\sigma_T^2$:
+\begin{equation*}
+\sum_{i=1}^d b_i^2 \sim \sigma_T^2\chi_d^2
+\end{equation*}
+This allows us to write:
+\begin{equation*}
+\frac{r}{\sigma_T}\mathbb{E}\left[\left(\sum_{i=1}^d b_i^2\right)^{1/2}\right] 
+= \frac{r}{\sigma_T}\mathbb{E}\left[\sigma_T\sqrt{\chi_d^2}\right]
+= r\sigma_T\mathbb{E}\left[\sqrt{\chi_d^2}\right]
+= r\sqrt{2}\frac{\Gamma\left(\frac{d+1}{2}\right)}{\Gamma\left(\frac{d}{2}\right)}
+\end{equation*}
+Applying Gautschi's inequality:
+\begin{equation*}
+\frac{\Gamma\left(\frac{d+1}{2}\right)}{\Gamma\left(\frac{d}{2}\right)} \leq \sqrt{\frac{d+1}{2}}
+\end{equation*}
+This gives us:
+\begin{equation*}
+r\sqrt{2}\frac{\Gamma\left(\frac{d+1}{2}\right)}{\Gamma\left(\frac{d}{2}\right)} \leq r\sqrt{2}\sqrt{\frac{d+1}{2}} = r\sqrt{d+1}
+\end{equation*}
+Combining all terms, we obtain our final bound:
+\begin{equation*}
+D_{\text{KL}}(q(\mathbf{x}) \parallel p_{\coeff^*}(\mathbf{x})) \leq \frac{r^2}{2} + r\sqrt{d+1} + \mathbb{E}_{\mathbf{x}\sim q(\mathbf{x})}[\|C(\Psi_*(\mathbf{x})) - C(\Psi_{\coeff^*}(\mathbf{x}))\|]
+\end{equation*}
+where $C(\Psi_{\coeff^*}(\mathbf{x})) = \log|\det J_{\Psi_{\coeff^*}}(\Psi_{\coeff^*}^{-1}(\mathbf{x}))|$.
+\end{proof}
+
+Evaluating whether the solver is invertible is difficult to characterize in practice.
+We note, however, that LMS solvers can at least be represented in matrix form, as they scale a linear combination of previous evaluations of the model.
+Accordingly, if only the coefficients are learned, then the LMS solver can be made invertible by the transform $A\mapsto A+\epsilon \id$ for a sufficiently small, non-zero $|\epsilon|$.
+
+\subsection{Easier Objective}
+\label{app:relaxed-obj}
+We also hope to verify that the relaxed objective is indeed easier to optimize.
+We characterize this by running an experiment on CIFAR-10: we optimize the S4S coefficients initialized at iPNDM with logSNR discretization and characterize the empirical loss of \eqref{eqn:relaxed-obj} as $r$ increases.
+We affirmatively verify this in \Figref{fig:relax-obj}.
+
+\begin{figure}
+    \centering
+    \includegraphics[width=0.5\linewidth]{images/relax-objective.pdf}
+    \caption{Values of $\mc{L}_{\text{relax}}$ as we expand $r$. As $r$ increases, the objective becomes easier to optimize, thereby validating the utility of the relaxed objective in making an easier optimization problem for learning solver coefficients.}
+    \label{fig:relax-obj}
+\end{figure}
+
+\section{Parametrization of Solver Discretization Steps}\label{app:time-param-sec}
+We parameterize the two versions of our time steps, $t_i^{\timeparams}$ and $t_i^c$, in two distinct stages described below.
+\subsection{General Time Steps}
+\label{app:time-param}
+Given a learnable vector $\timeparams \in \mathbb{R}^{N+1}$, we construct each time step $t_i^{\timeparams}$ through a two-stage process.
+First, we apply a cumulative softmax operation to ensure strict monotonicity:
+\begin{equation*}
+    \tau'_{\timeparams}(i) = \sum_{n=i}^N \text{softmax}(\timeparams)[n]
+\end{equation*}
+We then apply a linear rescaling to map these values to the interval $[t_{\text{min}}, T]$:
+\begin{equation*}
+    t_i^{\timeparams} = \frac{\tau'_{\timeparams}(i) - \tau'_{\timeparams,\text{min}}}{\tau'_{\timeparams,\text{max}} - \tau'_{\timeparams,\text{min}}}(T - t_{\text{min}}) + t_{\text{min}}
+\end{equation*}
+This construction ensures that $t_0^{\timeparams} = T > t_1^{\timeparams} > \dots > t_N^{\timeparams} = t_{\text{min}}$, and ultimately provides the foundation for determining step sizes and signal-to-noise ratio parameters, as described in the main text.
+\subsection{Decoupled Time Steps}
+\label{app:time-param-decouple}
+Following the parameterization of $\{t_i^{\timeparams}\}_{i=0}^{N+1}$, we now construct the decoupled time steps $\{t_i^c\}_{i=0}^N$ that are used as input to the score network. 
+Specifically, we define each decoupled time step $t_i^c$ as 
+\begin{equation*}
+    t_i^c = t_i^{\timeparams} + \timeparams_i^c
+\end{equation*}
+where $\timeparams^c \in \mathbb{R}^{N+1}$ is a learnable offset vector. 
+For numerical stability, we constrain the magnitude of the decoupled offsets $\timeparams^c$. 
+Let $\Delta t_i = |t_{i+1}^{\timeparams} - t_i^{\timeparams}|$ be the gap between consecutive time steps.
+We define the maximum allowed offset as $\delta = \alpha\min_i{\Delta t_i}$, where $\alpha > 0$ is a hyperparameter. 
+The final decoupled time steps are then given by:
+\begin{equation*}
+    t_i^c = \begin{cases} 
+        t_i^{\timeparams} & \text{if } i \in \{0,N\} \\
+        t_i^{\timeparams} + \text{clip}(\timeparams_i^c, [-\delta, \delta]) & \text{otherwise}
+    \end{cases}
+\end{equation*}
+where $\text{clip}(x, [a,b])$ clamps the value of $x$ to the interval $[a,b]$. 
+This ensures that the endpoints remain fixed while intermediate steps can only shift by a fraction of the smallest step size.
+
+\section{Additional Implementation Details}
+\subsection{Pseudocode for S4S-Alt}
+\label{app:alt-joint-algs}
+Here, we describe the pseudocode for S4S-Alt, which strongly resembles that of S4S. 
+However, we emphasize that we use the same value of $r$ that bounds the allowed deviation of the initial noise condition in \emph{both} optimization objectives. 
+We do this because both objectives must \emph{share} the same allowable distribution of the noise; otherwise, starting from different initial conditions in different parts of the overall optimization makes learning the effective parameters much more difficult.
+Additionally, using S4S-Alt generally requires significantly more examples relative to S4S, as we hope to ensure that both sets of parameters do not begin to overfit.
+
+\begin{algorithm}[H]
+\caption{S4S-Alt}
+\label{alg:s4s-alt}
+\begin{algorithmic}[1]
+\Require Coefficient parameters $\coeff$, discretization step parameters $\alltimeparams$, student solver $\coefftimesolver$, teacher solver $\solveropt$, distance metric $d$, number of alternating steps $K$, and $r$.
+\State $\mathcal{D} \leftarrow \{(\mathbf{x}_T', \mathbf{x}_T, \solveropt(\mathbf{x}_T)) \mid \mathbf{x}_T \sim \mathcal{N}(\bm0, \tilde\sigma^2\id), \mathbf{x}_T' = \mathbf{x}_T\}$ \Comment{Generate data $\mathcal{D}_k$}
+\State $k \leftarrow 1$
+\For{$k=1,\dots,K$}
+\While{not converged}
+    \State $(\mathbf{x}_T', \mathbf{x}_T, \solveropt(\mathbf{x}_T)) \sim \mathcal{D}$
+    \State $\mathcal{L}(\coeff,\x_T') = d(\coefftimesolver(\mathbf{x}_T'), \solveropt(\mathbf{x}_T))$ subject to $\mathbf{x}_T' \in B(\mathbf{x}_T, r\sigma_T)$
+    \State Update $\coeff$ and $\mathbf{x}_T'$ using the corresponding gradients $\nabla\mathcal{L}(\coeff, \mathbf{x}_T')$
+    \State $\mathbf{x}_T' \leftarrow \mathbf{x}_T + \mathbf{1}[\|\mathbf{x}_T' - \mathbf{x}_T\|_2 > r] \cdot r \frac{\mathbf{x}_T' - \mathbf{x}_T}{\|\mathbf{x}_T' - \mathbf{x}_T\|_2}$ \Comment{Projected SGD}
+    \State Update $\mathcal{D}$ with the new $\mathbf{x}_T'$
+\EndWhile
+\While{not converged}
+    \State $(\mathbf{x}_T', \mathbf{x}_T, \solveropt(\mathbf{x}_T)) \sim \mathcal{D}$
+    \State $\mathcal{L}(\alltimeparams,\x_T') = d(\coefftimesolver(\mathbf{x}_T'), \solveropt(\mathbf{x}_T))$ subject to $\mathbf{x}_T' \in B(\mathbf{x}_T, r\sigma_T)$
+    \State Update $\alltimeparams$ and $\mathbf{x}_T'$ using the corresponding gradients $\nabla\mathcal{L}(\alltimeparams, \mathbf{x}_T')$
+    \State $\mathbf{x}_T' \leftarrow \mathbf{x}_T + \mathbf{1}[\|\mathbf{x}_T' - \mathbf{x}_T\|_2 > r] \cdot r \frac{\mathbf{x}_T' - \mathbf{x}_T}{\|\mathbf{x}_T' - \mathbf{x}_T\|_2}$ \Comment{Projected SGD}
+    \State Update $\mathcal{D}$ with the new $\mathbf{x}_T'$
+\EndWhile
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+
+\subsection{Efficient Computational Techniques}
+\label{app:comp-graph}
+To optimize memory usage during training, we employ gradient rematerialization when computing $\nabla_{\coeff}\coeffsolver(\x'_T)$. 
+Rather than storing all intermediate neural network activations, which would incur $\mathcal{O}(N)$ memory overhead with respect to the number of parameters, we recompute them on the fly during backpropagation. 
+This approach follows~\citet{tong2024learning} and~\citet{watson2021learning}, trading increased computation time for reduced memory requirements. 
+Specifically, we rematerialize calls to the pretrained score network $\noisemodel$ while maintaining the chain of denoised states in memory, allowing our method to scale to large diffusion architectures while maintaining reasonable batch sizes.
+
+\section{Experiment Details}\label{app:exp-details}
+\subsection{Discretization Heuristics and Methods}
+\label{app:disc-methods}
+We use four time discretization heuristics and three methods for adaptively selecting the discretization steps.
+Here, we consider time interval from $T$ to $\epsilon$ over which the ODE is solved with $N+1$ total time steps; here, solving the ODE to $\epsilon$ rather than 0 helps with numerical stability.
+\subsubsection{Discretization Heuristics}
+\paragraph{Time Uniform and Time Quadratic Discretization}
+In the Time Uniform discretization schedule, we split the interval $[T,\epsilon]$ uniformly; this gives discretization schedule:
+\begin{equation*}
+    t_n = T + \frac{n}{N}(\epsilon-T)
+\end{equation*}
+for $n\in[N]$. 
+Alternatively, the Time Quadratic schedule assigns each time step as
+\begin{equation*}
+    t_n = T + \left(\frac{n}{N}\right)^2 (\epsilon-T).
+\end{equation*}
+These schedules are popular for variance preserving-style DMs~\cite{ho2020denoising,song2020denoising,lu2022dpm}.
+\paragraph{Time EDM Discretization}
+\citet{karras2022elucidating} propose a change of variables to $\kappa_t=\frac{\sigma_t}{\alpha_t}$ and creating a discretization schedule according to
+\begin{equation*}
+    t_n = t_{\kappa}\left(\left(\kappa_T^{1/\rho} + \frac{n}{N}\left(\kappa_\epsilon^{1/\rho} - \kappa_T^{1/\rho}\right)\right)^\rho\right)
+\end{equation*}
+where $t_\kappa$ is the inverse of $t\mapsto\kappa_t$, which exists as $\kappa_t$ is strictly monotone by the construction of $\sigma_t$, $\alpha_t$.
+
+\paragraph{Time log-SNR Discretization}
+Alternatively,~\citet{lu2022dpm,lu2022dpmpp} propose a change of variables to $\lambda_t=\log(\alpha_t/\sigma_t)$ log-SNR domain and discretizing uniformly over the interval, i.e. 
+\begin{equation*}
+    t_n = t_\lambda(\lambda_T + \frac{n}{N}(\lambda_\epsilon-\lambda_T))
+\end{equation*}
+where $t_\lambda$ is the inverse mapping of $t\mapsto\lambda_t$, which again exists because of strict monotonicity.
+\subsubsection{Discretization Schedule Selection Methods}
+\paragraph{DMN}
+DMN~\cite{xue2024accelerating} constructs an optimization problem that creates an upper bound on the global error.
+Concretely, they model sequentially solving the diffusion ODE in terms of Lagrange approximations, construct an upper bound of the error on the assumption that the score network prediction error is uniformly upper bounded by a constant, and select a sequence of $\lambda_i$ that minimizes the derived upper bound.
+
+\paragraph{GITS} 
+GITS~\cite{pmlr-v235-chen24bm} is a method that uses DP-based search to select an optimized sequence of discretization steps for a DM that minimizes the deviation the diffusion ODE.
+They do so by calculating the local error incurred from estimating the next time step $t_i$ from the current step $t_{i-1}$ on a finely discretized search space of possible time steps.
+Once a cost matrix of all pair-wise costs is calculated, they then use a DP algorithm to select the lowest-cost sequence of steps given a number of NFEs.
+Intuitively, this approach seeks to take steps that are relatively large in regions of low curvature and smaller steps in regions with high curvature where the discretization error might be high.
+
+\paragraph{LD3}
+LD3\cite{tong2024learning} seeks to learn a sequence of coefficients using the same parameterization as in \appref{app:time-param-sec}.
+They similarly try to minimize an objective over the global discretization error, often LPIPS.
+
+\subsection{Practical Implementation}
+\label{app:practical-implementation}
+Here, we discuss important practical details that we use for both S4S and S4S-Alt.
+Most crucial is our choice of $r$ when optimizing our relaxed objective in both S4S and S4S-Alt.
+Let $m$ denote the total number of parameters learned in the student solver.
+Then in both S4S and S4S-Alt, we set $r\propto \frac{1}{m^{5/2}}$.
+This helps balance the solver's ability to learn the relaxed objective with the number of parameters that it has available.
+
+In practice, for CIFAR-10, FFHQ, and AFHQv2, we use 700 samples for learning coefficients in S4S with a batch size of 20; when learning coefficients \emph{and} time steps in S4S-Alt, we generally use 1400 samples as training data with a batch size of 40.
+We use 200 samples and 400 samples as a validation data set, respectively.
+For latent DMs, we use 600 samples for learning S4S with a batch size of 20 using gradient accumulation, and use a dataset of 1000 samples with batch size of 40 for S4S-Alt.
+We again use 200 samples and 400 samples as a validation data set, respectively.
+In both settings, we run S4S for 10 epochs, and S4S-Alt for $K$=8 alternating steps.
+
+For teacher solvers, in general we follow~\citet{tong2024learning} and select the best-performing solver at 20 NFE.
+This is UniPC with 20 NFE and logSNR discretization for CIFAR-10, FFHQ, and AFHQv2; UniPC with 20 NFE and time uniform discretization for LSUN Bedroom, UniPC with 10 NFE and time uniform discretization for Imagenet, and UniPC with GITS discretization at 10 steps for MS-COCO.
+
+\section{Additional Results}
+
+\subsection{Single-Step Solvers}
+\label{app:single-step}
+While in the main text we mainly focus on LMS methods, we also consider SS solver methods, in particular focusing on DPM-Solver~\cite{lu2022dpm}.
+In particular, we consider learnable equivalents of DPM-Solver (2S), a second-order method which uses a single intermediate step $u_1$ as well as $\tilde\x_{t_{i-1}}$ to estimate $\tilde\x_{t_i}$, and DPM-Solver (3S), which uses two intermediate steps $u_1$ and $u_2$ and is therefore a third-order method.
+Note that while the practical algorithmic approach for learning the SS coefficients is the same as that in the LMS setting, there are significantly more parameters that can be learned as compared to LMS or even PC methods.
+Consequently, the allowable radius $r$ of our relaxed objective is much smaller than its LMS counterparts.
+
+\tabref{tab:singlestep} demonstrates our results on FFHQ using the logSNR discretization schedule.
+We compare against iPNDM-S4S as a baseline for LMS methods as well as to traditional DPM-Solver (2S).
+Here, we find that S4S similarly leads to significant gains for SS solvers, in fact even larger than the gains seen for LMS solvers.
+Nonetheless, despite the significant improvements attained by learning the solver coefficients, SS methods still lag behind their LMS counterparts.
+Intuitively, this is because SS methods have significantly more parameters to optimize.
+If $r$ is not chosen properly, then there is a significant chance that S4S \emph{overfits} to the training dataset but fails to generalize well to the original noise distribution.
+Moreover, SS methods suffer from the fact that their effective step size is larger than that of LMS methods, i.e. for an equal number of NFEs, the step size of a $k$-step LMS method is $1/k$ the step size of the $k$-step SS method.
+As a result, for the core remaining parts of our experiments, we focus on LMS methods.
+
+\begin{table}[t]
+    \small
+    \centering
+    \begin{tabular}{cc|cccc}
+        \toprule
+        Method & Order & NFE=3 & NFE=4 & NFE=6 & NFE=8 \\
+        \midrule
+        DPM-Solver (2S) & 2 & - & 239.41 & 65.24 & 28.06\\
+        DPM-Solver-S4S (2S) & 2 & - & 66.82 & 34.91 & 24.73\\
+        DPM-Solver-S4S (3S) & 3 & 89.75 & - & 42.02 & -\\
+        \midrule
+        iPNDM-S4S (3M) & 3 & \textbf{48.19} & \textbf{21.58} & \textbf{8.91} & \textbf{4.33}\\
+        \bottomrule
+    \end{tabular}
+    \caption{FID of SS methods for S4S initialized at DPM-Solver. Although DPM-Solver-S4S achieves significant gains in FID, especially relative to its unlearned counterpart, it lags behind the simpler and much easier to optimize LMS methods.}
+    \label{tab:singlestep}
+\end{table}
+
+\subsection{Additional Ablations}
+\label{app:add-ablations}
+We ablate several of the design decisions in our approach.
+Specifically, we characterize the importance of time-dependent coefficients, the choice of LPIPS as our distance metric, and the use of the relaxed objective.
+We find that time-dependent coefficients significantly improves the performance of S4S and S4S-Alt; this is somewhat expected, since using a fixed set of coefficients for several iterations significantly decreases the number of learnable parameters.
+Additionally, we find that we still attain strong performance when using the $L_2$ loss in lieu of LPIPS.
+Finally, using our relaxed objective greatly improves performance, particularly in S4S with few NFEs, though with more NFEs the benefit decays as the optimization problem becomes less underparametrized.
+
+
+\subsubsection{S4S Initialization}
+\label{app:ablate-initialization}
+A natural question to consider is the importance of the initialization heuristic used for S4S.
+Here, we consider the results of initializing an LMS method according to a standard Gaussian.
+We evaluate this initialization on CIFAR-10 and FFHQ with the logSNR discretization schedule; \tabref{tab:ablate-init} contains our results for this evaluation.
+Although S4S initialized with standard Gaussian coefficients achieves meaningful improvements, it is nonetheless outperformed by initializing at existing solver methods.
+
+\begin{table}[t]
+    \small
+    \centering
+    \begin{tabular}{cc|cccc}
+        \toprule
+        Dataset & Method & NFE=3 & NFE=4 & NFE=5 & NFE=6 \\
+        \midrule
+        \multirow{3}{*}{CIFAR-10} & Gaussian-S4S (3M) & 91.84 & 42.17 & 25.61 & 11.93\\
+        & iPNDM-S4S (3M) & 75.88 & 30.12 & 17.97 & 10.61 \\
+        & DPM-Solver-++-S4S (3M) & 93.58 & 40.18 & 22.21 & 11.04\\
+        \midrule
+        \multirow{3}{*}{FFHQ} & Gaussian-S4S (3M) & 81.44 & 44.91 & 24.83 & 15.01 \\
+        & iPNDM-S4S (3M) & 76.81 & 36.23 & 24.16 & 16.15\\
+        & DPM-Solver-++-S4S (3M) & 86.39 & 45.89 & 22.52 & 13.78\\
+        \bottomrule
+    \end{tabular}
+    \caption{FID of LMS methods initialized with standard Gaussian coefficients and optimized using S4S compared against initialization at iPNDM or DPM-Solver++. We use the logSNR discretization heuristic for all samples. Gaussian-initialized S4S outperforms traditional ODE solvers, but nonetheless improves less than its solver-initialized counterparts.}
+    \label{tab:ablate-init}
+\end{table}
+
+\subsubsection{Joint Optimization Objective and Details}
+\label{app:s4s-joint-details}
+Below, we describe the optimization objective and implementation details for learning the joint optimization objective, which learns both the solver coefficients and the time steps simultaneously.
+The pseudocode is essentially a restatement of that of S4S, but propagating the gradients to both sets of learnable coefficients.
+We use the same batch size 
+
+\begin{algorithm}[t]
+\caption{Joint Optimization Algorithm}
+\label{alg:s4s-joint}
+\begin{algorithmic}[1]
+\Require Coefficient parameters $\coeff$, discretization step parameters $\timeparams$, student solver $\coefftimesolver$, teacher solver $\solveropt$, distance metric $d$, and $r$.
+\State $\mathcal{D} \leftarrow \{(\mathbf{x}_T', \mathbf{x}_T, \solveropt(\mathbf{x}_T)) \mid \mathbf{x}_T \sim \mathcal{N}(\bm0, \tilde\sigma^2\id), \mathbf{x}_T' = \mathbf{x}_T\}$ \Comment{Generate data $\mathcal{D}$}
+\While{not converged}
+    \State $(\mathbf{x}_T', \mathbf{x}_T, \solveropt(\mathbf{x}_T)) \sim \mathcal{D}$
+    \State $\mathcal{L}(\coeff,\alltimeparams,\x_T') = d(\coefftimesolver(\mathbf{x}_T'), \solveropt(\mathbf{x}_T))$ subject to $\mathbf{x}_T' \in B(\mathbf{x}_T, r\sigma_T)$
+    \State Update $\coeff$, $\alltimeparams$, and $\mathbf{x}_T'$ using the corresponding gradients $\nabla\mathcal{L}(\coeff, \alltimeparams, \mathbf{x}_T')$
+    \State $\mathbf{x}_T' \leftarrow \mathbf{x}_T + \mathbf{1}[\|\mathbf{x}_T' - \mathbf{x}_T\|_2 > r] \cdot r \frac{\mathbf{x}_T' - \mathbf{x}_T}{\|\mathbf{x}_T' - \mathbf{x}_T\|_2}$ \Comment{Projected SGD}
+    \State Update $\mathcal{D}$ with the new $\mathbf{x}_T'$
+\EndWhile
+\end{algorithmic}
+\end{algorithm}
+
+\subsubsection{Training Dataset Size}
+\label{app:ablate-dataset-size}
+We also ablate the significance of the training dataset size in S4S-Alt.
+We display these results for CIFAR-10 with 6 NFEs in \Figref{fig:fid-vs-data}.
+
+\begin{figure}
+    \centering
+    \includegraphics[width=0.5\linewidth]{images/fid_vs_data.png}
+    \caption{FID vs. Training Dataset Size in S4S-Alt.}
+    \label{fig:fid-vs-data}
+\end{figure}
+
+
+\subsection{Full FID Tables}
+\label{app:fid-tables}
+
+\begin{table}[H]
+\centering
+\footnotesize
+\setlength{\tabcolsep}{3pt}
+\renewcommand{\arraystretch}{0.9}
+\begin{tabular}{llcccccccc}
+\toprule
+Schedule & Solver & 3 & 4 & 5 & 6 & 7 & 8 & 9 & 10 \\
+\midrule
+\multirow{6}{*}{\scriptsize{DMN}} & \scriptsize{DPM-Solver++ (3M)} & \scriptsize{82.45} & \scriptsize{37.52} & \scriptsize{30.08} & \scriptsize{18.40} & \scriptsize{12.31} & \scriptsize{8.95} & \scriptsize{7.40} & \scriptsize{3.69} \\
+ & \scriptsize{DPM-Solver++-S4S (3M)} & \scriptsize{75.43} & \scriptsize{34.48} & \scriptsize{28.24} & \scriptsize{17.55} & \scriptsize{11.75} & \scriptsize{8.66} & \scriptsize{7.06} & \scriptsize{3.51} \\
+\cmidrule{2-10}
+ & \scriptsize{iPNDM (3M)} & \scriptsize{76.99} & \scriptsize{33.13} & \scriptsize{26.10} & \scriptsize{16.00} & \scriptsize{10.20} & \scriptsize{10.19} & \scriptsize{8.84} & \scriptsize{3.56} \\
+ & \scriptsize{iPNDM-S4S (3M)} & \scriptsize{69.79} & \scriptsize{30.58} & \scriptsize{24.26} & \scriptsize{15.18} & \scriptsize{9.81} & \scriptsize{9.83} & \scriptsize{8.36} & \scriptsize{3.36} \\
+\cmidrule{2-10}
+ & \scriptsize{UniPC (3M)} & \scriptsize{70.52} & \scriptsize{30.32} & \scriptsize{23.04} & \scriptsize{14.46} & \scriptsize{8.55} & \scriptsize{6.78} & \scriptsize{5.15} & \scriptsize{3.12} \\
+ & \scriptsize{UniPC-S4S (3M)} & \textbf{\scriptsize{63.84}} & \textbf{\scriptsize{28.43}} & \textbf{\scriptsize{21.66}} & \textbf{\scriptsize{13.88}} & \textbf{\scriptsize{8.24}} & \textbf{\scriptsize{6.53}} & \textbf{\scriptsize{4.84}} & \textbf{\scriptsize{2.98}} \\
+\midrule
+\multirow{6}{*}{\scriptsize{Time EDM}} & \scriptsize{DPM-Solver++ (3M)} & \scriptsize{43.47} & \scriptsize{19.52} & \scriptsize{13.36} & \scriptsize{9.67} & \scriptsize{7.92} & \scriptsize{6.64} & \scriptsize{5.08} & \scriptsize{4.20} \\
+ & \scriptsize{DPM-Solver++-S4S (3M)} & \scriptsize{39.90} & \scriptsize{18.32} & \scriptsize{12.55} & \scriptsize{9.11} & \scriptsize{7.61} & \scriptsize{6.37} & \scriptsize{4.86} & \scriptsize{3.96} \\
+\cmidrule{2-10}
+ & \scriptsize{iPNDM (3M)} & \scriptsize{38.33} & \scriptsize{15.30} & \scriptsize{8.80} & \scriptsize{6.24} & \scriptsize{4.52} & \scriptsize{3.85} & \scriptsize{3.33} & \scriptsize{3.04} \\
+ & \scriptsize{iPNDM-S4S (3M)} & \textbf{\scriptsize{35.56}} & \textbf{\scriptsize{14.23}} & \textbf{\scriptsize{8.32}} & \textbf{\scriptsize{5.97}} & \textbf{\scriptsize{4.37}} & \textbf{\scriptsize{3.77}} & \textbf{\scriptsize{3.12}} & \textbf{\scriptsize{2.88}} \\
+\cmidrule{2-10}
+ & \scriptsize{UniPC (3M)} & \scriptsize{44.77} & \scriptsize{23.55} & \scriptsize{15.83} & \scriptsize{10.30} & \scriptsize{8.46} & \scriptsize{7.83} & \scriptsize{6.78} & \scriptsize{6.38} \\
+ & \scriptsize{UniPC-S4S (3M)} & \scriptsize{41.48} & \scriptsize{21.82} & \scriptsize{14.73} & \scriptsize{9.68} & \scriptsize{8.12} & \scriptsize{7.52} & \scriptsize{6.47} & \scriptsize{6.06} \\
+\midrule
+\multirow{6}{*}{\scriptsize{GITS}} & \scriptsize{DPM-Solver++ (3M)} & \scriptsize{30.74} & \scriptsize{17.73} & \scriptsize{13.57} & \scriptsize{9.91} & \scriptsize{6.99} & \scriptsize{5.31} & \scriptsize{4.26} & \scriptsize{3.62} \\
+ & \scriptsize{DPM-Solver++-S4S (3M)} & \scriptsize{28.20} & \scriptsize{16.41} & \scriptsize{12.74} & \scriptsize{9.34} & \scriptsize{6.64} & \scriptsize{5.11} & \scriptsize{4.08} & \scriptsize{3.42} \\
+\cmidrule{2-10}
+ & \scriptsize{iPNDM (3M)} & \scriptsize{26.55} & \scriptsize{13.88} & \scriptsize{9.60} & \scriptsize{6.10} & \scriptsize{4.85} & \scriptsize{3.72} & \scriptsize{3.43} & \scriptsize{3.02} \\
+ & \scriptsize{iPNDM-S4S (3M)} & \scriptsize{24.36} & \scriptsize{12.75} & \textbf{\scriptsize{9.12}} & \textbf{\scriptsize{5.83}} & \scriptsize{4.66} & \textbf{\scriptsize{3.58}} & \scriptsize{3.26} & \textbf{\scriptsize{2.90}} \\
+\cmidrule{2-10}
+ & \scriptsize{UniPC (3M)} & \scriptsize{25.14} & \scriptsize{12.63} & \scriptsize{9.64} & \scriptsize{7.27} & \scriptsize{4.75} & \scriptsize{4.25} & \scriptsize{3.27} & \scriptsize{3.04} \\
+ & \scriptsize{UniPC-S4S (3M)} & \textbf{\scriptsize{23.36}} & \textbf{\scriptsize{11.56}} & \scriptsize{9.13} & \scriptsize{6.85} & \textbf{\scriptsize{4.55}} & \scriptsize{4.08} & \textbf{\scriptsize{3.13}} & \scriptsize{2.95} \\
+\midrule
+\multirow{6}{*}{\scriptsize{LD3}} & \scriptsize{DPM-Solver++ (3M)} & \scriptsize{24.11} & \scriptsize{13.95} & \scriptsize{7.46} & \scriptsize{5.66} & \scriptsize{4.00} & \scriptsize{3.61} & \scriptsize{2.75} & \scriptsize{3.04} \\
+ & \scriptsize{DPM-Solver++-S4S (3M)} & \scriptsize{21.11} & \scriptsize{12.58} & \scriptsize{6.75} & \scriptsize{5.29} & \scriptsize{3.76} & \scriptsize{3.48} & \scriptsize{2.64} & \scriptsize{2.90} \\
+\cmidrule{2-10}
+ & \scriptsize{iPNDM (3M)} & \scriptsize{23.64} & \scriptsize{9.06} & \scriptsize{5.00} & \scriptsize{3.44} & \scriptsize{2.78} & \scriptsize{2.87} & \scriptsize{2.85} & \scriptsize{2.62} \\
+ & \scriptsize{iPNDM-S4S (3M)} & \scriptsize{20.65} & \textbf{\cellcolor{lightgray}{\scriptsize{8.25}}} & \textbf{\cellcolor{lightgray}{\scriptsize{4.61}}} & \textbf{\cellcolor{lightgray}{\scriptsize{3.21}}} & \textbf{\cellcolor{lightgray}{\scriptsize{2.61}}} & \textbf{\cellcolor{lightgray}{\scriptsize{2.76}}} & \scriptsize{2.71} & \textbf{\cellcolor{lightgray}{\scriptsize{2.51}}} \\
+\cmidrule{2-10}
+ & \scriptsize{UniPC (3M)} & \scriptsize{22.02} & \scriptsize{10.84} & \scriptsize{6.10} & \scriptsize{3.65} & \scriptsize{3.44} & \scriptsize{3.32} & \scriptsize{2.44} & \scriptsize{2.87} \\
+ & \scriptsize{UniPC-S4S (3M)} & \textbf{\cellcolor{lightgray}{\scriptsize{19.38}}} & \scriptsize{9.69} & \scriptsize{5.61} & \scriptsize{3.40} & \scriptsize{3.27} & \scriptsize{3.19} & \textbf{\cellcolor{lightgray}{\scriptsize{2.32}}} & \scriptsize{2.69} \\
+\midrule
+\multirow{6}{*}{\scriptsize{Time LogSNR}} & \scriptsize{DPM-Solver++ (3M)} & \scriptsize{60.83} & \scriptsize{27.58} & \scriptsize{17.92} & \scriptsize{10.72} & \scriptsize{6.14} & \scriptsize{4.31} & \scriptsize{3.63} & \scriptsize{3.15} \\
+ & \scriptsize{DPM-Solver++-S4S (3M)} & \scriptsize{55.88} & \scriptsize{25.45} & \scriptsize{16.88} & \scriptsize{10.08} & \scriptsize{5.90} & \textbf{\scriptsize{4.18}} & \textbf{\scriptsize{3.41}} & \scriptsize{2.99} \\
+\cmidrule{2-10}
+ & \scriptsize{iPNDM (3M)} & \scriptsize{52.63} & \scriptsize{22.99} & \scriptsize{15.58} & \scriptsize{9.45} & \scriptsize{5.92} & \scriptsize{4.51} & \scriptsize{3.71} & \scriptsize{3.14} \\
+ & \scriptsize{iPNDM-S4S (3M)} & \textbf{\scriptsize{48.19}} & \textbf{\scriptsize{21.58}} & \scriptsize{14.57} & \scriptsize{8.91} & \scriptsize{5.64} & \scriptsize{4.33} & \scriptsize{3.48} & \textbf{\scriptsize{2.98}} \\
+\cmidrule{2-10}
+ & \scriptsize{UniPC (3M)} & \scriptsize{94.93} & \scriptsize{33.70} & \scriptsize{12.95} & \scriptsize{8.30} & \scriptsize{5.12} & \scriptsize{4.62} & \scriptsize{4.47} & \scriptsize{3.80} \\
+ & \scriptsize{UniPC-S4S (3M)} & \scriptsize{88.13} & \scriptsize{31.23} & \textbf{\scriptsize{12.18}} & \textbf{\scriptsize{7.91}} & \textbf{\scriptsize{4.85}} & \scriptsize{4.47} & \scriptsize{4.26} & \scriptsize{3.62} \\
+\midrule
+\multirow{6}{*}{\scriptsize{Time Quadratic}} & \scriptsize{DPM-Solver++ (3M)} & \scriptsize{113.09} & \scriptsize{68.88} & \scriptsize{42.36} & \scriptsize{30.99} & \scriptsize{24.82} & \scriptsize{21.04} & \scriptsize{18.66} & \scriptsize{16.93} \\
+ & \scriptsize{DPM-Solver++-S4S (3M)} & \scriptsize{103.66} & \scriptsize{63.86} & \scriptsize{39.78} & \scriptsize{29.43} & \scriptsize{23.66} & \scriptsize{20.54} & \scriptsize{17.70} & \scriptsize{16.07} \\
+\cmidrule{2-10}
+ & \scriptsize{iPNDM (3M)} & \scriptsize{102.48} & \scriptsize{53.71} & \scriptsize{32.09} & \scriptsize{23.86} & \scriptsize{20.36} & \scriptsize{18.22} & \scriptsize{16.62} & \scriptsize{15.23} \\
+ & \scriptsize{iPNDM-S4S (3M)} & \textbf{\scriptsize{94.08}} & \textbf{\scriptsize{49.39}} & \textbf{\scriptsize{29.95}} & \textbf{\scriptsize{22.56}} & \textbf{\scriptsize{19.65}} & \textbf{\scriptsize{17.71}} & \textbf{\scriptsize{15.57}} & \textbf{\scriptsize{14.32}} \\
+\cmidrule{2-10}
+ & \scriptsize{UniPC (3M)} & \scriptsize{111.79} & \scriptsize{66.50} & \scriptsize{41.62} & \scriptsize{30.69} & \scriptsize{24.42} & \scriptsize{20.64} & \scriptsize{18.20} & \scriptsize{16.54} \\
+ & \scriptsize{UniPC-S4S (3M)} & \scriptsize{101.64} & \scriptsize{62.03} & \scriptsize{39.30} & \scriptsize{29.17} & \scriptsize{23.63} & \scriptsize{19.89} & \scriptsize{17.05} & \scriptsize{15.77} \\
+\midrule
+\multirow{6}{*}{\scriptsize{Time Uniform}} & \scriptsize{DPM-Solver++ (3M)} & \scriptsize{169.39} & \scriptsize{153.47} & \scriptsize{143.52} & \scriptsize{134.39} & \scriptsize{125.18} & \scriptsize{115.83} & \scriptsize{106.83} & \scriptsize{98.18} \\
+ & \scriptsize{DPM-Solver++-S4S (3M)} & \textbf{\scriptsize{155.10}} & \scriptsize{143.47} & \scriptsize{134.98} & \scriptsize{125.98} & \scriptsize{120.75} & \scriptsize{111.54} & \scriptsize{101.13} & \scriptsize{92.01} \\
+ \cmidrule{2-10}
+ & \scriptsize{iPNDM (3M)} & \scriptsize{178.95} & \scriptsize{159.28} & \scriptsize{139.32} & \scriptsize{124.94} & \scriptsize{113.44} & \scriptsize{102.81} & \scriptsize{92.46} & \scriptsize{82.91} \\
+ & \scriptsize{iPNDM-S4S (3M)} & \scriptsize{163.79} & \scriptsize{146.77} & \textbf{\scriptsize{129.81}} & \textbf{\scriptsize{117.56}} & \textbf{\scriptsize{107.45}} & \textbf{\scriptsize{99.27}} & \textbf{\scriptsize{87.04}} & \textbf{\scriptsize{77.95}} \\
+ \cmidrule{2-10}
+ & \scriptsize{UniPC (3M)} & \scriptsize{169.33} & \scriptsize{153.52} & \scriptsize{143.45} & \scriptsize{134.15} & \scriptsize{124.70} & \scriptsize{115.25} & \scriptsize{106.06} & \scriptsize{97.28} \\
+ & \scriptsize{UniPC-S4S (3M)} & \scriptsize{156.96} & \textbf{\scriptsize{142.90}} & \scriptsize{135.29} & \scriptsize{127.33} & \scriptsize{120.44} & \scriptsize{111.11} & \scriptsize{99.53} & \scriptsize{91.49} \\
+\midrule
+\multicolumn{2}{c}{S4S-Alt} & \textbf{\cellcolor{lightgray}{\scriptsize{14.71}}} & \textbf{\cellcolor{lightgray}{\scriptsize{6.52}}} & \textbf{\cellcolor{lightgray}{\scriptsize{3.89}}} & \textbf{\cellcolor{lightgray}{\scriptsize{2.70}}} & \textbf{\cellcolor{lightgray}{\scriptsize{2.56}}} & \textbf{\cellcolor{lightgray}{\scriptsize{2.29}}} & \textbf{\cellcolor{lightgray}{\scriptsize{2.18}}} & \textbf{\cellcolor{lightgray}{\scriptsize{2.18}}} \\
+\bottomrule
+\end{tabular}
+\caption{FID scores on AFHQ-v2 64$\times$64. Numbers in column headers indicate NFE counts. Bold: best within schedule; shaded: best overall.}
+\label{tab:fid_scores_afhqv2}
+\end{table}
+
+\begin{table}[H]
+\centering
+\footnotesize
+\setlength{\tabcolsep}{3pt}
+\renewcommand{\arraystretch}{0.9}
+\begin{tabular}{llcccccccc}
+\toprule
+Schedule & Solver & 3 & 4 & 5 & 6 & 7 & 8 & 9 & 10 \\
+\midrule
+\multirow{7}{*}{\scriptsize{DMN}} & \scriptsize{DPM-Solver++ (3M)} & \scriptsize{83.73} & \scriptsize{39.32} & \scriptsize{22.89} & \scriptsize{12.38} & \scriptsize{7.23} & \scriptsize{7.00} & \scriptsize{5.20} & \scriptsize{2.69} \\
+ & \scriptsize{DPM-Solver++-S4S (3M)} & \scriptsize{70.89} & \scriptsize{34.00} & \scriptsize{20.53} & \scriptsize{11.30} & \scriptsize{6.63} & \scriptsize{6.71} & \scriptsize{4.98} & \scriptsize{2.53} \\
+\cmidrule{2-10}
+ & \scriptsize{iPNDM (3M)} & \scriptsize{59.31} & \scriptsize{28.08} & \scriptsize{16.76} & \scriptsize{9.24} & \scriptsize{5.77} & \scriptsize{7.59} & \scriptsize{5.85} & \scriptsize{3.17} \\
+ & \scriptsize{iPNDM-S4S (3M)} & \textbf{\scriptsize{50.05}} & \scriptsize{24.21} & \scriptsize{14.99} & \scriptsize{8.35} & \scriptsize{5.37} & \scriptsize{7.20} & \scriptsize{5.57} & \scriptsize{3.02} \\
+\cmidrule{2-10}
+ & \scriptsize{UniPC (3M)} & \scriptsize{66.45} & \scriptsize{26.33} & \scriptsize{12.95} & \scriptsize{8.11} & \scriptsize{4.96} & \scriptsize{5.79} & \scriptsize{4.01} & \scriptsize{2.38} \\
+ & \scriptsize{UniPC-S4S (3M)} & \scriptsize{56.44} & \scriptsize{23.07} & \textbf{\scriptsize{11.63}} & \scriptsize{7.44} & \textbf{\scriptsize{4.66}} & \scriptsize{5.53} & \scriptsize{3.79} & \textbf{\scriptsize{2.26}} \\
+\cmidrule{2-10}
+ & \scriptsize{DPM-Solver-v3 (3M)} & \scriptsize{58.48} & \textbf{\scriptsize{17.88}} & \scriptsize{12.31} & \textbf{\scriptsize{7.32}} & \scriptsize{4.86} & \textbf{\scriptsize{4.72}} & \textbf{\scriptsize{3.49}} & \scriptsize{2.32} \\
+\midrule
+\multirow{7}{*}{\scriptsize{Time EDM}} & \scriptsize{DPM-Solver++ (3M)} & \scriptsize{70.06} & \scriptsize{50.40} & \scriptsize{32.01} & \scriptsize{18.41} & \scriptsize{11.58} & \scriptsize{8.39} & \scriptsize{6.48} & \scriptsize{5.18} \\
+ & \scriptsize{DPM-Solver++-S4S (3M)} & \scriptsize{59.61} & \scriptsize{43.17} & \scriptsize{28.11} & \scriptsize{16.52} & \scriptsize{10.87} & \scriptsize{8.01} & \scriptsize{6.07} & \scriptsize{4.96} \\
+\cmidrule{2-10}
+ & \scriptsize{iPNDM (3M)} & \scriptsize{48.02} & \scriptsize{29.50} & \scriptsize{16.57} & \scriptsize{9.75} & \scriptsize{6.93} & \scriptsize{5.24} & \scriptsize{4.34} & \scriptsize{3.70} \\
+ & \scriptsize{iPNDM-S4S (3M)} & \textbf{\scriptsize{41.27}} & \textbf{\scriptsize{25.74}} & \textbf{\scriptsize{14.72}} & \textbf{\scriptsize{8.81}} & \textbf{\scriptsize{6.35}} & \textbf{\scriptsize{4.98}} & \textbf{\scriptsize{4.07}} & \textbf{\scriptsize{3.47}} \\
+\cmidrule{2-10}
+ & \scriptsize{UniPC (3M)} & \scriptsize{57.85} & \scriptsize{50.63} & \scriptsize{34.27} & \scriptsize{19.47} & \scriptsize{12.65} & \scriptsize{9.68} & \scriptsize{7.84} & \scriptsize{6.16} \\
+ & \scriptsize{UniPC-S4S (3M)} & \scriptsize{48.40} & \scriptsize{44.30} & \scriptsize{30.60} & \scriptsize{17.80} & \scriptsize{11.62} & \scriptsize{9.05} & \scriptsize{7.46} & \scriptsize{5.86} \\
+\cmidrule{2-10}
+ & \scriptsize{DPM-Solver-v3 (3M)} & \scriptsize{44.64} & \scriptsize{34.39} & \scriptsize{33.20} & \scriptsize{18.44} & \scriptsize{10.50} & \scriptsize{7.39} & \scriptsize{5.91} & \scriptsize{4.72} \\
+\midrule
+\multirow{7}{*}{\scriptsize{GITS}} & \scriptsize{DPM-Solver++ (3M)} & \scriptsize{70.47} & \scriptsize{31.23} & \scriptsize{17.19} & \scriptsize{10.76} & \scriptsize{7.79} & \scriptsize{5.63} & \scriptsize{3.97} & \scriptsize{3.52} \\
+ & \scriptsize{DPM-Solver++-S4S (3M)} & \scriptsize{60.14} & \scriptsize{26.75} & \scriptsize{15.41} & \scriptsize{9.70} & \scriptsize{7.20} & \scriptsize{5.29} & \scriptsize{3.72} & \scriptsize{3.37} \\
+\cmidrule{2-10}
+ & \scriptsize{iPNDM (3M)} & \scriptsize{43.91} & \scriptsize{16.49} & \scriptsize{10.83} & \scriptsize{6.97} & \scriptsize{5.80} & \scriptsize{4.30} & \scriptsize{3.10} & \scriptsize{2.78} \\
+ & \scriptsize{iPNDM-S4S (3M)} & \textbf{\scriptsize{37.75}} & \textbf{\scriptsize{14.11}} & \textbf{\scriptsize{9.63}} & \textbf{\scriptsize{6.33}} & \textbf{\scriptsize{5.32}} & \textbf{\scriptsize{4.04}} & \textbf{\scriptsize{2.97}} & \textbf{\scriptsize{2.62}} \\
+\cmidrule{2-10}
+ & \scriptsize{UniPC (3M)} & \scriptsize{53.43} & \scriptsize{21.93} & \scriptsize{15.40} & \scriptsize{10.47} & \scriptsize{7.88} & \scriptsize{5.69} & \scriptsize{4.41} & \scriptsize{3.70} \\
+ & \scriptsize{UniPC-S4S (3M)} & \scriptsize{45.12} & \scriptsize{18.94} & \scriptsize{13.71} & \scriptsize{9.53} & \scriptsize{7.39} & \scriptsize{5.42} & \scriptsize{4.22} & \scriptsize{3.50} \\
+\cmidrule{2-10}
+ & \scriptsize{DPM-Solver-v3 (3M)} & \scriptsize{60.14} & \scriptsize{24.46} & \scriptsize{16.15} & \scriptsize{11.06} & \scriptsize{8.20} & \scriptsize{5.90} & \scriptsize{3.88} & \scriptsize{2.99} \\
+\midrule
+\multirow{7}{*}{\scriptsize{LD3}} & \scriptsize{DPM-Solver++ (3M)} & \scriptsize{33.38} & \scriptsize{27.08} & \scriptsize{12.42} & \scriptsize{9.24} & \scriptsize{4.40} & \scriptsize{4.00} & \scriptsize{3.87} & \scriptsize{3.33} \\
+ & \scriptsize{DPM-Solver++-S4S (3M)} & \scriptsize{27.73} & \scriptsize{22.85} & \scriptsize{10.81} & \scriptsize{8.14} & \textbf{\cellcolor{lightgray}{\scriptsize{4.08}}} & \scriptsize{3.74} & \scriptsize{3.65} & \scriptsize{3.16} \\
+\cmidrule{2-10}
+ & \scriptsize{iPNDM (3M)} & \scriptsize{32.64} & \scriptsize{10.93} & \scriptsize{5.64} & \scriptsize{5.40} & \scriptsize{5.36} & \scriptsize{2.75} & \scriptsize{3.79} & \scriptsize{2.32} \\
+ & \scriptsize{iPNDM-S4S (3M)} & \textbf{\cellcolor{lightgray}{\scriptsize{26.39}}} & \textbf{\cellcolor{lightgray}{\scriptsize{9.30}}} & \textbf{\cellcolor{lightgray}{\scriptsize{4.84}}} & \scriptsize{4.76} & \scriptsize{4.90} & \textbf{\cellcolor{lightgray}{\scriptsize{2.61}}} & \scriptsize{3.59} & \textbf{\cellcolor{lightgray}{\scriptsize{2.18}}} \\
+\cmidrule{2-10}
+ & \scriptsize{UniPC (3M)} & \scriptsize{32.62} & \scriptsize{15.83} & \scriptsize{13.14} & \scriptsize{3.55} & \scriptsize{4.67} & \scriptsize{2.87} & \scriptsize{3.30} & \scriptsize{2.73} \\
+ & \scriptsize{UniPC-S4S (3M)} & \scriptsize{26.63} & \scriptsize{13.46} & \scriptsize{11.35} & \textbf{\cellcolor{lightgray}{\scriptsize{3.17}}} & \scriptsize{4.22} & \scriptsize{2.67} & \scriptsize{3.09} & \scriptsize{2.56} \\
+\cmidrule{2-10}
+ & \scriptsize{DPM-Solver-v3 (3M)} & \scriptsize{84.42} & \scriptsize{29.86} & \scriptsize{14.83} & \scriptsize{10.69} & \scriptsize{5.51} & \scriptsize{3.59} & \textbf{\cellcolor{lightgray}{\scriptsize{2.78}}} & \scriptsize{2.56} \\
+\midrule
+\multirow{7}{*}{\scriptsize{Time LogSNR}} & \scriptsize{DPM-Solver++ (3M)} & \scriptsize{110.06} & \scriptsize{46.49} & \scriptsize{24.98} & \scriptsize{12.06} & \scriptsize{6.79} & \scriptsize{4.56} & \scriptsize{3.43} & \scriptsize{3.00} \\
+ & \scriptsize{DPM-Solver++-S4S (3M)} & \scriptsize{93.58} & \scriptsize{40.18} & \scriptsize{22.21} & \scriptsize{11.04} & \scriptsize{6.34} & \scriptsize{4.34} & \scriptsize{3.25} & \scriptsize{2.85} \\
+\cmidrule{2-10}
+ & \scriptsize{iPNDM (3M)} & \scriptsize{88.39} & \scriptsize{34.88} & \scriptsize{20.49} & \scriptsize{11.61} & \scriptsize{7.50} & \scriptsize{5.53} & \scriptsize{4.24} & \scriptsize{3.58} \\
+ & \scriptsize{iPNDM-S4S (3M)} & \textbf{\scriptsize{75.88}} & \scriptsize{30.12} & \scriptsize{17.97} & \textbf{\scriptsize{10.61}} & \scriptsize{6.91} & \scriptsize{5.24} & \scriptsize{3.99} & \scriptsize{3.43} \\
+\cmidrule{2-10}
+ & \scriptsize{UniPC (3M)} & \scriptsize{155.31} & \scriptsize{43.93} & \scriptsize{23.90} & \scriptsize{12.98} & \scriptsize{6.54} & \scriptsize{4.38} & \scriptsize{3.48} & \scriptsize{3.07} \\
+ & \scriptsize{UniPC-S4S (3M)} & \scriptsize{133.37} & \scriptsize{38.05} & \scriptsize{21.42} & \scriptsize{11.69} & \scriptsize{6.02} & \scriptsize{4.10} & \scriptsize{3.33} & \scriptsize{2.94} \\
+\cmidrule{2-10}
+ & \scriptsize{DPM-Solver-v3 (3M)} & \scriptsize{84.49} & \textbf{\scriptsize{29.87}} & \textbf{\scriptsize{14.85}} & \scriptsize{10.71} & \textbf{\scriptsize{5.52}} & \textbf{\scriptsize{3.59}} & \textbf{\scriptsize{2.78}} & \textbf{\scriptsize{2.56}} \\
+\midrule
+\multirow{7}{*}{\scriptsize{Time Quadratic}} & \scriptsize{DPM-Solver++ (3M)} & \scriptsize{223.06} & \scriptsize{170.85} & \scriptsize{124.72} & \scriptsize{91.51} & \scriptsize{69.90} & \scriptsize{54.84} & \scriptsize{44.38} & \scriptsize{37.00} \\
+ & \scriptsize{DPM-Solver++-S4S (3M)} & \scriptsize{188.15} & \scriptsize{149.60} & \scriptsize{110.20} & \scriptsize{82.92} & \scriptsize{64.23} & \scriptsize{51.47} & \scriptsize{41.63} & \scriptsize{34.91} \\
+\cmidrule{2-10}
+ & \scriptsize{iPNDM (3M)} & \scriptsize{199.73} & \scriptsize{139.72} & \scriptsize{96.56} & \scriptsize{68.68} & \scriptsize{52.22} & \scriptsize{37.64} & \scriptsize{27.37} & \scriptsize{23.28} \\
+ & \scriptsize{iPNDM-S4S (3M)} & \textbf{\scriptsize{167.85}} & \textbf{\scriptsize{121.49}} & \textbf{\scriptsize{85.83}} & \textbf{\scriptsize{62.41}} & \textbf{\scriptsize{48.65}} & \textbf{\scriptsize{35.96}} & \textbf{\scriptsize{25.74}} & \textbf{\scriptsize{22.26}} \\
+\cmidrule{2-10}
+ & \scriptsize{UniPC (3M)} & \scriptsize{220.29} & \scriptsize{164.80} & \scriptsize{117.49} & \scriptsize{85.38} & \scriptsize{65.44} & \scriptsize{51.80} & \scriptsize{42.29} & \scriptsize{35.34} \\
+ & \scriptsize{UniPC-S4S (3M)} & \scriptsize{187.89} & \scriptsize{141.66} & \scriptsize{103.61} & \scriptsize{78.11} & \scriptsize{61.21} & \scriptsize{49.21} & \scriptsize{39.65} & \scriptsize{33.29} \\
+\cmidrule{2-10}
+ & \scriptsize{DPM-Solver-v3 (3M)} & \scriptsize{299.55} & \scriptsize{249.40} & \scriptsize{188.77} & \scriptsize{129.51} & \scriptsize{90.93} & \scriptsize{65.13} & \scriptsize{50.30} & \scriptsize{41.07} \\
+\midrule
+\multirow{7}{*}{\scriptsize{Time Uniform}} & \scriptsize{DPM-Solver++ (3M)} & \scriptsize{305.04} & \scriptsize{282.99} & \scriptsize{263.61} & \scriptsize{249.52} & \scriptsize{237.94} & \scriptsize{227.53} & \scriptsize{217.62} & \scriptsize{208.19} \\
+ & \scriptsize{DPM-Solver++-S4S (3M)} & \scriptsize{259.33} & \scriptsize{244.55} & \scriptsize{234.70} & \scriptsize{225.57} & \scriptsize{219.83} & \scriptsize{218.06} & \scriptsize{205.34} & \scriptsize{197.85} \\
+ \cmidrule{2-10}
+ & \scriptsize{iPNDM (3M)} & \scriptsize{287.80} & \scriptsize{266.13} & \scriptsize{242.76} & \scriptsize{229.10} & \scriptsize{216.95} & \scriptsize{205.06} & \scriptsize{194.64} & \scriptsize{185.30} \\
+ & \scriptsize{iPNDM-S4S (3M)} & \textbf{\scriptsize{243.96}} & \textbf{\scriptsize{227.78}} & \textbf{\scriptsize{215.84}} & \textbf{\scriptsize{208.27}} & \textbf{\scriptsize{199.97}} & \textbf{\scriptsize{192.03}} & \textbf{\scriptsize{186.11}} & \textbf{\scriptsize{175.26}} \\
+ \cmidrule{2-10}
+ & \scriptsize{UniPC (3M)} & \scriptsize{304.86} & \scriptsize{282.77} & \scriptsize{263.43} & \scriptsize{249.18} & \scriptsize{237.56} & \scriptsize{226.95} & \scriptsize{216.85} & \scriptsize{207.23} \\
+ & \scriptsize{UniPC-S4S (3M)} & \scriptsize{255.32} & \scriptsize{246.58} & \scriptsize{235.16} & \scriptsize{226.52} & \scriptsize{222.79} & \scriptsize{214.66} & \scriptsize{203.80} & \scriptsize{194.92} \\
+ \cmidrule{2-10}
+ & \scriptsize{DPM-Solver-v3 (3M)} & \scriptsize{313.89} & \scriptsize{321.04} & \scriptsize{317.36} & \scriptsize{310.77} & \scriptsize{312.46} & \scriptsize{304.90} & \scriptsize{294.57} & \scriptsize{285.39} \\
+\midrule
+\multicolumn{2}{c}{S4S-Alt} & \textbf{\cellcolor{lightgray}{\scriptsize{16.95}}} & \textbf{\cellcolor{lightgray}{\scriptsize{6.35}}} & \textbf{\cellcolor{lightgray}{\scriptsize{3.73}}} & \textbf{\cellcolor{lightgray}{\scriptsize{2.67}}} & \textbf{\cellcolor{lightgray}{\scriptsize{2.52}}} & \textbf{\cellcolor{lightgray}{\scriptsize{2.39}}} & \textbf{\cellcolor{lightgray}{\scriptsize{2.31}}} & \textbf{\cellcolor{lightgray}{\scriptsize{2.18}}} \\
+\bottomrule
+\end{tabular}
+\caption{FID scores on CIFAR-10 32$\times$32. Numbers in column headers indicate NFE counts. Bold: best within schedule; shaded: best overall.}
+\label{tab:fid_scores_cifar10}
+\end{table}
+
+\begin{table}[H]
+\centering
+\footnotesize
+\setlength{\tabcolsep}{3pt}
+\renewcommand{\arraystretch}{0.9}
+\begin{tabular}{llcccccccc}
+\toprule
+Schedule & Solver & 3 & 4 & 5 & 6 & 7 & 8 & 9 & 10 \\
+\midrule
+\multirow{6}{*}{\scriptsize{DMN}} & \scriptsize{DPM-Solver++ (3M)} & \scriptsize{82.21} & \scriptsize{40.23} & \scriptsize{26.30} & \scriptsize{14.74} & \scriptsize{9.78} & \scriptsize{10.10} & \scriptsize{8.63} & \scriptsize{4.63} \\
+ & \scriptsize{DPM-Solver++-S4S (3M)} & \scriptsize{68.64} & \scriptsize{34.69} & \scriptsize{23.55} & \scriptsize{13.23} & \scriptsize{9.05} & \scriptsize{9.52} & \scriptsize{8.09} & \scriptsize{4.44} \\
+\cmidrule{2-10}
+ & \scriptsize{iPNDM (3M)} & \scriptsize{61.76} & \scriptsize{31.28} & \scriptsize{20.93} & \scriptsize{12.12} & \scriptsize{8.62} & \scriptsize{10.95} & \scriptsize{9.81} & \scriptsize{5.29} \\
+ & \scriptsize{iPNDM-S4S (3M)} & \textbf{\scriptsize{52.45}} & \scriptsize{27.51} & \scriptsize{18.83} & \scriptsize{11.03} & \scriptsize{8.07} & \scriptsize{10.29} & \scriptsize{9.20} & \scriptsize{5.06} \\
+\cmidrule{2-10}
+ & \scriptsize{UniPC (3M)} & \scriptsize{65.07} & \scriptsize{25.80} & \scriptsize{13.32} & \scriptsize{9.48} & \scriptsize{7.27} & \scriptsize{6.78} & \scriptsize{5.57} & \scriptsize{3.66} \\
+ & \scriptsize{UniPC-S4S (3M)} & \scriptsize{54.58} & \textbf{\scriptsize{22.32}} & \textbf{\scriptsize{11.79}} & \textbf{\scriptsize{8.57}} & \textbf{\scriptsize{6.69}} & \textbf{\scriptsize{6.39}} & \textbf{\scriptsize{5.30}} & \textbf{\scriptsize{3.50}} \\
+\midrule
+\multirow{6}{*}{\scriptsize{Time EDM}} & \scriptsize{DPM-Solver++ (3M)} & \scriptsize{62.58} & \scriptsize{39.52} & \scriptsize{23.66} & \scriptsize{15.16} & \scriptsize{11.10} & \scriptsize{9.61} & \scriptsize{9.06} & \scriptsize{6.99} \\
+ & \scriptsize{DPM-Solver++-S4S (3M)} & \scriptsize{53.21} & \scriptsize{34.47} & \scriptsize{20.93} & \scriptsize{13.75} & \scriptsize{10.20} & \scriptsize{9.07} & \scriptsize{8.52} & \scriptsize{6.62} \\
+\cmidrule{2-10}
+ & \scriptsize{iPNDM (3M)} & \scriptsize{45.97} & \scriptsize{29.07} & \scriptsize{17.26} & \scriptsize{11.31} & \scriptsize{8.56} & \scriptsize{6.83} & \scriptsize{5.72} & \scriptsize{4.95} \\
+ & \scriptsize{iPNDM-S4S (3M)} & \textbf{\scriptsize{38.45}} & \textbf{\scriptsize{24.90}} & \textbf{\scriptsize{15.10}} & \textbf{\scriptsize{10.37}} & \textbf{\scriptsize{8.01}} & \textbf{\scriptsize{6.42}} & \textbf{\scriptsize{5.42}} & \textbf{\scriptsize{4.75}} \\
+\cmidrule{2-10}
+ & \scriptsize{UniPC (3M)} & \scriptsize{59.88} & \scriptsize{47.73} & \scriptsize{26.54} & \scriptsize{15.07} & \scriptsize{11.20} & \scriptsize{11.65} & \scriptsize{10.91} & \scriptsize{8.89} \\
+ & \scriptsize{UniPC-S4S (3M)} & \scriptsize{50.37} & \scriptsize{41.83} & \scriptsize{23.43} & \scriptsize{13.56} & \scriptsize{10.36} & \scriptsize{11.04} & \scriptsize{10.28} & \scriptsize{8.48} \\
+\midrule
+\multirow{6}{*}{\scriptsize{GITS}} & \scriptsize{DPM-Solver++ (3M)} & \scriptsize{53.42} & \scriptsize{29.07} & \scriptsize{17.54} & \scriptsize{12.74} & \scriptsize{9.74} & \scriptsize{7.70} & \scriptsize{6.30} & \scriptsize{4.99} \\
+ & \scriptsize{DPM-Solver++-S4S (3M)} & \scriptsize{45.10} & \scriptsize{25.00} & \scriptsize{15.72} & \scriptsize{11.41} & \scriptsize{9.00} & \scriptsize{7.30} & \scriptsize{5.98} & \scriptsize{4.77} \\
+\cmidrule{2-10}
+ & \scriptsize{iPNDM (3M)} & \scriptsize{33.09} & \scriptsize{18.04} & \scriptsize{12.91} & \scriptsize{9.38} & \scriptsize{7.57} & \scriptsize{5.76} & \scriptsize{4.76} & \scriptsize{3.97} \\
+ & \scriptsize{iPNDM-S4S (3M)} & \textbf{\cellcolor{lightgray}{\scriptsize{28.28}}} & \textbf{\scriptsize{15.70}} & \textbf{\scriptsize{11.60}} & \textbf{\scriptsize{8.46}} & \textbf{\scriptsize{7.11}} & \textbf{\scriptsize{5.41}} & \textbf{\scriptsize{4.52}} & \textbf{\scriptsize{3.76}} \\
+\cmidrule{2-10}
+ & \scriptsize{UniPC (3M)} & \scriptsize{43.63} & \scriptsize{21.38} & \scriptsize{14.34} & \scriptsize{12.22} & \scriptsize{9.95} & \scriptsize{8.02} & \scriptsize{6.20} & \scriptsize{4.46} \\
+ & \scriptsize{UniPC-S4S (3M)} & \scriptsize{36.59} & \scriptsize{18.30} & \scriptsize{12.68} & \scriptsize{11.19} & \scriptsize{9.20} & \scriptsize{7.56} & \scriptsize{5.83} & \scriptsize{4.24} \\
+\midrule
+\multirow{6}{*}{\scriptsize{LD3}} & \scriptsize{DPM-Solver++ (3M)} & \scriptsize{49.86} & \scriptsize{28.67} & \scriptsize{14.39} & \scriptsize{7.70} & \scriptsize{5.01} & \scriptsize{4.21} & \scriptsize{3.56} & \scriptsize{3.41} \\
+ & \scriptsize{DPM-Solver++-S4S (3M)} & \scriptsize{41.43} & \scriptsize{23.92} & \scriptsize{12.32} & \scriptsize{6.95} & \scriptsize{4.57} & \scriptsize{3.94} & \scriptsize{3.42} & \scriptsize{3.24} \\
+\cmidrule{2-10}
+ & \scriptsize{iPNDM (3M)} & \scriptsize{43.05} & \scriptsize{16.68} & \scriptsize{9.41} & \scriptsize{6.19} & \scriptsize{4.62} & \scriptsize{3.75} & \scriptsize{3.41} & \scriptsize{3.13} \\
+ & \scriptsize{iPNDM-S4S (3M)} & \scriptsize{35.12} & \textbf{\cellcolor{lightgray}{\scriptsize{14.24}}} & \textbf{\cellcolor{lightgray}{\scriptsize{8.14}}} & \textbf{\cellcolor{lightgray}{\scriptsize{5.45}}} & \scriptsize{4.20} & \scriptsize{3.55} & \textbf{\cellcolor{lightgray}{\scriptsize{3.23}}} & \textbf{\cellcolor{lightgray}{\scriptsize{2.97}}} \\
+\cmidrule{2-10}
+ & \scriptsize{UniPC (3M)} & \scriptsize{40.27} & \scriptsize{18.04} & \scriptsize{10.85} & \scriptsize{8.04} & \scriptsize{4.33} & \scriptsize{3.46} & \scriptsize{3.53} & \scriptsize{3.30} \\
+ & \scriptsize{UniPC-S4S (3M)} & \textbf{\scriptsize{33.33}} & \scriptsize{15.09} & \scriptsize{9.34} & \scriptsize{7.09} & \textbf{\cellcolor{lightgray}{\scriptsize{3.91}}} & \textbf{\cellcolor{lightgray}{\scriptsize{3.23}}} & \scriptsize{3.34} & \scriptsize{3.12} \\
+\midrule
+\multirow{6}{*}{\scriptsize{Time LogSNR}} & \scriptsize{DPM-Solver++ (3M)} & \scriptsize{86.39} & \scriptsize{45.89} & \scriptsize{22.52} & \scriptsize{13.78} & \scriptsize{8.47} & \scriptsize{6.06} & \scriptsize{4.77} & \scriptsize{4.12} \\
+ & \scriptsize{DPM-Solver++-S4S (3M)} & \scriptsize{74.18} & \scriptsize{39.69} & \scriptsize{19.75} & \scriptsize{12.66} & \scriptsize{7.91} & \scriptsize{5.72} & \scriptsize{4.56} & \scriptsize{3.88} \\
+\cmidrule{2-10}
+ & \scriptsize{iPNDM (3M)} & \scriptsize{76.81} & \scriptsize{36.23} & \scriptsize{24.16} & \scriptsize{16.15} & \scriptsize{11.07} & \scriptsize{7.93} & \scriptsize{6.27} & \scriptsize{5.30} \\
+ & \scriptsize{iPNDM-S4S (3M)} & \textbf{\scriptsize{65.27}} & \textbf{\scriptsize{31.81}} & \scriptsize{21.33} & \scriptsize{14.85} & \scriptsize{10.38} & \scriptsize{7.53} & \scriptsize{5.89} & \scriptsize{5.07} \\
+\cmidrule{2-10}
+ & \scriptsize{UniPC (3M)} & \scriptsize{126.00} & \scriptsize{53.22} & \scriptsize{20.02} & \scriptsize{10.97} & \scriptsize{6.97} & \scriptsize{5.53} & \scriptsize{4.53} & \scriptsize{3.89} \\
+ & \scriptsize{UniPC-S4S (3M)} & \scriptsize{105.40} & \scriptsize{45.53} & \textbf{\scriptsize{17.73}} & \textbf{\scriptsize{10.09}} & \textbf{\scriptsize{6.48}} & \textbf{\scriptsize{5.19}} & \textbf{\scriptsize{4.28}} & \textbf{\scriptsize{3.72}} \\
+\midrule
+\multirow{6}{*}{\scriptsize{Time Quadratic}} & \scriptsize{DPM-Solver++ (3M)} & \scriptsize{131.14} & \scriptsize{94.28} & \scriptsize{70.33} & \scriptsize{55.02} & \scriptsize{44.74} & \scriptsize{37.45} & \scriptsize{32.26} & \scriptsize{28.46} \\
+ & \scriptsize{DPM-Solver++-S4S (3M)} & \scriptsize{112.50} & \scriptsize{82.78} & \scriptsize{61.65} & \scriptsize{49.58} & \scriptsize{41.76} & \scriptsize{35.04} & \scriptsize{30.81} & \scriptsize{26.94} \\
+\cmidrule{2-10}
+ & \scriptsize{iPNDM (3M)} & \scriptsize{105.90} & \scriptsize{71.59} & \scriptsize{51.72} & \scriptsize{39.21} & \scriptsize{31.40} & \scriptsize{26.52} & \scriptsize{23.42} & \scriptsize{21.30} \\
+ & \scriptsize{iPNDM-S4S (3M)} & \textbf{\scriptsize{90.71}} & \textbf{\scriptsize{62.94}} & \textbf{\scriptsize{45.63}} & \textbf{\scriptsize{35.77}} & \textbf{\scriptsize{28.99}} & \textbf{\scriptsize{25.12}} & \textbf{\scriptsize{22.34}} & \textbf{\scriptsize{20.32}} \\
+\cmidrule{2-10}
+ & \scriptsize{UniPC (3M)} & \scriptsize{128.38} & \scriptsize{89.94} & \scriptsize{66.09} & \scriptsize{51.36} & \scriptsize{41.54} & \scriptsize{34.76} & \scriptsize{29.98} & \scriptsize{26.55} \\
+ & \scriptsize{UniPC-S4S (3M)} & \scriptsize{107.65} & \scriptsize{77.61} & \scriptsize{58.90} & \scriptsize{46.69} & \scriptsize{38.75} & \scriptsize{32.51} & \scriptsize{28.48} & \scriptsize{25.04} \\
+\midrule
+\multirow{6}{*}{\scriptsize{Time Uniform}} & \scriptsize{DPM-Solver++ (3M)} & \scriptsize{195.55} & \scriptsize{179.13} & \scriptsize{165.48} & \scriptsize{153.52} & \scriptsize{142.81} & \scriptsize{133.12} & \scriptsize{124.36} & \scriptsize{116.46} \\
+ & \scriptsize{DPM-Solver++-S4S (3M)} & \scriptsize{167.46} & \scriptsize{157.05} & \scriptsize{147.30} & \scriptsize{141.23} & \scriptsize{134.10} & \scriptsize{127.40} & \scriptsize{117.91} & \scriptsize{108.99} \\
+ \cmidrule{2-10}
+ & \scriptsize{iPNDM (3M)} & \scriptsize{177.99} & \scriptsize{160.85} & \scriptsize{146.31} & \scriptsize{133.60} & \scriptsize{122.28} & \scriptsize{112.25} & \scriptsize{103.46} & \scriptsize{95.78} \\
+ & \scriptsize{iPNDM-S4S (3M)} & \textbf{\scriptsize{152.72}} & \textbf{\scriptsize{140.92}} & \textbf{\scriptsize{129.90}} & \textbf{\scriptsize{119.79}} & \textbf{\scriptsize{114.77}} & \textbf{\scriptsize{105.73}} & \textbf{\scriptsize{98.98}} & \textbf{\scriptsize{90.75}} \\
+ \cmidrule{2-10}
+ & \scriptsize{UniPC (3M)} & \scriptsize{195.24} & \scriptsize{178.73} & \scriptsize{165.03} & \scriptsize{152.95} & \scriptsize{142.09} & \scriptsize{132.28} & \scriptsize{123.39} & \scriptsize{115.35} \\
+ & \scriptsize{UniPC-S4S (3M)} & \scriptsize{164.34} & \scriptsize{154.02} & \scriptsize{146.30} & \scriptsize{138.21} & \scriptsize{133.36} & \scriptsize{125.43} & \scriptsize{117.83} & \scriptsize{109.96} \\
+\midrule
+\multicolumn{2}{c}{S4S-Alt} & \textbf{\cellcolor{lightgray}{\scriptsize{19.86}}} & \textbf{\cellcolor{lightgray}{\scriptsize{10.63}}} & \textbf{\cellcolor{lightgray}{\scriptsize{6.25}}} & \textbf{\cellcolor{lightgray}{\scriptsize{4.62}}} & \textbf{\cellcolor{lightgray}{\scriptsize{3.45}}} & \textbf{\cellcolor{lightgray}{\scriptsize{3.15}}} & \textbf{\cellcolor{lightgray}{\scriptsize{3.00}}} & \textbf{\cellcolor{lightgray}{\scriptsize{2.91}}} \\
+\bottomrule
+\end{tabular}
+\caption{FID scores on FFHQ 64$\times$64. Numbers in column headers indicate NFE counts. Bold: best within schedule; shaded: best overall.}
+\label{tab:fid_scores_ffhq}
+\end{table}
+
+\begin{table}[H]
+\centering
+\footnotesize
+\setlength{\tabcolsep}{3pt}
+\renewcommand{\arraystretch}{0.9}
+\begin{tabular}{llcccccc}
+\toprule
+Schedule & Solver & 3 & 4 & 5 & 6 & 7 & 8 \\
+\midrule
+\multirow{6}{*}{\scriptsize{DMN}} & \scriptsize{DPM-Solver++ (3M)} & \scriptsize{58.17} & \scriptsize{20.03} & \scriptsize{7.14} & \scriptsize{5.04} & \scriptsize{4.69} & \scriptsize{4.53} \\
+ & \scriptsize{DPM-Solver++-S4S (3M)} & \scriptsize{55.18} & \scriptsize{19.40} & \scriptsize{6.87} & \scriptsize{4.88} & \scriptsize{4.63} & \scriptsize{4.28} \\
+\cmidrule{2-8}
+ & \scriptsize{iPNDM (3M)} & \scriptsize{24.73} & \scriptsize{8.15} & \scriptsize{4.74} & \scriptsize{4.38} & \scriptsize{4.51} & \scriptsize{4.42} \\
+ & \scriptsize{iPNDM-S4S (3M)} & \textbf{\scriptsize{23.72}} & \textbf{\scriptsize{7.84}} & \textbf{\cellcolor{lightgray}{\scriptsize{4.63}}} & \textbf{\cellcolor{lightgray}{\scriptsize{4.25}}} & \textbf{\cellcolor{lightgray}{\scriptsize{4.46}}} & \textbf{\scriptsize{4.18}} \\
+\cmidrule{2-8}
+ & \scriptsize{UniPC (3M)} & \scriptsize{48.95} & \scriptsize{15.05} & \scriptsize{5.46} & \scriptsize{4.60} & \scriptsize{4.83} & \scriptsize{4.52} \\
+ & \scriptsize{UniPC-S4S (3M)} & \scriptsize{46.99} & \scriptsize{14.36} & \scriptsize{5.33} & \scriptsize{4.43} & \scriptsize{4.80} & \scriptsize{4.31} \\
+\midrule
+\multirow{6}{*}{\scriptsize{Time EDM}} & \scriptsize{DPM-Solver++ (3M)} & \scriptsize{123.72} & \scriptsize{60.70} & \scriptsize{18.40} & \scriptsize{7.71} & \scriptsize{5.42} & \scriptsize{5.29} \\
+ & \scriptsize{DPM-Solver++-S4S (3M)} & \scriptsize{117.96} & \scriptsize{57.69} & \scriptsize{17.77} & \scriptsize{7.42} & \scriptsize{5.36} & \scriptsize{5.04} \\
+\cmidrule{2-8}
+ & \scriptsize{iPNDM (3M)} & \scriptsize{88.53} & \scriptsize{33.84} & \scriptsize{11.50} & \scriptsize{7.25} & \scriptsize{5.45} & \scriptsize{4.84} \\
+ & \scriptsize{iPNDM-S4S (3M)} & \textbf{\scriptsize{85.46}} & \textbf{\scriptsize{32.50}} & \textbf{\scriptsize{11.21}} & \scriptsize{6.99} & \scriptsize{5.36} & \textbf{\scriptsize{4.53}} \\
+\cmidrule{2-8}
+ & \scriptsize{UniPC (3M)} & \scriptsize{121.64} & \scriptsize{57.32} & \scriptsize{16.05} & \scriptsize{6.92} & \scriptsize{5.45} & \scriptsize{5.47} \\
+ & \scriptsize{UniPC-S4S (3M)} & \scriptsize{117.82} & \scriptsize{55.51} & \scriptsize{15.53} & \textbf{\scriptsize{6.72}} & \textbf{\scriptsize{5.29}} & \scriptsize{5.11} \\
+\midrule
+\multirow{6}{*}{\scriptsize{GITS}} & \scriptsize{DPM-Solver++ (3M)} & \scriptsize{99.24} & \scriptsize{39.63} & \scriptsize{28.21} & \scriptsize{15.79} & \scriptsize{6.98} & \scriptsize{5.20} \\
+ & \scriptsize{DPM-Solver++-S4S (3M)} & \scriptsize{95.26} & \scriptsize{37.86} & \scriptsize{27.17} & \scriptsize{15.35} & \scriptsize{6.84} & \scriptsize{4.96} \\
+\cmidrule{2-8}
+ & \scriptsize{iPNDM (3M)} & \scriptsize{69.12} & \scriptsize{22.22} & \scriptsize{20.73} & \scriptsize{11.79} & \scriptsize{5.64} & \scriptsize{4.51} \\
+ & \scriptsize{iPNDM-S4S (3M)} & \textbf{\scriptsize{66.42}} & \textbf{\scriptsize{21.11}} & \scriptsize{20.07} & \scriptsize{11.48} & \scriptsize{5.49} & \scriptsize{4.32} \\
+\cmidrule{2-8}
+ & \scriptsize{UniPC (3M)} & \scriptsize{85.37} & \scriptsize{24.59} & \scriptsize{16.08} & \scriptsize{8.68} & \scriptsize{4.93} & \scriptsize{4.33} \\
+ & \scriptsize{UniPC-S4S (3M)} & \scriptsize{82.13} & \scriptsize{23.61} & \textbf{\scriptsize{15.42}} & \textbf{\scriptsize{8.53}} & \textbf{\scriptsize{4.79}} & \textbf{\scriptsize{4.11}} \\
+\midrule
+\multirow{6}{*}{\scriptsize{LD3}} & \scriptsize{DPM-Solver++ (3M)} & \scriptsize{52.28} & \scriptsize{17.71} & \scriptsize{6.81} & \scriptsize{4.89} & \scriptsize{4.76} & \scriptsize{4.91} \\
+ & \scriptsize{DPM-Solver++-S4S (3M)} & \scriptsize{48.04} & \scriptsize{16.69} & \scriptsize{6.43} & \scriptsize{4.76} & \scriptsize{4.67} & \scriptsize{4.61} \\
+\cmidrule{2-8}
+ & \scriptsize{iPNDM (3M)} & \scriptsize{17.93} & \scriptsize{6.45} & \scriptsize{4.86} & \scriptsize{4.70} & \scriptsize{4.73} & \scriptsize{4.91} \\
+ & \scriptsize{iPNDM-S4S (3M)} & \textbf{\cellcolor{lightgray}{\scriptsize{16.48}}} & \textbf{\cellcolor{lightgray}{\scriptsize{6.05}}} & \textbf{\scriptsize{4.68}} & \scriptsize{4.57} & \textbf{\scriptsize{4.64}} & \scriptsize{4.68} \\
+\cmidrule{2-8}
+ & \scriptsize{UniPC (3M)} & \scriptsize{43.25} & \scriptsize{11.33} & \scriptsize{5.25} & \scriptsize{4.74} & \scriptsize{4.79} & \scriptsize{4.87} \\
+ & \scriptsize{UniPC-S4S (3M)} & \scriptsize{40.24} & \scriptsize{10.56} & \scriptsize{5.05} & \textbf{\scriptsize{4.54}} & \scriptsize{4.71} & \textbf{\scriptsize{4.58}} \\
+\midrule
+\multirow{6}{*}{\scriptsize{Time LogSNR}} & \scriptsize{DPM-Solver++ (3M)} & \scriptsize{111.35} & \scriptsize{55.20} & \scriptsize{14.46} & \scriptsize{6.32} & \scriptsize{5.39} & \scriptsize{5.00} \\
+ & \scriptsize{DPM-Solver++-S4S (3M)} & \scriptsize{105.11} & \scriptsize{52.55} & \scriptsize{14.00} & \textbf{\scriptsize{6.18}} & \textbf{\scriptsize{5.32}} & \scriptsize{4.70} \\
+\cmidrule{2-8}
+ & \scriptsize{iPNDM (3M)} & \scriptsize{93.77} & \scriptsize{38.81} & \scriptsize{14.79} & \scriptsize{7.70} & \scriptsize{5.61} & \scriptsize{4.85} \\
+ & \scriptsize{iPNDM-S4S (3M)} & \textbf{\scriptsize{89.31}} & \textbf{\scriptsize{36.99}} & \scriptsize{14.43} & \scriptsize{7.53} & \scriptsize{5.55} & \textbf{\scriptsize{4.62}} \\
+\cmidrule{2-8}
+ & \scriptsize{UniPC (3M)} & \scriptsize{109.14} & \scriptsize{50.60} & \scriptsize{12.29} & \scriptsize{6.40} & \scriptsize{5.78} & \scriptsize{5.11} \\
+ & \scriptsize{UniPC-S4S (3M)} & \scriptsize{103.63} & \scriptsize{48.95} & \textbf{\scriptsize{11.94}} & \scriptsize{6.18} & \scriptsize{5.67} & \scriptsize{4.89} \\
+\midrule
+\multirow{6}{*}{\scriptsize{Time Quadratic}} & \scriptsize{DPM-Solver++ (3M)} & \scriptsize{91.57} & \scriptsize{40.27} & \scriptsize{17.77} & \scriptsize{8.51} & \scriptsize{5.73} & \scriptsize{4.86} \\
+ & \scriptsize{DPM-Solver++-S4S (3M)} & \scriptsize{88.59} & \scriptsize{38.48} & \scriptsize{17.38} & \scriptsize{8.26} & \scriptsize{5.65} & \scriptsize{4.65} \\
+\cmidrule{2-8}
+ & \scriptsize{iPNDM (3M)} & \scriptsize{63.67} & \scriptsize{22.65} & \scriptsize{11.32} & \scriptsize{6.60} & \scriptsize{5.02} & \scriptsize{4.48} \\
+ & \scriptsize{iPNDM-S4S (3M)} & \textbf{\scriptsize{60.36}} & \textbf{\scriptsize{21.87}} & \scriptsize{10.98} & \scriptsize{6.39} & \scriptsize{4.91} & \scriptsize{4.28} \\
+\cmidrule{2-8}
+ & \scriptsize{UniPC (3M)} & \scriptsize{82.66} & \scriptsize{28.84} & \scriptsize{11.06} & \scriptsize{5.73} & \scriptsize{4.65} & \scriptsize{4.37} \\
+ & \scriptsize{UniPC-S4S (3M)} & \scriptsize{78.47} & \scriptsize{27.66} & \textbf{\scriptsize{10.77}} & \textbf{\scriptsize{5.61}} & \textbf{\scriptsize{4.62}} & \textbf{\cellcolor{lightgray}{\scriptsize{4.09}}} \\
+\midrule
+\multirow{6}{*}{\scriptsize{Time Uniform}} & \scriptsize{DPM-Solver++ (3M)} & \scriptsize{68.92} & \scriptsize{26.34} & \scriptsize{9.95} & \scriptsize{6.12} & \scriptsize{5.27} & \scriptsize{5.06} \\
+ & \scriptsize{DPM-Solver++-S4S (3M)} & \scriptsize{65.90} & \scriptsize{25.21} & \scriptsize{9.71} & \scriptsize{5.99} & \scriptsize{5.16} & \scriptsize{4.81} \\
+ \cmidrule{2-8}
+ & \scriptsize{iPNDM (3M)} & \scriptsize{32.79} & \scriptsize{8.63} & \scriptsize{5.23} & \scriptsize{4.67} & \scriptsize{4.66} & \scriptsize{4.69} \\
+ & \scriptsize{iPNDM-S4S (3M)} & \textbf{\scriptsize{31.58}} & \textbf{\scriptsize{8.29}} & \textbf{\scriptsize{5.13}} & \textbf{\scriptsize{4.52}} & \textbf{\scriptsize{4.61}} & \textbf{\scriptsize{4.50}} \\
+ \cmidrule{2-8}
+ & \scriptsize{UniPC (3M)} & \scriptsize{63.78} & \scriptsize{20.14} & \scriptsize{7.58} & \scriptsize{5.34} & \scriptsize{5.06} & \scriptsize{5.02} \\
+ & \scriptsize{UniPC-S4S (3M)} & \scriptsize{61.41} & \scriptsize{19.50} & \scriptsize{7.27} & \scriptsize{5.20} & \scriptsize{4.91} & \scriptsize{4.80} \\
+\midrule
+\multicolumn{2}{c}{S4S-Alt} & \textbf{\cellcolor{lightgray}{\scriptsize{13.26}}} & \textbf{\cellcolor{lightgray}{\scriptsize{5.13}}} & \textbf{\cellcolor{lightgray}{\scriptsize{4.30}}} & \textbf{\cellcolor{lightgray}{\scriptsize{4.09}}} & \textbf{\cellcolor{lightgray}{\scriptsize{4.06}}} & \textbf{\cellcolor{lightgray}{\scriptsize{4.06}}} \\
+\bottomrule
+\end{tabular}
+\caption{FID scores on ImageNet 256$\times$256. Numbers in column headers indicate NFE counts. Bold: best within schedule; shaded: best overall.}
+\label{tab:fid_scores_imagenet256}
+\end{table}
+
+\begin{table}[H]
+\centering
+\footnotesize
+\setlength{\tabcolsep}{3pt}
+\renewcommand{\arraystretch}{0.9}
+\begin{tabular}{llcccccc}
+\toprule
+Schedule & Solver & 3 & 4 & 5 & 6 & 7 & 8 \\
+\midrule
+\multirow{7}{*}{\scriptsize{DMN}} & \scriptsize{DPM-Solver++ (3M)} & \scriptsize{136.53} & \scriptsize{79.29} & \scriptsize{39.67} & \scriptsize{22.66} & \scriptsize{17.18} & \scriptsize{15.19} \\
+ & \scriptsize{DPM-Solver++-S4S (3M)} & \scriptsize{116.46} & \scriptsize{71.36} & \scriptsize{35.82} & \scriptsize{21.42} & \scriptsize{16.56} & \scriptsize{14.48} \\
+\cmidrule{2-8}
+ & \scriptsize{iPNDM (3M)} & \scriptsize{76.56} & \scriptsize{45.73} & \scriptsize{30.09} & \scriptsize{20.57} & \scriptsize{18.02} & \scriptsize{18.70} \\
+ & \scriptsize{iPNDM-S4S (3M)} & \textbf{\scriptsize{66.77}} & \textbf{\scriptsize{40.05}} & \scriptsize{27.40} & \scriptsize{19.24} & \scriptsize{17.17} & \scriptsize{17.70} \\
+\cmidrule{2-8}
+ & \scriptsize{UniPC (3M)} & \scriptsize{126.55} & \scriptsize{68.04} & \scriptsize{31.75} & \scriptsize{19.46} & \scriptsize{15.27} & \scriptsize{14.81} \\
+ & \scriptsize{UniPC-S4S (3M)} & \scriptsize{110.11} & \scriptsize{60.68} & \scriptsize{29.18} & \scriptsize{18.40} & \scriptsize{14.57} & \scriptsize{13.90} \\
+\cmidrule{2-8}
+ & \scriptsize{DPM-Solver-v3 (3M)} & \scriptsize{96.83} & \scriptsize{42.95} & \textbf{\scriptsize{19.82}} & \textbf{\cellcolor{lightgray}{\scriptsize{12.81}}} & \textbf{\cellcolor{lightgray}{\scriptsize{11.10}}} & \textbf{\scriptsize{12.59}} \\
+\midrule
+\multirow{7}{*}{\scriptsize{Time EDM}} & \scriptsize{DPM-Solver++ (3M)} & \scriptsize{213.95} & \scriptsize{141.37} & \scriptsize{80.75} & \scriptsize{46.62} & \scriptsize{30.78} & \scriptsize{22.73} \\
+ & \scriptsize{DPM-Solver++-S4S (3M)} & \scriptsize{186.70} & \scriptsize{126.09} & \scriptsize{73.06} & \scriptsize{43.20} & \scriptsize{29.55} & \scriptsize{21.57} \\
+\cmidrule{2-8}
+ & \scriptsize{iPNDM (3M)} & \scriptsize{126.55} & \scriptsize{88.04} & \scriptsize{52.94} & \scriptsize{37.81} & \scriptsize{31.41} & \scriptsize{26.39} \\
+ & \scriptsize{iPNDM-S4S (3M)} & \textbf{\scriptsize{109.90}} & \textbf{\scriptsize{77.86}} & \scriptsize{48.79} & \scriptsize{35.27} & \scriptsize{30.26} & \scriptsize{24.78} \\
+\cmidrule{2-8}
+ & \scriptsize{UniPC (3M)} & \scriptsize{211.69} & \scriptsize{135.41} & \scriptsize{75.79} & \scriptsize{44.78} & \scriptsize{30.13} & \scriptsize{22.20} \\
+ & \scriptsize{UniPC-S4S (3M)} & \scriptsize{183.16} & \scriptsize{121.59} & \scriptsize{70.02} & \scriptsize{42.48} & \scriptsize{28.73} & \scriptsize{21.10} \\
+\cmidrule{2-8}
+ & \scriptsize{DPM-Solver-v3 (3M)} & \scriptsize{159.55} & \scriptsize{114.26} & \textbf{\scriptsize{43.56}} & \textbf{\scriptsize{23.64}} & \textbf{\scriptsize{19.59}} & \textbf{\scriptsize{15.68}} \\
+\midrule
+\multirow{7}{*}{\scriptsize{GITS}} & \scriptsize{DPM-Solver++ (3M)} & \scriptsize{169.26} & \scriptsize{121.24} & \scriptsize{90.64} & \scriptsize{72.89} & \scriptsize{64.37} & \scriptsize{61.41} \\
+ & \scriptsize{DPM-Solver++-S4S (3M)} & \scriptsize{148.05} & \scriptsize{108.86} & \scriptsize{83.25} & \scriptsize{67.94} & \scriptsize{61.69} & \scriptsize{58.83} \\
+\cmidrule{2-8}
+ & \scriptsize{iPNDM (3M)} & \scriptsize{126.10} & \scriptsize{109.43} & \scriptsize{94.83} & \scriptsize{75.52} & \scriptsize{64.55} & \scriptsize{59.71} \\
+ & \scriptsize{iPNDM-S4S (3M)} & \textbf{\scriptsize{108.68}} & \scriptsize{97.21} & \scriptsize{85.43} & \scriptsize{71.03} & \scriptsize{61.71} & \scriptsize{56.04} \\
+\cmidrule{2-8}
+ & \scriptsize{UniPC (3M)} & \scriptsize{150.08} & \scriptsize{103.39} & \scriptsize{86.62} & \scriptsize{71.78} & \scriptsize{61.22} & \scriptsize{56.08} \\
+ & \scriptsize{UniPC-S4S (3M)} & \scriptsize{129.69} & \textbf{\scriptsize{91.15}} & \textbf{\scriptsize{79.82}} & \scriptsize{67.24} & \scriptsize{59.50} & \scriptsize{53.15} \\
+\cmidrule{2-8}
+ & \scriptsize{DPM-Solver-v3 (3M)} & \scriptsize{166.97} & \scriptsize{129.41} & \scriptsize{92.66} & \textbf{\scriptsize{64.21}} & \textbf{\scriptsize{50.95}} & \textbf{\scriptsize{47.19}} \\
+\midrule
+\multirow{7}{*}{\scriptsize{LD3}} & \scriptsize{DPM-Solver++ (3M)} & \scriptsize{144.81} & \scriptsize{77.15} & \scriptsize{42.05} & \scriptsize{23.09} & \scriptsize{15.62} & \scriptsize{12.45} \\
+ & \scriptsize{DPM-Solver++-S4S (3M)} & \scriptsize{121.66} & \scriptsize{66.97} & \scriptsize{38.19} & \scriptsize{21.57} & \scriptsize{15.11} & \scriptsize{11.72} \\
+\cmidrule{2-8}
+ & \scriptsize{iPNDM (3M)} & \scriptsize{73.94} & \scriptsize{35.58} & \scriptsize{20.55} & \scriptsize{14.99} & \scriptsize{12.37} & \scriptsize{11.45} \\
+ & \scriptsize{iPNDM-S4S (3M)} & \textbf{\cellcolor{lightgray}{\scriptsize{61.83}}} & \textbf{\cellcolor{lightgray}{\scriptsize{30.82}}} & \textbf{\scriptsize{18.69}} & \textbf{\scriptsize{13.84}} & \scriptsize{11.76} & \scriptsize{10.85} \\
+\cmidrule{2-8}
+ & \scriptsize{UniPC (3M)} & \scriptsize{130.65} & \scriptsize{59.89} & \scriptsize{31.89} & \scriptsize{17.33} & \scriptsize{13.33} & \scriptsize{10.53} \\
+ & \scriptsize{UniPC-S4S (3M)} & \scriptsize{110.02} & \scriptsize{52.03} & \scriptsize{28.69} & \scriptsize{16.29} & \scriptsize{12.75} & \scriptsize{9.92} \\
+\cmidrule{2-8}
+ & \scriptsize{DPM-Solver-v3 (3M)} & \scriptsize{110.47} & \scriptsize{52.81} & \scriptsize{23.85} & \scriptsize{15.08} & \textbf{\scriptsize{11.11}} & \textbf{\scriptsize{9.73}} \\
+\midrule
+\multirow{7}{*}{\scriptsize{Time LogSNR}} & \scriptsize{DPM-Solver++ (3M)} & \scriptsize{227.26} & \scriptsize{113.01} & \scriptsize{63.69} & \scriptsize{41.60} & \scriptsize{32.96} & \scriptsize{27.31} \\
+ & \scriptsize{DPM-Solver++-S4S (3M)} & \scriptsize{198.27} & \scriptsize{101.50} & \scriptsize{57.33} & \scriptsize{39.04} & \scriptsize{31.62} & \scriptsize{25.61} \\
+\cmidrule{2-8}
+ & \scriptsize{iPNDM (3M)} & \scriptsize{192.47} & \scriptsize{96.55} & \scriptsize{62.97} & \scriptsize{45.45} & \scriptsize{35.94} & \scriptsize{29.28} \\
+ & \scriptsize{iPNDM-S4S (3M)} & \textbf{\scriptsize{167.90}} & \textbf{\scriptsize{85.62}} & \scriptsize{57.38} & \scriptsize{42.41} & \scriptsize{34.80} & \scriptsize{27.86} \\
+\cmidrule{2-8}
+ & \scriptsize{UniPC (3M)} & \scriptsize{223.84} & \scriptsize{106.68} & \scriptsize{62.32} & \scriptsize{43.15} & \scriptsize{34.15} & \scriptsize{26.99} \\
+ & \scriptsize{UniPC-S4S (3M)} & \scriptsize{195.09} & \scriptsize{95.94} & \scriptsize{57.50} & \scriptsize{40.87} & \scriptsize{33.21} & \scriptsize{25.52} \\
+\cmidrule{2-8}
+ & \scriptsize{DPM-Solver-v3 (3M)} & \scriptsize{193.57} & \scriptsize{86.05} & \textbf{\scriptsize{36.58}} & \textbf{\scriptsize{22.02}} & \textbf{\scriptsize{19.16}} & \textbf{\scriptsize{17.16}} \\
+\midrule
+\multirow{7}{*}{\scriptsize{Time Quadratic}} & \scriptsize{DPM-Solver++ (3M)} & \scriptsize{159.24} & \scriptsize{93.01} & \scriptsize{56.11} & \scriptsize{39.58} & \scriptsize{30.28} & \scriptsize{26.43} \\
+ & \scriptsize{DPM-Solver++-S4S (3M)} & \scriptsize{139.02} & \scriptsize{82.74} & \scriptsize{51.65} & \scriptsize{37.37} & \scriptsize{29.10} & \scriptsize{25.35} \\
+\cmidrule{2-8}
+ & \scriptsize{iPNDM (3M)} & \scriptsize{110.97} & \scriptsize{71.14} & \scriptsize{52.42} & \scriptsize{42.89} & \scriptsize{34.06} & \scriptsize{28.76} \\
+ & \scriptsize{iPNDM-S4S (3M)} & \textbf{\scriptsize{95.17}} & \textbf{\scriptsize{63.24}} & \scriptsize{48.46} & \scriptsize{40.36} & \scriptsize{33.04} & \scriptsize{27.18} \\
+\cmidrule{2-8}
+ & \scriptsize{UniPC (3M)} & \scriptsize{147.85} & \scriptsize{78.28} & \scriptsize{47.40} & \scriptsize{36.08} & \scriptsize{28.10} & \scriptsize{24.16} \\
+ & \scriptsize{UniPC-S4S (3M)} & \scriptsize{127.10} & \scriptsize{70.17} & \scriptsize{43.36} & \scriptsize{33.58} & \scriptsize{27.28} & \scriptsize{22.69} \\
+\cmidrule{2-8}
+ & \scriptsize{DPM-Solver-v3 (3M)} & \scriptsize{136.22} & \scriptsize{64.17} & \textbf{\scriptsize{38.96}} & \textbf{\scriptsize{25.96}} & \textbf{\scriptsize{23.31}} & \textbf{\scriptsize{20.50}} \\
+\midrule
+\multirow{7}{*}{\scriptsize{Time Uniform}} & \scriptsize{DPM-Solver++ (3M)} & \scriptsize{155.60} & \scriptsize{84.95} & \scriptsize{39.63} & \scriptsize{22.84} & \scriptsize{15.36} & \scriptsize{12.25} \\
+ & \scriptsize{DPM-Solver++-S4S (3M)} & \scriptsize{134.61} & \scriptsize{75.20} & \scriptsize{36.64} & \scriptsize{21.28} & \scriptsize{14.86} & \scriptsize{11.55} \\
+ \cmidrule{2-8}
+ & \scriptsize{iPNDM (3M)} & \scriptsize{86.76} & \scriptsize{34.61} & \scriptsize{19.56} & \scriptsize{15.85} & \scriptsize{13.52} & \scriptsize{12.17} \\
+ & \scriptsize{iPNDM-S4S (3M)} & \textbf{\scriptsize{75.52}} & \textbf{\scriptsize{30.95}} & \textbf{\cellcolor{lightgray}{\scriptsize{17.69}}} & \textbf{\scriptsize{14.99}} & \scriptsize{12.95} & \scriptsize{11.40} \\
+ \cmidrule{2-8}
+ & \scriptsize{UniPC (3M)} & \scriptsize{150.76} & \scriptsize{73.74} & \scriptsize{31.62} & \scriptsize{18.22} & \scriptsize{12.66} & \scriptsize{10.31} \\
+ & \scriptsize{UniPC-S4S (3M)} & \scriptsize{131.51} & \scriptsize{65.59} & \scriptsize{28.62} & \scriptsize{17.05} & \scriptsize{12.20} & \textbf{\cellcolor{lightgray}{\scriptsize{9.69}}} \\
+ \cmidrule{2-8}
+ & \scriptsize{DPM-Solver-v3 (3M)} & \scriptsize{110.45} & \scriptsize{52.81} & \scriptsize{23.85} & \scriptsize{15.08} & \textbf{\scriptsize{11.12}} & \scriptsize{9.73} \\
+\midrule
+\multicolumn{2}{c}{S4S-Alt} & \textbf{\cellcolor{lightgray}{\scriptsize{37.65}}} & \textbf{\cellcolor{lightgray}{\scriptsize{20.89}}} & \textbf{\cellcolor{lightgray}{\scriptsize{13.03}}} & \textbf{\cellcolor{lightgray}{\scriptsize{10.49}}} & \textbf{\cellcolor{lightgray}{\scriptsize{10.03}}} & \textbf{\cellcolor{lightgray}{\scriptsize{9.64}}} \\
+\bottomrule
+\end{tabular}
+\caption{FID scores on LSUN-Bedroom 256$\times$256. Numbers in column headers indicate NFE counts. Bold: best within schedule; shaded: best overall. Curiously, despite using essentially the same replication code as in~\citet{zheng2023dpm} and~\citet{tong2024learning} for LSUN-Bedroom generation, we were persistently unable to achieve the FID stated in many papers; accordingly, we present this mainly as demonstrating the overall trend for S4S on LSUN-Bedroom.}
+\label{tab:fid_scores_lsun_bedroom}
+\end{table}
+
+\begin{table}[H]
+\centering
+\footnotesize
+\setlength{\tabcolsep}{3pt}
+\renewcommand{\arraystretch}{0.9}
+\begin{tabular}{llcccccc}
+\toprule
+Schedule & Solver & 3 & 4 & 5 & 6 & 7 & 8 \\
+\midrule
+\multirow{7}{*}{\scriptsize{DMN}} & \scriptsize{DPM-Solver++ (3M)} & \scriptsize{65.43} & \scriptsize{26.54} & \scriptsize{20.40} & \scriptsize{15.36} & \scriptsize{14.42} & \scriptsize{13.14} \\
+ & \scriptsize{DPM-Solver++-S4S (3M)} & \scriptsize{60.26} & \scriptsize{24.81} & \scriptsize{19.50} & \scriptsize{14.92} & \scriptsize{13.96} & \scriptsize{12.44} \\
+\cmidrule{2-8}
+ & \scriptsize{iPNDM (3M)} & \scriptsize{66.77} & \scriptsize{27.16} & \scriptsize{19.42} & \scriptsize{14.26} & \scriptsize{11.74} & \scriptsize{11.85} \\
+ & \scriptsize{iPNDM-S4S (3M)} & \scriptsize{61.37} & \scriptsize{25.45} & \scriptsize{18.68} & \textbf{\scriptsize{13.88}} & \textbf{\scriptsize{11.40}} & \textbf{\scriptsize{11.13}} \\
+\cmidrule{2-8}
+ & \scriptsize{UniPC (3M)} & \scriptsize{60.75} & \scriptsize{24.18} & \scriptsize{18.21} & \scriptsize{14.59} & \scriptsize{14.26} & \scriptsize{14.03} \\
+ & \scriptsize{UniPC-S4S (3M)} & \textbf{\scriptsize{56.42}} & \textbf{\scriptsize{22.47}} & \textbf{\scriptsize{17.51}} & \scriptsize{14.12} & \scriptsize{13.97} & \scriptsize{13.24} \\
+\cmidrule{2-8}
+ & \scriptsize{DPM-Solver-v3 (3M)} & \scriptsize{107.07} & \scriptsize{59.43} & \scriptsize{49.97} & \scriptsize{30.55} & \scriptsize{23.10} & \scriptsize{18.98} \\
+\midrule
+\multirow{7}{*}{\scriptsize{Time EDM}} & \scriptsize{DPM-Solver++ (3M)} & \scriptsize{61.90} & \scriptsize{33.61} & \scriptsize{40.91} & \scriptsize{28.52} & \scriptsize{16.72} & \scriptsize{12.35} \\
+ & \scriptsize{DPM-Solver++-S4S (3M)} & \scriptsize{57.01} & \scriptsize{31.59} & \scriptsize{39.10} & \scriptsize{27.51} & \scriptsize{16.46} & \scriptsize{11.63} \\
+\cmidrule{2-8}
+ & \scriptsize{iPNDM (3M)} & \scriptsize{46.66} & \scriptsize{28.48} & \scriptsize{19.66} & \scriptsize{14.77} & \scriptsize{12.28} & \scriptsize{11.45} \\
+ & \scriptsize{iPNDM-S4S (3M)} & \textbf{\scriptsize{43.48}} & \textbf{\scriptsize{26.59}} & \textbf{\scriptsize{18.90}} & \textbf{\scriptsize{14.05}} & \textbf{\scriptsize{11.87}} & \textbf{\scriptsize{10.72}} \\
+\cmidrule{2-8}
+ & \scriptsize{UniPC (3M)} & \scriptsize{62.90} & \scriptsize{36.93} & \scriptsize{53.93} & \scriptsize{49.19} & \scriptsize{33.00} & \scriptsize{19.59} \\
+ & \scriptsize{UniPC-S4S (3M)} & \scriptsize{57.67} & \scriptsize{34.68} & \scriptsize{51.46} & \scriptsize{46.84} & \scriptsize{32.40} & \scriptsize{18.54} \\
+\cmidrule{2-8}
+ & \scriptsize{DPM-Solver-v3 (3M)} & \scriptsize{97.31} & \scriptsize{64.57} & \scriptsize{77.71} & \scriptsize{65.88} & \scriptsize{34.62} & \scriptsize{17.82} \\
+\midrule
+\multirow{7}{*}{\scriptsize{GITS}} & \scriptsize{DPM-Solver++ (3M)} & \scriptsize{39.62} & \scriptsize{20.57} & \scriptsize{19.18} & \scriptsize{13.64} & \scriptsize{12.52} & \scriptsize{11.72} \\
+ & \scriptsize{DPM-Solver++-S4S (3M)} & \textbf{\scriptsize{36.87}} & \scriptsize{19.53} & \scriptsize{18.04} & \scriptsize{13.03} & \scriptsize{12.23} & \textbf{\scriptsize{11.00}} \\
+\cmidrule{2-8}
+ & \scriptsize{iPNDM (3M)} & \scriptsize{43.06} & \scriptsize{23.29} & \scriptsize{16.40} & \scriptsize{12.33} & \scriptsize{11.56} & \scriptsize{11.36} \\
+ & \scriptsize{iPNDM-S4S (3M)} & \scriptsize{39.54} & \scriptsize{21.78} & \textbf{\scriptsize{15.69}} & \textbf{\cellcolor{lightgray}{\scriptsize{11.97}}} & \textbf{\cellcolor{lightgray}{\scriptsize{11.23}}} & \scriptsize{10.82} \\
+\cmidrule{2-8}
+ & \scriptsize{UniPC (3M)} & \scriptsize{39.42} & \scriptsize{20.22} & \scriptsize{22.25} & \scriptsize{14.63} & \scriptsize{12.40} & \scriptsize{11.30} \\
+ & \scriptsize{UniPC-S4S (3M)} & \scriptsize{36.94} & \textbf{\cellcolor{lightgray}{\scriptsize{19.14}}} & \scriptsize{21.28} & \scriptsize{13.96} & \scriptsize{12.08} & {\scriptsize{11.14}} \\
+\cmidrule{2-8}
+ & \scriptsize{DPM-Solver-v3 (3M)} & \scriptsize{70.07} & \scriptsize{35.45} & \scriptsize{27.86} & \scriptsize{15.31} & \scriptsize{13.31} & \scriptsize{12.10} \\
+\midrule
+\multirow{7}{*}{\scriptsize{LD3}} & \scriptsize{DPM-Solver++ (3M)} & \scriptsize{34.32} & \scriptsize{20.64} & \scriptsize{15.47} & \scriptsize{14.26} & \scriptsize{14.07} & \scriptsize{13.67} \\
+ & \scriptsize{DPM-Solver++-S4S (3M)} & \scriptsize{31.77} & \textbf{\scriptsize{19.21}} & \textbf{\cellcolor{lightgray}{\scriptsize{14.83}}} & \scriptsize{13.89} & \scriptsize{13.75} & \scriptsize{13.01} \\
+\cmidrule{2-8}
+ & \scriptsize{iPNDM (3M)} & \scriptsize{43.73} & \scriptsize{26.14} & \scriptsize{17.33} & \scriptsize{13.19} & \scriptsize{12.31} & \scriptsize{12.28} \\
+ & \scriptsize{iPNDM-S4S (3M)} & \scriptsize{40.75} & \scriptsize{24.60} & \scriptsize{16.27} & \textbf{\scriptsize{12.63}} & \textbf{\scriptsize{11.89}} & \textbf{\scriptsize{11.69}} \\
+\cmidrule{2-8}
+ & \scriptsize{UniPC (3M)} & \scriptsize{33.94} & \scriptsize{21.27} & \scriptsize{16.27} & \scriptsize{14.55} & \scriptsize{14.49} & \scriptsize{13.03} \\
+ & \scriptsize{UniPC-S4S (3M)} & \textbf{\cellcolor{lightgray}{\scriptsize{31.03}}} & \scriptsize{19.70} & \scriptsize{15.30} & \scriptsize{13.95} & \scriptsize{14.23} & \scriptsize{12.26} \\
+\cmidrule{2-8}
+ & \scriptsize{DPM-Solver-v3 (3M)} & \scriptsize{49.07} & \scriptsize{23.92} & \scriptsize{17.35} & \scriptsize{15.22} & \scriptsize{14.43} & \scriptsize{14.11} \\
+\midrule
+\multirow{7}{*}{\scriptsize{Time LogSNR}} & \scriptsize{DPM-Solver++ (3M)} & \scriptsize{61.46} & \scriptsize{36.02} & \scriptsize{27.02} & \scriptsize{19.31} & \scriptsize{13.86} & \scriptsize{11.76} \\
+ & \scriptsize{DPM-Solver++-S4S (3M)} & \scriptsize{56.23} & \scriptsize{33.93} & \scriptsize{25.49} & \scriptsize{18.56} & \scriptsize{13.48} & \scriptsize{11.16} \\
+\cmidrule{2-8}
+ & \scriptsize{iPNDM (3M)} & \scriptsize{52.27} & \scriptsize{30.47} & \scriptsize{20.11} & \scriptsize{15.18} & \scriptsize{12.65} & \scriptsize{11.60} \\
+ & \scriptsize{iPNDM-S4S (3M)} & \textbf{\scriptsize{48.28}} & \textbf{\scriptsize{28.88}} & \textbf{\scriptsize{18.98}} & \textbf{\scriptsize{14.71}} & \textbf{\scriptsize{12.48}} & \textbf{\scriptsize{10.94}} \\
+\cmidrule{2-8}
+ & \scriptsize{UniPC (3M)} & \scriptsize{61.08} & \scriptsize{37.31} & \scriptsize{32.95} & \scriptsize{27.20} & \scriptsize{19.12} & \scriptsize{14.30} \\
+ & \scriptsize{UniPC-S4S (3M)} & \scriptsize{57.23} & \scriptsize{34.56} & \scriptsize{31.41} & \scriptsize{26.11} & \scriptsize{18.58} & \scriptsize{13.73} \\
+\cmidrule{2-8}
+ & \scriptsize{DPM-Solver-v3 (3M)} & \scriptsize{99.16} & \scriptsize{64.39} & \scriptsize{44.02} & \scriptsize{33.51} & \scriptsize{24.23} & \scriptsize{15.99} \\
+\midrule
+\multirow{7}{*}{\scriptsize{Time Quadratic}} & \scriptsize{DPM-Solver++ (3M)} & \scriptsize{63.33} & \scriptsize{28.33} & \scriptsize{17.00} & \scriptsize{13.57} & \scriptsize{12.34} & \scriptsize{11.82} \\
+ & \scriptsize{DPM-Solver++-S4S (3M)} & \scriptsize{58.16} & \scriptsize{26.61} & \scriptsize{16.25} & \scriptsize{13.21} & \scriptsize{11.89} & \scriptsize{11.35} \\
+\cmidrule{2-8}
+ & \scriptsize{iPNDM (3M)} & \scriptsize{59.94} & \scriptsize{27.93} & \scriptsize{16.65} & \scriptsize{13.03} & \scriptsize{11.84} & \scriptsize{11.48} \\
+ & \scriptsize{iPNDM-S4S (3M)} & \textbf{\scriptsize{54.75}} & \scriptsize{26.19} & \scriptsize{15.76} & \textbf{\scriptsize{12.42}} & \textbf{\scriptsize{11.67}} & \cellcolor{lightgray}\textbf{\scriptsize{10.84}} \\
+\cmidrule{2-8}
+ & \scriptsize{UniPC (3M)} & \scriptsize{60.51} & \scriptsize{26.47} & \scriptsize{16.49} & \scriptsize{13.41} & \scriptsize{12.26} & \scriptsize{11.74} \\
+ & \scriptsize{UniPC-S4S (3M)} & \scriptsize{56.50} & \textbf{\scriptsize{24.95}} & \textbf{\scriptsize{15.67}} & \scriptsize{13.05} & \scriptsize{11.87} & \scriptsize{11.07} \\
+\cmidrule{2-8}
+ & \scriptsize{DPM-Solver-v3 (3M)} & \scriptsize{103.62} & \scriptsize{60.78} & \scriptsize{34.99} & \scriptsize{21.88} & \scriptsize{16.17} & \scriptsize{13.42} \\
+\midrule
+\multirow{7}{*}{\scriptsize{Time Uniform}} & \scriptsize{DPM-Solver++ (3M)} & \scriptsize{34.57} & \scriptsize{21.24} & \scriptsize{17.09} & \scriptsize{15.54} & \scriptsize{14.82} & \scriptsize{14.50} \\
+\cmidrule{2-8}
+ & \scriptsize{DPM-Solver++-S4S (3M)} & \textbf{\scriptsize{31.67}} & \textbf{\scriptsize{20.05}} & \textbf{\scriptsize{16.03}} & \scriptsize{14.85} & \scriptsize{14.57} & \scriptsize{13.68} \\
+ & \scriptsize{iPNDM (3M)} & \scriptsize{48.29} & \scriptsize{28.75} & \scriptsize{18.52} & \scriptsize{14.40} & \scriptsize{13.00} & \scriptsize{12.78} \\
+\cmidrule{2-8}
+ & \scriptsize{iPNDM-S4S (3M)} & \scriptsize{44.89} & \scriptsize{27.27} & \scriptsize{17.45} & \textbf{\scriptsize{14.00}} & \textbf{\scriptsize{12.77}} & \textbf{\scriptsize{12.11}} \\
+ & \scriptsize{UniPC (3M)} & \scriptsize{35.33} & \scriptsize{21.42} & \scriptsize{17.31} & \scriptsize{15.39} & \scriptsize{14.65} & \scriptsize{14.36} \\
+\cmidrule{2-8}
+ & \scriptsize{UniPC-S4S (3M)} & \scriptsize{33.04} & \scriptsize{20.32} & \scriptsize{16.57} & \scriptsize{14.83} & \scriptsize{14.30} & \scriptsize{13.78} \\
+ & \scriptsize{DPM-Solver-v3 (3M)} & \scriptsize{49.07} & \scriptsize{23.92} & \scriptsize{17.37} & \scriptsize{15.22} & \scriptsize{14.43} & \scriptsize{14.11} \\
+\midrule
+\multicolumn{2}{c}{S4S-Alt} & \textbf{\cellcolor{lightgray}{\scriptsize{25.44}}} & \textbf{\cellcolor{lightgray}{\scriptsize{16.05}}} & \textbf{\cellcolor{lightgray}{\scriptsize{13.26}}} & \textbf{\cellcolor{lightgray}{\scriptsize{11.17}}} & \textbf{\cellcolor{lightgray}{\scriptsize{10.83}}} & \textbf{\cellcolor{lightgray}{\scriptsize{10.68}}} \\
+\bottomrule
+\end{tabular}
+\caption{FID scores on MS-COCO 512$\times$512. Numbers in column headers indicate NFE counts. Bold: best within schedule; shaded: best overall.}
+\label{tab:fid_scores_ms_coco}
+\end{table}
+
+\subsection{Qualitative Model Samples}
+\label{app:qual-samples}
+
+We provide qualitative samples below.
+
+\begin{figure}[htbp]
+    \centering
+    \begin{subfigure}[b]{0.45\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/cifar-grid/cifar-teacher-grid.png}
+        \caption{Teacher}
+        \label{fig:sub1-cifar}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[b]{0.45\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/cifar-grid/cifar-ipndm-grid.png}
+        \caption{iPNDM}
+        \label{fig:sub2-cifar}
+    \end{subfigure}
+    \vskip\baselineskip
+    \begin{subfigure}[b]{0.45\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/cifar-grid/cifar-s4s-grid.png}
+        \caption{S4S}
+        \label{fig:sub3-cifar}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[b]{0.45\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/cifar-grid/cifar-s4s-alt-grid.png}
+        \caption{S4S-Alt}
+        \label{fig:sub4-cifar}
+    \end{subfigure}
+    \caption{Examples from CIFAR-10 32$\times$32}
+    \label{fig:main_cifar10}
+\end{figure}
+
+\begin{figure}[htbp]
+    \centering
+    \begin{subfigure}[b]{0.45\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/ffhq/ffhq-teacher-grid.png}
+        \caption{Teacher}
+        \label{fig:sub1-ffhq}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[b]{0.45\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/ffhq/ffhq-ipndm-grid.png}
+        \caption{iPNDM}
+        \label{fig:sub2-ffhq}
+    \end{subfigure}
+    \vskip\baselineskip
+    \begin{subfigure}[b]{0.45\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/ffhq/ffhq-s4s-grid.png}
+        \caption{S4S}
+        \label{fig:sub3-ffhq}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[b]{0.45\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/ffhq/ffhq-s4s-alt-grid.png}
+        \caption{S4S-Alt}
+        \label{fig:sub4-ffhq}
+    \end{subfigure}
+    \caption{Examples from FFHQ 64$\times$64}
+    \label{fig:main_ffhq}
+\end{figure}
+
+\begin{figure}[htbp]
+    \centering
+    \begin{subfigure}[b]{0.45\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/afhqv2-grid/afhqv2-teacher-grid.png}
+        \caption{Teacher}
+        \label{fig:sub1-afhqv2}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[b]{0.45\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/afhqv2-grid/afhqv2-ipndm-grid.png}
+        \caption{iPNDM}
+        \label{fig:sub2-afhqv2}
+    \end{subfigure}
+    \vskip\baselineskip
+    \begin{subfigure}[b]{0.45\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/afhqv2-grid/afhqv2-s4s-grid.png}
+        \caption{S4S}
+        \label{fig:sub3-afhqv2}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[b]{0.45\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/afhqv2-grid/afhqv2-s4s-alt-grid.png}
+        \caption{S4S-Alt}
+        \label{fig:sub4-afhqv2}
+    \end{subfigure}
+    \caption{Examples from AFHQv2 64$\times$64}
+    \label{fig:main_afhq}
+\end{figure}
+
+\begin{figure}[htbp]
+    \centering
+    \begin{subfigure}[b]{0.45\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/imagenet-grid/imn-teacher-grid.png}
+        \caption{Teacher}
+        \label{fig:sub1-imn}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[b]{0.45\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/imagenet-grid/imn-grid-unipc.png}
+        \caption{UniPC}
+        \label{fig:sub2-imn}
+    \end{subfigure}
+    \vskip\baselineskip
+    \begin{subfigure}[b]{0.45\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/imagenet-grid/imn-s4s-grid.png}
+        \caption{S4S}
+        \label{fig:sub3-imn}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[b]{0.45\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/imagenet-grid/imn-s4s-alt-grid.png}
+        \caption{S4S-Alt}
+        \label{fig:sub4-imn}
+    \end{subfigure}
+    \caption{Examples from ImageNet 256$\times$256}
+    \label{fig:main_imagenet}
+\end{figure}
+
+\begin{figure}[htbp]
+    \centering
+    \begin{subfigure}[b]{0.45\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/lsun-grid/lsun-teacher-grid.png}
+        \caption{Teacher}
+        \label{fig:sub1-lsun}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[b]{0.45\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/lsun-grid/lsun-unipc-grid.png}
+        \caption{UniPC}
+        \label{fig:sub2-lsun}
+    \end{subfigure}
+    \vskip\baselineskip
+    \begin{subfigure}[b]{0.45\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/lsun-grid/lsun-s4s-grid.png}
+        \caption{S4S}
+        \label{fig:sub3-lsun}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[b]{0.45\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/lsun-grid/lsun-s4s-alt-grid.png}
+        \caption{S4S-Alt}
+        \label{fig:sub4-lsun}
+    \end{subfigure}
+    \caption{Examples from LSUN Bedroom 256$\times$256}
+    \label{fig:main_lsunbedroom}
+\end{figure}
+
+\begin{figure}[htbp]
+    \centering
+    \begin{subfigure}[b]{0.45\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/ms-coco-grid/ms-coco-teacher-grid.png}
+        \caption{Teacher}
+        \label{fig:sub1-coco}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[b]{0.45\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/ms-coco-grid/ms-coco-unipc-grid.png}
+        \caption{UniPC}
+        \label{fig:sub2-coco}
+    \end{subfigure}
+    \vskip\baselineskip
+    \begin{subfigure}[b]{0.45\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/ms-coco-grid/ms-coco-s4s-grid.png}
+        \caption{S4S}
+        \label{fig:sub3-coco}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[b]{0.45\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/ms-coco-grid/ms-coco-s4s-alt-grid.png}
+        \caption{S4S-Alt}
+        \label{fig:sub4-coco}
+    \end{subfigure}
+    \caption{Examples from MS-COCO 512$\times$512}
+    \label{fig:main}
+\end{figure}
+
+\end{document}

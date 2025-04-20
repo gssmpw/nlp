@@ -1,0 +1,272 @@
+\section{Offline Token Preprocessing}
+\label{sec:offline}
+% \timothy{I think that ideally the section should start with the high-level flow of how the algorithm works. I'm not actually very clear on the details---I assume the transducers are being composed with a PDA? Is the PDA deterministic (I think an earlier version said it was)? If not, how do we actually run it during decoding? Shouldn't the composition involve a lot of preprocessing time?}
+
+% In this section, we present how our approach efficiently precomputes the mapping from LLM tokens to sets of possible terminal sequences.
+% 
+Our approach starts by preprocessing the lexer to efficiently construct a lookup table that relates LLM tokens to terminal sequences (\autoref{sec:lexing}) and vice versa (\autoref{sec:realizable}). 
+The preprocessed lexer is then used to analyze the parser to determine what terminal sequences are actually possible sequences in the grammar (\autoref{sec:parsing}).
+
+% \loris{mini outline here with sec num}
+
+\subsection{Lexer Preprocessing }
+\label{sec:lexing}
+
+% \loris{not sure if this is defined in sec 2, but I'll def here for now. Don't we need to also define that each terminal type is defined by a regex?}
+Let $\alphabet$ denote the set of string characters, $\alphabet^\ast$ denote the set of strings over this alphabet, and $\terms$ denote the set of terminals (i.e., grammar-level tokens).
+A \emph{lexer} is a function $\lexer$ that given an input string $w \in \alphabet^\ast$, returns a pair $(T_1\ldots T_k, w_r)$, where $T_1 \ldots T_k \in \terms^\ast$ is a sequence of terminals and $w_r \in \alphabet^\ast$ is the suffix of $w$ that has not been lexed (i.e., mapped to language terminals) yet. 
+
+Typically lexers resolve ambiguity by making some simplifying assumptions that also help improve efficiency and avoid backtracking.
+We use the same assumptions and describe them next.
+
+
+\paragraph{Maximal Munch Principle and Lookahead}
+
+Consider a language that contains two different tokens for the increment operator \texttt{++} and the addition operator \text{+}. 
+% 
+Although the input string \texttt{++} could be tokenized as two separate \texttt{+} addition tokens, in practice lexers prioritize the longer valid token to resolve ambiguity (and which usually captures the intended syntax of the programming language).
+% 
+This behavior is called the \emph{maximal munch principle}: the lexer matches the longest possible substring starting at the current position that aligns with a defined token pattern.
+
+Under a strict interpretation of the maximal munch principle, if the lexer reaches the end of the input stream while processing a partial triple-quoted Python string \texttt{"""a"}, the lexer should tokenize the input as two strings \texttt{""} and \texttt{"a"}.
+% 
+However, supporting such cases would require either waiting until the end of the input string to produce any tokens or allowing backtracking.
+% 
+As such, in practice many lexers (including Python's) will raise an error and stop lexing if the scanned prefix cannot be tokenized as a single terminal.
+%To avoid backtracking, many lexers would raise an error when tokenizing the string \texttt{"""a"} rather than backtracking to tokenize it as two strings. \loris{when is the error raised, and what is the error?}
+% 
+This greedy behavior disallows some strings, but guarantees that the lexer can resolve all tokenization ambiguities by inspecting only the next character at each step.
+% \timothy{Should maybe add a sentence stating that this is not too far from how actual lexers work.}
+
+\begin{definition}[1-lookahead]
+A lexer $\lexer$ is \emph{1-lookahead} if for every string $w \in \alphabet^\ast$ and valid continuation $c \in \alphabet$ of $\sent$, whenever $\lexer(\sent) = (\term_1 \ldots \term_k, r)$ then $\lexer(\sent c)$ is either $(\term_1 \ldots \term_k \term_{k+1}, c)$ for some $T_{k+1} \in \terms$ or $(\term_1 \ldots \term_k, r c)$.
+\end{definition}
+
+Terminals are specified as a set of regular expressions. It is oftentimes convenient to work with a \textit{lexing automaton}, which is the finite state automaton (FSA) that accepts strings matching any terminal definition \cite{mcnaughton1960regular}.
+We refer the reader to \autoref{app:fsa-definition} for formal definitions of the semantics of FSA, but recall that an FSA is a tuple $\automaton = (\Sigma, Q, q_0, \delta, F)$ where $\Sigma$ is the alphabet, $Q$ is the set of states with initial state $q_0\in Q$, $\delta$ contains transitions of the form $q \xrightarrow{c} q'$, and $F\subseteq Q$ is the set of final states.
+
+% \loris{you need to end with fact that one can build FSA when you have 1-lookahead and point to example figure, or start next section with that. Next para just assumes you magically have an FSA}
+
+\paragraph{Lexing Transducer}
+
+\input{figs/transducer}
+A 1-lookahead maximal munch lexer can be defined from a lexing automaton as follows:
+% Given an FSA that recognizes a given set of language tokens, the maximal munch principle with 1-lookahead operates as follows:
+The input is processed character-by-character by transitioning through the FSA's states.
+When no valid transition exists for the next character $c$, the lexer checks whether the current state corresponds to a valid language token. 
+% 
+If it does and the tokenizer has at this point produced a pair $(T_1\ldots T_k, w_r)$, the not-yet tokenized string $w_r$ is tokenized with token $T_{k+1}$ corresponding to the reached state, the FSA is reset to its initial state $q_0$ (and the tokenizer state $(T_1\ldots T_k T_{k+1}, \varepsilon)$ with the empty string $\varepsilon$), and the character $c$ is consumed as the starting character of a new token $q_0$. 
+If the current state does not correspond to a valid token or if $c$ cannot be consumed at $q_0$, then $c$ is invalid. 
+% 
+Invalid characters inform what tokens should be masked during constrained decoding.
+
+% A finite-state transducer (FST) extends an FSA with outputs, formally defined as a tuple $\transducer = (\alphabet, \terms, Q, q_0, \delta, F)$ where $\Sigma, Q, q_0$ and $F$ are as in FSA; $\Gamma$ is the output alphabet, and $\delta \subseteq Q \times (\Sigma \cup \{\epsilon\}) \times \Gamma^\ast \times Q$ is the set of transitions. 
+%
+% Each transition $(q, c, \term_1 \ldots \term_k, q') \in \delta$ means that $q$, $c$, $q'$ are as in FSA and the transition outputs the sequence $\term_1 \ldots \term_k$.
+
+This process can be formalized as a finite-state transducer (FST), an extension of a finite-state automaton that can produce output terminals when reading characters. Given the original lexing automaton $\automaton$ representing valid tokens, we write $\transducer_\automaton$ to denote the \emph{lexing transducer}, the FST corresponding to $\automaton$.
+% 
+The construction of $\transducer_\automaton$ from $\automaton$ is formalized in \autoref{alg:fst-construction} in Appendix A, but at a high level the process simply adds transitions to handle cases where no valid transition exists for the current character $c$, outputting terminals and exiting final states. 
+\autoref{fig:char-transducer} shows the lexing transducer derived from the FSA in \autoref{fig:overview}.
+
+% \loris{next sence is broken, also you never point at figures}
+% When the FSA cannot process $c$ from its current state, the transducer the token recognized up to that point, resets to the initial state $q_0$, and processes $c$ from $q_0$. 
+
+% \begin{lemma}
+% If $L_\automaton$ is 1-lookahead, then $\transducer_\automaton(\sent) = T_1 \ldots T_k$ if and only if $L_\automaton(\sent) = (T_1 \ldots T_k, r)$ for some suffix $r$.
+% \end{lemma}
+
+% \kh{TODO: Proof, by induction on $w$. }
+
+% \loris{this para name should be more about LLM.}
+\paragraph{LLM Token to Terminals}
+
+\input{figs/detokenizing}
+\input{figs/tokenlexing}
+
+
+Processing LLM tokens character-by-character with the lexing transducer at runtime would incur significant overhead.
+To address this problem, we instead construct a token-to-terminal transducer by composing the character-to-terminal lexing transducer with the detokenizing transducer introduced by \citet{koo2024automatabased}.
+%\loris{is this diff example than one in sec2?}
+A detokenizing transducer simply maps LLM tokens to their corresponding sequence of text characters (i.e., the input alphabet is $\vocab$ and the output alphabet is $\Sigma$).
+% 
+A detokenizing transducer is nondeterministic and can contain $\varepsilon$-transitions that produce outputs without consuming inputs.
+
+\autoref{fig:detokenizing} illustrates the detokenizing transducer $\transducer_\vocab$ derived from the vocabulary $\vocab = \{\texttt{a}, \texttt{b}, \texttt{c}, \texttt{ab}, \texttt{ac}, \texttt{aba}\}$ in \autoref{fig:overview}.
+Note that as an optimization common prefixes of tokens form a trie-like structure (e.g., state $q_\texttt{a}$ denotes the state reached when producing the first \texttt{a} for all tokens that start with that character), reducing computational overhead by reusing shared prefix computation.
+\autoref{fig:token-transducer} depicts the combined token-level lexing transducer $\transducer_{\automaton \circ \vocab}=\transducer_\automaton \circ \transducer_{\vocab}$, which is the determinized FST capturing the sequential functional composition of the two transducers---i.e., the output of $\transducer_\vocab$ is fed as input to $\transducer_\automaton$.
+This token-to-terminal transducer enables efficient lookup of valid next tokens and produced terminal symbols in each state.
+
+
+\subsection{Realizable Terminal Sequences}
+\label{sec:realizable}
+
+Now that we have defined the formal machinery behind lexing, we are ready to explain how LLM tokens can be mapped to possible sequences of terminals.
+
+When the transducer $\transducer_{\automaton \circ \vocab}$ in \autoref{fig:token-transducer} consumes the LLM token \texttt{aba} from the initial state $q_0$, it produces the terminal \texttt{B} and moves to state $q_1$. 
+If we inspect the grammar $\grammar_{\texttt{BC}}$ in \autoref{fig:overview_cfg}, we can deduce that the parser, which receives as input sequences of tokens, expects/requires the next language token to be \texttt{C}.
+% \loris{I don't follow next point, since I don't know what automaton I'm looking at}
+Since $\transducer_{\automaton \circ \vocab}$ in state $q_1$ does not immediately produce any output when consuming \texttt{b}, 
+the generated terminal sequence so far (i.e., \texttt{B}) is still a valid prefix according to the grammar $\grammar_{\texttt{BC}}$.
+However, after transitioning to $q_2$, no possible path can generate \texttt{C} next.
+
+As illustrated by the above example, for each transition $q \xrightarrow{t:T_1 \ldots T_k} q'$ in the lexing transducer $\transducer_{\automaton \circ \vocab}$, we should check whether there is a terminal $T$ such that \rone  $T$ can be generated along some path from $q'$, and \rtwo $T_1 \ldots T_k T$ is accepted by the grammar.
+%
+This observation leads to the following definition, which describes which terminal sequences need to be considered by the parser.
+
+\begin{definition}[Realizable Terminal Sequences]
+\label{def:realizable-term-seq}
+Given a token vocabulary $\vocab$ and FSA $\automaton$, let $\delta$ be the set of transitions in the token-level lexing transducer $\transducer_\automaton \circ \transducer_\vocab$.
+% 
+The set of \textit{realizable terminal sequences} $\realizable{\vocab}{\automaton}$ is defined as 
+\begin{multline*}
+\realizable{\vocab}{\automaton} = \{ T_1 \ldots T_k T \mid q \xrightarrow{t:T_1 \ldots T_k} q' \in \delta \textrm{ and } \\
+T \textrm{ can be generated along some path from } q' \}.
+\end{multline*}
+\end{definition}
+
+Note that the LLM vocabulary $\vocab$ contains all characters in $\alphabet$, ensuring that $\alphabet^\ast = \vocab^\ast$. 
+Therefore, any next terminal producible in $\transducer_\automaton$ is also producible in the combined transducer $\transducer_{\automaton \circ \vocab}$ and vice versa. 
+This equivalence allows us to simplify producibility checks: instead of analyzing the large combined transducer $\transducer_{\automaton \circ \vocab}$, we need only compute reachability to accepting states within $\transducer_\automaton$ to determine producible next terminals.
+
+\paragraph{Inverse Token Spanner Table}
+\setcounter{algorithm}{3}
+% 
+\begin{algorithm}[!t]
+\caption{\tname{BuildInverseTokenSpannerTable}}
+\label{alg:inverse-token-table}
+\begin{algorithmic}
+    \STATE {\bfseries Input:} Combined FST $\transducer_\automaton \circ \transducer_\vocab = (\vocab, \terms, Q, q_0, \delta, F)$
+    \STATE {\bfseries Output:} Realizable token sequences $\realizable{\vocab}{\automaton}$, \\
+    Inverse lookup table $\inversetable: \realizable{\vocab}{\automaton} \times Q \rightarrow 2^\vocab $
+    \STATE $\realizable{\vocab}{\automaton} := \emptyset$, $\inversetable(\cdot, \cdot) := \emptyset$
+    \FOR{$q \xrightarrow{t:T_1 \ldots T_k} q' \in \delta$}
+        \FOR{$T$ recognized at $q''$, that is reachable from $q'$}
+            \STATE $\realizable{\vocab}{\automaton} := \realizable{\vocab}{\automaton} \cup \{ T_1 \ldots T_k T \}$
+            \STATE $\inversetable(q, T_1 \ldots T_k T) := \inversetable(q, T_1 \ldots T_k T) \cup \{t\}$
+        \ENDFOR
+    \ENDFOR
+    \RETURN $\realizable{\vocab}{\automaton}$, $\inversetable$
+\end{algorithmic}
+\end{algorithm}
+
+\autoref{alg:inverse-token-table} computes the set of realizable terminal sequences and constructs the key data structure we use to perform constrained decoding.
+\begin{definition}[Inverse Token Spanner Table]
+Given a lexer state $q \in Q_{\automaton \circ \vocab}$ and $T_1 \ldots T_k T \in \realizable{\vocab}{\automaton}$, the entry $\inversetable(q, \alpha)$ in the \textit{inverse token spanner table} $\inversetable$ is the set of tokens that generates $T_1 \ldots T_kT$ from state $q$. Formally,
+\begin{multline*}
+\inversetable(q, T_1 \ldots T_k T) = \{ t \mid q \xrightarrow{t:T_1 \ldots T_k} q' \in \delta \textrm{ and } \\
+T \textrm{ can be generated along some path from } q' \}
+\end{multline*}    
+\end{definition}
+
+% \loris{explain what it does and define}
+This table allows a decoder to determine which LLM tokens can result in a given realizable terminal sequence $T_1 \ldots T_k T$ being produced from a specific lexer state.
+
+For the example of \autoref{fig:overview}, the terminal sequence \texttt{BC} is generated by the token \texttt{aba} in state $q_0$ (i.e., $\texttt{aba} \in \inversetable(q_0, \texttt{BC})$). The same sequence is generated by the token \texttt{ac} in state $q_2$ (i.e., $\texttt{ac} \in \inversetable(q_2, \texttt{BC})$).
+% \loris{should the two above be more like $\texttt{ac}\in \inversetable(q_2, \texttt{BC})$}
+
+
+% \khchanged{
+% Given a transition relation $\delta$ of transducer $\transducer$, we define the extended transition $\delta^\ast$ as the smallest set defined by \rone $q \xrightarrow{\epsilon:\epsilon}^\ast q \in \delta^\ast$ and \rtwo $q \xrightarrow{wc:\alpha \alpha'}^{\ast} q' \in \delta^\ast$ whenever $q \xrightarrow{w:\alpha}^{\ast} q'' \in \delta^\ast$ and $q'' \xrightarrow{c:\alpha'} q' \in \delta^\ast$.
+% }
+
+% \khchanged{
+% \begin{theorem}[Soundness]
+% Assume $\alphabet \subseteq \vocab$.
+% Given a state $q \in Q_{\automaton \circ \vocab}$ and a terminal sequences $T_1 \ldot T_k T \in  \realizable{\vocab}{\automaton}$, 
+% for each token $t \in \inversetable(q, T_1 \ldots T_k T)$, there exists $t_1 \ldots t_m \in \vocab^\ast$
+% \end{theorem}
+% }
+
+% \loris{point to example table in fig1 as example}
+
+\subsection{Parser Preprocessing}
+\label{sec:parsing}
+
+We do not formally define context-free grammars (CFG) for brevity and refer the reader to \autoref{app:cfg-definition} for details.
+% 
+For the sake of this paper, the reader only needs to know that a CFG parser is typically formalized as a pushdown automaton (PDA), an extension of FSA with an execution stack \cite{schutzenberger1963context}.
+The definition of a PDA is similar to that of an FSA, but transitions are also allowed to manipulate a stack over symbols $\Pi$ via push and pop operations.
+Therefore, in a PDA, a configuration after reading a sequence of input characters is a pair of automaton state $q\in Q$ and execution stack $\gamma\in \Pi^\ast$.
+ 
+We refer the reader to \autoref{app:pda-definition} for the formal definition of a PDA, but informally, each PDA transition $q \xrightarrow{c[\beta \rightarrow \beta']} q'$ can only be activated if the character being read is a $c$ and the top of the current stack configuration $\gamma$ matches to sequence of stack symbols $\beta \in \Pi^\ast$. 
+If the transitions is activated, the current state becomes $q'$, and the top $\beta$ elements of the stack are replaced with new stack elements $\beta' \in \Pi^\ast$.
+% Notably, widely used LR($k$) and LALR($k$) parsers can be formalized as deterministic PDAs \cite{knuth1965translation}.}
+
+As with lexer preprocessing, our goal is to also preprocess the parser to avoid iterating over every terminal sequence generated by the lexer at runtime.
+To achieve this objective, we
+directly compose the detokenizing transducer $\realizable{\vocab}{\automaton}$ (\Cref{def:realizable-term-seq}), with the PDA $\pushdown$ produced by a parser generator (and where transitions operate over single terminals)~\cite{allauzen2012pushdown} to obtain a new pushdown automaton $\pushdown \circ \transducer_{\realizable{\vocab}{\automaton}}$ where transitions operate over terminal sequences. 
+
+This last transducer can efficiently determine valid sequences of terminal symbols from each parser state.
+% 
+We note that preprocessing both the lexer and parser in tandem is a key feature that distinguishes our work from prior work~\cite{beurer2024domino, ugare2024syncode}.
+
+% \loris{should the cardinality beo over T and not RE? I want to move this para a few lines before, let me know once fixed}
+% \kh{RE is the range of T (plus reachability), so it is correct I think? }
+One key source of efficiency resulting from our approach is that many transitions in the combined transducer $\transducer_{\automaton \circ 
+ \vocab}$ produce the same terminal sequence $T_1 \ldots T_k T$, making $|\realizable{\vocab}{\automaton}|$ smaller than $|\vocab|$ or $|\delta|$.
+%\khchanged{
+% In particular, this set is larger than the set of terminal sequences realizable from any specific state $q$, but not significantly larger than the largest such set from a single state.
+% In particular, the \emph{global} set of realizable terminal sequences $\realizable{\vocab}{\automaton}$ enables efficient precomputation of what sequences of terminals the parser should consider, instead of considering realizable terminal sequences \emph{for each} lexer state $q$.}
+%
+Thus, the set of realizable terminal sequences $\realizable{\vocab}{\automaton}$ enables efficient precomputation of what sequences of terminals the parser should consider.
+
+% \loris{describe first what is the high level thing you are trying to build and start by saying that a parser uses a PDA (you have never said this)}
+%
+
+% Specifically, we construct a detokenizing transducer that captures all possible output sequence of terminal symbols.
+% \loris{will the PDA receive single tokens or seq of tokens now?}
+
+
+
+\paragraph{Context Dependent/Independent Tokens}
+
+Because pushdown automata need a stack to be able to parse arbitrary context-free grammars, we cannot decide entirely at preprocessing time whether a given terminal sequence can be accepted by a PDA at any given state---one has to inspect the content of the stack at execution time.
+% 
+However, many terminal sequences can be identified as always accepted or always rejected, independent of the current execution stack.
+
+\textit{Stack invariance} provides a sufficient condition for knowing when a sequence of terminals is accepted.
+
+% \loris{this is technical but we have no def of PDAs earlier. You can just have an informal def above where you say a PDA is like an FSA but can also push/pop on stack, therefore configs are pairs (q, gamma) and a push adds to gamma and a pop inspects top of gamma and pops}
+\begin{proposition}[Stack Invariance]
+If a PDA $\pushdown$ accepts an input sequence $w$ in state $q$ with stack configuration $\gamma$, 
+then $w$ is also accepted in the same state $q$ when the stack configuration is $\gamma' \cdot \gamma$ for some $\gamma'$ 
+(i.e., when $\gamma$ appears at the top of the stack with additional symbols beneath it).
+\end{proposition}
+
+% The proof follows from the fact that stack operations are restricted to the top of the stack, 
+% and hence the PDA never attempts to modify or inspect symbols below $\gamma$.
+
+
+It follows that a terminal sequence accepted by the PDA starting with an empty stack configuration is accepted under any stack configuration. 
+
+The following proposition shows how to construct a stack-free finite-state automaton that overapproximates the set of sequences accepted by a PDA.
+\begin{proposition}[Overapproximation via FSA]
+\label{prop:overapprox-fsa}
+Consider an FSA $\automaton_\pushdown$ obtained by removing all stack operations from a PDA $\pushdown$.
+If an input sequence $w$ is not accepted by $\automaton_\pushdown$ in state $q$, then $w$ cannot be accepted by $\pushdown$ in state $q$ with any stack configuration.
+\end{proposition}
+% Since the FSA $\automaton$ is obtained by removing all stack operations from the PDA $\pushdown$, 
+% any input sequence $w$ that is accepted by $\pushdown$ in some state $q$ with stack configuration $\gamma$ must also be accepted by the $\automaton$ in state $q$.
+
+% Not using as it says theorem instead of prop
+Following Proposition~\ref{prop:overapprox-fsa}, a terminal sequence is always rejected if it is rejected by the FSA obtained by removing all stack operations.
+% 
+
+
+The above reasoning can be formalized by computing the set of \textit{always-accepted tokens} $A$ and of \textit{context-dependent terminal sequences} $D$.
+%
+Given a lexer state $q^\automaton$ and a parser state $q^\pushdown$, we denote by $A(q^\automaton, q^\pushdown)$ the set of tokens that are accepted regardless of the stack configuration $\gamma$, and by $D(q^\automaton, q^\pushdown)$ the set of terminal sequences that may be accepted by some configuration $\gamma$. 
+%\loris{I thought you were computing the for sure rejected?}
+%\kh{that is only used to compute D}
+
+\autoref{alg:preprocess-parser} in Appendix A describes how to preprocess a parser to build a table of always-accepted tokens $A$ and context-dependent sequences $D$.
+
+\setcounter{algorithm}{5}
+
+% \paragraph{Contextual Lexing}
+
+% One challenge in lexical analysis arises when the same input sequence must be interpreted differently based on parsing context. 
+% For example, in Java, the end of the nested generic \texttt{List<List<T>{}>} could be erroneously tokenized by a lexer operating under maximal munch as $\texttt{>>}$, the right-shift operator. However, in this context the parser instead expects two consecutive \texttt{>} terminals denoting the closure of a generic type. 
+% To resolve this ambiguity, lexer must consider the parser’s current state. 
+% One approach involves allowing the lexer to nondeterministically generate both possible tokenizations (e.g., a single \texttt{>{}>} terminal or two separate \texttt{>} terminals) specifically for such cases, enabling the parser to select the valid interpretation based on grammatical constraints.

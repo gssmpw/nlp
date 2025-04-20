@@ -1,0 +1,300 @@
+\section{\Name{} Design}
+The essence of \Name{} lies in its innovative approach to uplink decoding, which is divided into two separated phases: "Early decoding" and "Completion decoding." Early decoding operates within a narrow time budget (e.g., 1ms) and is executed at the edge due to its time-sensitive nature. Completion decoding, on the other hand, has a more flexible time budget and can either be processed at the edge or offloaded to remote servers based on its latency requirements. This separation is facilitated by a split Distributed Unit (DU) architecture, which enables effective vRAN operations. \Name{} further enhances operational efficiency through a sophisticated framework for scheduling decoding tasks and managing offloading processes.
+
+In this two phase decoding strategy, we use task queues for managing the decoding flow. Specifically, incoming packets are initially forwarded to the early decoding queue, where they undergo decodability prediction and pre-parsing of the MAC PDU. The subsequent forwarding of these packets to specific completion decoding queues is based on their identified content and respective decoding delay budgets. This approach allows for packets with longer delay tolerances to be potentially offloaded to remote servers if the edge capacity is exceeded.
+
+\subsection{Decoding splitting}
+
+\begin{figure*}
+     \centering
+  \includegraphics[width=\linewidth]{figs/LLR_distribution.png}
+  \caption{LLR distribution of error/correct bits of an example decoding block}
+  \label{fig:LLR_distribution}
+\end{figure*}
+
+
+\subsubsection{Early decoding}\label{early_decoding}
+The early decoding phase in \Name{} serves two primary functions: (1) predicting the decodability of a Transport Block (TB), and (2) initiating the pre-parsing of subheaders within the MAC PDU encapsulated in that TB.
+
+The predictive capability of early decoding stems from an analysis of the average Log-Likelihood Ratio (LLR) values across early decoding iterations, which can indicate the likelihood of successful decoding before the final CRC check~\cite{EHARQ,LLRhspa,FastHarqURLLC}. This approach relies on the observation that extrinsic information, represented by LLRs, converges through successive iterations if the packet is decodable. Such convergence allows the base station to potentially pause the decoding early before CRC passing or the reaching of the maximum number of iterations. Conversely, a lack of convergence in the LLRs would suggest an undecodable packet.
+
+In \Name{}, each packet's early decoding phase integrates with decodability predictions, as shown in Algorithm~\ref{alg:Prediction}, to determine if further iterations are required. If the outcome remains uncertain (low LLRs), the process iterates until either the maximum iteration limit or the HARQ deadline is met. 
+We have two threshold vectors ($\vec{A}=[a_{0} \dotsm a_{m}]$, $\vec{N}=[n_{0} \dotsm n_{m}]$) that are used to predict the decodablity.
+This proactive prediction strategy contrasts with a prior passive method~\cite{Nuberu} that defers prediction until a decoding deadline is imminent, thus missing the opportunity for flexible scheduling based on deadline constraints
+
+Predicting decodability by itself is insufficient in a realistic RAN setting with diverse QoS requirements and MAC control loops. Treating all packets and bits equally fails to address the unique demands of latency-sensitive traffic and can disrupt MAC control loops. To address this, \Name{} enhances early decoding by not only predicting decodability through average LLR-based estimation but also by pre-parsing MAC subheaders to identify decoding content and MAC Control Elements (CEs) (to this end, we focus on BSR and PHR).
+
+We assess the correlation between the evolution of individual LLR values over iterations and the accuracy of their corresponding bits. Figure~\ref{fig:LLR_distribution} shows our analysis of a 1000-bit code block across 20 iterations and demonstrates the ability to utilize specific LLR values as indicators for bit correctness.
+For packets that fails in CRC checking before final completion of decoding, the correctness of a single bits can still be estimated based on its single LLR value.
+By examining the subheaders in an incompletely decoded packet, it is feasible to identify the PDU contents by extracting LCGIDs bits. Although the packet may not be fully decoded without passing CRC checking, the bit error rate post-prediction iterations is markedly lower. Given that headers represent a small fraction of the entire packet, we can achieve high accuracy in detecting subheaders for each sub-PDU.
+
+Unlike the single-header structure of LTE MAC PDUs, the 5G NR MAC PDU contains multiple subheaders, each preceding a MAC subPDU and providing the information necessary for decoding that subPDU.
+We devise an early parsing algorithm, Algorithm~\ref{alg:EarlyParsing}, specific to the 5G architecture, where each header includes a length field that indicates the position of subsequent subPDUs. Notably, MAC-CE subPDUs are positioned at the end of the MAC PDU. The algorithm scans from the beginning to the end of the PDU, retrieving headers to locate the MAC-CE headers via the "LCID" field. Packets with discerned MAC-CEs are expedited for decoding to ensure minimal latency. A threshold $L_t$ is used to estimate the correctness of each bit. 
+
+\begin{algorithm}
+\scriptsize % Set the font size
+\SetAlgoLined
+\KwResult{Decodability Prediction for LDPC Codeblock}
+\textbf{Input:} LLR values of the codeblock, Maximum iterations $I_{MAX}$, Threshold vectors $\vec{A}$, $\vec{N}$ for prediction\;
+\textbf{Output:} Decodability Status\;
+\textbf{Initialize:} $i \gets 0$, Decodability Status $\gets$ \textit{UNKNOWN}\;
+
+\While{$i < I_{MAX}$ \textbf{and} Decodability Status $=$ \textit{UNKNOWN}}{
+  $i \gets i + 1$\;
+  Get $L_i$ with one more decoding iteration\;
+  \For{each LLR value $L_i$ in the codeblock}{
+   \uIf{$L_i > a_i$}{
+    Decodability Status $\gets$ \textit{DECODABLE}\;
+    \textbf{break}\;
+   }
+   \uElseIf{$L_i < n_i$}{
+    Decodability Status $\gets$ \textit{NOT DECODABLE}\;
+    \textbf{break}\;
+   }
+  }
+  \uIf{Decodability Status $=$ \textit{UNKNOWN} \textbf{and} $i = I_{MAX}$}{
+   Decodability Status $\gets$ \textit{NOT DECODABLE}\;
+  }
+}
+$i_{prediction} \gets i$ \;
+\caption{Algorithm of decodability prediction}\label{alg:Prediction}
+\end{algorithm}
+
+\begin{algorithm}
+\scriptsize % Set the font size
+\SetAlgoLined
+\SetKwInput{KwInit}{Initialize}
+\KwInit{$i \gets i_{prediction}$ \tcp*{initial iteration index is set for prediction}}
+\SetKwFunction{FParsingSubHeader}{ParsingSubHeader}
+\SetKwProg{Fn}{Function}{}{end}
+\Fn{\FParsingSubHeader{$\vec{LLR}$, $Position_s$}}{
+   \uIf{all $l_k > L_t$ for each bit $k$ in $Position_s$}{
+      Extract $LCID_s$, $L_s$ \; \tcp{Get LCID and length of sub-PDU $s$}
+      \Return $True$\;
+   }
+   \Else{
+      \Return $False$\;
+   }
+}
+
+\While{$i < I_{MAX}$ \textbf{and} CRC check not passed}{
+   $i \gets i + 1$; $s \gets 0$; $Position_s \gets 0$\;
+   Get $\vec{LLR_i}$ with one more decoding iteration\;
+   \While{not reached the end of PDU}{
+      \uIf{\FParsingSubHeader{$LLR_i$, $Position_s$}}{
+         $s \gets s + 1$\;
+         $Position_s \gets Position_{s-1} + L_s$\;
+      }
+      \Else{
+         \textbf{break} \;
+         \tcp{Terminate the loop in the case when subheader parsing fails}
+      }
+   }
+}
+\caption{Algorithm for pre-parsing in early decoding}\label{alg:EarlyParsing}
+\end{algorithm}
+
+
+\iffalse
+\begin{algorithm}
+%\footnotesize % Set the font size here
+\scriptsize
+\SetAlgoLined
+\KwResult{Decodability Prediction for LDPC Codeblock}
+ \textbf{Input:} LLR values of the codeblock, Maximum iterations $I_{MAX}$, Threshold vectors $\vec{A}$, $\vec{N}$ for prediction\;
+ \textbf{Output:} Decodability Status\;
+ \textbf{Initialize:} $i \gets 0$, Decodability Status $\gets$ \textit{UNKNOWN}\;
+ 
+ \While{$i < I_{MAX}$ and Decodability Status $=$ \textit{UNKNOWN}}{
+  $i \gets i + 1$\;
+  Get $L_i$ with one more decoding iteration\;
+  \For{each LLR value $L_i$ in the codeblock}{
+   \uIf{$L_i > a_i$}{
+    Decodability Status $\gets$ \textit{DECODABLE}\;
+    \textbf{break}\;
+   }\uElseIf{$L_i < n_i$}{
+    Decodability Status $\gets$ \textit{NOT DECODABLE}\;
+    \textbf{break}\;
+   }
+  }
+  \uIf{Decodability Status $=$ \textit{UNKNOWN} and $i = I_{MAX}$}{
+   Decodability Status $\gets$ \textit{NOT DECODABLE}\;
+  }
+ }     $i_{prediction} \gets i$ \;
+ \caption{Algorithm of decodablity prediction}\label{alg:Prediction}
+\end{algorithm}
+
+\begin{algorithm}
+%\footnotesize % Set the font size here
+\scriptsize
+  \SetKwInput{KwInit}{Initialize}
+  \KwInit{$i \gets i_{prediction}$ \tcp*{initial iteration index is set for prediction}}
+  \SetKwFunction{FParsingSubHeader}{ParsingSubHeader}
+  \SetKwProg{Fn}{Function}{}{end}
+  \Fn{\FParsingSubHeader{$\vec{LLR}$, $Position_s$}}{
+     \uIf{all $l_k>L_t$ for each bit $k$ in $Position_s$}{
+        Extract $LCID_s$, $L_s$ \; \tcp{Get LCID and length of sub-PDU $s$}
+        \Return $True$\;
+     }
+     \Else{\Return $False$}
+  }
+
+  
+  \While{$i < I_{MAX}$ and CRC check not passed}{
+      $i \gets i + 1$; $s \gets 0$; $Position_s \gets 0$\;
+      Get $\vec{LLR_i}$ with one more decoding iteration\;
+        \While{not reached the end of PDU}{
+            %$Result \gets$ \FParsingSubHeader{$LLR_i$, $Position_s$}\;
+            %\uIf{$Result$}{
+            \uIf{\FParsingSubHeader{$LLR_i$, $Position_s$}}{
+                $s \gets s + 1$\;
+                $Position_s \gets Position_{s-1} + L_s$\;
+            }
+            \Else{
+                break \;
+                \tcp{Terminate the loop in the case when subheader parsing fails}
+
+            }
+        }
+
+  }
+  \caption{Algorithm for pre-parsing in early decoding}\label{alg:EarlyParsing}
+\end{algorithm}
+\fi
+
+\subsubsection{Completion decoding}
+After early decoding extracts critical bits and determines decoding status, additional iterations are needed for completion. The goal of this phase is to finish decoding packets and ensure every bit is correctly decoded (passing PDU CRC checking). To enable QoS differentiation for traffic streams and computation efficiency, we have separate queues for different delay budgets. PDUs are pushed into the queues based on the content with the lowest delay budget within the PDU. The schedculing and offloading details are provided in~\ref{scheduling framework}.
+
+
+\subsection{Split DU Architecture in \Name{}}
+\coloredtext{red}{
+To support decoding splitting, \Name{} incorporates a comprehensive DU split design, as depicted in Figure~\ref{fig:splitDU}. This design includes the splitting and/or duplication of DU stack components between the edge and remote sites, as well as the management of DU states and interfaces. The design leverages the inherent strengths of edge and remote processing, ensuring both efficiency and low latency.
+}
+
+\subsubsection{PHY component}
+\coloredtext{red}{
+Low PHY components such as channel estimation, FFT, and demodulation are localized at the edge. This ensures that upstream processing remains uninterrupted, leveraging the latency advantages of local processing. By keeping these critical components at the edge, \Name{} can guarantee quick and efficient initial processing of incoming data.
+In term of decoding, the early decoding phase is executed at the edge to quickly determine the decodability of Transport Blocks (TBs) and initiate pre-parsing of subheaders within the MAC PDU. If early decoding suggests that a TB is likely to be decodable, further processing can be deferred to the completion decoding phase, which may occur at the remote site or edge site depending on resource availability and latency requirements. For example, for AR/VR traffic with required low latency, completion decoding also remain at the edge. While for video traffic that can tolerate additional MH latency, it's completion decoding can be offloaded if needed.
+}
+
+\subsubsection{MAC component}
+\coloredtext{red}{
+Building on the split decoding, the split design extends to the MAC layer.
+The MAC scheduler is positioned at the edge due to its latency-sensitive nature. It takes decodability prediction results and MAC CE bits from pre-parsing as input for scheduling. Placing the MAC scheduler at the edge ensures that scheduling decisions can be made swiftly, enhancing the overall responsiveness of the network.
+The states that the MAC scheduler relies on are maintained solely at the edge. This centralized state management reduces synchronization overhead and simplifies the overall system design.
+}
+
+\coloredtext{red}{
+In the early decoding phase, MAC-CEs are identified through pre-parsing and extracted with the lowest delay budget. This necessitates distinguishing the MAC-CE sub-PDU processor from the general MAC PDU processor. By processing MAC-CEs promptly, \Name{} ensures that control loops remain efficient and responsive.
+The MAC PDU processor, a stateless function that does not depend on user or cell context stored in DU states, is replicated at both the edge and remote sites. This setup enables immediate processing of PDUs and efficient multiplexing of traffic streams after completion decoding. The replication of the MAC PDU processor facilitates a seamless transition between edge and remote processing, ensuring continuous and efficient handling of data packets.
+}
+
+\subsubsection{RLC Components}
+\coloredtext{red}{
+These entities manage functions such as segmentation, reassembly, and error correction to ensure reliable data transmission.
+RLC entities are deployed at edge or remote sites for different traffic flows. It would be straightforward to deploy RLC entities based on the traffic latency and its upstreaming decoding process.
+For critical traffic flows, RLC entities are deployed at the edge to minimize transmission delays and ensure timely data delivery. And for traffic flows that are less sensitive to latency, RLC entities are deployed at the remote site.
+}
+
+\subsubsection{Message Flows}
+\coloredtext{red}{
+Based on the placement of components of split DU, message flows are orchestrated accordingly. 
+RRC messages are routed back to the edge, maintaining a cohesive F1-C interface with the Centralized Unit (CU). Concurrently, SDUs of user traffic with high latency budget are directed to the remote site, interfacing with the CU via a separate F1-U channel that consolidates user traffic. 
+}
+
+\coloredtext{red}{
+This split DU arrangement ensures a clear demarcation of F1 interfaces between the split DUs and the CU, facilitating harmonious and efficient system operation. By streamlining message flows and interface management, \Name{} achieves a adaptable and optimized network architecture.
+}
+%1. No changes on LOW phy.
+%2. MAC control
+%3. MAC PDU processor. mac-ce, different QoS traffic, RRC messages
+%4. DU states manager at the edge
+
+\begin{figure}[h!]
+    \centering
+    \begin{subfigure}[t]{0.9\textwidth} % First subfigure
+        \centering
+        \includegraphics[width=\linewidth]{figs/splitDU.png}
+        \caption{\coloredtext{red}{Split DU architecture of \Name{}}}
+        \label{fig:splitDU}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[t]{0.9\textwidth} % Second subfigure
+        \centering
+        \includegraphics[width=\linewidth]{figs/archtecture.png}
+        \caption{\coloredtext{red}{\Name{} framework of scheduling and offloading}}
+        \label{fig:scheduling}
+    \end{subfigure}
+    \caption{Overall architecture and framework of \Name{}} % Main caption for the entire figure
+    \label{fig:architecture}
+\end{figure}
+
+
+\iffalse
+\begin{figure}
+\centering
+  \includegraphics[width=0.35\linewidth]{figs/splitDU.png}
+  \caption{\Name{} framework of scheduling and offloading}
+  \label{fig:scheduling}
+\end{figure}
+
+\begin{figure}
+\centering
+  \includegraphics[width=0.35\linewidth]{figs/archtecture.png}
+  \caption{\Name{} framework of scheduling and offloading}
+  \label{fig:scheduling}
+\end{figure}
+\fi
+
+\label{scheduling framework}
+\subsection{Decoding scheduling framework}
+The \Name{} design includes a scheduling framework to maximize the efficiency of edge computing and optimize the use of the Middle-Haul (MH) bandwidth. Illustrated in Figure~\ref{fig:scheduling}, this framework includes two interacting schemes: orchestrating decoding tasks at the edge and managing the offloading of completion decoding to remote servers. The design of this scheduling and offloading mechanism are based on several requirements.
+
+First, the framework should prioritize early decoding tasks due to their strict latency constraints, essential for meeting HARQ deadlines and timely MAC control actions. Missing these early decoding deadlines can lead to packet delivery failures and increased Block Error Rates (BLER), which in turn reduce throughput as BLER impacts link adaptation mechanisms. Delays in processing MAC control messages can trigger a cascade of negative effects on RAN performance, including inefficient spectral resource usage, scheduling latency breaches, and inaccurate power allocations.
+
+Second, the framework should account for the latency budget allocated for completion decoding, which is dependent on the specific content within the PDU packet. Inefficient handling of this phase, especially failing to complete decoding within the allocated time, results in squandering computational resources expended in the early decoding stages.
+
+Third, it should carry a discerning offloading policy that identifies the most opportune moments for migrating completion decoding tasks to remote servers. In other worrds, it should ensure an efficent usage of edge computing, aligning the immediate requirements of latency-sensitive decoding with the effective utilization of MH bandwidth, all aimed at minimizing overall latency.
+
+In this context, \Name{} introduces an edge queue scheduling strategy that dynamically distributes computational resources between early and completion decoding phases and an offloading policy that can further dynamically migrate completion decoding load to the remote.
+
+\subsubsection{Scheduling at edge}
+The goal of decoding task scheduling at the edge in \Name{} is to balance the load between early and completion decoding, while interacting with BLER-based link adaptation to adjust link load. I.e., the key idea is to use BLER-based link adaptation for load control.
+When there are sufficient CPU cores at edge, early decoding tasks should be prioritized to avoid being blocked by completion tasks, preventing missed prediction deadlines and unnecessary load reduction by link adaptation. Conversely, when computing resources are scarce, allowing more missed deadlines with NACKs (uncertain prediction outputs) can lift the BLER above the target threshold (5\%), triggering BLER-based load/link adaptation to reduce the decoding load.
+
+\Name{} employs the Earliest Deadline First (EDF) scheduling policy to manage decoding tasks at the edge. Multiple queues buffer decoding tasks based on their latency budgets. The early queue, with a small decoding time budget (e.g., 1 ms), handles low-latency early decoding tasks, while multiple completion queues handle tasks with varying latency budgets (e.g., 5-100 ms for different QoS levels). Within each queue, tasks are ordered by their remaining time budget, with the task having the shortest remaining time budget at the head of the line.
+Tasks are scheduled based on the remaining time budget before their deadlines. The scheduler compares the tasks at the heads of the different queues and schedules the one with the earliest deadline. When there are enough idle CPU cycles, completion decoding tasks are dequeued quickly, ensuring that early decoding tasks are prioritized when the head-of-line task has more than 1 ms remaining. Conversely, when CPU cores are scarce, completion tasks may have less than 1 ms remaining and are thus prioritized.
+
+
+This dynamic adjustment ensures optimal prioritization and efficient use of computational resources, balancing the need to meet early decoding deadlines with the overall decoding load. By integrating link adaptation, EDF scheduling dynamically adjusts to the edge's decoding capacity, ensuring effective management of decoding tasks.
+In other words, the pressure of completion decoding load will increase the early decoding missing rate, which can trigger link adaptation to reduce the decoding load.
+\Name{} is able to maintain the BLER of 5\% with dynamic traffic and maximize the utlization of edge decoding capacity.
+
+
+\subsubsection{Offloading to remote}
+\label{offload}
+\coloredtext{red}{
+To alleviate the pressure on completion decoding loads, \Name{} implements an adaptive offloading control algorithm that dynamically balances the distribution of completion decoding tasks between edge and remote locations. This algorithm employs dynamic offload queuing control to maintain a balance between Middle-Haul (MH) bandwidth usage and decoding latency. 
+Overly aggressive offloading can lead to increased demands on MH bandwidth, while insufficient offloading can cause congestion at the edge, resulting in higher latency due to backlogs in the completion decoding queue.
+}
+
+\coloredtext{red}{
+In \Name{}, a single offloading queue buffers packets destined for remote decoding. This mechanism helps efficiently manage the flow of data between the edge and remote servers. The offloading criteria are based on the queuing delay within the offloading queue and the completion decoding queues. The following equation encapsulates this approach:
+}
+
+\begin{equation}
+\label{eq_off}
+Offload_{i}^{q} = 
+\begin{cases}
+1, & \text{if } L_{i}^{o}-L_{i}^{MH} < L_{i}^{q} \\
+0, & \text{if } L_{i}^{o}-L_{i}^{MH} \geq L_{i}^{q}
+\end{cases}
+\end{equation}
+
+\coloredtext{red}{
+At each defined period $i$, the criteria are computed where $L_{i}^{o}$ denotes the queuing latency of the offloading queue and $L_{i}^{q}$ represents the queuing latency of the completion queue $q$.
+\Name{} measures the Head of Line queuing latency of all the queues based on timestamps created when early decoding tasks arrive at the edge DU. The equation signifies that when the difference between the queuing latency for offloading and the queuing latency for edge completion decoding is less than the MH latency $L_{i}^{MH}$, offloading is initiated (indicated by 1) for queue $q$. Conversely, if this condition is not met, offloading is not performed (indicated by 0). This strategic decision-making ensures optimal resource utilization and maintains system efficiency.
+To estimate MH latency, we measures the round-trip time (RTT) of the offloaded decoding packet along with its decoding feedback from remote to edge.
+}
+
+

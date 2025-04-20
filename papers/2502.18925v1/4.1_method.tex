@@ -1,0 +1,194 @@
+\section{Method}
+\textbf{Problem Definition.} We investigate spatiotemporal prediction tasks spanning meteorological forecasting~\cite{bi2023accurate}, computational fluid dynamics~\cite{wu2024prometheus}, and PDE-based systems~\cite{wu2024neural}. The observational data is structured as a 4D tensor $\mathbf{X} \in \mathbb{R}^{T \times C \times H \times W}$, where $T$ denotes temporal steps, $C$ represents physical variables (temperature, pressure, velocity fields), and $(H,W)$ specify spatial resolution. Our objective is to learn a parametric mapping $f_\Theta: \mathbf{X}_t \mapsto \hat{\mathbf{Y}}_{t+1}$ that predicts subsequent system states from historical sequences $\mathbf{X}_t = \{\mathbf{X}_1, ..., \mathbf{X}_t\}$. The parameters $\Theta$ are optimized through maximum likelihood estimation:
+\begin{equation}
+\Theta^* = \arg\max_{\Theta} \sum_{i=1}^T \log P(\mathbf{Y}_{t+1}^i | \mathbf{X}_t^i; \Theta)
+\end{equation}
+where $P(\mathbf{Y}_{t+1}^i | \mathbf{X}_t^i; \Theta)$ defines the predictive distribution. The optimized model enables multi-step forecasting via iterative rollout $\hat{\mathbf{Y}}_{t+k} = f_\Theta(\{\mathbf{X}_t, \hat{\mathbf{Y}}_{t+1}, ..., \hat{\mathbf{Y}}_{t+k-1}\})$, crucial for applications requiring temporal extrapolation in climate modeling~\cite{bi2023accurate}, combustion dynamics~\cite{anonymous2024openck}, and fluid simulations~\cite{wupure}.
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=1\textwidth]{image/ICML_beamvq_main.png}
+\caption{\textbf{Architecture Overview of~\method{}.}  
+(a) \textbf{Stage $1$: Base Model Training}: A deterministic predictor (FNO/ViT/ConvLSTM) learns single-step mappings $\mathbf{X}_t \xrightarrow{f_{\Theta_f}} \hat{\mathbf{Y}}_{t+1}$ via MSE minimization.  
+(b) \textbf{Stage $2$: Top-K VQ-VAE}: Latent code $\mathbf{z}$ from encoder $e_{\Phi_h}$ is quantized to $K$ nearest codebook vectors $\{\mathbf{q}^{(k)}\}$, decoded to diverse predictions $\{\tilde{\mathbf{Y}}_{t+1}^{(k)}\}$.  
+(c) \textbf{Joint Optimization}: The optimal reconstruction $\tilde{\mathbf{Y}}_{t+1}^*$ (selected by metric $M$) guides base model refinement, while top-$K'$ ensemble $\bar{\mathbf{Y}}_{t+1}$ enables self-training.} 
+\label{fig:Idea_main} 
+\end{figure*}
+
+\textbf{Architecture Overview.} Our framework comprises three core stages of progressive refinement, as shown in Figure \ref{fig:Idea_main}. Initially, we train a base spatiotemporal predictor $f_\Theta$ that processes historical observations $\mathbf{X}_t \in \mathbb{R}^{1 \times C \times H \times W}$ (single-step training) to generate next-step predictions $\hat{\mathbf{Y}}_{t+1} = f_\Theta(\mathbf{X}_t)$. Subsequently, we develop a Top-K VQ-VAE $h_{\phi}$ through codebook-based pretraining, where the encoder $e_\phi$ maps $\hat{\mathbf{Y}}_{t+1}$ to latent code $\mathbf{z}$, quantized via K-nearest codebook vectors $\{\mathbf{q}^{(k)}\}_{k=1}^K \subset \mathcal{C}$, followed by decoder $d_\phi$ reconstruction to yield diverse outputs $\{\tilde{\mathbf{Y}}_{t+1}^{(k)}\}$. During joint optimization, we employ a non-differentiable metric $M$ (e.g., Critical Success Index~\cite{gao2022earthformer}) to select the optimal reconstruction $\tilde{\mathbf{Y}}_{t+1}^*$, then minimize $\|\tilde{\mathbf{Y}}_{t+1}^* - \mathbf{Y}_{t+1}\|_2^2$ to refine $f_\Theta$, while augmenting training data with ensemble averages of top-$K'$ candidates. For multi-step inference, beam search~\cite{steinbiss1994improvements} maintains $K$ trajectory candidates per step, progressively selecting optimal sequences through metric-guided pruning.
+
+\subsection{Stage $1$: Pre-training the Base Prediction Model}
+We first develop a foundational predictor $f_{\Theta}$ that learns deterministic spatiotemporal dynamics from observational data. The model ingests input tensors $\mathbf{X}_t \in \mathbb{R}^{1 \times C \times H \times W}$ (single-step temporal context during training) and generates predictions $\hat{\mathbf{Y}}_{t+1} = f_{\Theta}(\mathbf{X}_t)$ through parametric mapping $f_{\Theta}: \mathbb{R}^{C \times H \times W} \to \mathbb{R}^{C \times H \times W}$. Architectural implementations are task-adaptive: Fourier Neural Operators (FNO)~\cite{li2020fourier} for spectral systems governed by PDEs, Vision Transformers~\cite{dosovitskiy2020image} for global dependency modeling, or ConvLSTM~\cite{shi2015convolutional} networks for local spatiotemporal correlations. The parameters $\Theta$ are learned by minimizing the reconstruction error:
+\begin{equation}
+\mathcal{L}_{\text{base}} = \mathbb{E} \left\| \hat{\mathbf{Y}}_{t+1} - \mathbf{Y}_{t+1} \right\|_2^2
+\end{equation}
+where the expectation is over training pairs $(\mathbf{X}_t, \mathbf{Y}_{t+1})$. Optimization employs gradient-based methods (Adam)~\cite{kingma2014adam} with learning rate annealing, ensuring stable convergence. This stage establishes a strong deterministic prior that captures dominant physical patterns - for instance, FNO architectures learn Green's functions in Fourier space for fluid dynamics, while transformer variants attend to long-range atmospheric interactions. The trained $f_{\Theta^*}$ provides initial point estimates for subsequent uncertainty-aware refinement.
+
+\subsection{Stage $2$: Top-K VQ-VAE Pre-training}  
+We construct a variational quantization framework $h_\Phi = (e_\Phi, \mathcal{C}, d_\Phi)$ to learn diverse reconstructions from deterministic predictions. Given the base model output $\hat{\mathbf{Y}}_{t+1}$, the encoder $e_\Phi$ projects it to latent code:
+\begin{equation}
+\mathbf{z} = e_\Phi(\hat{\mathbf{Y}}_{t+1}) \in \mathbb{R}^{d_z}
+\end{equation}
+A codebook $\mathcal{C} = \{\mathbf{c}_i\}_{i=1}^N \subset \mathbb{R}^{d_z}$ with $N$ entries enables Top-K vector quantization:
+\begin{equation}
+\mathbf{q}^{(k)} = \mathop{\text{argmin}}_{\mathbf{c} \in \mathcal{C}} \|\mathbf{z} - \mathbf{c}\|_2^2 \quad \text{for } 1 \leq k \leq K
+\end{equation}
+The decoder $d_\Phi$ reconstructs $K$ variants through parallel decoding:
+\begin{equation}
+\tilde{\mathbf{Y}}_{t+1}^{(k)} = d_\Phi(\mathbf{q}^{(k)}), \quad 1 \leq k \leq K
+\end{equation}
+The training objective combines three components:
+\begin{equation}\small
+\mathcal{L}_{\text{VQ}} = \underbrace{\|\tilde{\mathbf{Y}}_{t+1}^{(1)} - \mathbf{Y}_{t+1}\|_2^2}_{\text{Reconstruction}} + \underbrace{\|\text{sg}[\mathbf{z}] - \mathbf{q}^{(1)}\|_2^2}_{\text{Codebook Learning}} + \beta\underbrace{\|\mathbf{z} - \text{sg}[\mathbf{q}^{(1)}]\|_2^2}_{\text{Commitment}}
+\end{equation}
+where $\text{sg}[\cdot]$ denotes stop-gradient operator and $\beta$ balances latent commitment. This design ensures:  
+\textbf{(1)} Accurate primary mode reconstruction via $\tilde{\mathbf{Y}}_{t+1}^{(1)}$ optimization;  
+\textbf{(2)} Codebook diversity preservation through Top-K retrieval;  
+\textbf{(3)} Stable encoder-codebook alignment via commitment loss.
+
+We conducted several experiments to verify the effect of selecting different $K$. And we use an optimization to explain how to choose $K$ to achieve the best performance.
+
+\begin{theorem}
+    The best selection of $K$ is determined by the numerical solution of the following optimization problem
+    \begin{align}
+    & \arg\min_{\boldsymbol{\pi}}\quad h(\boldsymbol{\pi},\mathbb{T}):=\boldsymbol{\pi}^\top A_\mathbb{T}\boldsymbol{\pi}, \\
+    & \text{subject to} \quad
+        \begin{cases}
+            \sum_{i = 1}^N\pi_iT_i\leq\alpha, \\
+            \sum_{i = 1}^N\pi_i = 1, \\
+            0\leq\pi_i\leq m^{-1}, \quad 1\leq i\leq N.
+        \end{cases}
+    \end{align}
+    where $\pi_i$ is the sampling probability of the augmented data
+\end{theorem}
+
+For details of the proof, please refer to Appendix~\ref{sec:proof}.
+
+The pre-trained $h_{\Phi^*}$ establishes a structured latent manifold~\cite{han2018structured} that encapsulates both predictive fidelity and uncertainty, which will be leveraged in Stage $3$ for probabilistic refinement.
+
+
+\subsection{Stage $3$: Joint Optimization}  
+We develop a dual-phase optimization framework to refine the base predictor $f_\Theta$ using the frozen Top-K VQ-VAE $h_\Phi$. The process iterates between:
+\begin{equation}
+\hat{\mathbf{Y}}_{t+1} = f_\Theta(\mathbf{X}_t), \quad \{\tilde{\mathbf{Y}}_{t+1}^{(k)}\}_{k=1}^K = h_\Phi(\hat{\mathbf{Y}}_{t+1})
+\end{equation}
+where $h_\Phi$ remains fixed with $\Phi = \Phi^*$ from Stage $2$. A domain-specific metric $M$ (e.g., Critical Success Index) evaluates each reconstruction:
+\begin{equation}
+s^{(k)} = M(\tilde{\mathbf{Y}}_{t+1}^{(k)}, \mathbf{Y}_{t+1}), \quad k \in [1,K]
+\end{equation}
+\textbf{Optimization Cycle is as follows:}
+
+1. \textit{Optimal Guidance}: Select the highest-scoring variant  
+\begin{equation}
+k^* = \mathop{\arg\max}\limits_{k} s^{(k)}, \quad \mathcal{L}_{\text{guide}} = \|\tilde{\mathbf{Y}}_{t+1}^{(k^*)} - \mathbf{Y}_{t+1}\|_2^2
+\end{equation}
+
+2. \textit{Ensemble Distillation}: Aggregate top-$K'$ candidates  
+\begin{equation}
+\bar{\mathbf{Y}}_{t+1} = \frac{1}{K'}\sum_{k=1}^{K'} \tilde{\mathbf{Y}}_{t+1}^{(k_{\text{top}})}
+\end{equation}
+where $k_{\text{top}}$ indexes the $K'$ highest $s^{(k)}$.
+
+3. \textit{Parameter Update}:  
+\begin{equation}
+\Theta \leftarrow \Theta - \eta\nabla_\Theta(\mathcal{L}_{\text{guide}} + \lambda\|\hat{\mathbf{Y}}_{t+1} - \bar{\mathbf{Y}}_{t+1}\|_2^2)
+\end{equation}
+The frozen VQ-VAE acts as an uncertainty-aware teacher: $\mathcal{L}_{\text{guide}}$ aligns predictions with metric-optimal reconstructions. Ensemble distillation $\bar{\mathbf{Y}}_{t+1}$ mitigates exposure bias through data augmentation. Hyperparameter $\lambda$ balances direct supervision and distributional smoothing  
+
+% This dual optimization propagates gradient signals through both deterministic predictions and codebook-induced variations, enhancing the base model's capacity to capture:  
+% i) Dominant dynamical modes via $\mathcal{L}_{\text{guide}}$  
+% ii) Capturing distributional diversity via ensemble regularization 
+% iii) Extreme event signatures through metric-aware selection  
+
+% The algorithm terminates when validation $M$ saturates, yielding $f_{\Theta^\dagger}$ with improved physical consistency and uncertainty quantification.
+
+
+\subsection{Inference Stage with Beam Search}
+We propose a novel beam search protocol that synergizes the base predictor $f_\Theta$ with the diversity-generating VQ-VAE $h_\Phi$. The algorithm maintains $B$ candidate trajectories to balance exploration (via codebook variations) and exploitation (through metric-guided selection), crucial for chaotic systems where small deviations amplify exponentially. The procedure (Algorithm~\ref{alg:beam_search}) operates in three phases:
+
+
+\textbf{Initialization}: Generate $K$ initial variants from $\mathbf{X}_t$ using the VQ-VAE's decoding diversity
+
+\textbf{Iterative Rollout}: At each step $n$, expand $B$ candidates into $B\times K$ possibilities using the codebook
+
+\textbf{Trajectory Selection}: Retain top-$B$ paths based on accumulated scores $s_n^{(b,k)} = \sum_{m=t+1}^n S(\tilde{\mathbf{Y}}_m^{(b,k)})$
+
+
+\begin{algorithm}[h]
+\SetAlgoLined
+\DontPrintSemicolon
+\caption{Beam Search with Codebook Variations}\label{alg:beam_search}
+\KwIn{Initial state $\mathbf{X}_t \in \mathbb{R}^{C\times H\times W}$, beam width $B$, horizon $N$}
+\KwOut{Optimal trajectory $\{\tilde{\mathbf{Y}}_{t+1}^*,...,\tilde{\mathbf{Y}}_{t+N}^*\}$}
+  
+\emph{// Phase 1: Initialization}\;
+$\hat{\mathbf{Y}}_{t+1} \leftarrow f_\Theta(\mathbf{X}_t)$\;
+$\{\tilde{\mathbf{Y}}_{t+1}^{(k)}\}_{k=1}^K \leftarrow h_\Phi(\hat{\mathbf{Y}}_{t+1})$\;
+$\mathcal{B}_{t+1} \leftarrow \text{Top-}B\left( \{ (\tilde{\mathbf{Y}}_{t+1}^{(k)}, S(\tilde{\mathbf{Y}}_{t+1}^{(k)})) \}_{k=1}^K \right)$\;
+
+\emph{// Phase 2: Iterative Rollout}\;
+\For{$n \leftarrow t+2$ \textbf{to} $t+N$}{
+    $\mathcal{C}_n \leftarrow \emptyset$\;
+    \ForEach{beam $b \in \mathcal{B}_{n-1}$}{
+        $\hat{\mathbf{Y}}_n^{(b)} \leftarrow f_\Theta(\tilde{\mathbf{Y}}_{n-1}^{(b)})$\; 
+        $\{\tilde{\mathbf{Y}}_n^{(b,k)}\}_{k=1}^K \leftarrow h_\Phi(\hat{\mathbf{Y}}_n^{(b)})$\;
+        \For{$k\leftarrow 1$ \textbf{to} $K$}{
+            $s_n^{(b,k)} \leftarrow s_{n-1}^{(b)} + \alpha^{n-t}S(\tilde{\mathbf{Y}}_n^{(b,k)})$\; 
+            $\mathcal{C}_n \leftarrow \mathcal{C}_n \cup \{(\{\tilde{\mathbf{Y}}\text{ sequence}\}, s_n^{(b,k)})\}$\;
+        }
+    }
+    $\mathcal{B}_n \leftarrow \mathop{\arg\max}\limits_{\substack{\mathcal{S}\subset\mathcal{C}_n \\ |\mathcal{S}|=B}} \sum_{(\cdot,s)\in\mathcal{S}} s$\;
+}
+
+\emph{// Phase 3: Terminal Selection}\;
+$\{\tilde{\mathbf{Y}}^*\} \leftarrow \mathop{\arg\max}\limits_{(\mathcal{Y},s)\in\mathcal{B}_{t+N}} s$\;
+
+\Return $\{\tilde{\mathbf{Y}}_{t+1}^*,...,\tilde{\mathbf{Y}}_{t+N}^*\}$\;
+\end{algorithm}
+
+\paragraph{Key Enhancements}  
+Our beam search extends conventional approaches through:
+
+\begin{itemize}
+\item \textbf{Codebook-Driven Diversity}: The VQ-VAE generates $K$ physically-plausible variations at each step, avoiding mode collapse in chaotic systems. For weather prediction, this captures alternative storm trajectories that single-point estimates miss.
+
+\item \textbf{Exponential Score Discounting~\cite{wang2024nuwadynamics}}: The term $\alpha^{n-t}$ ($\alpha \in (0,1]$) in the scoring function prioritizes recent accuracy, crucial for non-stationary processes. This implements:
+\begin{equation}
+s_n^{(b,k)} = \sum_{m=t+1}^n \alpha^{n-m} S(\tilde{\mathbf{Y}}_m^{(b,k)})
+\end{equation}
+\item \textbf{Dynamic Beam Pruning}: The selection operator $\arg\max_{\mathcal{S}}$ solves a knapsack-like optimization to maximize total score while maintaining beam width $B$. This is equivalent to:
+\begin{equation}
+\mathcal{B}_n = \underset{\mathcal{S}}{\text{maximize}} \sum_{(\cdot,s)\in\mathcal{S}} s \quad \text{s.t. } |\mathcal{S}| \leq B
+\end{equation}
+\end{itemize}
+The whole algorithm of the proposed~\method{} is summarized in Algorithm~\ref{alg:framework}.
+\begin{algorithm}[h]
+\SetAlgoLined
+\DontPrintSemicolon
+\caption{Unified Framework of \method{}}\label{alg:framework}
+\KwIn{Historical observations $\mathbf{X}_t$, prediction horizon $N$}
+\KwOut{Optimal trajectory $\{\tilde{\mathbf{Y}}_{t+1}^*, ..., \tilde{\mathbf{Y}}_{t+N}^*\}$}
+
+\emph{// Stage $1$: Base Model Training}\;
+Initialize predictor $f_\Theta$ \;
+Train $f_\Theta$ via $\min_\Theta \|\hat{\mathbf{Y}}_{t+1} - \mathbf{Y}_{t+1}\|_2^2$\;
+
+\emph{// Stage $2$: VQ-VAE Codebook Learning}\;
+Learn encoder $e_\Phi$, decoder $d_\Phi$, codebook $\mathcal{C}$\;
+Generate $K$ variants $\{\tilde{\mathbf{Y}}_{t+1}^{(k)}\}$ per prediction\;
+
+\emph{// Stage $3$: Joint Optimization}\;
+\While{not converged}{
+    Generate candidates $\{\tilde{\mathbf{Y}}_{t+1}^{(k)}\}$ via $h_\Phi$\;
+    Select best candidate $\tilde{\mathbf{Y}}_{t+1}^*$ using metric $M$\; 
+    Update $f_\Theta$ with $\tilde{\mathbf{Y}}_{t+1}^*$ and top-$K'$ ensemble\;
+}
+
+\emph{// Stage $4$: Beam Search Inference}\;
+Initialize beam with top-$B$ candidates\;
+\For{$n = t+1$ \textbf{to} $t+N$}{
+    Expand each beam with $K$ codebook variants\;
+    Keep top-$B$ trajectories by accumulated scores\;
+}
+\Return Best trajectory from final beam\;
+\end{algorithm}

@@ -1,0 +1,166 @@
+\putsec{sw-optim}{Software Optimizations and Limitations}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\begin{figure}[t]
+  \centering     
+  \includegraphics[width=\columnwidth]{figures/in-shader-perf.pdf}
+  \caption {Normalized rasterization time of the ROP-based blending and
+  in-shader blending with an OpenGL extension (log scale).}
+  \vspace{-0.10in}
+  \label{fig:in-shader-perf}
+\end{figure}
+
+\putssec{in-shader-blending}{Performing In-Shader Blending}
+
+One approach to reduce the ROP pressure might be performing raster operations,
+particularly pixel blending, in the fragment shader. While one may think that
+this could take advantage of the high parallelism of shader cores, we cannot
+na\"ively perform blending in the fragment shader because we need to ensure the
+blending order of fragments to obtain accurate pixel colors. 
+%
+Even though graphics hardware forms thread blocks and dispatches them to the
+shader cores in order, the fragment threads corresponding to the same pixel can
+run \emph{out-of-order} due to warp scheduling policy and memory systems (e.g.,
+cache hits/misses, memory controller). As a result, performing in-shader
+blending without additional mechanisms does not prevent fragment threads from
+violating the blending order and atomicity, thereby producing an incorrect
+pixel color.
+
+Recently, several standard graphics APIs offer an extension that enables the
+use of a critical section in the fragment shader, such as \texttt{\small
+GL\_ARB\_fragment\_shader\_interlock} in OpenGL and \texttt{\small
+VK\_EXT\_fragment\_shader\_interlock} in Vulkan, where an order of lock
+acquisition can be configured to follow the order of fragments.
+%
+We implement in-shader blending by modifying the fragment shader with the
+OpenGL extension. After discarding the fragments with alpha values below the
+threshold (i.e., $\epsilon$=$\frac{1}{255}$) through alpha pruning, alive
+threads (fragments) attempt to acquire a lock by calling \texttt{\small
+beginInvocationInterlockARB}.\footnote{We configure the extension so that
+entering the critical section follows the order of the fragments.}
+%
+Inside the critical section, the pixel (RGBA) load, blend, and store operations
+are performed in an atomic manner. By releasing the lock after the store, the
+next fragment thread in line enters the critical section and reads the valid
+pixel color.
+
+We observe that in-shader blending for Gaussian splatting performs
+substantially worse than ROP-based blending, as shown in
+\figref{in-shader-perf}. 
+%
+The significant drop in performance is mainly due to the overhead of the
+locking mechanism rather than the raster operations. 
+%
+As we can see, in-shader blending \emph{without} interlocking, which allows
+fragment threads to run in parallel to access and update the same pixel in
+non-deterministic order, performs close to or faster than ROP-based rendering.
+However, it does not guarantee the exact blending results.
+%
+In summary, we conclude that it is necessary to use ROPs for blending in terms
+of performance and preciseness in volume rendering.
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\begin{algorithm}[t]
+\caption{Multi-Pass Rendering with Early Termination}
+\label{alg:multipass}
+\renewcommand{\algorithmicrequire}{\textbf{Input:}}
+\renewcommand{\algorithmicensure}{\textbf{Output:}}
+\begin{algorithmic}[1]
+  \small
+  \REQUIRE N; Number of passes, G; Gaussians, View; Viewpoint
+  \ENSURE  Pixels; RGBA pixel colors
+
+  \STATE Pixels $\gets$ 0; Stencils $\gets$ 0
+  \STATE Splats, Depths $\gets$ Preprocess(G, View)
+  \STATE SortedIdx $\gets$ SortGaussians(Depths)
+  \STATE Batches $\gets$ SplitIntoNBatches(Splats, SortedIdx)
+
+  \FOR{each $i$ from 1 to N}
+  \STATE \textbf{// Draw call with the $i$-th batch of splats}
+  \STATE Pixels $\gets$ DrawBatch(Batches[$i$], Pixels, Stencils)
+  \IF{$i <$ N}
+  \STATE \textbf{// Stencil buffer update for terminated pixels}
+  \STATE Stencils $\gets$ EarlyTerminate(Pixels.A, Stencils)
+  \ENDIF
+  \ENDFOR
+\end{algorithmic}
+\end{algorithm}
+
+\putssec{multipass}{Software-Based Early Termination}
+
+To demonstrate the effectiveness of hardware-based early termination, we first
+implement software-based (OpenGL) early termination via conventional multi-pass
+rendering approaches~\cite{kru:wes03}.
+%
+The key concept of the multi-pass approach for early termination is to render
+an image with \emph{multiple} draw calls. If a pixel is terminated on the
+$i$-th draw call due to an early termination condition (i.e., $\alpha$ $\geq$
+0.996), we skip processing the fragments of the terminated pixel from the
+$(i+1)$-th draw call using a stencil test.\footnote{The stencil test is one of
+the raster operations, which controls fragment processing by comparing the
+per-pixel stencil value in a stencil buffer with the predefined reference
+value.}
+%
+As the original algorithm~\cite{kru:wes03} was devised for texture-based volume
+rendering, we begin by describing our algorithm for Gaussian splatting.
+
+\algref{multipass} outlines the procedure for multi-pass rendering with early
+termination. Initially, the colors and stencil values of pixels are set to 0. A
+stencil value of zero indicates that the corresponding pixel has not yet been
+terminated. 
+%
+For $\mathrm{N}$-pass rendering, the algorithm first divides the depth-ordered
+splats equally into $\mathrm{N}$ batches after preprocessing and sorting. It
+then iterates through multiple passes, with each pass consisting of two draw
+calls.
+%
+In the first call, we \emph{partially} update the colors of the pixels that
+pass the stencil test (i.e., stencil value == 0). In the second call, we update
+the stencil values for the pixels that meet the termination condition in the
+first call.
+
+To update the stencil value, the second call renders a screen-sized rectangle
+composed of two triangles using a different fragment shader and stencil test.
+%
+The rasterizer produces a fragment for every pixel, which is sent to the
+fragment shader. Each fragment in the shader loads the alpha of the pixel and
+is discarded if the pixel is not terminated yet (i.e., $\alpha$ $<$ 0.996).
+%
+After the shading, the stencil test is performed for the non-discarded
+fragments, which represent the terminated pixel locations up to this pass, and
+updates the stencil values to 1.
+%
+Consequently, the fragments of early-terminated pixels are not shaded or
+blended in subsequent passes, reducing the ROP pressure.
+
+\begin{figure}[t]
+  \centering     
+  \includegraphics[width=\columnwidth]{figures/multipass-perf.pdf}
+  \caption {Performance of software-based early termination (OpenGL) with multi-pass
+  rendering across the number of passes.} 
+  \vspace{-0.20in}
+  \label{fig:multipass-perf}
+\end{figure}
+
+\figref{multipass-perf} shows the speedup of software-based early termination
+according to the number of passes. The baseline is the original OpenGL-based
+rendering, where the number of passes ($\mathrm{N}$) is 1. The performance is
+influenced by two factors: the reduction in the number of fragments due to
+early termination and the overhead from additional draw calls for stencil
+updates. While using a larger $\mathrm{N}$ can reduce fragments more by
+checking early termination in a finer-grained manner, it also increases the
+overall overhead of stencil updates.
+%
+As a result, for the scenes with low fragment reduction (e.g., Bonsai, Kitchen)
+or already short rendering times (e.g., Lego, Palace), the performance
+improvement is marginal, or it performs worse than the baseline due to the
+overhead.
+% 
+In large scenes with more fragment reduction (e.g., Train, Truck), we can
+observe a speedup, but it does not reach its full potential due to the stencil
+update overhead, which hardware-based early termination helps avoid.
+%
+In addition, the optimal number of passes varies depending on the scene and
+viewpoint, making the software-based approach less practical. Support for
+hardware-based early termination can also help address this issue.

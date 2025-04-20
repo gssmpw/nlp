@@ -1,0 +1,67 @@
+\section{Ootomo and Yokota Case Study}\label{sec:ootomo-case-study}
+
+While tensor cores provide high-performance, their FP16 inputs mean they have low precision. 
+Ingenious methods have therefore been developed to take advantage of tensor cores' performance without sacrificing precision.
+One such method was proposed by \citet{markidis}, which introduced a residual matrix to record the loss of mantissa (the difference between FP32 and FP16 inputs) which can then be used to recover precision. A similar technique was used by \citet{fasi2023matrix} (which we abbreviate to O-Y). For a matrix product $A\cdot B$, the residual matrices $R_A$ and $R_B$ are calculated as the difference between the single-precision and half-precision representations of A and B as $R_A = A_{f32} - A_{f16}$ and $R_B = B_{f32} - B_{f16}$ respectively. The final recovered result is calculated using 
+\begin{equation*}
+A_{f32}\cdot B_{f32} = R_AR_B + A_{f16}R_B + R_AB_{f16} + A_{f16}B_{f16}
+\end{equation*}
+
+To further reduce the error, \citet{ootomo2022recovering} (which we abbreviate to O-Y) improved \citeauthor{markidis} method by incorporating rounding to nearest in the accumulator by performing accumulation outside of the tensor core unit. Additionally, they implemented scaling when computing the residual matrix. The updated procedure is as follows:
+
+\begin{align*}
+R_A &= (A_{f32} - A_{f16}) \cdot 2^{11} \text{\hspace{2em}}
+R_B = (B_{f32} - B_{f16}) \cdot 2^{11} \\
+A_{f32} B_{f32} &= \frac{R_AR_B}{2^{22}} + \frac{A_{f16}R_B + R_AB_{f16}}{2^{11}} + A_{f16}B_{f16} \\
+D &= RN(A_{f32}B_{f32} + C)
+\end{align*}
+where $2^{11}$ is the scaling factor and RN denotes rounding to nearest.
+
+The O-Y method is meant to improve the error correction of \citeauthor{markidis}'s at the cost of extra computation.  Using our models from Section~\ref{sec:fasi-case-study}, we implement both error correction methods described by the paper in SMT.  We then attempt to prove that the absolute accuracy for one of the final elements of the matrix, when using \cite{ootomo2022recovering} method, can never be worse than \cite{markidis}. To do this, we ask an SMT solver to prove the following formula:
+\begin{myprop}
+$\exists~\text{inputs}~s.t.~|Markidis(inputs) - actual(inputs)| < |Ootomo(inputs) - actual(inputs)|$ 
+\end{myprop}
+Where $Markidis$ and $Ootomo$ correspond to the result of one element in the final matrix computed using equation (6) and equation (24) from \citet{ootomo2022recovering}, respectively; $actual$ corresponds to the result obtained by performing the dot product in double precision. We also restrict the exponent ranges for the inputs to $2^{\text{-}15}$ and $2^{14}$ as was done for O-Y's Type 1 experiments.
+
+Table \ref{tab:markidi-v-ootomo} shows the values for which O-Y's method has a higher error than \citeauthor{markidis}'s.  For this single query, it takes cvc5 less than 5 minutes
+to find values for which the error using O-Y's method can be worse.  This is not to say that O-Y's method is worse overall, but rather proves that it is not more accurate for every input.  Nor does this contradict their empirical results showing that their method was more accurate in general.  In \citet{ootomo2022recovering}, it was noted that one of the main contributors to the error was due to the round-to-zero mode of tensor cores.  This means that for many cases, performing the accumulation outside of tensor cores can \emph{improve} the accuracy of the final result.  However, as we showed in section \ref{sec:fasi-case-study}, tensor cores do not normalize the intermediate sums.  This lack of normalization between each addition can improve the final accuracy by keeping parts of the mantissa that would have been lost during the normalization step thus making O-Y's method worse on some inputs.
+
+\begin{table}
+\centering
+\small
+\caption{\label{tab:markidi-v-ootomo}Inputs which show the the error of \citet{ootomo2022recovering} \textbf{(O-Y)} can be greater than \citet{markidis} (\textbf{M)}}
+\begin{tabular}{|l|llll|}
+\hline
+$\vec{\textbf{a}}$ & $1.0009765625\cdot2^{\text{-}8}$ & $1.326171875\cdot2^{\text{-}14}$ & $2^{\text{-}12}$ & $2^{\text{-}12}$ \\
+$\vec{\textbf{b}}$ & $1.998046875\cdot2^{\text{-}7}$ & $1.4443359375\cdot 2^{\text{-}7}$ &$2^{\text{-}12}$ & $2^{\text{-}12}$ \\
+\textbf{\textit{c}} & \multicolumn{4}{c|}{$2^{\text{-}24}$} \\
+\textbf{True} & \multicolumn{4}{c|}{$1 + 2^{\text{-}23}$} \\
+\textbf{M} & \multicolumn{4}{c|}{$1 + 2^{\text{-}23}$} \\
+\textbf{O-Y} & \multicolumn{4}{c|}{$1.0$} \\
+\hline
+\end{tabular}
+\end{table}
+
+The values produced by our experiment in Table \ref{tab:markidi-v-ootomo} follows the same pattern. To illustrate precisely why the error occurs, we walk through the example below.
+
+
+\begin{enumerate}
+    \item $\vec{a}$ and $\vec{b}$ are multiplied; largest exponent of all terms is -1.
+    \item Each term is shifted to align their exponent to -1
+    \item $a_1b_1$ and $a_2b_2$ are accumulated, resulting in exactly $1-2^{\text{-24}}$. \textit{This term is not normalized}.
+    \item $2^{\text{-}24}$ ($a_3b_3$) is added to the previous term, resulting in exactly 1.0, represented internally as $2^{\text{-}1}\cdot 2^1$
+    \item $2^{\text{-}24}$ ($a_4b_4$) is added to the previous term resulting in $1.0 + 2^{\text{-}24}$, represented as $2^{\text{-}1} \cdot 2^1 + 2^{\text{-}23}$
+    \item At this point, O-Y's method diverges from \citeauthor{markidis}
+    \begin{enumerate}
+        \item 0.0 is added to $1.0 + 2^{\text{-}24}$
+        \item $1.0 + 2^{\text{-}24}$ is normalized, yielding $1.0$, as the lowest bit is lost in the shift.
+        \item $1.0$ is accumulated with $2^{\text{-}24}$ outside tensor cores. The result is $1.0$.
+    \end{enumerate}
+    \item In \citeauthor{markidis}, $c$ is accumulated \textit{inside} the tensor cores
+    \begin{enumerate}
+        \item $2^{\text{-}24}$ ($c$) is added to $1.0 + 2^{\text{-}24}$, resulting in $1.0 + 2^{\text{-}23}$, represented internally as $2^{\text{-}1}$ for the exponent with $2^1 + 2^{\text{-}22}$ in the mantissa.
+        \item The term is normalized, yielding $1.0+2^{\text{-}23}$
+    \end{enumerate}
+\end{enumerate}
+This experiment demonstrates precisely how the lack of normalization inside tensor cores can lead to a result with less error.
+\citet[\S D-2]{fasi2021numerical} also demonstrated how normalization contributes to error with an experiment in which the value $1-2^{\text{-}24}$ is accumulated with four values, each $2^{\text{-}24}$.  When partial sums are normalized, the accumulation between $1-2^{\text{-}24}$ and $2^{\text{-}24}$ would result in the value of $1$. After being normalized, the exponent difference between the accumulated term and the remaining terms would cause the remaining additions to have no effect in round-to-zero, as their sums would be shifted out.  Instead, when the intermediate sum is not normalized, none of the bits from the $2^{\text{-}24}$ terms are lost and the final error is only $2^{\text{-}24}$.

@@ -1,0 +1,174 @@
+\section{Performance Evaluation}
+In this section, we evaluate the performance of the UDF implementing the data-masking operation. Specifically, we study the impact of factors such as: (1) data type of a column being masked, and (2) size and depth of the column being masked and (3) the number of columns being masked on the overall performance of the data-masking view. 
+
+\subsection{Methodology}
+We first set up a micro-benchmark to evaluate the performance of the $MASK\_FIELD\_IF()$ UDF in a controlled and isolated environment. We analyze trends in the UDF's performance as a function of the above-mentioned factors and provide insights obtained through CPU profiles. We confirm the trends observed from the micro-benchmarks with results obtained by running Spark SQL queries that use the $MASK\_FIELD\_IF()$ UDF on a large compute cluster running Apache Spark 3.1.1. Each query uses 50 executors, each provisioned with 8GB memory and 4 CPU cores. \\
+
+We use a homegrown synthetic data generation tool to generate datasets that include the following types of columns common in our ecosystem:
+\begin{itemize}
+    \item {\bf Primitive Fields:} columns of string type to simulate simple flat data structures, 
+    \item {\bf Flat Structs:} structs with varying number of primitive fields (from single-field structs to structs containing five primitive fields, e.g. \texttt{STRUCT<field\_1: STRING, \ldots, field\_5:STRING>}), 
+    \item {\bf Nested Structs:} structs containing nested fields of varying depths. For example, a three-level deep struct produced by our tool has the following shape: \\
+     \texttt{nfield\_l1: STRUCT<pfield: STRING, nfield\_l2: \\
+     STRUCT<pfield: STRING, nfield\_l3: STRUCT<pfield: STRING>>>}.
+    \item {\bf Arrays:} columns of array type, with varying entries per array (e.g. 10, 50, 100). We generate datasets containing one- and two-dimensional arrays, to simulate schemas that are commonly used in AI/ML training pipelines.
+\end{itemize}
+For the cluster benchmarks, we generate a synthetic dataset containing 10 million rows. The size of the dataset is chosen so that the task startup overheads for benchmarking queries get amortized over a sufficiently large partition of rows processed by each task. The data is written in ORC storage format with ZLIB compression, which is the storage format adopted for LinkedIn's warehouse data. We note however that the performance numbers reported in this section should generalize to other commonly used formats like Parquet. 
+
+The primary performance metric is the per-row CPU time difference between queries using the masking operator (via the \\ $MASK\_FIELD\_IF()$ UDF) and those using an "identity" operator (a no-op UDF that returns the input as-is) on the same field. This approach isolates the computational overhead of the masking operation, eliminating the influence of external factors like storage latency, network performance, and disk I/O.
+
+Since the goal is to analyze performance trends rather than absolute values, this metric effectively illustrates how the masking operator overhead changes across different scenarios. Both UDFs are implemented using Spark's Expression APIs to ensure consistency.
+
+\subsection{Experiment Results}
+
+The results shown in this section are from cluster benchmarks unless mentioned otherwise.
+
+\subsubsection{Impact of Column Size} 
+We measure the overhead of applying the $MASK\_FIELD\_IF()$ UDF on a column as a function of its size. In
+Figure~\ref{fig:PerfRedactedFieldSize}, we show the CPU overhead of masking a struct column containing varying number of
+string fields. 
+\begin{figure}[ht]  % 'ht' means here or at the top
+    \includegraphics[width=0.225\textwidth]{figures/perf/redactionColumnSize_overhead_per_row_plot.png}
+    \vspace{-1em}
+    \caption{Impact of field size on CPU overhead (cluster-benchmark)}  % Adding a caption
+    \label{fig:PerfRedactedFieldSize}  % Adding a label for referencing
+    \vspace{-2em}
+\end{figure}
+From Figure~\ref{fig:PerfRedactedFieldSize}, we see that the overhead for masking a primitive field (string type in this case) is slightly lower than that for 
+complex fields such as structs. But increase in the column size does not have any impact on the overhead. We confirm this behavior through a CPU profile of the $MASK\_FIELD\_IF()$ UDF which shows that 
+evaluating the input column is slightly more expensive for a struct compared to primitive types such as string, in the generic masking implementation. \\
+
+\subsubsection{Impact of Field Depth} 
+We analyze the performance of the $MASK\_FIELD\_IF()$ UDF as a function of the depth of the field being masked. The synthetic data generation tool generates random records conforming to the
+ deeply nested schema shown in Figure~\ref{fig:PerfVaryingDepthsSchema}, where the struct at each level contains a string field and another nested
+struct. Figure~\ref{fig:PerfVaryingDepthsResult} shows the overhead for masking the string fields at varying depths, starting with
+\emph{nfield\_l1.pfield} (represented by the x-axis label $d=1$) and moving deeper down the hierarchy (e.g.,
+\emph{nfield\_l1.nfield\_l2.pfield}).
+\begin{figure}[ht]  % 'ht' means here or at the top
+\vspace{-1em}
+   \begin{subfigure}[b]{0.45\columnwidth}
+    \includegraphics[width=\linewidth]{figures/perf/PerfVaryingDepthsSchema.png}
+    \caption{Deeply Nested Schema}  % Adding a caption
+        \label{fig:PerfVaryingDepthsSchema}  % Adding a label for referencing
+    \end{subfigure}
+    \hfill % Optional space between figures
+       \begin{subfigure}[b]{0.45\columnwidth}
+        \includegraphics[width=\linewidth]{figures/perf/redactionFieldDepths_overhead_per_row_plot.png}
+            \caption{Impact of field path depth on CPU overhead (cluster-benchmark)}  % Adding a caption
+                \label{fig:PerfVaryingDepthsResult}  % Adding a label for referencing
+    \end{subfigure}
+    \vspace{-1em}
+    \caption{Impact of field path depth}
+    \vspace{-1em}
+\end{figure}
+As seen from Figure~\ref{fig:PerfVaryingDepthsResult}, the overhead grows linearly with increasing depth of the string fields. 
+CPU profiling reveals that this behavior stems from how nested struct objects are represented internally in Spark. The struct objects are organized in a tree-like hierarchy, so the
+ $MASK\_FIELD\_IF()$ UDF must traverse this tree to locate and transform the target field. Upon transformation of the target field, each parent struct in the tree needs to be reconstructed with the modified field due to 
+ immutability of objects passed to the UDF. \\
+
+\subsubsection{Impact of number of fields masked} 
+In this section, we evaluate the masking overhead as a function of the number
+of fields that need to be masked. For simplicity, we consider a "flat" struct consisting of five string
+fields (Figure~\ref{fig:PerfVaryingRedactedFieldsSchema}) and vary the number of members of the struct that are masked. 
+\begin{figure}[ht]  % 'ht' means here or at the top
+    \vspace{-1em}
+   \begin{subfigure}[b]{0.45\columnwidth}
+    \includegraphics[width=\linewidth]{figures/perf/PerfVaryingRedactedFieldsSchema.png}
+    \caption{A flat struct containing primitive fields}  % Adding a caption
+    \label{fig:PerfVaryingRedactedFieldsSchema}  % Adding a label for referencing
+\end{subfigure}
+\begin{subfigure}[b]{0.45\columnwidth}  % 'ht' means here or at the top
+    \includegraphics[width=\linewidth]{figures/perf/redactionFieldCounts_overhead_per_row_plot.png}
+    \caption{Impact of number of masked fields on CPU overhead (cluster-benchmark)}  % Adding a caption
+    \label{fig:PerfVaryingRedactedFieldsResult}  % Adding a label for referencing
+    \end{subfigure}
+    \vspace{-1em}
+    \caption{Impact of number of maskings}
+    \vspace{-2em}
+\end{figure}
+As seen in Figure~\ref{fig:PerfVaryingRedactedFieldsResult}, the overhead increases linearly with the number of fields being
+masked. The schema considered in Figure~\ref{fig:PerfVaryingRedactedFieldsSchema} does however point to an optimization opportunity, 
+where instead of invoking the masking operation separately for each member of the struct, 
+the masking operations across members of the struct can be performed together at once. 
+We expect this optimization to reduce the per-field overhead incurred due to schema traversal and struct object transformation and reconstruction.
+A special case of this optimization is implemented in the policy compiler, where the UDF performs struct-level masking when all its members need to be masked. 
+We plan to incorporate the generalization of this optimization in our UDF implementation to further exploit the UDF batching feature of the policy compiler. \\
+
+\subsubsection{Impact of consent rates} 
+The  \% of rows from which one or more fields need to be masked depends on the fraction of data subjects that consent to allow access to those fields.  
+We refer to this fraction as the {\em consent rate}. 
+\begin{figure}[ht]  % 'ht' means here or at the top
+    \vspace{-1em}
+    \includegraphics[width=0.3\textwidth]{figures/perf/consentRate_overhead_per_row_plot.png}
+    \vspace{-1em}
+    \caption{Impact of consent rates on CPU overhead (micro-benchmark)}  % Adding a caption
+    \vspace{-1em}
+    \label{fig:PerfVaryingRedactionRate}  % Adding a label for referencing
+\end{figure}
+Figure~\ref{fig:PerfVaryingRedactionRate} contains the micro-benchmark results showing the CPU overhead for different data types as a function of the
+consent rate. A consent rate of 1 reduces the $MASK\_FIELD\_IF()$ UDF to a no-op action. As expected, the average CPU overhead increases
+as the consent rate decreases for each data type. As discussed in the previous sections, struct column masking has
+higher overhead than string column masking for all consent rates. Similarly, masking a field inside a struct has a higher overhead
+than struct column masking due to the additional overhead of schema traversal and object transformation. \\
+
+% \subsubsection{Comparison with Case Statement Based Redaction} 
+% For top-level columns that need to be masked, the masking operator can also be
+% implemented as a simpler SQL using CASE statements. Figure~\ref{fig:red-casewhen} shows two equivalent
+% queries that mask a top-level column $c1$ from $T$.
+% \lstset{style=sqlstyle}
+% % Example SQL code
+% \begin{figure}[ht]
+%     \begin{lstlisting}
+% SELECT CASE WHEN <condition> THEN c1 ELSE null END FROM T
+% SELECT MASK_FIELD_IF(<condition>, c1, "c1", null) FROM T
+%     \end{lstlisting}
+%     \caption{Masking UDF and CASE WHEN }
+%     \label{fig:red-casewhen}
+% \end{figure}
+% \begin{figure}[ht]  % 'ht' means here or at the top
+%     \includegraphics[width=0.3\textwidth]{figures/perf/PerfVaryingRedactionSQLs.png}
+%     \caption{Overhead with Redaction Operator and CASE expression}  % Adding a caption
+%     \label{fig:PerfVaryingRedactionSQLs}  % Adding a label for referencing
+% \end{figure}
+% Figure~\ref{fig:PerfVaryingRedactionSQLs} shows a comparison between the two implementations for two different column types. The figure shows a much higher overhead for the masking UDF compared to the CASE expression. Base d on our analysis of CPU profiles, we note that the UDF implementation incurs additional overheads due to generic parsing and interpretation of field paths. However, the implementation can be
+% optimized to short-circuit masking logic in case a top-level column needs to be masked. We plan to incorporate this optimization in our UDF implementation.\\
+
+\subsubsection{Data Masking in Arrays} 
+We next evaluate the overhead of the masking operation 
+on array-typed columns where each element is of type struct. Specifically, the column has the following data type: 
+$acol : array(struct<field_1:string, field_2:string>)$. We consider masking overhead on two different field paths: 
+\begin{enumerate}
+\item $\$.acol.[item].field_1$: which indicates unconditional masking of $field_1$ from all elements in the $acol$, and 
+\item $\$.acol[?(@.field_1 == 'jackfruit')].[item].field_2$: which indicates conditional masking of $field_2$ based on the value of $field_1$. 
+\end{enumerate}
+\begin{figure}[ht]  % 'ht' means here or at the top
+    \vspace{-1em}
+    \includegraphics[width=0.3\textwidth]{figures/perf/redactionArrays_overhead_per_row_plot.png}
+    \vspace{-1em}
+    \caption{Impact of array sizes on CPU overhead (cluster-benchmark)}  % Adding a caption
+    \vspace{-2em}
+    \label{fig:PerArrayPrimSec}  % Adding a label for referencing
+\end{figure}
+Figure~\ref{fig:PerArrayPrimSec} shows that the masking overhead grows linearly with array size for each field path.
+For a given array size, the overhead of unconditional masking is smaller than
+conditional masking due to the additional cost of comparing element values. In our implementation, this comparison requires conversion between Spark's UTF-8 strings to
+Java UTF-16 strings, which is the dominant contributor to the overhead. \\
+
+%\noindent {\bf Comparison of Virtual Redaction Percentage:} In this experiment, we focus on the conditional field redaction
+%within arrays, with change in how frequently the redaction condition matches in the array. Similar to previous experiment, we
+%consider the redaction operator with path \texttt{array\_column[?(@.string\_field\_1 == `jackfruit')][:].string\_field\_2}. This
+%compares the value of string\_field\_1 with the literal `jackfruit'. However, we vary the \% of values in the array
+%where the condition matches, i.e. string\_field\_1 value is equal to `jackfruit'. This is done by using a uniform
+%distribution of N distinct string values while generating data, where N is varied from 1 to 10. This variation impacts
+%the number of elements in the array that will be modified, but this does not change the number of comparisons needed.
+
+%\begin{figure}[ht]  % 'ht' means here or at the top
+%    \includegraphics[width=0.5\textwidth]{figures/perf/PerArraySecRedPercent.png}
+%    \caption{Overhead with Change in Percentage of Array Elements to be Redacted}  % Adding a caption
+%    \label{fig:PerArraySecRedPercent}  % Adding a label for referencing
+%\end{figure}
+
+%As seen in the plot Figure~\ref{fig:PerArraySecRedPercent}, the CPU overhead increases as the probability of condition
+%matching increases, since more array elements need to be modified through the redaction operator.
+
+

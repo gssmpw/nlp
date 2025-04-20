@@ -1,0 +1,253 @@
+\section{\sys's Design}
+
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{figs/design-expert-map-v2.pdf}
+  \vspace{-0.15in}
+  \caption{Expert selections tracked by an expert map.}
+  \vspace{-0.1in}
+  \label{fig:design-expert-map.pdf}
+\end{figure}
+
+
+\subsection{Expert Maps}
+\label{subsec:design-expert-map}
+
+We propose a new data structure, \textit{expert maps}, to track expert activation patterns with a fine granularity.
+%
+Figure~\ref{fig:design-expert-map.pdf} depicts the structure of an expert map. 
+During the $i$-th iteration, the $l$-th self-attention layer first calculates the attention states. 
+The gate network receives attentions and computes a probability distribution $\mathbf{P}^{(i)}_l \in \mathbb{R}^{J}$ over all the experts at Layer $l$:
+%
+\begin{align*}
+    \mathbf{P}^{(i)}_l := \big{\{}p^{(i)}_{l,1}, \ldots, p^{(i)}_{l,j}, \ldots, p^{(i)}_{l,J}\big{\}}, \quad \sum_{j \in [J]} p^{(i)}_{l,j} = 1, ~\forall p^{(i)}_{l,j} \geq 0.
+\end{align*}
+Then, top $K \in [1, J]$ experts are selected from $P^{(i)}_l$ to compute representations for Layer $l$.
+We collect the probability distributions $P^{(i)}_l$ across all $L$ layers to form the expert map of Iteration $i$:
+%
+\begin{align*}
+    \textit{map}_i := \{\mathbf{P}^{(i)}_1, \ldots, \mathbf{P}^{(i)}_l, \ldots, \mathbf{P}^{(i)}_{L}\}, \quad l \in [L].
+\end{align*} 
+% 
+
+By tracking expert maps, we guide \sys to discover fine-grained expert patterns---the iteration-level expert selection preferences via probability distributions. 
+% 
+Intuitively, analyzing probability distributions enables \sys to not only identify which experts are binarily selected or omitted, but also to assess the confidence or preference assigned to each expert from the perspective of the gate networks.
+% One recent research, MoE-Infinity~\cite{xue2024moe}, proposed the Expert Activation Matrix, which aggregates the request-level expert hit counts for tracking activation patterns.
+
+The design of expert maps has two key advantages over existing coarse-grained expert tracking methods (\eg, MoE-Infinity~\cite{xue2024moe} tracks the request-level expert hit counts).
+%
+\textit{First}, existing works only focus on \textit{aggregated} request-level expert activations, whereas an expert map tracks individual iterations with detailed expert selections.
+%
+\textit{Second}, existing works only record the expert hit counts, whereas we track detailed probability distributions. 
+% 
+Note that expert maps can easily recover coarse-grained information by applying a top $K$ selection operator to the probability distributions and aggregating expert counts over iterations, therefore generalizing to existing tracking methods.
+%
+We evaluate \sys against other tracking methods to show the effectiveness of expert maps in \S\ref{subsec:eval-ablation}.
+
+
+\subsection{Expert Map Search}
+\label{subsec:design-similarity-match}
+
+When predicting and prefetching experts for \MoE models, a \textit{prefetch distance} is usually defined to avoid impacting inference latency~\cite{song2024promoe}. 
+%
+Prefetch distance refers to the number of layers ahead that a prefetch instruction is issued before the target layer activates its experts, similar to the same term in memory prefetching~\cite{lee2012prefetching}.
+Let $d$ denote the prefetch distance of the \MoE model to serve. 
+%
+Figure~\ref{fig:design-map-search} shows that \sys employs two fine-grained search approaches to jointly match expert maps for 
+guiding expert prefetching. 
+%
+% \hnote{A brief overview of the two searches...and why we need two searches}
+% \todo{define trajectory}
+%
+Semantic search compares the input embeddings with historical embeddings to find expert maps with similar inputs, whereas trajectory search observes previous expert trajectories (\ie, probability distributions) and matches similar expert maps.
+We combine both semantic and trajectory features to improve \sys's map-matching and expert offloading accuracy.
+Two search approaches' effectiveness is evaluated in \S\ref{subsec:eval-ablation}.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{figs/design-map-search-v2.pdf}
+  \vspace{-0.2in}
+  \caption{Semantic and trajectory expert map search.}
+  \vspace{-0.1in}
+  \label{fig:design-map-search}
+\end{figure}
+
+
+\textbf{Semantic-based expert map search.} 
+For the initial layers $l \in [1, d]$, due to the prefetch distance $d$, existing solutions~\cite{eliseev2023fast,song2024promoe,xue2024moe} \textit{cannot} observe expert patterns for prediction and prefetching before the target layer is ready to activate experts. Thus, they usually define coarse-grained rules for prefetching initial layers. For example, MoE-Infinity~\cite{xue2024moe} prefetches the most popular experts across all historical data points.
+
+In contrast, \sys leverages semantic hints from the input prompt to search for the most useful expert maps, requiring zero knowledge from the expert activation patterns. 
+%
+When serving request prompts and recording their expert maps, we record the \textit{semantic embeddings} for each inference iteration:
+%
+% 1) prefill stage, we record the token-wise semantic embeddings for the prefill stage since prefill iterations take individual tokens as input, and 
+% 2) decode stage, extract the semantic embeddings for the decode stage using mean pooling following the standard methodology in \NLP research~\cite{reimers2019sentence}.
+%
+% to extract the semantic embeddings using a mean pooling of the output from the \MoE model's original embedding layer, which ensures the extracted embedding dimension is consistent across varying prompt lengths.
+Since existing \MoE-based \LLMs all contain an embedding layer for analyzing the semantic meaning of inputs, it's natural to extract the semantic embeddings using the output from the model's original embedding layer. 
+% 
+For any input prompts, we compute pairwise cosine similarity $\textit{score}^{\textit{sem}} \in \mathbb{R}^{B \times C}$ between the semantic embedding $\textit{sem}^{\textit{new}} \in \mathbb{R}^{B \times h}$ and the collection of historical semantic embeddings $\textit{sem}^{\textit{old}} \in \mathbb{R}^{C \times h}$ in the Expert Map Store:
+\begin{align}
+    \textit{score}^{\textit{sem}}_{x,y} := \frac{\textit{sem}^{\textit{new}}_x \cdot \textit{sem}^{\textit{old}}_y}{\|\textit{sem}^{\textit{new}}_x\| \cdot \|\textit{sem}^{\textit{old}}_y\|}, \quad x \in [B], ~y \in [C],
+    \label{eq:score-sem}
+\end{align}
+%
+where $B$ is the batch size of input prompts, $C$ is the Expert Map Store capacity, and $h$ is the hidden dimension size. Then, for prompt $x$, the historical Iteration $y$ with the highest score is selected. 
+% 
+We use partial expert maps from the selected iteration, $\{\mathbf{P}^{(y)}_1, \ldots, \mathbf{P}^{(y)}_d\} \in \textit{map}^{\textit{old}}_y$, to guide the expert prefetching for layers $l \in [1, d]$. 
+
+
+\textbf{Trajectory-based expert map search.}
+Unlike layers $l \in [1, d]$, we can observe expert probability trajectories of previous $(l-1)$ layers to search expert maps for layers $l \in [d+1, L]$.
+% \footnote{We represent array operations in Python-style for simplicity, where the rows and columns are indexed by layer and expert IDs (Figure~\ref{fig:design-expert-map.pdf}).}.
+Similar to the semantic-based search, we compute pairwise cosine similarity $\textit{score}^{\textit{traj}} \in \mathbb{R}^{B \times C}$ between the observed trajectory, $\textit{map}^{\textit{new}} \in \mathbb{R}^{B \times (l-1)J}$, and the collection of historical expert maps, $\textit{map}^{\textit{old}} \in \mathbb{R}^{C \times (l-1)J}$, in the Expert Map Store: 
+%
+\begin{align}
+    \textit{score}^{\textit{map}}_{x,y} := \frac{\textit{map}^{\textit{new}}_x \cdot map^{\textit{old}}_y}{\|\textit{map}^{\textit{new}}_x\| \cdot \|\textit{map}^{\textit{old}}_y\|}, \quad x \in [B], ~y \in [C].
+    \label{eq:score-map}
+\end{align}
+%
+We select the historical iteration with the highest score. Then, we use $P^y_{l+d} \in \textit{map}^{\textit{old}}_y$ from the selected expert map to guide the expert prefetching for the target Layer $l+d$, where $d$ is the prefetch distance.
+
+
+By combining the two expert map search methods, we carefully customize the map that guides expert prefetching for every inference iteration in \MoE serving.
+%
+With this design, expert map search introduces negligible overhead to the end-to-end inference latency, which we demonstrate in \S\ref{subsec:eval-overhead}.
+
+% We further show that the expert map search overhead is negligible compared to the end-to-end inference latency in \S\ref{subsec:eval-overhead}.
+
+\subsection{Expert Prefetching}
+\label{subsec:design-expert-prefetch}
+
+
+Given the searched and customized expert map for a layer $l \in [L]$, we guide the expert prefetching in fine granularity.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=.85\linewidth]{figs/design-correlations.pdf}
+  \vspace{-0.1in}
+  \caption{Pearson correlation coefficients between semantic and trajectory cosine similarity and expert hit rate across three MoE models and two datasets.}
+  \vspace{-0.1in}
+  \label{fig:design-correlations}
+\end{figure}
+
+
+\textbf{Similarity-aware expert selection.}
+With the different contexts collected during iterations, expert maps searched by \sys also have varying similarity scores, which reflects the search confidence. 
+%
+To quantify the correlations between similarity score and expert hit rate, we run three \MoE models (\mixtral, \qwen, and \phimoe) with two datasets (LMSYS-Chat-1M and ShareGPT) using the methodology described in \S\ref{subsec:design-similarity-match}. 
+For each inference iteration, we compute the similarity scores, collect expert hit rates guided by the searched expert maps, and calculate the Pearson correlation coefficients~\cite{cohen2009pearson}.
+Pearson coefficient is commonly used to measure correlations between variables, where a coefficient close to 1 indicates a strong positive correlation and a coefficient close to 0 means a weak correlation.
+%
+Figure~\ref{fig:design-correlations} shows the Pearson coefficient between similarity score and expert hit rate with three \MoE models and two datasets.
+%
+The results show that high similarity scores potentially relate to high expert hit rates if using the corresponding expert maps.
+Hence, we design \sys's expert prefetching to be similarity-aware. 
+
+
+For a layer $l \in [L]$ with a $\textit{score} \in [-1, 1]$ to prefetch, we first dynamically compute an expert selection threshold $\delta_l \in [0, 1]$ given by
+\begin{align*}
+    \delta_l := \textrm{Clip}(1-\textit{score},~0,~1) = \max(0,~\min(1-\textit{score},~1)),
+\end{align*}
+where $\textit{score}$ is the cosine similarity score computed in Equations~\ref{eq:score-sem} and \ref{eq:score-map}. 
+% 
+Given searched $\mathbf{P}_l$, we find the set of experts to prefetch $E_{\textit{prefetch}}$ by iteratively picking the expert with the highest probability from $\mathbf{P}_l = \{p_{l,1}, \ldots, p_{l,j}, \ldots, p_{l,J}\}$ until the summed probability of $E_{\textit{prefetch}}$ exceeds $\delta_l$:
+\begin{align}
+    \min_{\{E_{l,j}\}} &|E_{\textit{prefetch}}| \label{eq:expert-prefetch-set} \\
+    \mathrm{s.t.} 
+    &\sum_{E_{l,j} \in E_{\textit{prefetch}}} p_{l,j} \geq \delta_l, ~j \in [J], ~\forall l \in [L], \label{eq:expert-prefetch-set-constraint-1} \\
+    &|E_{\textit{prefetch}}| \geq K, ~K \leq [J], \label{eq:expert-prefetch-set-constraint-2}
+\end{align}
+% 
+where $K$ is the number of experts needed to activate per layer (\eg, \mixtral activates two experts per layer). 
+% 
+Constraint~\ref{eq:expert-prefetch-set-constraint-1} requires the total probability of selected experts to prefetch per layer to be greater than $\delta_l$.
+Constraint~\ref{eq:expert-prefetch-set-constraint-2} represents the minimum amount of selected experts must be larger than the number of experts to activate required by the \MoE model. 
+% 
+Intuitively, we assign higher $\delta$ to low-score expert maps so that more experts are prefetched to mitigate mispredictions and assign lower $\delta$ for high-score expert maps to reduce memory footprint. 
+%
+Experts with higher probabilities are prioritized to be prefetched.
+
+\textbf{Asynchronous expert map matching and prefetching.} 
+Existing studies~\cite{eliseev2023fast,xue2024moe} predict and prefetch experts synchronously during inference, severely hindering the inference performance. 
+% 
+For example, MoE-Infinity~\cite{xue2024moe} cannot compute forward functions before finishing expert prediction and prefetching at every \MoE layer~\cite{moe-infinity-code}.
+To minimize the system overhead and inference latency, we decouple the map matching and expert prefetching from the inference process using an asynchronous Publisher-Subscriber architecture (Figure~\ref{fig:design-map-search}).
+The Expert Map Store is a message broker that keeps messages from both the inference process and the Expert Map Matcher. 
+% 
+As the inference proceeds, \sys's inference process continuously publishes and writes the inference contexts (\ie, semantic embeddings and expert probability distributions) to the Expert Map Store. At the same time, the Expert Map Matcher subscribes to the context data, matches expert maps based on new context data, and prefetches experts to the Expert Cache in an asynchronous manner.
+
+
+
+\subsection{Expert Map Store Management}
+\label{subsec:design-expert-map-store}
+
+Practically, we design \sys's Expert Map Store to maintain a capacity $C$ for storing unique expert maps.
+To effectively guide inference across diverse prompts, it makes sense to identify and deduplicate redundant expert maps.
+
+\textbf{Expert map deduplication.}
+Since \sys uses two approaches (\ie, semantic-based and trajectory-based) to compute similarity, we unify the two similarity scores to compute the pairwise redundancy scores between new iteration data and historical iteration data:
+\begin{align*}
+    \textit{RDY}_{x,y} := \frac{d}{L} \cdot \textit{score}^{\textit{sem}}_{x,y} + \frac{L-d}{L} \cdot \textit{score}^{\textit{map}}_{x,y}, \quad x \in [B], ~y \in [C],
+    % \label{eq:score-sem}
+\end{align*}
+where $\textit{score}^{\textit{sem}}_{x,y} \in \mathbb{R}^{B \times C}$ and $\textit{score}^{\textit{map}}_{x,y} \in \mathbb{R}^{B \times C}$ are semantic-based and trajectory-based pairwise similarity scores calculated from Equations~\ref{eq:score-sem} and \ref{eq:score-map}, $d$ is the prefetch distance, $L$ is the total number of layers, $B$ is the batch size of new interaction data, and $C$ is the Expert Map Store capacity.
+Intuitively, as shown in Figure~\ref{fig:design-map-search}, the semantic-based and trajectory-based similarity scores contribute to the search expert map in proportion to $\frac{d}{L}$ and $\frac{L-d}{L}$, respectively. 
+Therefore, we follow the same ratio to unify and compute the redundancy score.
+Whenever new iterations' context data arrive at the Expert Map Store, we compute the pairwise redundancy score $\textit{RDY}_{x,y}$ to determine which old iterations to drop.
+Hence, we update the old iterations $y$ (columns in $\textit{RDY}_{x,y}$) with new iterations $x$ (corresponding rows in $\textit{RDY}_{x,y}$) in the Expert Map Store.
+
+
+\textbf{Theoretical analysis.}
+The expert map deduplication can be formulated as a Minimum Sphere Covering problem~\cite{elzinga1972minimum}.
+The objective is to minimize the total number of expert maps in the store, where each expert map is a vector representation of spheres, while maximizing the sphere coverage in the expert activation space.
+Studies~\cite{rankin1947closest,dumer2007covering} have proved that maintaining at least $2LJ$ expert maps guarantees a lower bound of 75\% expert map similarity (\ie, we can find an expert map that is at least 75\% similar to any new iterations), and keeping $\frac{1}{2}LJ \ln(LJ)$ expert maps provides a lower bound of 98\% similarity, where $L$ and $J$ are the numbers of layers and experts per layer in the \MoE model, respectively.
+% Figure~\ref{} shows the similarity lower bounds of different store capacity when serving \mixtral~\cite{jiang2024mixtral}, \qwen, and Snowflake Arctic~\cite{snowflake-arctic} with ShareGPT~\cite{sharegpt} dataset. \todo{add figure here}
+Given that modern \MoE-based \LLMs generally have $L \in [8, 128]$ and $J \in [24, 96]$, we can approximate the Expert Map Store's maximal requirement to be less than 50K expert maps with 200~MB CPU memory~\cite{xue2024moe}.
+
+
+\subsection{Expert Caching and Eviction}
+\label{subsec:design-expert-cache}
+
+
+Similar to existing expert offloading solutions~\cite{eliseev2023fast,xue2024moe,song2024promoe}, we design \sys to maintain an Expert Cache on GPUs to reuse expert weights when serving different request prompts.
+Given matched expert maps from \S\ref{subsec:design-similarity-match}, we guide \sys's Expert Cache to compute two priority scores for individual experts: 
+1) a prefetching priority to decide the prefetching orders of experts in the searched maps, and 
+2) an eviction priority to determine the eviction orders of experts in the Expert Cache. 
+
+
+\textbf{Expert prefetching priority.}
+Recall the set of experts to prefetch $E_{\textit{prefetch}}$ is determined in Equation~\ref{eq:expert-prefetch-set}. For each expert $E_{l,j} \in E_{\textit{prefetch}}$, we define the prefetching priority to be
+\begin{align*}
+    PRI^{\textit{prefetch}}_{l, j} := \frac{p_{l,j}}{l-l_{\textit{now}}}, \quad l \in [L], ~j \in [J],
+    % \label{eq:expert-prefetch-priority}
+\end{align*}
+where $p_{l,j}$ is the expert probability from the searched expert map, and $l_{\textit{now}}$ is the current layer that inference process stays at.
+Intuitively, experts with higher probability $p_{l,j}$ to be activated should be prefetched sooner, and experts that sit closer to the current layer (\ie, smaller $l - l_{\textit{now}}$) should also be prioritized.
+
+\textbf{Expert eviction priority.}
+Similar to MoE-Infinity~\cite{xue2024moe}, \sys's expert caching is based on the \LFU algorithm. We integrate the searched map to jointly determine the eviction priority.
+For each expert $E_{l,j} \in E_{\textit{cache}}$, we define the eviction priority to be
+\begin{align*}
+    \textit{PRI}^{\textit{evict}}_{l, j} := \frac{1}{p_{l,j} \cdot \textit{freq}_{l,j}}, \quad l \in [L], ~j \in [J],
+    % \label{eq:expert-eviction-priority}
+\end{align*}
+where $\textit{freq}_{l,j}$ is the cache visit frequency and $p_{l,j}$ is the probability from the searched map for an expert $E_{l,j} \in E_{\textit{cache}}$. 
+%
+Intuitively, when reaching the Expert Cache limit, we want to first evict experts who are less frequently hit and have lower probabilities of being activated.
+Note that similar to existing works~\cite{xue2024moe,song2024promoe}, we do not consider the recent usage of experts as opposed to the classic \LRU algorithm~\cite{eliseev2023fast}.
+Since the expert usage is layer-wise sequential, \ie, one layer following another, prioritizing recently used experts is against the nature of sequential forward computation in \MoE serving.
+
+
+\textbf{On-demand expert loading.}
+% Expert prefetching cannot achieve perfect predictions. 
+Mispredictions of expert prefetching lead to expert miss in the Expert Cache, as the \MoE model cannot find available experts designated by the gate networks.
+Whenever an expert miss occurs, \sys pauses all expert prefetching tasks and immediately loads missed experts from CPU to GPU memory for fast serving.
+
+
+% \textbf{Expert task pool.}
+% As the three main expert tasks in \sys: expert prefetching, eviction, and on-demand loading, are all GPU-centric, we design and implement an expert task pool in the GPU space to efficiently manage and execute the expert tasks.
+% Whenever \sys issues an expert prefetching, eviction, or on-demand loading task, we call the \sys's GPU handler to add the task to the expert task pool.
+% The task execution order 

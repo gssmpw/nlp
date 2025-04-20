@@ -1,0 +1,253 @@
+\section{Optimizing Scalar Quantization for Serverless Hybrid Vector Search}
+\label{s:2-osq}
+
+\input{figs/insert-osq-fig-star}
+
+We aim to develop a distributed vector index and architecture design utilizing \textbf{FaaS platforms} (e.g., AWS Lambda \cite{AWSLambdaGeneral}, Azure Functions \cite{AzureFunctionsGeneral}) to deliver large-scale and
+low-cost \textbf{hybrid similarity queries} with support for complex predicates across multiple attributes. We seek to provide the ability to scale to zero and support sporadic utilization, avoiding deploying and managing pre-provisioned servers. Our work demonstrates that an optimized \textbf{serverless-centric} index combined with the elasticity of a FaaS-based design provides an efficient and practical solution. 
+% --------------------------------------------------------
+\subsection{Serverless Hybrid Search Index Design}
+\label{ss:2.1-index-design}
+
+%The FaaS setting itself presents additional design challenges.
+Our indexing method must maximize accuracy/recall while minimizing latency and cost, particularly for high-recall domains (e.g., 95+\%) and with rich attribute filtering, while satisfying the following requirements: \textbf{1) Parallelizable over FaaS Instances}: It must support significant parallelism in a distributed setting within the limited compute capabilities of individual FaaS instances.
+\textbf{2) Low Memory Footprint}: Compact indexes are essential due to constrained memory resources and the lack of local persistent storage across invocations.
+\textbf{3) High Recall with Minimal Re-Ranking}: Current ANNS methods either require large in-memory storage of full-precision vectors which is infeasible for FaaS, or incur slow, costly re-ranking due to excessive disk I/O. A scalable solution is needed which does not require substantial memory or suffer from re-ranking delays.
+\textbf{4) Suitability for Rich Attribute Filtering}: Current hybrid ANNS methods offer only limited filtering capabilities, with selection based on low-cardinality tags and/or single-attribute, equality-only predicates. In contrast, we aim to handle any number of attributes (of varying data types/cardinalities), as well as complex predicates over any combination of attributes simultaneously. Further, our solution needs to be scalable and handle varying selectivity levels and avoid multiple search passes. %, often caused by insufficiently many vectors satisfying the filter being found on the first pass.
+
+
+There are four popular categories of ANNS indexing methods---Trees, Hashing, Quantization, and Proximity Graphs---with the latter two dominating the state-of-the-art. Quantization methods, in particular \textbf{Product Quantization (PQ)} and its variants \cite{TuncelFerhatosmanoglu2002VQIndex, Jegou2011PQ, OptimizedProductQuantization, VarianceAwareQuantization, NEURIPS2023-Wang-NHQ} are widely used, both standalone and as part of composite index structures (e.g., with proximity graphs). 
+% However, PQ-based solutions are not suitable in our FaaS-based setting, for one key reason; as a standalone index, PQ struggles to provide high recall \cite{douze2024faisslibraryivfsq8}. 
+However, despite achieving significant compression, PQ-based solutions struggle to achieve high recall when only the in-memory quantized vectors are considered \cite{Niu2023ResidualVectorProductQuantization, FaissMissingManual, RabitQ2024, Noh_2021_ICCV_PQ_Recall}.
+PQ-based methods therefore typically rely on \textit{large amounts of re-ranking on full precision vectors} \cite{RabitQ2024}; this is not viable in the FaaS setting as full-precision vectors are too large to hold in memory and too slow to fetch from disk \textit{in the quantities required}. In contrast, scalar quantization (SQ) can maintain higher accuracy while still achieving considerable compression, which alleviates the need for such extensive re-ranking.
+
+\textbf{Proximity graph}-based ANNS solutions, such as HNSW, offer high recall at low latency. However, whilst various works have studied \textit{attribute filtering} within PG methods \cite{Gollapudi2023FilteredDiskANN, Patel2024ACORN, wang2022navigableproximitygraphdrivennative-NHQ-2, NEURIPS2023-Wang-NHQ, zhao2022constrainedapproximatesimilaritysearchAIRSHIP}, they struggle to offer rich filtering support and assume a level of correlation between vector similarity and attribute similarity, which may not always hold. For example, approaches such as ACORN \cite{Patel2024ACORN} expand the HNSW neighborhoods and/or search scope, based on attribute distributions and assumptions around query predicate selectivity. Not only does this require a priori knowledge of query workloads, it is also focused on single-attribute support; it is challenging to adapt such approaches to cater for multiple attributes simultaneously. SeRF \cite{SeRF2024}, another PG-based approach for range queries, also fails to provide filtering support across multiple attributes simultaneously. 
+Incorporating filters can disrupt graph traversal, preventing greedy search from efficiently navigating to relevant nodes.
+Further, the ‘decomposition-assembly model’ \cite{NEURIPS2023-Wang-NHQ} whereby hybrid queries are split into two problems, addressed by different indexing solutions, is difficult to apply to PGs. 
+In contrast, quantization-based methods are amenable to this approach, making it simpler to adapt them for hybrid search.
+Importantly, PG-based approaches also impose \textit{high memory requirements}. For standard HNSW, the full-precision vectors form the nodes of the in-memory graph. 
+There are many HNSW variants, aimed at reducing search complexity or memory requirements while maintaining accuracy/recall levels. 
+% These include traversing IVF centroids using HNSW as a cluster selection method before brute-force search over full-precision (in-memory) vectors, or using PQ codes as graph nodes with uncompressed vectors also in memory, amongst others. 
+For example, PQ codes can be used as graph nodes, with uncompressed vectors also held in memory.
+Such solutions still have high memory footprints, or require significant disk-based re-ranking \cite{FaissMissingManual}; neither is desirable in the FaaS setting. 
+Parallelization of PG methods is also challenging; partitioning a global graph severs long-range connections, which are essential for traversal efficiency, while pre-partitioning before graph construction isolates boundary nodes by disrupting their true neighborhoods and distorts local neighborhood structures.
+We require a highly parallelizable solution which can achieve significant compression without compromising accuracy.
+% Parallelizing PG methods is challenging; partitioning a global graph severs long-range connections, disrupting traversal, while pre-partitioning isolates boundary nodes, hindering cross-partition search. We need a highly parallelizable solution that achieves strong compression without sacrificing accuracy.
+
+
+
+\textbf{Scalar Quantization (SQ)} is a type of vector compression with several appealing properties that can be enhanced and adapted for serverless hybrid ANNS. First, its scan-based search mechanism on compressed vectors is well-suited for distribution and parallelization, unlike PG-based methods. Due to its ability to achieve higher accuracy with a modest compression ratio (e.g., compared to PQ), it can achieve high recall with low re-ranking requirements, leveraging its contiguous data organization to optimize memory utilization. Since we can design a standalone SQ-based solution that does not require full-precision vectors or auxiliary graph structures to be stored in memory, it imposes only a modest memory footprint. Finally, since the core SQ index structure does not require complex modifications in the filtered case (unlike PGs), it is amenable to be adapted for hybrid search.
+
+However, in recent years SQ has most commonly been considered in its basic form and used as a simple uniform compression technique (e.g., IVF\_SQ8 in Milvus \cite{Wang2021Milvus}/FAISS \cite{douze2024faisslibraryivfsq8}). While classical SQ approaches, such as the VA$^+$-file \cite{Ferhatosmanoglu2000VAPlus}, demonstrate strong performance for large, high-dimensional datasets in centralized computing environments \cite{Echihabi2018HydraSurvey}, they are far from optimal and require modernization to serve as the basis for a distributed, parallel quantization-based indexing scheme with rich attribute filtering, and meeting the serverless FaaS-centric requirements outlined above. Hence, in this section, we introduce our \textbf{Optimized Scalar Quantization (OSQ)} and describe its different components and adaptation at each level of the SQUASH indexing system. An illustration of OSQ's effectiveness for serverless hybrid ANNS over alternatives is summarized in Table \ref{tab:index-features}.
+
+\input{tables/tab-index-features}
+
+
+%----------------------------------------------------------------------
+%----------------------------------------------------------------------
+\subsection{Optimized Scalar Quantization (OSQ)}
+\label{ss:2.2-osq}
+
+%Optimized Scalar Quantization (OSQ) is a serverless-centric indexing method for hybrid vector similarity search.
+%While SQ approaches are able to achieve high accuracy, relatively large memory requirements can be incurred if careful optimizations are not made.
+Given the inherent resource constraints of the FaaS environment, it is important for the index to achieve strong compression. OSQ introduces a segment-based storage scheme which enables the theoretical compression of SQ to be realized in practice. 
+By merging variable-length bit approximations for consecutive dimensions, OSQ reduces bit wastage compared to standard SQ, minimizing padding and ensuring more compact storage. 
+OSQ also introduces an extraction scheme to efficiently retrieve individual dimensions using lightweight bit-shift operations and extract the same dimension of all candidate vectors simultaneously.
+OSQ is readily applied to both vectors and attributes for quantization and pre-computation of distances. Numerical attributes are quantized in a similar fashion to individual vector dimensions. For categorical variables, we maintain an in-memory mapping from quantized cells to unique attribute values.
+
+% \subsubsection{Segment-based storage}
+\subsubsection{Shared Segment-based Data Organization}
+We aim to encode an appropriate number of bits for each dimension. The number of bits assigned to a dimension determines the precision of the quantized approximations; each additional bit doubles the number of available quantization cells, which significantly improves representation accuracy. Recent solutions utilizing SQ allocate an equal number of bits (e.g., 8-bits) to each dimension \cite{douze2024faisslibraryivfsq8, ZillizSQ}. 
+However, this approach disregards the fact that certain dimensions can be significantly more important than others for distinguishing vectors, e.g., due to their higher variance. 
+% particularly when transformations are applied during pre-processing.
+This is particularly true when energy-compacting transforms are applied during pre-processing.
+While non-uniform bit allocation schemes allow more important dimensions to be represented with higher precision \cite{Ferhatosmanoglu2000VAPlus}, existing methods fail to achieve the theoretical compression in practice due to misalignment of the resulting variable-length bit allocations with available data types. 
+Since modern CPU architectures and memory systems are optimized for power-of-two data sizes, libraries only offer 8/16/32/64-bit integers. 
+As a result, existing solutions store sub-8-bit dimensions in fixed-length 8-bit variables, wasting bits and leading to larger indexes.
+
+In our approach, the bit patterns of variable-length quantization codes for multiple consecutive dimensions are concatenated into shared $S$-bit storage segments, each of which can be e.g., 8/16/32/64 bits.
+This scheme is illustrated in Figure \ref{fig:osq-main}\subref{fig:subfig-osq-b}.
+Dimensions are able to overlap multiple segments, and segments may contain some or all of one or more dimensions.
+This simple solution makes OSQ optimal in terms of memory requirements. For a given total per-vector quantization bit budget $b$, segment size $S$ and dimensionality $d$, the number of segments required (per vector) under OSQ $G_{OSQ} = \ceil{\frac{b}{S}}$, whereas under standard SQ $G_{SQ} = d$. 
+(Illustrative example: $d = 128, S = 8, b = 512$. $G_{OSQ} = 64, G_{SQ} = 128$).
+
+%An important consideration is the distribution of `information' across dimensions.
+
+Figure \ref{fig:subfig-osq-a} shows the current state-of-the-art SQ data organization under a non-uniform bit allocation of between 0 and 8 bits per dimension.
+Since each $B[j]$-length (variable) bit string is stored in an $S$-bit (fixed) representation, SQ suffers from bit wastage in all dimensions where $B[j] \neq S$, as well as the final padding. The degree of wastage $W$ is shown in Figure \ref{fig:bit-wastage-graph} (for a given segment size $S$). We define the segment delta for a given SQ dimension $S_{\delta}(j)$ as the difference between the bits allocated to $j$ and the segment size $S$; $\overline{S_{\delta}}$ is the average for all dimensions. Hence, $W = \sum_{j} S - B[j]$.
+In contrast, OSQ incurs the minimal possible bit wastage, i.e., only the padding in the final segment. 
+Another benefit of OSQ is the ability to allocate more bits than the segment size (e.g., 9 bits) to a single particularly important dimension. Without OSQ, the size of all segments would need to increase to e.g., 16-bit integer. %, which imposes even more bit wastage.
+A combined distance on `fused' dimensions can be computed to further improve the effectiveness of this approach.
+
+To perform the non-uniform bit allocation, bits are iteratively assigned to the dimension with the highest variance; the variance is reduced accordingly after each assignment \cite{gersho2012vector}.
+The resulting bit allocations $B$ and quantization cell counts $C$ ($B[j] = k \rightarrow C[j] = 2^k$) are recorded. 
+Each dimension $v_{i,j}$ of vector $v_i$ is quantized by identifying its cell within dimension $j$.
+Since $j$ contains $C[j] = 2^{B[j]}$ cells, quantized cell positions are encoded in a $B[j]$-length bit pattern. 
+The final SQ representation for a single vector concatenates these bit patterns across all dimensions; in OSQ, data is stored in a segment-wise fashion.
+A powerful property of the dimension-wise quantization approach is that while the vector space is (non-uniformly) partitioned into $2^b$ (rectangular) cells, individual cells need not be maintained or managed, ensuring the index can remain compact while offering a rich representation.
+The dimension-wise approach is also amenable to significant query-time acceleration (e.g., by pre-computing distances from a given query to each quantization cell); we discuss our solution for this in Section \ref{sss:fine-grained-distance-cals}.
+%Further work could explore the use of t
+
+% Any more?
+\input{figs/insert-bit-wastage-graph}
+
+
+\input{figs/insert-bitwise-extraction}
+
+\subsubsection{OSQ Dimensional Extraction}
+In order to access individual dimensions from our OSQ index, we require a mechanism to efficiently extract sub-$S$-bit chunks from an $S$-bit segment. This functionality is required when we seek to compute dimension-wise distances between a query vector and a set of data vectors.
+The OSQ extraction scheme utilizes \textit{column-wise} lightweight left/right bit-shift operations for this purpose, as illustrated in Figure \ref{fig:bitwise-dim-extraction}. 
+% There are two cases to consider: 1) a dimension is wholly contained in a single segment, 2) a dimension is spread over multiple segments. 
+Dimensions may either be wholly contained in a single segment, or spread over multiple segments.
+In both cases, we seek to position the relevant bits in the `rightmost' positions, i.e. starting from the LSB.
+% , as would be the case for a standard SQ data organization. 
+% Could also define an offset, i.e., how many bits away from the left hand start of the segment we are - these aren’t the same value.
+In the first case, we perform left-shift operations if the required bits are not on the left side of the segment (e.g., $D_3$ in Figure \ref{fig:bitwise-dim-extraction}), before executing the necessary right-shifts to correctly position the bits. This zeros any earlier bits not relevant to the current dimension.
+Extra steps are required to merge the bits from multiple segments (e.g., for $D_2$ in Figure \ref{fig:bitwise-dim-extraction}). The bits from each segment are extracted independently, and positioned in a residue segment $R_i$, with an appropriate offset from the MSB. Let the number of bits of dimension $j$ contained within segment $k$ be denoted as $b_{j,k}$. The 3 bits of $D_2$ in $S_1$ are extracted as in case 1, before being stored in $R_1$ with an offset of ($B[2] - b_{2,1} = 5 - 3 = 2$) bits from the MSB. As the remaining 2 bits of $D_2$ (in $S_2$) are the final bits of $D_2$, they require no offset in $R_2$. A bitwise OR operation is then performed between $R_1$ and $R_2$ in order to produce the final extracted bit representation.
+These operations are accelerated with vectorization \cite{NumpyVectorization}, allowing a given dimension to be extracted simultaneously for all vectors. Further, in the hybrid search setting, we typically consider a reduced candidate set after filtering; extraction operations are only performed on rows satisfying the predicate filter (as in Figure \ref{fig:bitwise-dim-extraction}). 
+% This further reduces the computational burden of OSQ.
+
+%----------------------------------------------------------------------
+%----------------------------------------------------------------------
+\subsection{Hybrid Search with Quantized Attributes}
+\label{ss:2.3-attribute-filtering}
+
+\begin{definition}[Hybrid Search]
+\textit{Given a dataset $D = \{ (v_1, a_1), \dots, (v_N, a_N) \}$ of $N$ vectors $v_i \in$ $\mathbb{R}^d$ with associated attribute data $a_i \in$ $\mathbb{R}^A$, query vector $q = \{v_q , p_q \}$, and limit $k$, find the $k$ vectors in $D$ that are most similar to $q$ which also satisfy predicate $p_q$ (for all attributes). The predicate $p_q$ consists of an operator $m_k$ and one or more operands $n_{k,l}$ for each attribute $k$: $\{(m_0, n_{0,1}, n_{0,2}), \dots, (m_{A-1}, n_{A-1, 1}, n_{A-1, 2}) \}$}.
+\label{def:s3-hybrid-search}
+\end{definition}
+
+
+
+Our approach for hybrid search, as in Definition \ref{def:s3-hybrid-search}, is illustrated in Figure \ref{fig:squash-attribute-filtering}. We quantize attributes using OSQ in a similar fashion to individual vector dimensions, and employ a cumulative bitwise masking approach to perform filtering.
+%advanced indexing \cite{NumpyAdvancedIndexing} as well as 
+The final attribute mask is combined with a partition-vector residency map in order to perform distributed filtered search without memory overhead or multiple search passes. The design supports an unlimited number of real-valued or categorical attributes, allowing any combination of equality and range predicates over multiple attributes simultaneously. OSQ minimizes the index size and reduces computational overhead during filtering, making the method highly scalable and suitable for serverless deployments.  This is in contrast to existing filtered ANNS techniques which are limited by one or more constraints: restricting the number and types of attributes, handling only single-attribute queries, or supporting only low-cardinality labels and equality operators. Many also rely on a priori workload knowledge to optimize their filters or indexes. 
+
+\input{figs/insert-attribute-filtering-figure}
+
+\subsubsection{Query Predicate Parsing}
+The first step of hybrid query processing is to parse the filter predicate. We present how we support $<, \leq, =, >, \geq$ and `B' (i.e., between, $x \leq y \leq z$) operators. Any combination of these can be provided, and specific attributes can be omitted from the filter. 
+% Filter predicates also include 1 or 2 operands (2 are only required for `B').
+% For numerical or ordinal categorical attributes, all operators are supported. Only equality operators are supported for nominal categorical attributes.
+We maintain an in-memory array of attribute quantization boundary values $V$. 
+It has dimensionality ($M + 1, A$), where $M$ is the maximum number of quantization cells in any dimension ($max(C)$) and $A$ is the number of attributes indexed.
+At query time, we construct a lookup array $R$, of dimensionality ($M+1, A, |Q|)$, where $|Q|$ is the number of queries to be processed. $R$ contains binary values indicating, for a given query, whether a given quantized cell satisfies the filter for this attribute. % (i.e., that cell `matches' the filter). 
+For example, if query $q$ specifies that attribute 0 has value $a_0 < 15$, and $V[:,0] = [0, 5, 10, 15, 20]$, then we set $R[:,0,q] = [1, 1, 1, 0, 0]$. This is illustrated in step 1 of Figure \ref{fig:squash-attribute-filtering}.
+
+\subsubsection{Filter Mask Calculation}
+Next, we generate the attribute filter mask, i.e., a binary array indicating the vector IDs that satisfy the filter predicate. Our solution is based on pass/fail bitmaps, and progressively performs efficient bitwise AND operations over all attributes. 
+Note that while we present our solution with conjunctive ANDs (i.e., filters for all attributes must hold simultaneously), it is readily extensible to support disjunctive OR predicates.
+The attribute filter mask $F$ is a binary array of length $N$, initialized to 1 for all vectors, as none have initially been pruned. We then perform a vectorized lookup into $R[:,0,q]$ (for query $q$) using values from the first column (length $N$) of the Attribute Q-Index, which are held in memory for all vectors. This returns a binary satisfaction array $S_0$, also of length $N$, with 1s in the positions (rows) whose corresponding vectors satisfy the filter predicate for the first attribute. We then perform a bitwise AND between $F$ and $S_0$ to update $F$ (i.e., $F = F \wedge S_0$). Following this step, mask $F$ contains 1s at the positions of vectors which passed the first predicate check, and 0s for vectors which failed. We repeat this process for all attributes, performing successive vectorized lookups/bitwise ANDs to update the mask. Following this, only rows still set to 1 have passed the filter predicates for all attributes, and are carried forward as candidates - the rest are pruned. 
+Our approach is also amenable to optimizations based on query workloads. 
+For instance, binary filter masks $S_J$ based on popular predicates could be appended to the attribute Q-index and seamlessly swapped in during the progressive bitwise matching phase. 
+% This would eliminate the need to identify matching rows for any pre-computed filters.
+
+
+
+
+%----------------------------------------------------------------------
+%----------------------------------------------------------------------
+\subsection{Multi-Stage Search Routine}
+\label{ss:2.4-search-pipeline}
+
+This section describes the multi-stage search routine in SQUASH, in four functional areas, namely coarse partitioner, pre-processing, fine-grained index and post-refinement \cite{douze2024faisslibraryivfsq8}. 
+
+\subsubsection{Coarse Partitioner, Pre-Processing}
+To this point, we have presented non-distributed OSQ. We now present its distributed and parallel search adaptation for the serverless FaaS setting.
+The coarse partitioning step involves 
+constrained clustering to extract balanced partitions for computational load balance in the resource-constrained FaaS environment. 
+Alternative balanced partitioning schemes can be utilized, for example fusing vector and multi-attribute similarity information.
+Within each partition, we design an OSQ index. We apply an optional unitary, i.e., angle and length-preserving, transformation in order to decorrelate dimensions and 
+compact energy which boosts the performance of our non-uniform bit allocation. In our implementation, we used the Karhunen-Loève Transform (KLT) for this purpose.
+% This also improves the quality of our non-uniform bit allocation, as its 
+We transform each partition independently which is not only more efficient and parallel, but it also captures the local data distribution more accurately; the distance-preserving nature of unitary transforms ensures queries are still processed correctly when results are combined from multiple partitions.
+Finally, we perform efficient one-dimensional K-means clustering to design optimal scalar quantizers based on the data distribution \cite{LloydsAlgorithm1982}. 
+
+% Rather than performing a uniform SQ (e.g., equally spaced cells), we execute Lloyd’s algorithm, which designs optimal scalar quantizers for each dimension based on the data distribution. 
+
+\input{algos/squash-algo-cluster-ranking}
+
+\subsubsection{Filtered Partition Ranking and Selection}
+At query time, we first carry out the attribute filtering workflow described in Section \ref{ss:2.3-attribute-filtering}. The attribute satisfaction mask $F$ (output of Figure \ref{fig:squash-attribute-filtering}, Step 3) is calculated globally (i.e., across all partitions).
+Next, we determine which partitions to visit to answer a given query. 
+This should be achieved in a single pass (i.e., performing per-partition processing only once per query) in order to avoid processor re-invocation.
+% minimize I/O, runtime and costs.
+\textit{We guarantee that should they exist globally, at least $k$ vectors satisfying the filter predicate will be identified.} For all visited partitions, we consider \textit{all} vectors passing the filter as candidates. %, thus ensuring we find the true nearest neighbors.
+% while still guaranteeing the return of sufficiently many vectors which pass the filter predicate. 
+% This is challenging in the distributed setting, where a first attempt identifying fewer than $k$ satisfactory vectors requires re-invocation of some or all of the per-partition processors.
+\begin{equation}
+    T = 1 + \frac{\sigma_{\mu}}{\mu_{\mu}} + \beta \sqrt{d}
+    \label{eqn-cdf-calculation}
+\end{equation}
+
+Our goal is to visit the minimal set of partitions while satisfying both of the following: 1) at least $k$ vectors passing the filter will be considered, 2) all partitions whose centroids are within a multiplicative distance factor $T$ of the nearest (to the query) are visited (to ensure high recall).
+To compute $T$ for a dataset, we first calculate the pairwise distance matrix between all vectors and centroids, before deriving the ratio matrix $R$ by dividing each value by the home centroid distance (home ratios are 1, and others >1). 
+The row-wise means ($\mu_R$) and standard deviations ($\sigma_R$) of $R$ are then computed.
+In Equation \ref{eqn-cdf-calculation}, $\mu_{\mu} = $ \textsc{mean}$ (\mu_{R}) $ and $\sigma_{\mu} = $ \textsc{mean}$ (\sigma_{R}) $ are the means of the row-wise means/standard deviations of $R$, respectively. $d$ is the dimensionality, while $\beta$ is a small value (e.g., 0.001) which can be tuned based on recall requirements. 
+
+Algorithm \ref{alg:squash-cluster-ranking} shows our partition selection approach. 
+We first initialize a dictionary $P_Q$ of queries to be issued to each partition (L1).
+% To perform partition ranking for a given query, distances from the query vector to each partition centroid are first calculated (L4-5). 
+For each query, distances to each partition centroid are calculated (L4-5). 
+Partitions are then considered in ascending distance order (L6). A compact in-memory bitmap $P_V$ of the vectors resident in each partition is maintained.
+The \textsc{FilterPartitionVectors} function (L9) uses $P_V$ and the attribute filter mask $F$ to find the vector indices \textit{in a given partition} $p$ satisfying the predicate. 
+% If matching vectors are found, we add a bitmap representation to the query metadata for that partition, indicating the \textit{local} indices of the candidate vectors for this query (L11). 
+If matching vectors are found, a bitmap representation is added to $P_Q[p]$, indicating \textit{local} candidate indices (L11).
+This allows the per-partition processors to prune all non-passing vectors. 
+Partitions are continually considered until both 1) $T$ has been reached, and 2) at least $k$ vectors have been identified (L7).
+As an optional step in the batch setting, we can issue additional queries to partitions which few queries are currently searching. 
+Each such partition is assigned the queries which it was most narrowly previously pruned from (i.e., where it had the first centroid distance above the threshold), until a balanced workload is achieved.
+% until a balanced query workload is achieved across all partitions.
+
+% \subsubsection{Pruning via Binary Quantization}
+\subsubsection{Fast Pruning via Low-Bit OSQ}
+Having reduced the search scope via attribute filtering and partition selection, we wish to quickly prune a significant portion of the remaining local (partition-level) candidates with minimal accuracy loss, allowing full distance calculations to be avoided for as many vectors as possible. This is particularly important when the filter predicate is not highly restrictive, to reduce the load on resource-constrained FaaS instances.
+Therefore, in addition to the primary index, we also build a low-bit OSQ index (also in-memory), which assigns a single bit to each dimension and can be leveraged for early candidate pruning via fast bitwise comparisons.
+The low-bit OSQ scheme utilizes binary quantization, in conjunction with our segment-based storage scheme, to consolidate the 1-bit representations for $S$ dimensions into each $S$-bit segment.
+We first standardize the data, before thresholding vectors around 0 to determine 0/1 mappings. Following this, binary values are stored into segments via OSQ.
+% packed into a bitmap, in order to minimize memory and I/O overheads.
+
+We compute (binary quantized) query-to-vector Hamming distances for all local candidates. We observe that Hamming distance using OSQ-based binary vectors
+approximately maintains the same relative ordering as lower bound (LB) Euclidean distance for high-dimensional data.
+This can be intuitively explained by the shared boundary-based proximity and dimensional independence properties.
+Experiments (not shown) indicate strong correlations between the query-to-vector Euclidean distance and the Hamming distances computed based on binary OSQ vectors on a range of datasets. 
+The binary OSQ-based distances 
+serve as a lightweight bitwise (albeit coarse) approximation for the final results.
+The Hamming distance between two binary vectors $x$ and $y$ of equal length $n$ is defined as the number of positions at which corresponding bits differ. 
+% If $x$ and $y$ are binary vectors of length $n$, 
+The Hamming distance $d_H(x, y)$ is:
+\begin{equation}
+    d_H(x, y) = \sum_{i=1}^{n} \mathbbm{1}(x_i \neq y_i)
+    \label{eq-hamming-dist}
+\end{equation}
+Where $\mathbbm{1}(x_i \neq y_i)$ is an indicator function that equals 1 if $x_i \neq y_i$, and 0 otherwise.
+The percentage cutoff $H_{perc}$ (i.e., the proportion of the best vectors in ascending Hamming distance order to retain) can be tuned according to the approximation tolerance of the user. 
+
+
+\subsubsection{Fine-Grained Distance Calculations}
+\label{sss:fine-grained-distance-cals}
+
+
+Using the primary OSQ index, we approximate the distance from a query $q$ to a given vector by identifying the distance from $q$ to the nearest edge of the high-dimensional cell containing that (quantized) vector; this is a lower bound (LB) distance calculation.
+This is calculated as the square root of the sum, over all dimensions, of the squared distances to the nearest boundary values \cite{Weber1998VA}; i.e., the right boundary if $j < cell(q[k])$, the left boundary if $j > cell(q[k])$, and if $j = cell(q[k])$, then the LB distance is 0 for that dimension.
+Since the query is un-quantized, this is an asymmetric distance calculation (ADC) \cite{Jegou2011PQ}.
+We only calculate LBs for candidates not pruned thus far, and candidates are ranked in ascending LB distance order.
+
+
+
+% SQ-based methods calculate LB distances by summing per-dimension query-to-boundary distances for each candidate vector.
+Importantly, we note that many vectors are quantized to the same cell in a given dimension.
+In existing SQ-based methods, this leads to many redundant computations when processing multiple candidates with shared per-dimension quantized values. 
+To address this, we construct an in-memory ADC lookup table $L$ of dimensionality ($M + 1, d$) for each query $q$, where $M$ is the maximum number of quantization cells in any dimension ($max(C)$).
+This enables each squared `query dimension' to `dimension boundary value' distance to be calculated only once.
+% This enables the distances from the un-quantized query values to the relevant quantization cell boundaries to be calculated only once. 
+Building $L$ requires only $(\sum_j C[j]) - 1$ calculations, and is performed extremely efficiently with vectorized operations. 
+As described above, $L[j,k]$ contains the distance from $q[k]$ (un-quantized) to the \textit{nearest} quantization boundary value in dimension $j$. 
+We then use the lookup to calculate LB distances for all unpruned candidates by performing `advanced indexing' \cite{NumpyAdvancedIndexing} operations; i.e., using the in-memory quantized values (only for remaining local candidates) to index into $L$ for all dimensions, before performing row-wise sums to give final per-vector LB distances.
+
+
+\subsubsection{Post-Refinement and Result Aggregation}
+
+As an optional step, random reads to disk can be performed to fetch un-quantized vector data, and compute full-precision distance calculations. This would boost recall and improve the ordering of the final result set. When doing so, $R \cdot k$ ($R > 1$) records are retrieved, enabling the discovery of any true nearest neighbors with LB distances just outside the top-$k$. 
+Importantly, OSQ enables the use of small $R$ values, typically 2, in contrast to many PQ/PG approaches which require substantial re-ranking, e.g., $R > 100$. This low re-ranking requirement is important in making OSQ suitable for serverless ANNS.
+As a final step, we perform an MPI-style reduce operation, where per-partition `local results' are merged at the global level. This entails performing a merge sort of the result sets from each per-partition processor to determine the global top-$k$.

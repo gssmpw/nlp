@@ -1,0 +1,140 @@
+\section{\algname for GSplat Map Registration}
+\label{sec:method}
+We introduce \algname, our semantics-grounded, initialization-free registration algorithm for GSplat maps. At its core, \algname leverages open-vocabulary semantics within a principled optimization-based framework to enable the robust registration of multi-robot GSplat maps. \algname utilizes an SCF procedure, composed of: (a) Semantic feature extraction and matching, (b) Coarse Gaussian-to-Gaussian geometric registration, and (c) Fine photometric registration, illustrated in 
+\Cref{fig:siren_pipeline}.
+Here, for simplicity, we discuss the registration pipeline in the problem setting with two multi-robot maps, where we seek to register a source GSplat map to a target GSplat map. However, the discussion applies to the registration of multiple local multi-robot maps.
+
+
+In the first step, \algname identifies corresponding pairs of Gaussians in a pair of GSplat maps by examining the similarity between the semantic features of the ellipsoids. Subsequently, given the set of corresponding Gaussians, \algname solves a Gaussian-to-Gaussian optimization problem to compute the optimal transformation aligning the pair of multi-robot maps with a robust objective function, which leverages the semantic similarity between each pair of ellipsoids to guard against the impacts of outliers. In the last step, \algname harnesses the novel-view synthesis capabilities of Gaussian Splatting to render candidate images for image-to-image registration, enabling fine registration of both maps via a structure-from-motion-based approach. In this stage, \algname utilizes image-level semantic features to identify pairs of corresponding images, critical to the robust matching of local features such as corners, edges, and blobs between the images. We discuss each of these steps in greater detail.
+
+
+\begin{figure*}[th]
+    \centering
+    \includegraphics[width=\linewidth]{figures/pipeline/siren_pipeline.pdf}
+    \caption{\algname consists of three steps: (a) semantic feature extraction and matching of Gaussians across the local maps, (b) coarse Gaussian-to-Gaussian registration for coarsely aligning the local maps, (c) fine photometric registration for high-accuracy fusion of the local maps, through image-to-image registration and bundle adjustment.}
+    \label{fig:siren_pipeline}
+\end{figure*}
+
+\subsection{Semantic Feature Extraction and Matching}
+Noting that semantics underpin \algname, we begin with a discussion of the semantic distillation procedure utilized by \algname in grounding $2$D semantic information from the vision-language model in GSplat maps, where we associate semantic embeddings with each ellipsoid in the GSplat map. 
+
+\smallskip
+\noindent\textbf{Semantic Gaussian Splatting.}
+Existing methods for training semantic GSplat models generally train auxiliary models, e.g., autoencoders or CNNs, for dimensionality reduction of the semantic features from vision-language models to compute lower-dimensional semantic features, which are distilled into the GSplat model \cite{qin2024langsplat, zhou2024feature}. These methods require relatively significant computation time and GPU memory, which we seek to avoid in \algname. Consequently, we take a different approach to semantic distillation. In \algname, we simultaneously train a semantic field $\psi$ alongside the GSplat model. The semantic field ${\psi: \mbb{R}^{3} \mapsto \mbb{R}^{d}}$ maps $3$D points to $d$-dimensional semantic features, where $d$ is determined by the vision-language foundation model, e.g., ${d = 512}$~or~${1024}$ in CLIP. We parameterize ${\psi}$ with a multi-resolution neural hashgrid, trained with the GSplat model, using the loss function:
+\begin{equation}
+    \label{eq:semantics_loss_function}
+    \mcal{L} = \mcal{L}_{\mathrm{gs}} + \gamma \sum_{\mcal{I} \in \mcal{D}} \norm{\mcal{I}_{f} - \hat{\mcal{I}}_{f}}_{F}^{2} - \beta \sum_{\mcal{I} \in \mcal{D}} \phi(\mcal{I}_{f}, \hat{\mcal{I}}_{f}),
+\end{equation}
+where ${\mcal{I}_{f} \in \mbb{R}^{W \times H \times d}}$ and ${\hat{\mcal{I}}_{f} \in \mbb{R}^{W \times H \times d}}$ represent the ground-truth and predicted semantic feature maps associated with each image in the training dataset $\mcal{D}$, $\gamma$ and $\beta$ represent relative weight terms, and $\phi$ represents the cosine-similarity function between each semantic feature in $\mcal{I}_{f}$ and $\hat{\mcal{I}}_{f}$. 
+
+To predict the semantic feature map associated with each training image, we leverage a key insight of Gaussian Splatting: Gaussian Splatting provides highly-accurate depth estimates, even without any depth supervision \cite{huang20242d}. This key insight enables us to avoid training proposal networks (as required in NeRFs) that generate samples of the termination points of rays associated with each pixel in the rendered image of a camera, ultimately enabling \algname to avoid significant compute and memory overhead associated with training proposal networks.
+As such, given a camera pose, we back-project points from the image plane to the $3$D world and pass these points into $\psi$ to predict the semantic feature associated with these points. We augment each pixel in the image plane with its semantic features to obtain the semantic feature map. Training the GSplat with the semantic component does not adversely impact the photometric performance of the GSplat, enabling us to utilize the same hyperparameters and adaptive densification procedure used in the original GSplat work \cite{kerbl20233d}.
+
+\smallskip
+\noindent\textbf{Feature Extraction.}
+In the feature extraction and matching step, \algname identifies feature-rich areas of the scene via semantic localization, to improve the robustness of the subsequent optimization-based registration steps, as the feasibility and convergence of the optimization problems significantly depend on the presence of informative features.
+Given a trained semantic GSplat model, we augment each Gaussian with a semantic attribute, computed by querying the semantic field $\psi$ at the mean $\mu$ of each Gaussian. Subsequently, from a set of open-vocabulary queries, we compute the semantic relevancy score between each Gaussian and the natural-language query by taking the pairwise softmax over the cosine-similarity between the semantic feature of each Gaussian and the semantic embedding associated with the text query and the cosine-similarity between the semantic feature of each Gaussian and the semantic embedding associated with a generic or null text query (i.e., a text query for a generic object or an object a user does not want to localize) \cite{kerr2023lerf}. Depending on the quality of the local multi-robot maps, we can post-process the resulting set of Gaussians to either inflate the set by incorporating other Gaussians in close proximity to the initial set (based on the geometric or semantic distance) or deflate the set by removing Gaussians considered to be outliers (based on statistics, e.g., the standard deviation of the distance between neighboring Gaussians).
+
+\smallskip
+\noindent\textbf{Feature Matching.}
+Given the set of extracted Gaussians for each map, we match Gaussians from the source GSplat map to the target GSplat map, resulting in a set of correspondences $\mcal{E}$ where ${(i, j) \in \mcal{E}}$ indicates that Gaussian $i$ in the source GSplat map corresponds to Gaussian $j$ in target GSplat map. To identify the candidate matches in $\mcal{E}$, we compute the cosine-similarity between the semantic embeddings of the Gaussians in the source and target maps. We match each Gaussian in the source map to a random set of $M$ Gaussians in the target map, sampling among the target Gaussians (i.e., Gaussians in the target map) that are within a specified distance from the source Gaussian (i.e., Gaussian in the source map). In the sampling step, \algname can utilize a uniform distribution or a distribution where the probability values are proportional to the cosine-similarity values between the source and target Gaussians. For computational reasons, this operation can be performed using efficient data structures such as KD-trees. In addition, we can repeat the procedure to match each Gaussian in the target GSplat map to a set of Gaussians in the source GSplat map, taking care to ensure that $\mcal{E}$ does not contain any duplicate entry. Moreover, the matching process can be augmented with geometric information, by selecting candidate matches using geometric descriptors, such as the Fast Point Feature Histograms (FPFH) descriptors \cite{rusu2009fast}. We denote the set of Gaussians in the source map present in $\mcal{E}$ by $\mcal{P}$ and the set of Gaussians in the target map present in $\mcal{E}$ by $\mcal{Q}$.
+
+\subsection{Coarse Gaussian-to-Gaussian Registration}
+\label{sec:coarse_gaussian_to_gaussian_registration}
+We use the output from the feature matching step to compute an initial non-rigid transformation, consisting of a scale ${s_{c} \in \mbb{R}}$, a rotation matrix ${R \in \SO(3)}$, and a translation vector ${t \in \mbb{R}^{3}}$, aligning the Gaussians in the source GSplat map to the Gaussians in the target GSplat map. Since computing this transformation using all the Gaussians is intractable in general, we solve for this transformation using the Gaussians in $\mcal{P}$ and $\mcal{Q}$, a feature-dense, much smaller set of Gaussians, a design choice that not only reduces the computational cost, but also improves the feasibility and convergence properties of the resulting optimization problem. Specifically, we formulate the coarse Gaussian-to-Gaussian registration problem as an optimization problem over the transformation parameters, given by:
+\begin{equation}
+    \label{eq:coarse_registration_nonsimplified}
+    \begin{aligned}
+        \minimize{s_{c} \in \mbb{R}_{++}, R \in \SO(3), t \in \mbb{R}^{3}} \frac{1}{2} \sum_{(i, j) \in \mcal{E}} & w_{ij} \left(\norm{s_{c}Rp_{i} + t - q_{j}}_{2}^{2} \right. \\
+        &\quad \left. + \norm{s_{c}^{2}R \Sigma_{p_{i}}R^{\T} - \Sigma_{q_{j}}}_{F}^{2} \right),
+    \end{aligned}
+\end{equation}
+where ${p_{i} \in \mbb{R}^{3}}$ denotes the mean of Gaussian $i$ in the source map,  ${q_{j} \in \mbb{R}^{3}}$ denotes the mean of Gaussian $j$ in the target map, and $\Sigma_{p_{i}}$ and $\Sigma_{q_{j}}$ denote the covariance of Gaussian $i$ in the source map and Gaussian $j$ in the target map, respectively. We introduce the weight $w_{ij}$ in \eqref{eq:coarse_registration_nonsimplified} to increase the robustness of the optimization problem to outliers (i.e., false correspondences), by reducing the influence of outliers. We define $w_{ij}$ to be proportional to the cosine-similarity between the semantic embeddings of Gaussian $i$ in $\mcal{P}$ and Gaussian $j$ in $\mcal{Q}$. The optimization problem in \eqref{eq:coarse_registration_nonsimplified} is challenging to solve in general, necessitating the derivation of a less challenging formulation. Noting that the covariance of the Gaussians in the source and target maps can be expressed in the form ${\Sigma_{p_{i}} = H_{p_{i}} \Lambda_{p_{i}} \Lambda_{p_{i}}^{\T} H_{p_{i}}^{\T}}$ and ${\Sigma_{q_{j}} = H_{q_{j}} \Lambda_{q_{j}} \Lambda_{q_{j}}^{\T} H_{q_{j}}^{\T}}$, where $H_{p_{i}}$ and $H_{q_{j}}$ denote the orientation of Gaussian $i$ in the source map and Gaussian $j$ in the target map, respectively, and $\Lambda_{p_{i}}$ and $\Lambda_{q_{j}}$ denote the scale of the Gaussians, we express the problem in \eqref{eq:coarse_registration_nonsimplified} in the form:
+\begin{equation}
+    \label{eq:coarse_registration}
+    \begin{aligned}
+        \minimize{s_{c} \in \mbb{R}_{++}, R \in \SO(3), t \in \mbb{R}^{3}} \frac{1}{2} \sum_{(i, j) \in \mcal{E}} & w_{ij} \left(\norm{s_{c}Rp_{i} + t - q_{j}}_{2}^{2} \right. \\
+        & \left. + \norm{s_{c}R H_{p_{i}}  \Lambda_{p_{i}} - H_{q_{j}}  \Lambda_{q_{j}}}_{F}^{2} \right),
+    \end{aligned}
+\end{equation}
+which can be solved efficiently in closed-form, which we show in Appendix~\ref{app:method}, with:
+\begin{align}
+    R_{c}^{\star} &= U_{c} \Theta_{c} V_{c}^{\top}, \label{eq:coarse_registration_opt_R} \\
+    s_{c}^{\star} &= \frac{\trace(\Theta_{c} \Sigma)}{\trace\left(W\check{P}^{\top}\check{P} + \sum_{(i, j) \in \mcal{E}} w_{ij} \check{H}_{p_{i}}^{\top}\check{H}_{p_{i}}\right)}, \label{eq:coarse_registration_opt_scale} \\
+    t_{c}^{\star} &= \tilde{\mu}_{\mcal{Q}} - s_{c}^{\star} R^{\star} \tilde{\mu}_{\mcal{P}}, \label{eq:coarse_registration_opt_translation}
+\end{align}
+where ${U_{c} \Sigma_{c} V_{c}^{\top} = \check{Q}W\check{P}^{\top}
++ \sum_{(i, j) \in \mcal{E}} w_{ij} \check{H}_{q_{j}}\check{H}_{p_{i}}^{\top}}$, computed via the singular value decomposition (SVD),
+and ${\Theta_{c} = \diag(1, 1, \det(U_{c}V_{c}^{\top}))}$.
+We define ${\tilde{\mu}_{\mcal{P}}}$ and ${\tilde{\mu}_{\mcal{Q}}}$ as the weighted average of the means of the Gaussians in $\mcal{P}$ and $\mcal{Q}$, with weights $w_{ij}$ for Gaussian $i$ in $\mcal{P}$ and Gaussian $j$ in $\mcal{Q}$. Further, ${\check{P} \in \mbb{R}^{3 \times N}}$ and ${\check{Q} \in \mbb{R}^{3 \times N}}$ represent the \emph{zero-centered} Gaussians in $\mcal{P}$ and ${\mcal{Q}}$, respectively, with the $i$th column of $\check{P}$ given by ${\check{P}_{i} = p_{i} - \tilde{\mu}_{\mcal{P}}}$ and similarly for the $j$th column of $\check{Q}$.  We introduce the terms ${\check{H}_{p_{i}} \in \mbb{R}^{3 \times 3}}$ and ${\check{H}_{q_{j}} \in \mbb{R}^{3 \times 3}}$ to simplify notation, with: ${\check{H}_{p_{i}} = H_{p_{i}}  \Lambda_{p_{i}}}$ and ${\check{H}_{q_{j}} = H_{q_{j}}  \Lambda_{q_{j}}}$. In addition, ${W \in \mbb{R}^{N \times N}}$ denotes the diagonal weight matrix, ${W_{kk} = w_{k}}$, with ${w_{k} = w_{ij}}$,~${\forall k = (i, j) \in \mcal{E}}$.
+
+
+Although the resulting solution is optimal for the problem in \eqref{eq:coarse_registration}, the solution of \eqref{eq:coarse_registration} might not be optimal for the registration of the two sets of Gaussians, i.e., $\mcal{P}$ and $\mcal{Q}$, given that $\mcal{C}$ might contain spurious correspondences. To improve the robustness of \algname to spurious correspondences, we utilize RANSAC \cite{fischler1981random} when solving the optimization problem in \eqref{eq:coarse_registration}. With RANSAC, we iteratively update the correspondences in $\mcal{C}$ to remove false correspondences and compute an optimal transformation associated with the resulting set of correspondences.
+
+\subsection{Fine Photometric Registration}
+In the preceding coarse registration step, \algname computes a transformation aligning the source and target maps using only the geometric attributes of the Gaussians in each map. The coarse registration step fails to leverage the highly-informative visual features inherent in the GSplat maps, effectively limiting the accuracy of the estimated transformation. To overcome this limitation, \algname harnesses the novel-view synthesis capability of GSplat maps to generate photorealistic images and optimizes over the resulting set of rendered images to compute a transformation consistent with the rendered images from the source and target maps. The fine photometric registration procedure employs a lightweight structure-from-motion framework to minimize the computation costs, while improving the fidelity of the registered maps. This procedure consists of the following steps: (i) image generation, (ii) image registration and triangulation, and (iii) bundle adjustment, which we discuss in the rest of this section.
+
+\smallskip
+\noindent\textbf{Image Generation and Matching.}
+The fine registration procedure begins with the identification of a set of images with common features across the source and target maps, constituting arguably the most important step of the fine registration procedure. In particular, the feasibility of the fine registration procedure hinges on matching corresponding features across all images in the set. In general, identifying good candidate images for the matching process is challenging, especially without any prior knowledge of the region of overlap between the source and target maps. To address this challenge, we leverage the semantic submap extracted in the first stage of \algname to identify a region of overlap between the source and target maps. Subsequently, we exploit novel-view synthesis in Gaussian Splatting to render images at corresponding poses in both maps, by transforming the camera pose in one map to the associated camera pose in the other map, utilizing the coarse registration result to compute the corresponding pose. With this approach, not only do the resulting images contain common features from the overlapping region, the images also contain a dense set of features, associated with the semantic submap. However, the pair of rendered images may not contain sufficient matches, which could degrade the accuracy of the fine registration procedure. To mitigate this risk, we harness image semantics in vision foundation models to evaluate the similarity between each pair of rendered images, retaining only sufficiently similar images. In this work, we use CLIP along with the cosine-similarity metric, given that the image embeddings of CLIP were trained with a cosine-similarity loss function; however, other vision foundation can also be used, e.g., \cite{caron2021emerging}.
+
+
+\smallskip
+\noindent\textbf{Image Registration and Triangulation.}
+Following the generation of corresponding images, we extract features from all images using the learned feature extractors NetVLad \cite{arandjelovic2016netvlad} for global image-level descriptors and SuperPoint \cite{sarlin2020superglue} for local features, which we found to be more robust compared to classical feature extractors, e.g., SIFT \cite{karami2017image}. Subsequently, we match features across all images using \cite{sarlin2020superglue}. From corresponding features, we estimate the relative pose of the camera and the estimated $3$D locations of the feature points via image registration and triangulation, yielding an initial estimate of the camera pose associated with each image in a common reference frame.
+
+
+\smallskip
+\noindent\textbf{Bundle Adjustment.}
+The image registration step does not always provide high-accuracy camera pose estimates. Hence, we refine the estimated camera poses via bundle adjustment, i.e., we optimize over the camera pose and the $3$D locations of the feature points jointly through non-linear optimization. For brevity, we do not discuss the bundle adjustment problem in greater detail, noting its extensive discussion in prior work, e.g., \cite{schonberger2016structure}.  Although non-convex, the optimization problem can be solved efficiently via iterative methods, such as the Levenberg-Marquardth method, which we employ in this work. From the bundle adjustment optimization problem, we compute the camera poses associated with each image in an arbitrary common frame $\mcal{B}$. Given the camera poses expressed in $\mcal{A}$ and the corresponding poses in the source and target maps, we can compute an optimal transformation for registering $\mcal{A}$ to either the source frame (frame $\mcal{B}_{s}$) or the target frame (frame $\mcal{B}_{t}$) from the following registration problem in $\SE(3)$:
+\begin{equation}
+    \label{eq:fine_registration_nonsimplified}
+    \begin{aligned}
+        \minimize{s_{f} \in \mbb{R}_{++}, R \in \SO(3), t \in \mbb{R}^{3}} \frac{1}{2} \sum_{(i, j) \in \mcal{V}} & \left(\norm{s_{f}Ra_{i} + t - b_{j}}_{2}^{2} \right. \\
+        &\quad \left. + \beta_{ij} \norm{R R_{c_{i}} - R_{d_{j}}}_{F}^{2} \right),
+    \end{aligned}
+\end{equation}
+where ${s_{f}}$, ${R}$, and ${t}$ denote the scale, rotation, and translation parameters, respectively, $\mcal{V}$ denotes the set of edges between the camera poses expressed in $\mcal{A}$ and the corresponding poses in either the source or target frame, with ${a_{i} \in \mbb{R}^{3}}$ and ${b_{j} \in \mbb{R}^{3}}$ denoting the origin of the camera in $\mcal{A}$ and the origin of the camera in the frame $\mcal{B}_{s}$ or $\mcal{B}_{t}$, respectively, and ${R_{a_{i}}}$ and ${R_{b_{j}}}$ denoting the associated rotation matrices. We introduce the weight parameter ${\beta_{ij} \in \mbb{R}_{++}}$, which determines the contribution of the rotation-error component. In general, the optimization problem in \eqref{eq:fine_registration_nonsimplified} cannot be solved in closed-form. Solving \eqref{eq:fine_registration_nonsimplified} generally requires an iterative optimization method, e.g., sequential convex programming methods or Riemannian optimization methods.
+However, as ${\beta_{ij}}$ approaches zero,~${\forall (i, j) \in \mcal{V}}$, the optimal solution \eqref{eq:fine_registration_nonsimplified} approaches a limit point, with:
+\begin{equation}
+    \label{eq:bundle_adjustment_opt}
+    \begin{aligned}
+        &R_{f}^{\star} \rightarrow U_{f} \Theta_{f} V_{f}^{\top}, 
+        \enspace 
+        s_{f}^{\star} \rightarrow \frac{\trace(\Theta_{f} \Sigma_{f})}{\trace\left(\check{A}^{\top}\check{A}\right)},
+        \\
+        &t_{f}^{\star} \rightarrow  \mu_{\mcal{B}} - s_{f}^{\star} R_{f}^{\star} \mu_{\mcal{A}},
+    \end{aligned}
+\end{equation}
+where ${U_{f} \Sigma_{f} V_{f}^{\top} = \check{B}\check{A}^{\top}}$, ${\Theta_{f} = \diag(1, 1, \det(U_{f}V_{f}^{\top}))}$, $\mu_{\mcal{A}}$ and $\mu_{\mcal{B}}$ denote the mean of the camera origins in frames $\mcal{A}$ and $\mcal{B}$, respectively, and the $i$th column of ${\check{A} \in \mbb{R}^{3 \times N}}$ and the $j$th column of ${\check{B} \in \mbb{R}^{3 \times N}}$ are given by ${a_{i} - \mu_{\mcal{A}}}$ and ${b_{j} - \mu_{\mcal{B}}}$, respectively. The limit point follows from the derivation in \Cref{sec:coarse_gaussian_to_gaussian_registration} and \cite{umeyama1991least}. We can compose the pairwise transformations between frame $\mcal{A}$ and frames $\mcal{B}_{s}$ and $\mcal{B}_{t}$ to compute a transformation from $\mcal{B}_{s}$ and $\mcal{B}_{t}$. We apply the resulting transformation to the source map to express the source and target maps in a common frame and subsequently merge the resulting maps to obtain a composite GSplat map. Following the registration procedures, the composite map can be finetuned with new or existing data, which we explore in our experiments in Appendix~\ref{ssec:finetuning}.
+We summarize the procedures in \algname in \Cref{alg:coarse_gaussian_registration}.
+
+\begin{algorithm2e}[th]
+    \caption{\algname: Multi-Robot Map Registration}
+    \label{alg:coarse_gaussian_registration}
+    
+    \KwIn{Local GSplat Maps $\mcal{G}_{1}$, $\mcal{G}_{2}$\;}
+    \KwOut{Fused GSplat Map $\mcal{G}_{f}$\;}
+    \SetCommentSty{algsupercommfont}
+    \tcp{Semantic Feature Extraction and Matching}
+    Correspondence Set $\mcal{C} \gets \mathrm{GetCorrespondence}(\mcal{G}_{1}, \mcal{G}_{2})$\;    
+    \tcp{Coarse Registration}
+    \SetCommentSty{algcommfont}
+    \tcp{Compute the Optimal Rotation}
+    ${R_{c}^{\star} \gets \mathrm{Procedure~} \eqref{eq:coarse_registration_opt_R}}$\;
+    \tcp{Compute the Optimal Scale}
+    ${s_{c}^{\star} \gets \mathrm{Procedure~} \eqref{eq:coarse_registration_opt_scale}}$\;
+    \tcp{Compute the Optimal Translation}
+    ${t_{c}^{\star} \gets \mathrm{Procedure~} \eqref{eq:coarse_registration_opt_translation}}$\;
+    \SetCommentSty{algsupercommfont}
+    \tcp{Fine Registration}
+    \SetCommentSty{algcommfont}
+    \tcp{Get Images}
+    ${\mcal{D}_{s} \gets \mathrm{Render} (\mcal{G}_{1}, \mcal{G}_{2}, R_{c}^{\star}, s_{c}^{\star}, t_{c}^{\star})}$\;
+    \tcp{Refine Transformation}
+    ${(R_{f}^{\star}, s_{f}^{\star}, t_{f}^{\star}) \gets \mathrm{Procedure~} \eqref{eq:bundle_adjustment_opt}}$\;
+    \SetCommentSty{algsupercommfont}
+    \tcp{Fuse Local Maps}
+    \SetCommentSty{algcommfont}
+    ${\mcal{G}_{f} \gets \mathrm{Fuse}(\mcal{G}_{1}, \mcal{G}_{2}, R_{f}^{\star}, s_{f}^{\star}, t_{f}^{\star})}$\;
+\end{algorithm2e}

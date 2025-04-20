@@ -1,0 +1,1047 @@
+\documentclass[letterpaper,twocolumn,10pt]{article}
+\usepackage{usenix2019_v3}
+
+
+\usepackage{color}
+\usepackage{multirow}
+\usepackage{xurl}
+\usepackage{algorithmicx,algorithm}
+\usepackage[noend]{algpseudocode}
+\usepackage{subfig}
+\usepackage{array}
+\usepackage{colortbl}
+\usepackage{enumitem} \usepackage{times}
+\usepackage{xspace}
+\usepackage{latexsym}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{balance}
+\usepackage{graphicx}
+\usepackage{svg}
+\usepackage{pifont}
+\usepackage[font=small]{caption}
+\svgsetup{
+    inkscapepath=i/svg-inkscape/
+}
+\svgpath{{svg/}}
+\usepackage{amssymb}
+\usepackage{amsmath}
+\usepackage{etoolbox}
+\usepackage[all]{nowidow}
+\usepackage{authblk}
+
+\setlist{nolistsep}
+\setlength{\textfloatsep}{15pt}
+
+\newcommand{\para}{\medskip\noindent}
+\newcommand{\parabf}[1]{\medskip\noindent\textbf{#1}}
+\newcommand{\parait}[1]{\medskip\noindent\textit{#1}}
+\newcommand{\paraf}[1]{\noindent\textbf{#1}}
+\newcommand{\cut}[1]{}
+\newcommand{\etal}{{\em et al.}}
+
+\newcommand{\sysname}{ParaServe\xspace}
+\newcommand{\topk}{top-$k$\xspace}
+\newcommand{\topn}{top-$n$\xspace}
+
+\newcommand{\XXX}[0]{\textcolor{blue}{(XXX)}}
+
+\newcommand{\revisionnew}[1]{\textcolor{blue}{#1}}
+\newcommand{\revision}[1]{\textcolor{black}{#1}}
+\newcommand{\xin}[1]{\textcolor{blue}{(XIN: #1)}}
+\newcommand{\todo}[1]{\textcolor{red}{(TODO: #1)}}
+\newcommand{\chao}[1]{\textcolor{orange}{(CHAO: #1)}}
+\newcommand{\sheng}[1]{\textcolor{cyan}{(SHENG: #1)}}
+\newcommand{\xzl}[1]{\textbf{\color{violet}{(Xuanzhe: #1)}}} 
+\usepackage{titlesec}
+\titleformat{\author}[block]{\large}{}{0pt}{}
+\titlespacing{\author}{0pt}{0pt}{1em}
+
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{corollary}{Corollary}[section]
+\newtheorem{definition}{Definition}[section]
+\newtheorem{assumption}{Assumption}[section]
+\newtheorem{lemma}{Lemma}[section]
+\newtheorem{proposition}{Proposition}[section]
+\newtheorem{remark}{Remark}[section]
+
+\begin{document}
+\sloppy
+\date{}
+
+\title{Towards Swift Serverless LLM Cold Starts with \sysname}
+
+\author{
+    \rm{Chiheng Lou}$^{\dag}$\hspace{1.2em}
+    \rm{Sheng Qi}$^{\dag}$\hspace{1.2em}
+    \rm{Chao Jin}$^{\dag}$\hspace{1.2em}
+    \rm{Dapeng Nie}$^{\ddag}$\hspace{1.2em}
+    \rm{Haoran Yang}$^{\ddag}$\hspace{1.2em}
+    \rm{Xuanzhe Liu}$^{\dag}$\hspace{1.2em}
+    \rm{Xin Jin}$^{\dag}$
+    Peking University$^{\dag}$\hspace{1.2em}
+    Alibaba Group$^{\ddag}$
+}
+
+\maketitle
+\pagestyle{plain}
+
+\begin{abstract}
+\label{sec:abstract}
+
+With the surge in number of large language models (LLMs),
+the industry turns to serverless computing for LLM inference serving.
+However, serverless LLM serving suffers from significant cold start latency and service level objective (SLO) violations due to the substantial model size,
+which leads to prolonged model fetching time from remote storage.
+We present \sysname,
+a serverless LLM serving system that minimizes cold start latency through the novel use of pipeline parallelism.
+Our insight is that by distributing model parameters across multiple GPU servers, we can utilize their aggregated network bandwidth to concurrently fetch different parts of the model.
+\sysname adopts a two-level hierarchical design.
+At the cluster level, \sysname determines the optimal degree of parallelism based on user SLOs and carefully places GPU workers across servers to reduce network interference.
+At the worker level, \sysname overlaps model fetching, loading, and runtime initialization to further accelerate cold starts.
+Additionally, \sysname introduces pipeline consolidation, which merges parallel groups back to individual workers to maintain optimal performance for warm requests.
+Our comprehensive evaluations under diverse settings demonstrate that \sysname reduces the cold start latency by up to 4.7$\times$ and improves SLO attainment by up to 1.74$\times$ compared to baselines.
+
+\end{abstract}
+     \section{Introduction}
+\label{sec:introduction}
+
+Large language models (LLMs) have become an essential part of daily work and life, powering a wide range of applications such as chatbots~\cite{gpt4, claude, claude2}, programming assistants~\cite{copilot, cursor, qdeveloper}, and AI-enhanced search engines~\cite{newbing, chatgpt-browsing}.
+With the widespread adoption of LLMs, the industry has released numerous LLMs with varying structures, sizes, or training corpora for diverse scenarios~\cite{opt, gpt3, gpt4, claude, claude2, falcon, gemma, gemma2, palm, llama, llama2, gemini, mistral, phi3}.
+Businesses of different scales are also seeking to leverage custom LLMs tailored to their unique needs~\cite{iclr22_lora, blog_botpnguin, blog_kili, blog_azure}, rather than relying on general-purpose LLM APIs from AI service providers.
+
+Serverless computing~\cite{serverless_survey, fse_serverless} has become a compelling choice for users to deploy their LLM serving pipelines~\cite{huggingface, serverlessllm, sagemaker, kserve}.
+In serverless LLM serving, users only need to store the model weights in cloud storage and upload an image that runs LLM services.
+The cloud platform automatically provisions resources to instantiate the LLM, and dynamically scales the number of workers based on the actual request load.
+This approach offers significant cost savings through pay-per-use billing, where users are only charged for the resource consumption during active request processing.
+
+However, realizing the serverless paradigm for LLM serving is challenging, primarily due to the long latency of cold starts, i.e., provisioning new workers when there's not enough to meet the current load.
+Such cold starts are common in serverless workloads due to their bursty traffic patterns, as shown in public traces~\cite{azure_trace}.
+As cold starts take place on the critical path of request handling, they directly impact service level objectives (SLOs).
+The impact is especially pronounced for LLMs that range in size from gigabytes to terabytes.
+For instance, in our production environment, a cold-start instance produces the first token after up to 40 seconds, whereas subsequent generation takes only $\sim$30ms per token.
+This contrast stresses the need for faster cold starts.
+
+In serverless serving, the LLMs are retrieved on demand from remote model registry, which we refer to as model fetching.
+Serverless functions have limited network bandwidth in nature.
+As LLMs are large, model fetching costs significant time that contributes most to the total cold start latency.
+Prior works utilize caching to alleviate the model fetching time~\cite{serverlessllm, faaswap}.
+The idea is to cache LLMs in memory or SSDs to accelerate setting up a GPU worker.
+While caching is effective for the most frequently accessed models, the problem remains unsolved for the long-tail customers, who derive the most benefit from the serverless paradigm~\cite{serverless_survey}.
+
+We present \sysname, a serverless LLM serving system designed to minimize cold start latency.
+The insight of \sysname is simple yet effective---whereas a single server has limited bandwidth, we can distribute the workers across different servers, with each fetching a part of the model in parallel.
+It is viable because LLMs follow a layered structure; the layers are accessed sequentially, obviating the need to load the entire model at once.
+\sysname can start the inference once the first few layers are ready on the first server, and forward the intermediate results to subsequent servers that host the rest of the layers.
+This design, known as \emph{pipeline parallelism}, has been well studied in distributed model training and inference~\cite{huang2019gpipe, terapipe, narayanan2019pipedream, nips18_pipesgd, nips22_sapipe, megascale, li2023alpaserve}.
+\sysname applies pipeline parallelism in a novel way to reduce the blocking effect of model fetching.
+
+We take a two-level \emph{hierarchical} approach to realize the parallel model fetching in our production environment.
+At the \emph{cluster level}, we design an algorithm to compute the appropriate parallelism size (i.e., the number of servers to distribute the model) based on the model size, cluster resource usage, and user SLOs.
+We then use a network-contention-aware worker placement policy to choose a set of servers to host the pipeline.
+At the \emph{worker level}, we overlap remote-to-host model fetching, host-to-GPU model loading, and the initialization of container and GPU runtime to further reduce the cold start latency.
+
+Although pipeline parallelism can effectively reduce the cold start latency for the initial inference,
+it incurs inevitable overheads in subsequent rounds due to the transmissions of intermediate results across workers.
+To address this problem, we propose \emph{pipeline consolidation}.
+Specifically, we allow workers to fetch and load the remaining parts of the model in the background, eventually transitioning back to local inference with fully-loaded model.
+Depending on the load, each participant worker can independently decide whether to release its resources or load the full model after cold starts.
+Therefore, with a single cold start, \sysname can scale up as many workers as the pipeline size, allowing for faster elasticity.
+
+In summary, we make the following contributions:
+\begin{itemize}[leftmargin=*]
+    \item We design and implement \sysname, a serverless LLM serving system that leverages pipeline parallelism to reduce cold start latency.
+    \item We adopt a hierarchical approach that combines cluster-level and worker-level optimizations to satisfy user SLOs with pipeline parallelism.
+    \item We propose pipeline consolidation for faster scaling of LLM workers without extra cold starts.
+    \item Experiments on real-world datasets show that \sysname reduces the cold start latency by up to 4.7$\times$ and improves SLO attainment by up to 1.74$\times$ compared to baselines.
+\end{itemize}
+ \section{Background and Motivation}
+\label{sec:background}
+
+In this section, we introduce large language models (LLMs) and serverless LLM serving,
+and identify opportunities to reduce serverless cold start latency.
+
+\subsection{LLM inference}
+
+An LLM takes as input a sequence of tokens, called \emph{prompt}, and generates an output sequence in an \emph{autoregressive} fashion,
+meaning that it generates one token at a time based on both the prompt and its previous outputs.
+The core component of an LLM is the self-attention layer, which needs to compute the key, value, and query vectors of tokens in the input sequence.
+Since the key and value vectors of previous tokens remain unchanged during iterations,
+LLM serving systems usually cache these vectors to avoid redundant computation, known as \emph{KV cache}.
+The stage that generates the first token is called \emph{prefill}, during which the key and value vectors of all tokens in the prompt are calculated and stored in GPU memory.
+Subsequent tokens are generated in the \emph{decoding} phase, which reuses the key-value cache and generates one token at a time.
+
+Pipeline parallelism is a model parallelism strategy that is commonly used in LLM training to enable the scaling of model sizes beyond the capacity of a single GPU~\cite{huang2019gpipe, terapipe, narayanan2019pipedream, nips18_pipesgd, nips22_sapipe, megascale}.
+In this method, different layers of the model are distributed across multiple workers and inter-worker communication is needed to transfer intermediate results.
+To minimize pipeline bubbles,
+a mini-batch of training examples is usually split into micro-batches that are executed in pipeline~\cite{huang2019gpipe, narayanan2019pipedream}.
+Pipeline parallelism introduces little communication overhead between workers.
+For example, running an input with 256 tokens using OPT-175B generates intermediate messages of 6MB,
+which can be transmitted within single-digit milliseconds over a 10Gbps network.
+
+\subsection{Serverless LLM Serving}
+
+\begin{figure}
+    \centering
+    \includegraphics[width=\linewidth]{figures/motivation/breakdown.pdf}
+    \caption{Cold start latency breakdown.}
+    \label{fig:breakdown}
+\end{figure}
+
+\begin{figure}
+    \centering
+    \includegraphics[width=\linewidth]{figures/motivation/opt-breakdown.pdf}
+    \caption{Optimized cold-start workflow.}
+    \label{fig:opt-breakdown}
+\end{figure}
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{figures/overview/overview.pdf}
+    \vspace{-0.1in}
+    \caption{\sysname system overview.}
+    \label{fig:overview}
+    \vspace{-1em}
+\end{figure}
+
+In serverless LLM serving, users upload (1) LLM models to a model registry, and (2) a function image containing the serving framework and runtime libraries to a container image registry.
+The serving framework is responsible for fetching the model from the remote registry, loading the model into GPU memory, and running the model to generate tokens upon user requests.
+The serverless platform automatically adjust the number of function workers to match the current load.
+One of the most attractive offerings of serverless LLM serving is its pay-per-use billing, where users are charged only for the running period of each worker and not for the idle time.
+Therefore, serverless is cost-efficient for long-tail customers whose workloads are sporadic and highly unpredictable.
+
+In LLM serving, users often specify service level objectives (SLOs) that represent performance expectations~\cite{distserve, llumnix, fastserve,li2023alpaserve}.
+These SLOs are typically made up of two metrics: time to first token (TTFT) and time per output token (TPOT).
+TTFT represents the time elapsed from user sending the request to the generation of the \emph{first} token,
+while TPOT is the average time taken to generate each \emph{subsequent} token.
+Different workloads prioritize these metrics differently.
+For example, real-time chatbots~\cite{gpt4,claude,claude2} emphasize low TTFT, whereas tasks like article writing prefer lower TPOT~\cite{distserve}.
+
+Despite the potential benefits of serverless LLM serving,
+existing systems suffer from significant cold start latency.
+A \emph{cold start} occurs when an incoming request finds no available worker hosting the target model,
+requiring the system to initialize a new worker.
+Figure~\ref{fig:breakdown} provides a breakdown of cold start latency in our production serverless LLM serving platform, using Llama2-7B model on the NVIDIA A10 GPU.
+In general, a cold start involves the following stages:
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Container Creation.} The cluster controller allocates resources and creates a container on a GPU server.
+    \item \textbf{Library Loading.} The container starts the Python runtime and imports necessary libraries such as PyTorch~\cite{pytorch} and TensorFlow~\cite{tensorflow}.
+    This stage also initializes LLM serving frameworks like vLLM~\cite{vllm}, DeepSpeed~\cite{aminabadi2022deepspeed}, TensorRT-LLM~\cite{tensorRT}, and Triton~\cite{triton}.
+    \item \textbf{CUDA Context Initialization.} The Python runtime set up the CUDA context to prepare for GPU tasks.
+    \item \textbf{Model Fetching.} The serving framework retrieves the model from remote storage to local memory.
+    \item \textbf{Model Loading.} The fetched model is loaded into GPU memory.
+    \item \textbf{Inference.} The serving framework runs the model to generate the first token of the input sequence.
+\end{itemize}
+
+As show in Figure~\ref{fig:breakdown}, 
+it takes up to 40 seconds to produce the first token for a Llama2-7B model, whereas each subsequent token is generated in $\sim$30 milliseconds on average.
+Model fetching is the most time-consuming among all stages since the network bandwidth of inference servers are limited and the model weights are large.
+Furthermore, network contention can occur when multiple cold start containers are placed on the same server.
+They compete for the network bandwidth, leading to extremely long fetching latency.
+Container creation also costs a considerable amount of time, as LLM workloads require large function images.
+
+\subsection{Opportunies}
+
+This paper employs a two-level hierarchical approach to achieve maximum overlapping in the cold start critical path for serverless LLM serving.
+At the cluster level, we leverage pipeline parallelism for coarse-grained overlapping of model fetching across workers, addressing the most time-consuming phase of cold starts.
+Upon cold start, we create a pipeline parallelism group across GPU servers, with each worker hosting a part of the model.
+At the worker level, we perform fine-grained overlapping by carefully reorganizing the intra-worker workflow in Figure~\ref{fig:breakdown}.
+First, we offload model fetching from user container to a system-level service,
+allowing the fetching process to begin before container creation.
+Second, we notice that model and library loading stages are bound by different resources: model loading is GPU-bound, while library loading is CPU-bound.
+Thus, we run the two stages in parallel.
+We swap the order of library loading and CUDA context initialization, and trigger model loading once CUDA context has been prepared.
+Finally, we pipeline the fetching and loading at tensor granularity to hide the loading overhead.
+After all initialization stages have finished, the worker runs the model and generates the first token, completing the cold start.
+The optimized cold-start workflow is shown in Figure~\ref{fig:opt-breakdown}. \section{\sysname Overview}
+\label{sec:overview}
+
+\begin{figure}[t]
+    \centering
+    \subfloat[Normal cold start.]
+    {\includegraphics[width=0.46\linewidth, page=1]{figures/design/pipeline.pdf}}
+    \quad
+    \subfloat[Cold start with 2 workers.]
+    {\includegraphics[width=0.46\linewidth, page=2]{figures/design/pipeline.pdf}}
+    \quad
+    \subfloat[Cold start with scaling down.]
+    {\includegraphics[width=0.46\linewidth, page=3]{figures/design/pipeline.pdf}}
+    \quad
+    \subfloat[Cold start with scaling up.]
+    {\includegraphics[width=0.46\linewidth, page=4]{figures/design/pipeline.pdf}}
+    \quad
+    \vspace{-0.1in}
+    \caption{Comparison of cold-start workflows for different methods.}
+    \label{fig:pipeline}
+    \vspace{-1em}
+\end{figure}
+
+\begin{figure*}[t]
+    \centering
+    \subfloat[TTFT of different pipeline parallelism sizes.]
+    {\includegraphics[width=0.32\textwidth]{figures/motivation/fig-motivation-ttft.pdf}}
+    \quad
+    \subfloat[Impact of pipeline parallelism size on TPOT.]
+    {\includegraphics[width=0.32\textwidth]{figures/motivation/fig-motivation-tpot.pdf}}
+    \quad
+    \subfloat[Influence of GPU memory usage on TPOT when pipeline parallelism size is 4. The grey dotted line is the TPOT when pipeline parallelism size is 1.]
+    {\includegraphics[width=0.32\textwidth]{figures/motivation/fig-motivation-share.pdf}}
+    \vspace{-0.1in}
+    \caption{Tradeoff analysis of pipeline parallelism.}
+    \label{fig:tradeoff}
+    \vspace{-1em}
+\end{figure*}
+
+\sysname is a serverless LLM serving system designed to minimize the cold start latency.
+Unlike traditional serverless model serving systems that load the entire model in a single worker,
+\sysname leverages parallel model fetching to significantly reduce model fetching time.
+
+As shown in Figure~\ref{fig:overview}, \sysname consists of two optimization levels.
+At the cluster level, the central controller employs a parallelism size selection algorithm (\S\ref{sec:pipeline}) and a network-contention-aware worker placement strategy (\S\ref{sec:placement})
+to reduce cold start latency through pipeline parallelism.
+The parallelism size selection algorithm determines the appropriate pipeline parallelism size for each cold-start model based on user SLOs and cluster resource availability.
+For a given parallelism size, \sysname partitions the model across multiple workers and assigns these workers to different GPU servers using the network-contention-aware worker placement strategy.
+This strategy identifies potential network contentions on GPU servers and ensures that such contention does not cause SLO violations.
+
+At the worker level, \sysname applies fine-grained overlapping across cold start stages to reduce worker initialization time (\S\ref{sec:prefetching}).
+First, a node-level model prefetcher is used to proactively fetches model weights for cold-start workers, overlapping model fetching with container creation and runtime initialization time.
+Second, \sysname prioritizes the CUDA context initialization and introduces a parameter manager that loads parameters to GPU in parallel with library loading.
+Additionally, model fetching and loading are pipelined to hide the model loading overhead.
+These overlapping strategies reduce the overhead of cold start stages other than model fetching, thereby highlighting the value of pipeline parallelism.
+
+Finally, as pipeline parallelism can degrade inference performance,
+\sysname performs pipeline consolidation (\S\ref{sec:elastic}) to transform pipeline workers into standalone workers that host all parameters.
+\sysname allows some of cold-start workers to continue loading the remaining model parts while serving requests.
+Eventually, these workers evolve into individual workers that host the entire model.
+Each worker independently decides whether to load additional parameters or terminate after completing the cold start process.
+Ongoing requests, initially processed in the pipeline parallelism group, are migrated to the standalone workers. \section{Cluster-Level Controller}
+
+In this section, we present the design of the cluster-level central controller in \sysname.
+The controller makes decision on two aspects: (a) pipeline parallelism size and (b) worker placement.
+To find the optimal pipeline parallelism size, we first analyze the tradeoffs involved in pipeline parallelism,
+and then develop an algorithm to select the appropriate parallelism size based on the model size and user SLOs (\S\ref{sec:pipeline}).
+For worker placement, we employ a network-contention-aware worker placement strategy to prevent SLO violations (\S\ref{sec:placement}).
+
+\subsection{Parallelism Size Selection}
+\label{sec:pipeline}
+
+Figure~\ref{fig:pipeline}(a) illustrates the normal cold-start workflow, which goes through six stages sequentially.
+As model fetching is the most time-consuming stage,
+\sysname leverages pipeline parallelism to optimize cold starts.
+As shown in Figure~\ref{fig:pipeline}(b), upon a cold start, we launch multiple workers on different GPU servers, each fetches a part of the model.
+During inference, workers exchange intermediate results but the size of these messages is relatively small.
+By reducing the portion of the model each worker needs to fetch, pipeline parallelism significantly reduces cold start latency.
+
+\subsubsection{Tradeoff Analysis}
+\label{sec:tradeoff}
+
+Despite the benefits of pipeline parallelism, it introduces resource and performance overheads.
+To better understand these tradeoffs, we conduct experiments using a testbed with four GPU servers, each equipped with a NVIDIA A10 GPU and 188GB memory.
+The network bandwidth of each server is 16Gbps.
+
+Figure~\ref{fig:tradeoff}(a) demonstrates the TTFT of models under different pipeline parallelism sizes.
+Larger parallelism sizes reduce model fetching time, resulting in shorter TTFT.
+Note that the marginal improvement on TTFT diminishes as other cold-start stages also consume non-negligible time.
+This limitation is further tackled by worker-level optimizations in \S\ref{sec:prefetching}.
+
+In terms of TPOT, pipeline parallelism has a negative impact as shown in Figure~\ref{fig:tradeoff}(b).
+This is because individual workers in a pipeline parallelism group allocate GPU memory proportionally to their partitioned model size by default, and the amount of allocated memory also determines the GPU computation quota in our production environment.
+Thus, reduced GPU memory leads to severe performance degradation.
+
+Fortunately, users can allocate more GPU resources to workers than the default quota to achieve lower TPOT.
+Figure~\ref{fig:tradeoff}(c) illustrates the inference performance when different amount of GPU memory is allocated to each worker and pipeline parallelism size is four.
+Note that the performance degradation would be negligible if each worker in parallelism group is given the same amount of GPU memory as in the non-parallelized case (i.e., parallelism size is one).
+
+In conclusion, larger parallelism size reduces the cold start latency, but impacts the inference performance.
+Allocating more GPU memory to workers reduces the performance loss but at the cost of higher price.
+\sysname designs the pipeline parallelism size selection algorithm based on these two tradeoffs.
+
+\begin{algorithm}[t]
+    \caption{Pipeline Parallelism Size Selection Algorithm}\label{alg:pipeline}
+    \textbf{Input:} time cost of container creation and runtime initialization $t_c$, data transmission $t_n$, prefill $t_p$, decoding $t_d$, and waiting $t_w$;
+    model size $M$; GPU server network bandwidth $b_i$ and PCIe bandwidth $p_i$; user specified requirements $\text{SLO}_{\text{TTFT}}$ and $\text{SLO}_{\text{TPOT}}$.
+
+    \textbf{Output:} cold start scheme including pipeline parallelism size $s$, \#full-memory workers $w$, and selected GPU servers $g$.
+    \begin{algorithmic}
+        \For{$s\in \{1,2,\cdots,4\}$}
+        \For{$w\in \{0,1,\cdots,s\}$}
+        \State $i_1,i_2,\cdots,i_k\gets$ Servers that fit a model of size $M$, sorted by $\frac{1}{b_{i_x}}+\frac{1}{p_{i_x}}$ in increasing order
+        \State $j_1,j_2,\cdots,j_l\gets$ Servers that fit a model of size $M/s$, sorted by $\frac{1}{b_{j_x}}+\frac{1}{p_{j_x}}$ in descending order
+        \State $j_1',\cdots,j_{l'}'\gets \text{MergeSort}((j_1,\cdots,j_l), (i_{w+1},\cdots,i_k))$
+        \State $g\gets (i_1,i_2\cdots,i_w,j_1',\cdots,j_{s-w}')$
+        \State $\text{max\_ratio}\gets \max_{x\in g}\left(\frac{1}{b_x}+\frac{1}{p_x}\right)$
+        \State $\text{TTFT}\gets t_w+t_c+\frac{M}{s}\times \text{max\_ratio}+t_p\times(s-w+\frac{w}{s})+t_n\times s$
+        \State $\text{TPOT}\gets t_d\times(s-w+\frac{w}{s})+t_n\times s$
+        \If{$\text{TTFT}\leq \text{SLO}_{\text{TTFT}}$ \textbf{and} $\text{TPOT}\leq \text{SLO}_{\text{TPOT}}$}
+        \State \textbf{return} $(s, w, g)$
+        \EndIf
+        \EndFor
+        \EndFor
+        \State \textbf{return} $(1,1, (i_1))$ \Comment{Use single worker if no solution}
+    \end{algorithmic}
+\end{algorithm}
+
+\subsubsection{Algorithm Design}
+
+The parallelism size selection algorithm takes model size, user SLOs, and cluster resource status as inputs.
+The cluster resource status includes the remained GPU memory of all servers and their network bandwidth, adjusted by network-contention-aware worker placement policy in \S\ref{sec:placement}.
+The algorithm output is a cold start scheme containing the pipeline parallelism size, GPU memory usage of workers, and worker placement.
+
+To narrow down the search space, we limit the possible GPU memory usage of a worker to two cases:
+(a) the same as the non-parallelized setup (b) proportional to the inverse of pipeline parallelism size.
+We call them full-memory workers and low-memory workers, respectively.
+
+Our algorithm has two stages.
+First, we enumerate all choices with different pipeline parallelism sizes or GPU memory usage and predict the TTFT and TPOT for each choice.
+Second, we select the optimal choice that satisfies user SLOs with minimum resource usage.
+The maximum pipeline parallelism size is limited to $4$ as larger parallelism sizes gain little improvement.
+
+The TTFT and TPOT prediction takes historical information as inputs, including the time cost of container creation and runtime initialization ($t_c$), data transmission ($t_n$), prefill ($t_p$), and decoding ($t_d$).
+The data transmission time is the latency of TCP network between GPU servers.
+The prefill and decoding time cost are model-specific metrics obtained from the model's previous executions.
+The maximum waiting time of requests for the model is also needed, defined as $t_w$.
+Assume the pipeline parallelism size is $s$ and there are $w$ full-memory workers $(0\leq w\leq s)$,
+while the network and PCIe bandwidth of servers that workers reside in are $\{b_{q_1},b_{q_2},\cdots,b_{q_s}\}$ and $\{p_{q_1},p_{q_2},\cdots,p_{q_s}\}$.
+Finally, we predict the TTFT using the following equation:
+\begin{equation}
+\begin{split}
+\text{TTFT}&=t_w+t_c+\frac{M}{s}\times\max_i\{\frac{1}{b_{q_i}}+\frac{1}{p_{q_i}}\}\\
+&+t_p\times(s-w+\frac{w}{s})+t_n\times s,
+\end{split}\label{eq:prediction-ttft}
+\end{equation}
+\noindent where $M$ is the model size.
+TTFT is made up of five parts: request waiting, runtime initialization, model fetching, model loading, and prefill.
+The model fetching time is influenced by the partitioned model size and the slowest worker,
+while the prefill time depends on parallelism size and number of full-memory workers.
+A full-memory worker costs $t_p/s+t_n$ units of time in prefill, while a low-memory worker costs $t_p+t_n$ units of time.
+
+To satisfy TTFT requirement, we select GPU servers to minimize the model fetching and loading time for a given pipeline parallelism size $s$ and number of full-memory workers $w$,
+Assume the GPU servers that can accommodate full-memory workers are $\{i_1,i_2,\cdots,i_k\}$.
+Apart from them, there are also servers that can accommodate low-memory workers, denoted as $\{j_1,j_2,\cdots,j_l\}$.
+Our selection strategy is to first allocate the top $w$ servers with minimum model fetching and loading time (i.e., the smallest $\frac{1}{b_{i_x}}+\frac{1}{p_{i_x}}$) from $\{i_x\}$ to full-memory workers,
+and then merge the remaining servers into the set $\{j_x\}$.
+After that, we select the top $s-w$ servers from the merged set by same strategy and allocate them to all low-memory workers.
+
+Similarly, we can predict the TPOT as follows:
+\begin{equation}
+    \text{TPOT}=t_d\times(s-w+\frac{w}{s})+t_n\times s.
+\end{equation}\label{eq:prediction-tpot}
+\indent Among all choices that satisfy both TTFT and TPOT SLOs,
+\sysname selects the one with minimal parallelism size and GPU resource usage.
+Algorithm~\ref{alg:pipeline} presents the pipeline parallelism selection algorithm.
+
+
+\subsection{Network-Contention-Aware Worker Placement}
+\label{sec:placement}
+
+There are two types of network contentions in the cluster.
+The first one is the contention between model fetching and inference, i.e., the sending of intermediate results across workers.
+Because the intermediate results are small, simply prioritizing inference packets solves the contention.
+
+The second type of contention is the interference between cold-start workers on the same GPU server.
+Cold-start workers that collocated on a GPU server will compete for network resources during model fetching,
+leading to unexpected cold start performance.
+In contrast, simply assigning cold-start workers to servers in a mutually exclusive manner results in low GPU resource utilization.
+To this end, we propose a network-contention-aware worker placement policy that identifies network contentions and places cold-start workers based on user SLOs.
+
+\subsubsection{Policy Design}
+
+\begin{algorithm}[!t]
+    \caption{Network-Contention-Aware Worker Placement Policy}\label{alg:placement}
+    \textbf{Input:} each worker's deadline given by TTFT $\{D_i\}$ and estimated pending model size $\{S_i\}$
+    \begin{algorithmic}
+        \Function{GetNodeBandwidth}{$node$, $T$}
+        \State $B\gets$ bandwidth of $node$
+        \State $w_1,w_2,\cdots,w_N\gets$ existing cold-start workers of $node$
+        \For{$w\in (w_1,w_2,\cdots,w_N)$}
+        \If{$S_w>\frac{B}{N+1}\times(D_w-T)$}
+        \State \textbf{return} 0
+        \EndIf
+        \EndFor
+        \State \textbf{return} $\frac{B}{N}$
+        \EndFunction
+
+        \Function{HandleBandwidthChange}{$node$, $T$}
+        \State $B\gets$ bandwidth of $node$
+        \State $T'\gets$ last $T$ that changed bandwidth of $node$
+        \State $w_1,w_2,\cdots,w_N\gets$ existing cold-start workers of $node$
+        \For{$w\in (w_1,w_2,\cdots,w_N)$}
+        \State $S_w\gets S_w-\frac{B}{N}\times (T-T')$
+        \If{$S_w\leq 0$}
+        \State Remove $w$ from cold-start workers of $node$
+        \EndIf
+        \EndFor
+        \State $T'\gets T$
+        \EndFunction
+    \end{algorithmic}
+\end{algorithm}
+
+Initially, collocated workers share the network bandwidth with equal credits.
+Once we assign a worker to a GPU server,
+we record the model size it needs to fetch and the user-specified maximum TTFT.
+To place a new worker,
+we inspect each GPU server to check that whether adding a cold-start worker to this server would lead to SLO violations for existing workers.
+If check passed, we estimate and record the network bandwidth that the new worker can obtain.
+Note that PCIe bandwith is much higher than network and PCIe switch is able to further isolate PCIe usage across tasks, so we do not take PCIe contention into account.
+
+Specifically, we denote the bandwidth of a GPU server as $B$.
+For each cold-start worker $i$ on the GPU server, we record the fetching deadline $D_i$ and estimate its pending model size $S_i$.
+The fetching deadline comes from the prediction of TTFT (Eq.~\ref{eq:prediction-ttft}).
+When a new cold-start worker comes, the network bandwidth would change to $B/(N+1)$ if there were $N$ cold-start workers on the server.
+We check whether all cold-start workers on the server are able to complete fetching before deadline under the new bandwidth.
+Formally, we check that whether the following condition is true for all workers:
+\begin{equation}
+    S_i\leq \frac{B}{N+1}\times(D_i-T),
+\end{equation}\label{eq:check}
+\noindent where $T$ represents current time. This server accepts the new worker if all workers passed the check.
+
+To estimate the pending model size, we record the time of last network bandwidth change $T$'.
+The start and completion of a cold start change the network bandwidth, informing controller to adjust the pending model size.
+Here, we assume the current time is $T$ and the number of cold-start workers before change is $N$.
+Then we adjust the pending model size upon each bandwidth change according to the following equation:
+\begin{equation}
+    S_i'=S_i-\frac{B}{N}\times(T-T').
+\end{equation}\label{eq:estimation}
+\indent After adjustment, a $S_i$ that is below zero means that the worker has fetched the model ideally, thus we delete it from the cold-start worker list.   
+Algorithm~\ref{alg:placement} outlines the pseudocode of obtaining server bandwidth and handling bandwidth change.
+
+\section{Worker-Level Overlapping}
+\label{sec:prefetching}
+
+\begin{figure}
+    \centering
+    \subfloat[Prefetching whole model.]
+    {\includegraphics[width=0.46\linewidth, page=5]{figures/design/pipeline.pdf}}
+    \quad
+    \subfloat[Prefetching in two stages.]
+    {\includegraphics[width=0.46\linewidth, page=6]{figures/design/pipeline.pdf}}
+    \quad
+    \vspace{-0.1in}
+    \caption{Cold-start workflows with worker-level overlapping.}
+    \label{fig:overlap}
+    \vspace{-1em}
+\end{figure}
+
+As described in \S\ref{sec:tradeoff}, the TTFT of pipeline parallelism has diminishing marginal returns due to container initialization stages,
+including container creation, library loading and CUDA context initialization.
+Container creation is slow because function images of LLM workloads usually contain multiple Python libraries such as PyTorch~\cite{pytorch}, TensorFlow~\cite{olston2017tensorflow}, TensorRT~\cite{tensorRT} and vLLM~\cite{vllm}.
+These Python libraries have complex dependencies, leading to large image sizes.
+For example, the basic image for running vLLM is around 8.31GB.
+Loading and initializing numerous libraries also cost long libray loading time.
+Preparing a universal container for all workers~\cite{sosp23_xfaas, osdi23_wei, sosp24_trenv} does not help in this case because users have requirements for different library versions.
+
+In this section, we present the worker-level overlapping in \sysname that carefully reorganizes the startup workflow to reduce worker initialization time.
+Basically, \sysname leverages two optimizations to overlap initialization stages.
+First, we prefetch model weights on local GPU server as soon as container creation starts so that the container initialization stages are overlapped with model fetching.
+Second, we prioritize CUDA context initialization and develop a parameter manager to load model while initializing Python libraries so that the library loading stage is overlapped with model loading.
+
+\subsection{Model Prefetching}
+
+\sysname launches a model prefetcher on each GPU server, which is responsible for proactively fetching models from remote storage.
+When a worker has been allocated to the server, the central controller informs the model prefetcher about model metadata.
+After that, the prefetcher starts to load the model weights from remote storage to a shared memory region.
+The cold-start worker will fetch parameters from shared memory in a streaming manner after runtime has initialized.
+
+Model prefetching starts before container creation,
+so that the container creation and runtime initialization stages are overlapped.
+The worker performs model prefetching and loading in a pipelined fashion.
+In the shared memory region of a model,
+we use the first eight bytes to store the address that represents the end of currently fetched model weights.
+Model weights are represented using SafeTensors format~\cite{safetensors}.
+SafeTensors format contains the metadata of all parameters at the beginning of the file,
+so that it is convenient for the worker to check whether a tensor has been fetched.
+
+As allocating shared memory is time-consuming,
+the model prefetcher allocates a shared memory region for all models in advance.
+During startup, it accesses each virtual page in the region to allocate corresponding physical pages.
+When a fetching request arrives,
+the model prefetcher calculates the size of all model files and allocates space from the shared memory region.
+A standalone process is then triggered to read the model weights from remote storage and write contents into shared memory.
+
+\subsection{Parameter Manager}
+
+\sysname leverages a parameter manager to load model parameters in the background.
+The parameter manager runs in an individual thread and is responsible for resolving tensor metadata, reading weights from the shared memory, and finally loading weights into GPU.
+The whole procedure is zero-copy and pipelined.
+The parameter manager also takes advantage of the high parallelism of GPU cores and uses multiple CUDA streams to load models.
+The priorities of CUDA streams are determined according to whether the loading process is on the critical path or in the background.
+
+During cold starts, the entry program in container will first initialize the parameter manager to start loading model parameters,
+and then import other AI libraries.
+The serving framework later queries the parameter manager through a specified API to obtain tensors in a streaming manner with zero copy.
+
+Figure~\ref{fig:overlap}(a) illustrates the optimized cold-start workflow after adopting model prefetching and parameter manager.
+Model fetching and container initialization runs in parallel,
+while library loading is overlapped with model loading.
+In this way, the overhead of other cold start stages is concealed behind model fetching,
+reinforcing the effectiveness of pipeline parallelism.
+
+As \sysname may launch workers in pipeline parallelism groups and later load the remaining part of model in background,
+Figure~\ref{fig:overlap}(b) also shows the cold-start workflow in this scenario.
+The model prefetcher downloads two parts of model sequentially.
+After the first part of model has been loaded, the worker starts to perform inference with other workers in the pipeline parallelism group.
+Meanwhile, the parameter manager loads the second part of model in background and finally transform itself into a standalone worker.
+
+\parabf{TTFT prediction with worker-level overlapping.}
+After applying worker-level optimizations, the TTFT is reduced by fine-grained overlapping.
+Based on additional historical information including the time cost of container creation ($t_{cc}$), CUDA context initialization ($t_{cu}$) and library loading ($t_l$),
+we change the TTFT prediction used in pipeline parallelism size selection (Eq.~\ref{eq:prediction-ttft}) into the following formula.
+\begin{equation}
+\begin{split}
+    \text{TTFT}&=t_w+\max_i\left(t_{cc}+t_{cu}+\max\left(\frac{M/s}{p_{q_i}}, t_l\right),\frac{M/s}{b_{q_i}}\right)\\
+    &+t_p\times(s-w+\frac{w}{s})+t_n\times s.
+\end{split}\label{eq:prediction-ttft-opt}
+\end{equation}
+
+\section{Pipeline Consolidation}
+\label{sec:elastic}
+
+\sysname proposes pipeline consolidation that merges pipeline parallelism groups into individual workers to obtain optimal performance.
+Specifically, after the parameter manager has loaded the requested model parameters in pipeline-parallel inference,
+we inform it to continue loading the remaining part of model in background.
+Once loading completes, the worker returns to the non-parallelized setup and serves subsequent requests with whole model in local GPU, thereby achieving optimal performance.
+Note that the parameter manager loads the second part of model in low-priority CUDA streams,
+so that the performance of inference task will not be affected.
+
+\subsection{Worker Scaling}
+
+\begin{figure}
+    \centering
+    \subfloat[Normal scaling.]
+    {\includegraphics[width=0.46\linewidth, page=1]{figures/design/autoscaling.pdf}}
+    \quad
+    \subfloat[Scaling up in \sysname.]
+    {\includegraphics[width=0.46\linewidth, page=2]{figures/design/autoscaling.pdf}}
+    \quad
+    \vspace{-0.1in}
+    \caption{Maximum request per second (RPS) over time for different scaling policies when creating $30$ new workers. Assume each worker can handle $1$ request per second.}
+    \label{fig:autoscaling}
+    \vspace{-1em}
+\end{figure}
+
+\sysname provides two scaling choices.
+First, after workers have loaded corresponding parts of models,
+we can perform \emph{scaling down} by allowing one of them to fetch the unloaded model parts in background.
+Once all parameters are loaded, we migrate all existing requests to that worker by migrating their key-value cache.
+Finally, the worker continues to generate tokens with whole model while other workers are terminated.
+Figure~\ref{fig:pipeline}(c) demonstrates the process of scaling down.
+In this way, we obtain the first token earlier by parallelized model fetching and finally obtain a worker with whole model, similar to normal cold starts.
+
+The second scaling choice is \emph{scaling up}, changing all cold-start workers into individual serving endpoints, as Figure~\ref{fig:pipeline}(d) has shown.
+LLM inference workloads usually have bursty traffic~\cite{serverlessllm, li2023alpaserve, sosp21_harvestvm}.
+In serverless LLM serving, bursty requests often cause the system to concurrently create multiple workers in the cluster.
+In this scenario, the scaling up method allows for quickly creating workers in pipeline parallelism groups,
+so that the system can reach the maximum throughput earlier.
+
+Figure~\ref{fig:autoscaling} uses an example of creating $30$ new workers concurrently to show the benefits of scaling up.
+When a burst of requests arrive, existing serverless LLM serving systems initialize new workers concurrently,
+resulting in significant network and memory consumption in the cluster.
+Additionally, workers are not able to serve requests until the whole model has loaded, as shown in Figure~\ref{fig:autoscaling}(a).
+In contrast, \sysname with scaling up is able to prepare pipeline parallelism groups quickly.
+Figure~\ref{fig:autoscaling}(b) demonstrates the startup strategy of \sysname, which allocates workers to $8$ pipeline parallelism groups,
+where one group has two workers and others have four.
+In this way, workers are able to generate tokens upon loaded part of the model,
+thereby starting to serve requests much earlier.
+Since pipeline parallelism has comparable throughput with same number of workers that hold the whole model~\cite{li2023alpaserve},
+the system can achieve the maximum possible throughput upon the creation of all groups.
+Furthermore, workers continue to load models in background,
+and eventually turn into individual workers to reduce inference latency.
+In other words, the system is able to achieve high throughput earlier and finally obtains same number of workers with normal cold starts.
+
+In default, \sysname adopts the scaling down mechanism to reduce cold start latency with little overhead.
+To quickly react to bursty loads and change to the scaling up mechanism, we determine the number of workers to remain with a sliding window strategy.
+For each model, we record the number of requests that arrived during the past window and use it as the predicted maximum number of requests that may arrive in the next window.
+The required number of workers to retain is calculated based on the current number of requests in the waiting queue combined with the predicted maximum number of requests expected to arrive in the next window.
+In cold start, we create a pipeline parallelism group that is no smaller than required number of new workers and later transform the group into desired number of individual workers.
+We may create multiple pipeline parallelism groups to serve a sudden burst of requests.
+
+\subsection{Key-Value Cache Migration}
+
+After reducing the pipeline parallelism size,
+we migrate all uncompleted requests to one worker for better performance,
+while allowing for earlier release of resources occupied by other workers.
+Since model layers are assigned to different workers, the KV cache of all requests is distributed across workers,
+necessitating the KV cache migration.
+
+\sysname performs KV cache migration inside a pipeline parallelism group, where the KV cache of layers is distributed across workers.
+Before migration, we first stop scheduling of existing requests and wait for all on-the-fly batches return.
+Next, we query the cache block manager to obtain the blocks that are used by existing requests,
+and then collect these blocks from all workers using a \emph{gather} primitive in collective communication.
+Blocks are gathered to the first worker and placed at different layers, according to which worker it comes from.
+
+The KV cache migration process in \sysname is highly optimized.
+First, the whole migration workflow is performed in an individual thread and uses low-priority CUDA streams so that the inference tasks will not be affected.
+Second, we create multiple CUDA streams when moving data from or to GPUs to utilize the GPUs' high parallelism.
+Furthermore, the data transmission is performed in a streaming manner.
+On the target worker, once a chunk of tensors arrives,
+it is instantly loaded to GPU in a separate CUDA stream.
+On other workers, once a chunk of tensors is loaded from GPU to host,
+we immediately send them to the network.
+ \section{Implementation}
+\label{sec:implementation}
+
+We implement \sysname on top of vLLM~\cite{vllm}.
+We modify vLLM and add around 3200 lines of code in C++ and Python.
+We also develop a serverless LLM serving framework with around 3000 lines of code in Python. 
+The serving framework performs request routing and automatically scales number of vLLM workers for each model to match current loads.
+To improve the cold start performance, we run inference in eager mode that does not use CUDA graphs.
+
+\parabf{Parameter Manager.}
+We develop parameter manager as a TorchScript~\cite{torchscript} C++ library.
+The entry Python program in container first loads the library and triggers the loading thread,
+which accesses the shared memory created by model prefetcher and loads the model into GPU.
+The vLLM engine later queries the loading thread and obtains loaded tensors in order.
+
+\parabf{Engine Initialization Optimizations.}
+We perform several optimizations to the initialization process of vLLM.
+First, vLLM allocates CPU key-value cache as swapping space during initialization, costing non-negligible time.
+Thus, we postpone the CPU cache initialization phase.
+Second, vLLM runs a random input for the model upon loading completes to profile the amount of free memory during inference and calculate the number of key-value cache blocks.
+We calculate the amount of free memory based on number of model layers and shapes of intermediate results, thereby skipping the profiling phase.
+Third, vLLM first initializes the dummy model on CPU, and then substitute existing tensors with newly loaded tensors, and finally transmit these tensors to GPU.
+We allow the engine to directly employ GPU tensors provided by the parameter manager.
+
+\begin{figure*}[t!]
+    \centering
+    \includegraphics[width=0.98\textwidth]{figures/eval/fig-eval-1.1.pdf}
+    \vspace{-0.1in}
+    \caption{Cold start latency of systems for different models.}
+    \label{fig:eval-ttft}
+    \vspace{-1em}
+\end{figure*}
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.98\linewidth]{figures/eval/fig-eval-1.2.pdf}
+    \vspace{-0.1in}
+    \caption{Performance breakdown of techniques in \sysname.}
+    \label{fig:eval-breakdown}
+    \vspace{-1em}
+\end{figure} \section{Evaluation}
+\label{sec:evaluation}
+
+In this section, we present experimental results to validate the efficiency and effectiveness of \sysname.
+Our evaluation demonstrates that \sysname achieves a substantial reduction in TTFT, outperforming baselines by up to 4.7$\times$ (\S\ref{sec:eval-raw-latency}).
+In end-to-end experiments, \sysname improves TTFT SLO attainment by up to 1.74$\times$ across various loads and constraints while maintaining minimal TPOT SLO violations (\S\ref{sec:eval-end-to-end}).
+Furthermore, our analysis of pipeline consolidation reveals that scaling down reduces end-to-end generation time by 2.29$\times$, while scaling up lowers the average TTFT under bursty requests by 1.87$\times$ (\S\ref{sec:eval-consolidation}).
+Lastly, we wrap up with brownfield results and show that \sysname achieves an average TTFT reduction of 2.6$\times$ in production environment (\S\ref{sec:deployment}).
+
+\subsection{Experiments Setup}
+\label{sec:setup}
+
+\parabf{Testbed.}
+We have two testbeds: (i) a GPU cluster that contains 4 A10 servers and 4 V100 servers.
+Each A10 server has a single NVIDIA A10 GPU and 188GB memory, while each V100 server has four NVIDIA V100 GPUs and 368GB memory.
+The network bandwidth per server is 16Gbps.
+(ii) a GPU cluster consisting of 2 servers, each equipped with four NVIDIA A10 GPUs, and another 4 servers, each equipped with four NVIDIA V100 GPUs.
+The A10 servers have 752GB memory and a network bandwidth of 64Gbps per server,
+while the V100 servers have 368GB memory and a network bandwidth of 16Gbps per server.
+Both testbeds are connected to a remote storage that hosts the models.
+The remote storage has sufficient network capacity and the model fetching bandwidth is constrained only by the bandwidth of GPU servers.
+Since our GPU servers do not have NVLink~\cite{nvlink}, all evaluated models are able to reside in single card to avoid performance degradation.
+
+\parabf{Baselines.}
+We compare \sysname against two baselines:
+\begin{itemize}[leftmargin=*]
+\item Serverless vLLM. vLLM~\cite{vllm} is a LLM serving engine and we equip it with the same serverless LLM serving framework with \sysname.
+During a cold start, the scheduler iterates through all GPU servers and selects the first one with sufficient GPU resources to host the worker.
+For a fair comparison, we disable CUDA graph in serverless vLLM.
+\item ServerlessLLM~\cite{serverlessllm}.
+ServerlessLLM is a state-of-the-art serverless LLM serving system that reduces the cold start latency by loading-optimized checkpoint and caching.
+Due to the lack of high-speed SSDs in our testbed, we can only allow ServerlessLLM to leverage all free memory on servers to cache models.
+We use Kubernetes~\cite{kubernetes} to deploy ServerlessLLM and the containers are created at the beginning, so there will be no container creation overhead during serving.
+We also configure ServerlessLLM to use vLLM~\cite{vllm} as the serving backend and the CUDA graph is disabled.
+\end{itemize}
+
+\begin{figure*}[tp]
+    \centering
+    \includegraphics[width=0.99\textwidth]{figures/eval/fig-eval-2.1-cv.pdf}
+    \vspace{-0.2in}
+    \caption{TTFT SLO attainment of systems under different CVs.}
+    \label{fig:eval-end2end-cv}
+    \vspace{-1em}
+\end{figure*}
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.99\linewidth]{figures/eval/fig-eval-2.1-slo.pdf}
+    \vspace{-0.1in}
+    \caption{TTFT SLO attainment of systems under different SLOs.}
+    \label{fig:eval-end2end-slo}
+    \vspace{-1em}
+\end{figure}
+
+\begin{table}[t]
+    \centering
+    \resizebox{\linewidth}{!} {
+    \begin{tabular}{ccccc}
+        \toprule
+        \textbf{Model}  & \textbf{Model Size} & \textbf{GPU Card} & \textbf{TTFT} & \textbf{TPOT} \\
+\midrule
+        Llama2-7B & 12.5GB & A10 & 1.5s & 42ms  \\
+        Llama2-13B & 24.2GB & V100 & 2.4s & 58ms  \\
+        \bottomrule
+    \end{tabular}
+    }
+    \vspace{-0.1in}
+    \caption{Measured TTFT and TPOT of warm requests.}
+    \vspace{-0.5em}
+    \label{tab:slos}
+\end{table}
+
+\begin{table}[t]
+    \centering
+    \resizebox{\linewidth}{!} {
+    \begin{tabular}{cccccc}
+        \toprule
+        \textbf{Application} & \textbf{TTFT} & \textbf{TPOT} & \textbf{Dataset} \\
+        \midrule
+        Chatbot Llama2-7B  & 7.5s & 200ms  & ShareGPT\cite{sharegpt} \\
+        Chatbot Llama2-13B & 12s & 200ms & ShareGPT\cite{sharegpt} \\
+        Code Completion Llama2-7B & 7.5s & 84ms  & HumanEval\cite{humaneval} \\
+        Code Completion Llama2-13B & 12s & 116ms  & HumanEval\cite{humaneval} \\
+        Summarization Llama2-7B & 15s & 84ms & LongBench\cite{longbench} \\
+        Summarization Llama2-13B & 24s & 116ms & LongBench\cite{longbench} \\
+        \bottomrule
+    \end{tabular}
+    }
+    \vspace{-0.1in}
+    \caption{Summary of applications in end-to-end experiments.}
+    \label{tab:tasks}
+    \vspace{-1em}
+\end{table}
+
+\subsection{Cold Start Latency}
+\label{sec:eval-raw-latency}
+
+We first evaluate the cold start latency of different systems on testbed (i).
+We conduct experiments on both V100 and A10 GPUs and configure \sysname to use a parallelism size of 4.
+For ServerlessLLM, we measure its performance with and without model caching.
+Figure~\ref{fig:eval-ttft} illustrates the time to first token for different models.
+The results demonstrate that \sysname achieves the shortest cold start latency for all models.
+Specifically, \sysname reduces cold start latency by up to 4.7$\times$ compared to serverless vLLM and by up to 3.1$\times$ to ServerlessLLM.
+This performance improvement is attributed to parallelized model fetching and worker-level optimizations.
+
+Furthermore, when \sysname is constrained to use single worker,
+it also obtains better performance than ServerlessLLM.
+For smaller models, such as OPT-6.7B,
+\sysname with single worker even achieves a short cold start latency than ServerlessLLM with cached models.
+This improvement primarily comes from \sysname's worker-level overlapping strategies and the optimizations applied to vLLM's cold-start process.
+
+\parabf{Performance Breakdown.}
+To better comprehend the performance of \sysname, we conduct a detailed breakdown of techniques employed in \sysname.
+Figure~\ref{fig:eval-breakdown} illustrates the incremental improvement achieved by applying each proposed technique. 
+Starting with the original vLLM system, we apply the following techniques step-by-step: model prefetching (+Prefetch),
+streaming loading and implementation optimizations (+Stream), overlapped model loading and library initialization (+Overlap),
+and parallelized model fetching (+Parallel).
+The results show that each technique contributes to a reduction in cold start latency and the cumulative effect of all techniques results in a substantial overall improvement.
+
+\subsection{End-to-End Experiments}
+\label{sec:eval-end-to-end}
+
+We further evaluate the effectiveness of \sysname through comprehensive end-to-end experiments.
+
+\parabf{Workloads.}
+We choose the Llama2 model series~\cite{llama2} with FP16 precision in the end-to-end experiments.
+Following prior work~\cite{distserve},
+we use three typical LLM applications in experiments: chatbot, code completion, and summarization.
+Requests for these applications are sampled from ShareGPT~\cite{sharegpt}, HumanEval~\cite{humaneval} and Longbench~\cite{longbench}, respectively.
+Since there is no available SLO settings for these applications,
+we derive SLOs based on the performance of warm requests.
+Specifically, we measure the TTFT and TPOT for warm requests using Llama2-7B and Llama2-13B,
+with each request containing 1024 input tokens and a batch size of 8.
+The results are shown in Table~\ref{tab:slos}.
+The global TTFT SLO is set to five times the TTFT of warm requests, while the TPOT SLO is defined as a stricter constraint, being twice the TPOT of warm requests.
+
+Given the nature of summarization tasks, which typically allow more relaxed latency requirements,
+their TTFT SLOs are doubled.
+Additionally, for chatbot tasks, the TPOT SLO is aligned with standard human reading speeds (i.e., 300 words per minute).
+Finally, we generate 64 instances for each application to represent various user models, similar to prior work~\cite{li2023alpaserve, serverlessllm}.
+Table~\ref{tab:tasks} shows the summary of applications.
+
+We leverage Microsoft Azure Function Trace~\cite{azure_trace} to generate workloads,
+similar to the approach taken by prior works~\cite{li2023alpaserve, serverlessllm}.
+Models are mapped to functions in the trace using a round-robin approach,
+and the requests are sampled from the trace using a Gamma distribution.
+We manage the sampling process by controlling the coefficient of variance (CV) and request rate per second (RPS).
+
+\parabf{Effectiveness under different CVs.}
+Figure~\ref{fig:eval-end2end-cv} demonstrates the TTFT SLO attainment of the systems under different CVs.
+To assess the effectiveness of cache, we also evaluate \sysname with caching enabled.
+The results indicate that as RPS increases, TTFT SLO attainment decreases due to resource lacking during bursty requests.
+Nevertheless, \sysname consistently satisfies the majority of TTFT SLO requirements under heavy loads, achieving up to 1.74$\times$ higher compared to baselines in all scenarios.
+This is because \sysname select appropriate pipeline parallelism size based on user SLOs and distribute cold-start workers to mitigate network contention.
+In contrast, ServerlessLLM exhibits high SLO violations due to limited effectiveness of caching for long-tail models.
+Enabling cache in \sysname further improves the TTFT SLO attainment by up to 1.11$\times$, as frequently accessed models benefit from caching.
+
+For TPOT SLO attainment, both \sysname and baselines achieve over 95\% attainment in most scenarios,
+and more than 90\% under all CVs and RPS.
+This level of performance is sufficient for most use cases.
+
+\parabf{Effectiveness under different SLO scales.}
+We evaluate the systems under different TTFT and TPOT SLOs by adjusting a global SLO scaling parameter, with CV fixed at 8.
+As shown in Figure~\ref{fig:eval-end2end-slo}(a), under tight SLO conditions,
+all systems experience significant SLO violations,
+as the time granted for preparing a cold-start worker is exceedingly limited. 
+In such cases, the TTFT SLO attainment of all systems is capped at 63\%.
+However, \sysname still outperforms baselines, as its faster worker initialization reduces the waiting time for subsequent requests, even if the first request violates SLO.
+Figure~\ref{fig:eval-end2end-slo}(b) demonstrates the performance under looser SLO conditions.
+\sysname achieves up to 1.52$\times$ improvement in TTFT SLO attainment compared to baselines,
+with caching further enhancing this improvement to 1.58$\times$.
+
+\begin{figure}[t]
+    \centering
+    \begin{minipage}[t]{0.49\linewidth}
+        \centering
+        \includegraphics[width=0.99\linewidth]{figures/eval/fig-eval-2.1-app.pdf}
+        \caption{TTFT SLO attainment for different applications.}
+        \label{fig:eval-app}
+    \end{minipage}
+    \begin{minipage}[t]{0.49\linewidth}
+        \centering
+        \includegraphics[width=0.99\linewidth]{figures/eval/fig-eval-3.1-v100.pdf}
+        \caption{Total tokens generated over time for a single request.}
+        \label{fig:eval-single}
+    \end{minipage}
+    \vspace{-1em}
+\end{figure}
+
+\begin{figure}[t]
+    \centering
+    \subfloat[Average TTFT of different loads.]
+    {\includegraphics[width=0.47\linewidth]{figures/eval/fig-eval-3.2-v100-ttft.pdf}}
+    \quad
+    \subfloat[Average TPOT of different loads.]
+    {\includegraphics[width=0.47\linewidth]{figures/eval/fig-eval-3.2-v100-tpot.pdf}}
+    \vspace{-0.1in}
+    \caption{Performance comparison for handling bursty loads with different parallel group sizes.}
+    \label{fig:eval-burst}
+    \vspace{-1em}
+\end{figure}
+
+\parabf{Application Analysis.}
+We also analyze the performance of systems for different applications.
+Figure~\ref{fig:eval-app} illustrates the TTFT SLO attainment of chatbot, code completion, and summarization applications under CV=8 and RPS=0.6.
+First, the results show that \sysname significantly enhances the TTFT SLO attainment for chatbot and code application,
+with up to 1.61$\times$ and 1.70$\times$ improvement, respectively.
+The code application has lower SLO attainment compared to others because code completion tasks (i.e., requests in HumanEval dataset~\cite{humaneval}) have shorter average output length than chat tasks (i.e., requests in ShareGPT dataset~\cite{sharegpt})~\cite{distserve}.
+Therefore, workers for code completion models keep alive for shorter time, leading to more cold starts.
+Since the summarization application has loose SLO requirements, it meets few SLO violations for all systems.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.98\linewidth]{figures/eval/fig-eval-deployment.pdf}
+    \vspace{-0.1in}
+    \caption{TTFT of requests in brownfield evaluation.}
+    \label{fig:eval-deployment}
+    \vspace{-1em}
+\end{figure}
+
+\subsection{Pipeline Consolidation}
+\label{sec:eval-consolidation}
+
+To evaluate the effectiveness of pipeline consolidation,
+we conduct experiments to analyze \sysname's performance using two scaling methods.
+We deploy Llama2-13B on V100 servers in testbed (i) and set the input and maximum output length of a request to 512 tokens.
+
+\parabf{Scaling down.}
+We demonstrate the benefits of scaling down using a single cold start request that generates 512 tokens.
+We set pipeline parallelism size to 4 and record the generation time of each token, as shown in Figure~\ref{fig:eval-single}.
+With scaling down, the system continues loading the remaining parts of the model in parallel with inference,
+and migrates the key-value cache of the ongoing request once loading is complete.
+This allows subsequent tokens to be generated at a faster speed.
+As a result, scaling down reduces the end-to-end generation time by 2.29$\times$,
+while maintaining almost same inference speeds during the early cold-start period.
+
+\parabf{Scaling up.}
+We evaluate scaling up by measure \sysname's performance under bursty workloads.
+We set the maximum batch size for each worker to 8 and vary the number of incoming requests.
+Figure~\ref{fig:eval-burst}(a) illustrates the average TTFT across different loads.
+The results show that larger pipeline parallelism sizes significantly reduce TTFT,
+enabling the system to increase throughput earlier.
+For example, when handling 128 concurrent requests (the maximum load for 16 V100 GPUs),
+using four workers in a pipeline parallelism group reduces the average TTFT by 1.87$\times$.
+Furthermore, Figure~\ref{fig:eval-burst}(b) indicates that scaling up incurs little inference overhead,
+with the average TPOT increasing by 1.08-1.19$\times$.
+This increase is attributed to transmission overhead of intermediate results.
+
+\subsection{Brownfield Evaluation}
+\label{sec:deployment}
+
+We implement \sysname in the production environment and evaluate its effectiveness.
+Specifically, we deploy multiple serverless functions for cold-start instances while incorporating the parameter manager and engine optimizations.
+Due to security constraints in the production environment, functions cannot establish direct TCP connections with one another.
+To address this, we leverage a shared object in remote storage to enable inter-worker communication.
+For the evaluation, we use vLLM to run Llama2-7B on NVIDIA A10 GPUs with 24GB GPU memory.
+Requests are generated following Microsoft Azure Function Trace~\cite{azure_trace}.
+The bandwidth per function is limited to 5Gbps and each instance is granted a grace period of 5 minutes.
+Figure~\ref{fig:eval-deployment} shows the cold start latency improvement achieved by \sysname.
+The results show that \sysname significantly reduces cold start latency compared to the original vLLM system,
+with an average cold-start TTFT reduction of 2.6$\times$.
+This substantial performance improvement stems from \sysname's parallelized model fetching and optimized worker initialization processes.
+
+ \section{Discussion}
+\label{sec:discussion}
+
+\parabf{Deploying larger models.}
+\sysname is applicable to both models that reside in single GPU server as well as models that are deployed in multiple servers with tensor and pipeline parallelism.
+For models that are distributed across GPU servers, we can improve their cold-start performance through enlarging the pipeline parallelism size.
+By controlling the degree of parallelism, we reduce cold start latency to satisfy user SLOs.
+Moreover, worker-level overlapping and pipeline consolidation can also be utilized in this context.
+
+\parabf{Maximum request capacity of \sysname.}
+For each cold-start instance,
+\sysname allows it to use more workers or GPU resources than needed to reduce cold start latency,
+probably decreasing the maximum cold-start requests that the system can serve.
+However, this issue is effectively mitigated in \sysname.
+First, increasing pipeline parallelism size actually improves cluster-level resource utilization by enabling finer-grained GPU memory allocation.
+Second, for users who allocate extra GPU resources to cold-start workers , these resources are quickly released by adopting pipeline consolidation, so the overhead is minimum.
+Finally, although pipeline parallelism introduces additional host memory usage due to multiplexed Python runtime,
+this does not block the launching of workers since host memory is usually adequate in GPU servers.
+Our end-to-end experiments in \S\ref{sec:eval-end-to-end} also validate that \sysname can achieve high SLO attainment under heavy loads, while baselines cannot.
+ \section{Related Work}
+\label{sec:related}
+
+
+\parabf{Cold-start optimizations in serverless model serving.}
+There have been plenty of works on reducing the cold start latency in serverless model serving~\cite{infaas, infless, asyfunc, faaswap, serverlessllm}.
+For instance, FaaSwap{faaswap} and ServerlessLLM~\cite{serverlessllm} utilize locality by caching models in local memory or SSDs,
+while INFless~\cite{infless} prewarms instances based on historical request patterns.
+gCROP~\cite{gcrop} introduces a on-demand GPU image restore technique that accelerates GPU runtime initialization.
+Unlike these works, \sysname primarily targets reducing model fetching latency by aggregating network bandwidth of GPU servers.
+
+\parabf{Pipeline parallelism.}
+Pipeline parallelism has been widely used to scale GPU resources for training large models~\cite{huang2019gpipe, terapipe, narayanan2019pipedream, nips18_pipesgd, nips22_sapipe, megascale}.
+Recently, researchers have also explored its use during inference~\cite{li2023alpaserve, hpipe, pipeinfer, pipeedge}.
+AlpaServe~\cite{li2023alpaserve} observes that model parallelism improves GPU utilization under bursty workloads and introduces a model placement policy when deploying models.
+HPipe~\cite{hpipe} and PipeEdge~\cite{pipeedge} apply pipeline parallelism to improve the inference performance for LLMs on edge devices.
+PipeInfer~\cite{pipeinfer} explores speculative inference through asynchronous pipeline parallelism to reduce inference latency.
+\sysname leverages pipeline parallelism to reduce cold start latency in serverless LLM serving and
+further introduces pipeline consolidation, which dynamically scales works in a pipeline parallelism group to improve performance.
+
+\parabf{LLM serving optimizations.}
+Many LLM serving optimizations have been proposed to improve serving performance~\cite{li2023alpaserve, fastserve, loongserve, distserve, orca, vllm, infinigen, llumnix, sarathi, serverlessllm}.
+In the area of request scheduling, Orca~\cite{orca} introduces iteration-level scheduling to run more requests in parallel,
+while Llumnix~\cite{llumnix} employs runtime scheduling to meet user SLOs.
+FastServe~\cite{fastserve} focuses on average job completion time and introduces a preemptive scheduling policy.
+For key-value cache management,
+vLLM~\cite{vllm} leverages the concept of virtual memory in operating systems and InfiniGen~\cite{infinigen} optimizes KV block placement to improve inference efficiency.
+Additionally, to mitigate the interference between prefill and decoding phases, DistServe~\cite{distserve} proposes disaggregated inference,
+whereas SARATHI~\cite{sarathi} adopts chunked prefill.
+\sysname specifically focuses on reducing cold start latency in serverless LLM serving.
+Our techniques are orthogonal to existing inference optimizations and we can seamlessly integrate new optimizations into \sysname. \section{Conclusion}
+\label{sec:conclusion}
+
+This paper presents \sysname,
+a serverless LLM serving system designed to reduce cold start latency through parallelized model fetching.
+\sysname adopts a two-level hierarchical approach to accelerate cold starts,
+and consolidates pipeline workers into individual workers to ensure high performance for warm requests.
+Evaluation results show that \sysname reduces cold start latency by up to 4.7$\times$ compared to baselines and improves TTFT SLO attainment by up to 1.74$\times$ under various constraints.
+By integrating cluster-level and worker-level optimizations, \sysname offers a scalable and efficient solution to meet user-defined SLOs in serverless LLM serving, particularly for latency-sensitive applications. \label{lastpage}
+
+{\bibliographystyle{ieeetr}
+\bibliography{xin}}
+
+
+\end{document}

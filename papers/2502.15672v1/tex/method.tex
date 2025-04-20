@@ -1,0 +1,151 @@
+
+
+\section{Models}
+\label{sec:method}
+
+
+Our video-action model \vam{} is composed of \vm{} --- a self-supervised video model that learns semantic driving features through next-token prediction (\autoref{sec:model:vm}) --- and an action expert module (\autoref{sec:model:vam}) that enables end-to-end autonomous driving from video inputs.
+\autoref{fig:vam_overview} illustrates that perception-to-action pipeline.
+
+
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.9\linewidth]{figures/images/VAM_overview.pdf}
+    \caption{\textbf{End-to-end pipeline of \vam{}.} 
+    From a context of up to 8 frames, first \vm (in yellow) builds a spatio-temporal representation, and then \vam{}'s action expert (in green) estimates the dynamic profile of the driving actions to undertake, as a trajectory of 6 waypoints sampled at 2 Hz.}
+    \label{fig:vam_overview}
+\end{figure}
+
+\subsection{\vm{} = Auto-regressive Video-Model on tokenized video stream}
+\label{sec:model:vm}
+
+% VIDEO MODEL -- Tokenizer + AR model
+At its core, the auto-regressive video model captures the underlying dynamics of driving scenes by modeling the joint distribution of spatio-temporal token sequences. It operates on discrete video tokens, i.e., compact representations of video frames obtained through an image tokenizer (\autoref{sec:model:vm:tokenizer}). By learning to predict the next token in these sequences (\autoref{sec:model:vm:autoregressive}), \vm{} builds a rich understanding of the temporal patterns in driving environments.
+
+\subsubsection{Image Tokenizer}
+\label{sec:model:vm:tokenizer}
+
+The architecture starts by transforming continuous image data into a discrete sequence of tokens using vector quantization, a process known as visual tokenization \citep{van2017vqvae}, by mapping local image features to their nearest neighbors in a learned codebook. The codebook acts as a compressed visual vocabulary, enabling efficient auto-regressive modeling while preserving the essence of the visual information for downstream tasks.
+
+More formally, consider a video clip with $T$ frames, with each frame $X_t \in \mathbb{R}^{h \times w \times c}$ for $t \in \{1, \dots, T\}$. Here, $h \times w$ is the spatial resolution, and $c$ is the number of channels. The encoder $f_{\theta} : X \rightarrow e$ processes each frame independently to produce a latent embedding $e \in \mathbb{R}^{h' \times w' \times d}$. For a given frame embedding $e$, at each spatial location $(i,j) \in h' \times w'$, we quantize $e^{(i,j)}$ to a discrete token $q^{(i,j)}$ by performing a nearest-neighbor lookup in the codebook $\{e_k\}$:
+
+\begin{equation}
+q^{(i,j)} := \arg \min_k \| e^{(i,j)} - e_k \|_2.
+\label{eq:nn-lookup}
+\end{equation}
+
+In this equation, $e_k$ represents the embedding vectors in a shared codebook of size $\mathbb{R}^{K \times d}$, where $K$ is the number of discrete entries or codebook vectors, and $d$ is the dimensionality of each vector. The discrete token map $q$ is then used to retrieve the corresponding embeddings, resulting in the embedding map $e_q$.
+
+To map the tokenized representation back into the image domain, we use a decoder $g_{\theta}$, which takes the embedding map $e_q$ and generates the reconstructed output $\hat{x} := g_{\theta}(e_q)$.
+That process resembles a standard autoencoder but includes a unique non-linearity that maps latent representations to one of $K$ embedding vectors.
+
+During training, the codebook is initialized randomly and jointly optimized with the encoder and decoder. That adapts the codebook to the data distribution, capturing the most relevant visual features for the task.
+
+
+
+The image tokenizer is trained using a vector quantization objective, combining reconstruction, commitment, and adversarial losses to ensure high-fidelity and perceptually realistic image reconstructions. A straight-through estimator computes the gradients, thus handling the non-differentiable nearest-neighbor lookup. For detailed formulations, see \cite{sun2024llamagen}.
+
+
+
+\subsubsection{Auto-regressive next token predictor}
+\label{sec:model:vm:autoregressive}
+
+The second stage of our approach generates videos in the latent space of the pre-trained Vector Quantized Variational AutoEncoder (VQ-VAE) tokenizer. We use an auto-regressive framework inspired by Large Language Model (LLM) pre-training, employing a transformer decoder to predict tokens sequentially. That allows the model to generate video content patch by patch, capturing spatial and temporal dependencies.
+
+
+
+\paragraph{Objective:} 
+The model learns the conditional probability of each token given its preceding tokens. For a sequence of $n$ tokens $ \mathcal{Q} = [q^{0}, q^{1}, \dots, q^{n-1}]$, the joint distribution is factorized as the product of conditional probabilities:
+\begin{equation}
+    P(\mathcal{Q}; \theta) = \prod\limits_{i=1}^{n} P(q^{i}|q^{0}, q^{1}, \dots, q^{i-1}; \theta)
+    \label{eq:ar_modeling}
+\end{equation}
+where $\theta$ are the model parameters. 
+
+We train the model to minimize the negative log-likelihood of the observed token sequences:
+\begin{equation}
+    \mathcal{L}_{\theta} = -\sum_{i=1}^n \log P(q^{i}|q^{0}, q^{1} \dots, q^{i-1}; \theta)
+    \label{eq:NLL}
+\end{equation}
+
+We use a softmax function on the model's logits to produce a probability distribution over the vocabulary. We train the model using teacher forcing with cross-entropy loss, aligning the predicted and true token distributions.
+
+\paragraph{\vm{}: model architecture}  
+Building upon the previously described tokenizer discretization, we employ a GPT-2~\cite{radford2019language} architecture to model the temporal dynamics of video tokens auto-regressively (following \autoref{eq:ar_modeling}).  While the tokenizer's vocabulary focuses on the perceptual compression of individual frames, our model learns a new set of embeddings optimized for capturing spatio-temporal relationships in the token sequence. Those embeddings map the tokenizer's discrete codes $q$ into a continuous latent space $z$ where spatio-temporal relationships can be modeled auto-regressively.
+
+At each layer $l \in L$, where $L$ is the total number of layers, the computation is as follows:
+
+\begin{align}
+z & \leftarrow z + \text{CausalAttn}(\text{LN}(z))  \\ 
+z & \leftarrow z + \text{FFN}(\text{LN}(z)).    
+\end{align}
+
+
+
+where \( \text{FFN}(\cdot) \) denotes a fully connected layer, \( \text{CausalAttn}(\cdot) \) is a causal attention layer with masking~\cite{waswani2017attention}, and \( \text{LN}(\cdot) \) denotes layer normalization~\cite{lei2016layer}.
+We use GELU~\cite{hendrycks2016gaussian} as the activation function and employ weight tying between the input embedding layer and the output projection layer to reduce the number of parameters. Additionally, at inference time, a KV cache~\cite{ott2019fairseq} is maintained for efficient auto-regressive sampling.
+
+Following GAIA-1~\cite{hu2023gaia1}, we use two types of learned positional embeddings to capture both spatial and temporal dependencies. The \emph{spatial positional embedding}  is shared across all frames, allowing the model to capture spatial dependencies within each image independently. In contrast, the \emph{temporal positional embedding} is unique for each frame, enabling the model to capture dependencies across frames in a video. By combining these two positional embeddings, the model effectively learns both intra-frame and inter-frame relationships.
+
+\subsection{\vam{} = \vm{} + action expert}
+\label{sec:model:vam}
+
+% context: is video-gen pre-train good to drive ?
+Whether video generation pre-training effectively captures the features essential for safe and reliable driving is a key question. To bridge the gap between pre-trained video representations and driving decisions, we introduce an action expert module, forming \vam{} by complementing \vm{} with decision-making.
+%
+The action expert, inspired by $\pi0$~\cite{black2024pi0}, uses flow matching to generate actions by progressively denoising a noisy ego-trajectory, illustrated on the bottom left of~\autoref{fig:actionexpert}, into a coherent driving trajectory. The denoising is conditioned on high-level driving commands (e.g., `turn left', `go straight') and video features from \vm{} encoding the scene dynamics.
+%
+While $\pi0$ conditions on single frames for robotic manipulation, we extend it to driving by exploiting the temporal contexts of multiple frames that are crucial for understanding dynamic scenarios.
+
+We adopt flow matching instead of alternatives such as action quantization~\cite{lee2024vqbet} because it directly learns the vector fields that define the transport to the target probability distribution, enabling accurate action generation while effectively modeling complex multimodal distributions. That is particularly important for our trajectory dataset, which is challenging to capture with quantization-based methods due to its long-tail distribution dominated by straight trajectories, with maneuvers such as U-turns appearing rarely (\autoref{fig:trajectories}). 
+
+More formally, we assume a dataset of driving recordings and their associated high-level commands $\mathcal{D} = \{(O_t, A_t, c_t)\}$, with $O_t = [o_{t}, \dots, o_{t-N}]$ representing a sequence of images observed up to the $N$ past frames; $c_t \in \{\text{left}, \text{right}, \text{straight}\}$ being the high-level commands, which act as a guide for the vehicle direction, \eg, `turn left', on~\autoref{fig:actionexpert}; and $A_t = [a_{t+1}, \dots, a_{t+H}]$ being the `action', defined as a sequence of $[x, y]$ ego-positions in the BEV reference-frame specifying the dynamic profile of the driving path to undertake. We illustrate the `action' trajectory at the top left of~\autoref{fig:actionexpert}. The `action' is extracted from the pre-recorded ego-motion over the next $H$ future timesteps after the current timestep $t$.
+
+Through the combination of \vm{} and the action expert module, \vam effectivelly learns the conditional vector fields $v_\theta(A^{\tau}_t; O_t, c_t)$ that transport actions sampled from a noised distribution $A^{\tau}_t=[a^{\tau}_{t+1}, a^{\tau}_{t+2}, \dots, a^{\tau}_{t+H}]$ to actions $A_t$ from the observed distribution $O_t$ and high-level commands $c_t$. That denoising process is formalized in \autoref{sec:imitationlearning}.
+
+
+
+\begin{figure}[h]
+\centering
+\begin{subfigure}{0.45\linewidth} 
+    \includegraphics[clip, width=\linewidth]{figures/images/Action_expert_detail.pdf}
+      \caption{\textbf{Flow-matching action expert}}
+    \label{fig:actionexpert}
+\end{subfigure}
+\hspace{1.5cm}
+\centering
+\begin{subfigure}{0.35\linewidth}
+    \includegraphics[clip, width=\linewidth]{figures/images/VAM_Attention_mask.pdf}     
+      \caption{\textbf{Joint Attention Masking}}
+    \label{fig:joint_attention_mask}
+\end{subfigure}
+\caption{\textbf{Model details.}  (\subref{fig:actionexpert}) The iterative denoising process for driving trajectory estimation: starting from random noise, \vam estimates the sequence of driving waypoints (green dots), conditional to high-level commands (e.g., `turn left') and \vm{} features.  (\subref{fig:joint_attention_mask}) The joint attention between \vm{} tokens $o$ and action tokens $A$ at training time.}
+\label{fig:actionexpert_system}
+\end{figure}
+
+
+\paragraph{Architecture.}
+% main blocks: action encoder, action transformer, action decoder
+In more detail, the action expert consists of an action encoder, a joint attention transformer, and an action decoder (\autoref{fig:actionexpert}).
+
+
+
+\begin{itemize}
+    \item \textbf{Action Encoder:} It projects the actions into a latent space using an MLP and incorporates positional embeddings of the flow matching step $\tau$, a learned temporal embedding (``action at time $t$'') and a learned embedding for each high-level command (left, right, straight).
+    
+    \item \textbf{Joint Attention Transformer:} This module enables interaction between action representations and visual features, conditioning the denoising process on observed scene dynamics coming from \vm{}. We use a specialized attention masking scheme illustrated in~\autoref{fig:joint_attention_mask}
+    \begin{itemize}
+        \item Action tokens attend to all past context frames and all other action tokens within the same frame. 
+        \item Visual tokens maintain causal masking to preserve their sequential nature, preventing them from being conditioned by future observations. 
+    \end{itemize}
+    
+    \item \textbf{Action Decoder:} It maps the latent action features back to the action space with a linear layer, predicting the denoising vector field $v_\theta(A^{\tau}_t; O_t, c_t)$.
+\end{itemize}
+
+
+
+The architecture provides two key advantages. First, \vm{} and the action expert interact exclusively through joint attention. This design choice allows the action expert to use a smaller MLP dimensionality than \vm{} while maintaining matching dimensions in attention layers. Such dimensional reduction is crucial for efficiency, as the action expert performs multiple forward passes during iterative denoising and sampling. Second, the layer-wise joint attention addresses the challenge of feature extraction from \vm{}'s layers. Different layers capture varying levels of abstraction—from raw vocabulary embeddings to task-specific features. Rather than selecting and committing to a single layer, the joint attention mechanism learns to extract relevant features across \vm{}'s entire depth.
+
+% Inference
+During inference, we sample trajectories by integrating the denoising vector field over 10 steps using the forward Euler method, starting from random noise $A^0_t \sim \mathcal{N}$. That integration process progressively refines the noisy actions into a coherent driving trajectory that satisfies both the high-level command and environmental constraints captured by the temporal à

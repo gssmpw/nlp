@@ -1,0 +1,76 @@
+\section{System model \& problem definition}
+
+We define the offline optimization problem for database query planning and show an approach to offline optimization based on Bayesian optimization. We implement this approach in \sysname.
+
+% Why is this problem hard? (1) need some way to learn from feedback, (2) must deal with a large plan space, (3) many query plans are bad (take 1000x longer than optimal to execute).
+
+\sparagraph{Challenges} An obvious naive strategy to perform offline optimization is to exhaustively enumerate the space of all possible query plans. This is obviously computationally intractable even for relatively simple queries on few tables: the number of join orderings alone grows super-factorially with the number of joined tables: for a query joining $n$ tables, considering only binary joins and ignoring physical operator selection, there are $n! \cdot C_n = \frac{2n!}{n!}$ distinct join orderings, where $C_n$ is the $n$-th Catalan number~\cite{joe_complexity}.
+
+A refinement of this strategy might be to consider query planning with ``perfect cardinalities,'' since cardinality estimates are often hypothesized to be the main culprit for poor query plan performance~\cite{howgood}. Exhaustively computing cardinality estimates for even a simple query can take \emph{months}~\cite{flowloss}, and adaptively measuring only the cardinality estimates used by the query planner leads to the infamous ``fleeing from knowledge'' problem in which the optimizer repeatedly picks poor query plans due to underestimation from the independence assumption~\cite{fleeing_from_knowledge}.
+
+Furthermore, the plan space contains numerous bad plans which on their own are intolerable to execute to completion as they are many orders of magnitude slower than the optimal. Thus, an offline optimization method must efficiently explore the space of query plans while avoiding executing these bad plans to completion.
+
+It is also crucial that the optimization process use information gained from executing candidate plans to inform its exploration. A necessary property of an offline optimization method is that it can be run for longer in order to obtain better results.
+
+
+\begin{figure}
+    \centering
+    \includegraphics[width=\linewidth]{figures/MainFigure.pdf}
+    \caption{\sysname workflow}
+    \label{fig:system_model}
+\end{figure}
+
+\sparagraph{System model} \Cref{fig:system_model} depicts the architecture of \sysname. First,
+\circleOne a user identifies a query $Q$ that they wish to optimize offline. \sysname will then begin searching for a fast plan for $Q$. To do so, \sysname uses a \emph{Bayesian optimization} loop:
+\circleTwo an initialization strategy (discussed in \cref{sec:initialization_strategies}) is used to produce a set of plans
+\circleThree the plans are translated into strings (discussed in \cref{sec:string-format}) and embedded into a vector space using a learned model, 
+\circleFour the embedded plans and their observed execution latencies are used to initialize the surrogate model, 
+\circleFive an \emph{acquisition function} (discussed in \cref{sec:bo-background}) is used to select a point in the latent space, and then
+\circleSix the latent space vector is decoded back to a query plan.
+\circleSeven This plan is then given a timeout value $TO(P)$, and executed against a read-only snapshot of the database. The query either executes successfully with latency $L(P) < TO(P)$, or times out.
+\circleEight the Bayesian optimization algorithm uses the observed latency of the new query plan to improve its understanding of the query space. Then, the process repeats steps \circleFive $\to$ \circleEight until a time budget is exhausted or the user is satisfied with the achieved latency.
+\circleNine Finally, the best seen plan goes into a cache.
+
+When the query is being executed online, \textcolor{red}{\circleOne} the user submits a runtime query to the system. \textcolor{red}{\circleTwo} If the plan is present in the cache because it was optimized offline, the cached plan is used. Otherwise, the DBMS' optimizer is used. \textcolor{red}{\circleThree} Looking at the runtime statistics of the executed plan, \sysname decides whether the query should be re-optimized.
+
+\sparagraph{Problem definition} Our goal is to find a query plan $P$ with low latency for a query $Q$ using as few additional resources as possible (i.e., as quickly as possible).\footnote{Note that the constraint on time is required to make the problem non-trivial: if we have infinite computational resources, we can simply test every possible query plan and pick the fastest one.} Unlike traditional query optimizers, \sysname will continuously test new query plans until terminated (either by a time budget or directly by the user). We denote the sequence of queries produced by \sysname at a given time $t$ as $S_t = P_1, P_2, \dots, P_n$. Let $\mathbb{I}_i$ be an indicator such that when $\mathbb{I}_i = 0$, the plan $P_i$ completed successfully, and when $\mathbb{I}_i = 1$, the plan $P_i$ timed out. Thus, the cost a sequence $S_t$ is denoted as:
+
+\begin{equation*}
+    Cost(S_t) = \sum_i \mathbb{I}_i \times TO(P_i) + (1 + -\mathbb{I}_i) \times L(P_i)
+\end{equation*}
+
+\noindent ... and the best latency achieved within $S_t$ is denoted as:
+\begin{equation*}
+Latency(S_t) = \min_i 
+\begin{cases}
+    L(P_i)  & \mbox{if } \mathbb{I}_i = 0 \\
+    \infty  & \mbox{if } \mathbb{I}_i = 1 \\ 
+\end{cases}
+\end{equation*}
+
+\noindent Our goal is minimize latency while staying within a user-specified cost budget $B$:
+
+\begin{equation}
+\begin{aligned}
+    \min_{S_t} \quad & Latency(S_t) \\
+    \mbox{subject to } \quad & Cost(S_t) < B
+\end{aligned}
+\end{equation}
+
+\sparagraph{Discussion} Traditional and previous learned query optimizers solve this problem for (very small) budgets $B$ (e.g. for Neo~\cite{neo}, $B < 500ms$). Here we consider $B$ large enough to actually test the query plan. Prior optimizers are designed to have the optimization time amortized out compared to execution, our approach assumes optimization time is many times higher than the query latency.
+
+\sparagraph{Assumptions} Our system model assumes the following about the DBMS and workload:
+\begin{enumerate}[leftmargin=*]
+    \item There is a \emph{default query optimizer} that produces reasonable but not globally optimal query plans for any given query.
+    \item Queries can be executed against \emph{read snapshots} of the database.
+    \item The execution engine can \emph{accept physical plans/hints} that specify join orders and physical join operators.
+    \edit{\item Joins within queries are PK-FK equijoins. \footnote{\edit{This is mostly a constraint of our current implementation; future work could  straightforwardly extend this technique to support non-key or non-equijoin queries, since our core technique only needs to know which tables are involved in which joins.}}}
+\end{enumerate}
+
+\sparagraph{Why a read snapshot?} \sysname needs to execute many plans over the course of optimizing a query, some of which may be bad plans with very large intermediate results. So as not to disrupt the database's currently-running workload, we assume the ability to execute queries against read snapshots.
+
+% Cannot interfere with currently-running workload. Many cloud databases support cheap or zero-cost read snapshots. Also presents an opportunity for parallelism that we leave to future work.
+
+\sparagraph{Example: a trivial offline optimizer} The easiest way to implement an offline optimizer in our framework is with random plan search, similar to Quickpick \cite{quickpick} but ignoring cost estimates. Given a query $Q$, first measure the latency of the query plan $P_d$ produced by the default query optimizer $L(P_d)$. Then, select a query plan $P_1$ for $Q$ at random, and execute it with timeout equal to the latency of the default plan $TO(P_1) = L(P_d)$. Ignore the feedback, and continue executing random plans up to the budget B. While the odds of finding a better plan than $P_d$ are poor, note that you never exceed the budget B and your final plan is always at least as good as the default optimizer. We experimentally evaluate this simple baseline in Section~\ref{sec:eval}.
+
+\sparagraph{Cross-query learning} A hidden benefit to \sysname is that each time a query is optimized, a large number of query plans are executed. These execution traces can be used as training data for cross-query models. \sysname does this by using past execution traces to fine-tune an LLM to conditionally generate a query plan string (described in Section~\ref{sec:string-format}) for a given query. While this LLM obviously will not always produce a high-quality query plan, we show experimentally that these LLM-generated plans are reasonable starting points for future optimizations. Thus, \sysname creates a ``virtuous cycle:'' each time a query is optimized, additional training data is collected. That training data can be used to fine-tune an LLM. The LLM can then generate good initialization points for optimizing the next query, and so on. We describe our technique for cross-query learning in Section~\ref{sec:initialization_strategies}.

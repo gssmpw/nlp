@@ -1,0 +1,91 @@
+\section{Adapting DMD for Graphics Applications}
+\label{sec:methodology}
+
+% this preable is not necessary imo
+ %There have been hundreds of variants of DMD in the past decade since its first debut. Having originally been designed for data analysis, the DMD algorithm isn't ready for graphics application out of the box. In this section, we will provide details on the customization of the DMD framework for graphics applications.
+
+\subsection{Constructing Training Data}
+We point out that the system solved by Equation \ref{eqn:reduced_koopman} is agnostic to the structure of the input state $\bm{u}$. As stated, the DMD operator learns a mapping that evolves the state $\bm{u}$ from one point in time to its state at a future moment, and the natural description of a fluid state is to represent $\bm{u}$ as a stacked vector of fluid velocities, which implies that the DMD operator learns the \emph{PDE} that governs the evolution of the fluid velocities over time.
+
+For NS solvers, the evolution of a fluid is described by the inviscid Euler equations,
+\begin{equation}
+    \label{eqn:euler_equations}
+    \begin{cases}
+        \frac{\partial \bm{u}}{\partial t} + (\bm{u} \cdot \nabla) \bm{u} = -\frac{1}{\rho} \nabla p + \bm{g} \\
+        \nabla \cdot \bm{u} = 0
+    \end{cases}
+\end{equation}
+where $\bm{u}$ is the velocity field, $p$ is the pressure, $\rho$ is the density, and $\bm{g}$ is the gravitational force. We discretize the domain $\Omega$ with the staggered grid, a standard approach in computer graphics \cite{harlow1965numerical}, where the velocity field $\bm u$ is defined at the cell faces and the pressure $p$ is defined at the cell centers. This thus provides snapshots of the fluid velocity field $\bm{u}(t)$, at any point in time $t$. Note that $\bm{u}$ is a vector of size $\mathbb{R}^{N}$. This vector space henceforth will be our \emph{fullspace}, as it includes spatially every point in our full resolution simulation.
+
+Since our training data can be generated from any simulation method (or even observed from the real world), we utilize several fluid simulation algorithms to construct our dataset. Specifically, we include the standard stable fluids \cite{stam1999stable}, the MacCormack \cite{selle2008unconditionally} (MC), the MacCormack + Reflection \cite{zehnder2018advection} (MC+R) and the Lattice Boltzmann Method with the Bhatnagar-Gross-Krook collision model \cite{chen1998lattice} (LBM-BGK).
+
+\subsection{Learning from Noisy Data with Nonlinear Optimization}
+
+Fluid behaviour is inherently chaotic, particularly in highly turbulent systems. Additionally, discretization of such states leads to noisy data, particularly as structures approach the Nyquist limit of the sampling grid. Further, simulation speed and artist directability is of primary concern in graphics application above simulation accuracy, often leading to simulations with CFD-condition-violating large timesteps and early termination of iterative algorithms. This further leads to degraded simulation results. As such, we note that input fluid data in general will be highly noisy.
+% Standard DMD has high precision requirements for the data.
+%In graphics applications, users prioritize simulation speed and visual effects, and are satisfied as long as aesthetically pleasing fluid structures are visible, such as the vortices distributed on either side of a cylinder in the Kármán vortex street. Therefore, the user inputs a relatively large time step ($\Delta t$), and the simulator is not as precise as CFD algorithms. As a result, the dataset obtained tends to be noisier compared to that from CFD simulations.
+Standard DMD, as shown in \refeq{eqn:reduced_koopman_solution}, directly fits the data from the $i$-th frame to the ($i+1$)-th frame without considering the (potentially coherent) relationships between the $i$-th frame and the ($i+2$)-th or subsequent frames. This short time horizon makes it highly sensitive to noise, both spatially as the fluid state changes rapidly at the Nyquist limit, and at the operator level. As a result, standard DMD imposes high requirements on data quality. 
+
+% How optdmd solve the problem (how to denoise the data by using optdmd)
+To address this issue, we choose to use OptDMD \cite{askham2018variable} for our graphics applications. 
+OptDMD processes all snapshots simultaneously, significantly reducing the impact of noise by looking at the signal over a longer time horizon. 
+By considering the $i$-th frame, the ($i+1$)-th frame, the ($i+2$)-th frame, and so on together, the influence of random noise is mitigated. 
+To achieve this, OptDMD transforms the training of the reduced Koopman operator into an exponential data fitting problem and utilizes the variable projection method to solve this optimization problem. 
+First, we perform an SVD of the dataset $\bm{X}$ to get $\bm{U_r}, \bm{\Sigma_r}, \bm{V_r}$ such that $\bm{X_r} = \bm{U_r} \bm{\Sigma_r} \bm{V_r^T}$. Then, we can construct the optimization problem as:
+\begin{equation}
+    \label{eqn:variable_projection}
+    \argmin_{\bm{\alpha}, \bm{B}} \; \|\bm{\bar{V_r}\Sigma} - \bm{\Phi}(\bm{\alpha})\bm{B}\|_F
+\end{equation}
+where $\bm{\bar{V_r}}$ denotes the element-wise complex conjugate of $\bm{V_r}$, $\bm{\alpha}$ is an initial guess. 
+
+To solve this in reasonable runtime, we need a \emph{decent} guess at $\bm{\alpha}$. To do so, we simply solve a single instance of the base DMD method (Equation \ref{eqn:reduced_koopman}) to find the eigenvalue matrix $\bm\Lambda$ and set $\bm\alpha = \bm\Lambda$.
+
+The matrix $\bm{\Phi}$ can then be computed as:
+\begin{equation}
+     \label{eqn:Phi_OptDND}
+    \bm{\phi_i} = \frac{1}{\|\bm{U_r}\bm{B^T}(:,i)\|_2}\bm{U_r}\bm{B^T}(:, i)
+\end{equation}
+where $\bm{\phi_i}$ is the $i$-th colomn of matrix $\bm{\Phi}$.
+
+\subsection{Memory Overhead Optimization}
+% DMD memory cost is large
+DMD can effectively reconstruct datasets, but its training process requires a significant amount of memory due to the SVD. When the dataset is large, it becomes necessary to store an $N\times N$ matrix in memory, where $N$ represents the dimensionality of a snapshot, thus demonstrating a significant memory requirement. 
+
+We note that previous DMD literature either has much smaller datasets afforded by 2D data, or perform training on large clusters \cite{schmid2010dynamic, proctor2016dynamic, askham2018variable, sashidhar2022bagging}. Uniquely in graphics, we expect algorithms to be able to simulate 3D examples (i.e. large $N$) but run on consumer hardware (i.e. small memory). 
+
+To reduce the memory requirements of DMD, we employ randomized SVD. Randomized SVD approximates the range of the original matrix $\bm{X}$ by constructing a matrix $\bm{Q}$. This is done by multiplying a randomly initialized low-dimensional matrix $\bm{Q}$ with the original matrix $\bm{X}$ and performing decompositions iteratively until a stable vector matrix $\bm{Q}$ is obtained. The goal is to ensure that  $\bm{X} \approx \bm{Q}\bm{Q^T} \bm{X}$. We then construct the matrix  $\bm{B} = \bm{Q^T} \bm{X}$, which applies to the space spanned by $\bm{Q}$. Traditional SVD can thus be performed on the much smaller $\bm{B}$ to obtain  $\bm{B} = \bm{U} \bm{\Sigma} \bm{V^T}$, and finally be used to approximate $\bm{X} \approx \bm{Q} \bm{U} \bm{\Sigma} \bm{V^T}$.
+
+\begin{figure}[!ht]
+    \centering
+    \includegraphics[width=1\columnwidth]{figure/moduli_editing.pdf}
+    \caption{\textbf{Editing Temporal Dynamics of the Plume with Bunny with the Koopman Operator Approximation}. In this experiment, we demonstrate the impact of changing the moduli of low-frequency and high-frequency modes in a 4:1 (left) and 1:4 (right) ratio. As mentioned in \refsec{sec:editing}, in real applications, users can modify and manipulate the dynamic of different scales of vorticity by adjusting the reduced-order parameters.}
+    \label{fig:bunny_editing}
+    \Description{}
+\end{figure}
+
+\subsection{Arbitary Time Step}
+Since the reduced \koopman{} is a linear operator, as shown in \reffig{fig:dmdadvectioncomparison} we could easily pre-compute the power of the reduced \koopman{} and apply it to a reduced state $z$, enabling \textit{large} time step $k$ times of the time step $\Delta t$ that $\bm A$ is trained on:
+\begin{equation}
+    \label{eqn:large_time_step}
+    \bm{u}(t + k\Delta t) = \bm{\Phi} \bm{\Lambda}^k z(t)
+\end{equation}
+where $k$ is an integer of how many time steps we want to simulate forward. This can map any state at time $t$ to the state at time $t + k\Delta t$ in \textbf{one} matrix multiplication. This returns to the idea that the generator $\bm{\mathcal{K}}$ produces a \emph{family} of operators $\{\bm{\mathcal{K}}_t\}$ that represent the flow map from $\bm{u}_0$ to $\bm{u}(t)$.
+
+Notice additionally that because the operator maps velocity fields to velocity fields, advection of the velocity variable is achieved for \emph{free}. Nonlinear advection of the field is encoded directly in the operator.
+
+\subsection{Boundary Conditions and Divergence Free Constraint}
+The truncated Koopman operator $\tilde{\bm{K}}$ is trained on a full-space velocity field $\bm{u}$ which satisfies some boundary conditions and the divergence free constraint. We follow a similar proof to that provided by \citet{treuille2006model} to demonstrate that the Koopman operator also satisfies the space boundary conditions and constraints. 
+
+First, the boundary conditions and constraints can be represented as some linear constraint matrix $\bm C$ on the time series data $\bm X$ such that $\bm{C} \bm{X} = 0$.
+Any column $b_i$ in $\bm{U_r}$ by definition satisfies $\bm{X}\bm{X^T}\bm{b_i} = \lambda_i \bm{b_i}$. We can then conclude that $\bm{C}\bm{X}\bm{X^T}\bm{b_i} = \lambda_i\bm{C}\bm{b_i} = 0$, and thus claim that $\bm{b_i}$ satisfies the constraint matrix as long as $\lambda_i \ne 0$.
+
+As this is true for all columns, then $\bm{C}\bm{U_r} = 0$ and consequently $\bm{C}\bm{\Phi} = 0$. This means that any velocity field $\bm u$ reconstructed from its reduced representation satisfies any linear constraint satisfied by the initial data. 
+
+\subsection{Encompassing External Forces in Reduced Space}
+
+The OptDMD method in CFD can only reconstruct the dataset and cannot respond to user inputs of new external forces. However, in graphics applications, it is very common to edit or manipulate existing datasets, such as adding or reducing forces. To address this, we combine DMD with Control (DMDc) \cite{proctor2016dynamic} and OptDMD, marking the first instance of integrating these two methods. This integration allows user-input external forces to be incorporated into the OptDMD framework. Our improved framework is as follows:
+\begin{equation}
+    \label{eqn:external_forces}
+    \bm{z}(t + \Delta t) = \bm{\Lambda} \bm{z}(t) + \bm{\Phi^+} \sum_{i = 1}^m\bm{B_i} \bm{q_i(t)} \Delta t + \bm{\Phi^+} \sum_{j = 1}^n\bm{f_j(t)} \Delta t
+\end{equation}
+where $\bm B_i$ and $\bm q_i$ can be constructed differently based on the settings of various scenarios. $\bm f_j$ $\in \mathbb{R}^{N\times 1}$ represents a user-modifiable external force. For example, in the 2D standalone plume scenario, we can define $\bm q_1 \in \mathbb{R}^{M \times 1}$ as the density field, where $M$ represents the number of grid cells, and rewrite its impact on the velocity field in matrix form $\bm B_1 \in \mathbb{R}^{N \times M}$. Similarly, we can define $\bm q_2 \in \mathbb{R}^{M \times 1}$ as the temperature field, and rewrite its impact on the velocity field in matrix form $\bm B_2 \in \mathbb{R}^{N \times M}$. These effects can then be projected onto the reduced space as $(\bm \Phi^+ (\bm B_1 \bm q_1 + \bm B_2 \bm q_2))$.

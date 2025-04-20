@@ -1,0 +1,128 @@
+
+\section{Algorithm}
+
+\subsection{Encouraging KV Sharing}
+\label{sec:algo-kv}
+
+As shown in Section \ref{sec:profiling}, the efficiency of search strategies is strongly influenced by the amount of available KV cache sharing among the retained trajectories. 
+However, the most accurate search strategy, REBASE \cite{wu2024inference}, has substantial inference overheads due to the reduction in KV cache sharing from sampling in a more balanced manner when deciding which trajectories to expand.
+
+In order to enhance the available KV cache sharing, we design a cost model-based method which we integrate at each step in the search process when determining which trajectories to sample continuations from.
+This cost model is designed to mitigate the efficiency overheads from balanced sampling (which is necessary for obtaining diverse trajectories) by adding a cost term which accounts for the overhead of divergent KV branches in the search tree. 
+The objective of our algorithm is outlined in Figure \ref{fig:main} (Middle), where we aim to promote KV cache sharing by minimizing the number of retained nodes in order to minimize the cost of the search process.
+
+A key challenge when trying to incorporate efficiency considerations when selecting which trajectories to retain is that we cannot consider each trajectory in isolation. 
+For example, if trajectories $A$ and $B$ share node $C$ in the search tree (and therefore share the KV cache state for this part of their trajectories), we need to retain node $C$ if we retain \textit{either} trajectory $A$ or trajectory $B$.
+Due to the importance of KV sharing in determining runtime, this means that when deciding whether to keep trajectory $A$, the efficiency implications of pruning trajectory $A$ are only apparent if we determine which other trajectories are retained or pruned. 
+The efficiency cost of retaining each trajectory therefore depends \textit{on the other trajectories that are retained or pruned}.
+As such, it is challenging to assign a cost for retaining each trajectory, and we can only account for efficiency \textit{at the scope of the tree}.
+
+To account for efficiency in the search process, our algorithm therefore decides which trajectories to retain or prune while considering the efficiency costs and benefits of retaining a set of trajectories, rather than assigning an efficiency cost and reward for each separate trajectory.
+In order to facilitate this, we formulate our objective as an integer linear programming (ILP) problem, where we have a binary variable corresponding to whether each trajectory is retained.
+We include additional constraint binary variables for each earlier node in the search tree, which is set to 1 if any of the trajectories that share this node are retained.
+This allows us to optimize the ILP to consider interdependency between trajectories when determining the amount of exploitable KV sharing.
+
+Our cost model needs to contain both a term which factors in the reward for keeping each trajectory, as well as the cost of the set of trajectories that we select.
+For the reward term in our cost model, we use the weights obtained with REBASE sampling as the value for retaining each trajectory \cite{wu2024inference}.
+The weights $W_i$ are determined using the following expression, where $N$ is the total number of continuations that need to be sampled, $R_i$ is the reward for trajectory $i$ computed using a Process Reward Model (PRM), $T_R$ is a temperature parameter that controls how balanced the sampling is, and $A$ is the set of all trajectories:
+
+\begin{equation}
+    \label{eq:rebase}
+    W_i = \mathrm{ceil} ( N \frac{\mathrm{exp}(R_i / T_R)}{\sum_{k \in A}\mathrm{exp}(R_k / T_R)}  )
+\end{equation}
+
+This sampling procedure produces more continuations for more promising trajectories (as determined by their reward scores), while still producing some continuations from less promising trajectories (as opposed to beam search, which retains a subset of promising trajectories and then prunes the rest).
+By still producing some continuations for less promising trajectories, REBASE performs additional exploration, which yields higher accuracy for the same search width.
+
+We then introduce the following objective which we want to maximize at each step, which contains one term which retains the highest priority trajectories, as well as a second term that promotes KV sharing by penalizing the size of the retained tree:
+
+\begin{equation}
+    \label{eq:cost_model_v1}
+    \max_{S}( \frac{\sum_{i \in S} W_i}{\sum_{i \in A} W_i} 
+   \;-\;
+   \lambda_b \,\frac{|V_S|}{|V_A|} )
+\end{equation}
+
+where $S$ is the set of selected trajectories (which can be variable in size);
+$V_A$ and $V_S$ are, respectively, the set of all nodes in the tree before applying the cost model and the set of nodes that are retained after pruning the tree; and $\lambda_b$ is a hyperparameter which controls the relative strength of the budget term. 
+Note that we add the additional constraint that $|S| \geq 1$ to ensure that we always retain at least one leaf node.
+
+This objective aims to maximize the reward of the retained nodes, while still maintaining efficiency.
+Note that if $\lambda_b$ is set to 0, this objective bears similarity to the optimization target for existing strategies like beam search, which aim to maximize the reward for the retained set of trajectories (under some constraint for the number of trajectories that can be kept).
+For $\lambda_b > 0$, this term penalizes the number of retained nodes in the tree, which encourages retaining trajectories which share part of their prior KV cache state rather than completely distinct trajectories.
+To solve this ILP, we leverage the Pulp optimization library \cite{mitchell2011pulp} using the CBC solver \cite{john_forrest_2024_13347261}.
+
+After we apply our KV cache-promoting cost model to prune out trajectories, we then re-apply REBASE sampling to determine how many continuations to sample from each of the remaining trajectories.
+The updated weights $W'_i$ are then determined using the following expression, which considers only the retained trajectories:
+
+\begin{equation}
+    \label{eq:rebase_v2}
+    W'_i = \mathrm{ceil} ( N \frac{\mathrm{exp}(R_i / T_R)}{\sum_{k \in S}\mathrm{exp}(R_k / T_R)}  )
+\end{equation}
+
+For the subsequent iteration in the search process, the weights $W'_i$ are used to decide how many continuations to sample for each of the retained trajectories.
+
+% Main plot
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\begin{figure*}[h]%{t}{0.46\textwidth}
+\centering
+\includegraphics[width=0.9\linewidth]{figures/results.pdf}
+% \vspace*{-2mm}
+\vspace*{-2mm}
+ \caption{ 
+ Accuracy versus efficiency trade-off curves for different search strategies with the Llemma-34B model.
+ We report results for search widths of 16, 64, and 256 across all methods.
+ We provide baseline results for Beam Search and DVTS (both with retaining a fixed number of trajectories as well as $\sqrt{N}$ trajectories at each step) \cite{snell2024scaling,beeching2024scalingtesttimecompute}, as well as for REBASE \cite{wu2024inference}.
+ Our results demonstrate how our method allows for improved efficiency relative to REBASE, while maintaining the accuracy benefits due to retaining necessary diverse trajectories.
+  }
+  \vspace{-2mm}
+  \label{fig:results}
+\end{figure*}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+ 
+\subsection{Retaining Diversity}
+
+The crucial challenge as we encourage KV cache sharing is the importance of diversity for attaining high accuracy.
+If we naively enforce KV sharing, this will also consequently prune out diverse trajectories which were crucial for attaining high accuracy.
+This creates a difficult trade-off, where we want to retain diverse trajectories to maintain accuracy, but not at the expense of large runtime penalties.
+
+However, existing approaches for sampling continuations lead to many redundant or similar continuations.
+Even if some of these continuations are not exact duplicates, they can still have a similar semantic meaning.
+For example, consider the first steps of two different solution trajectories for the question: ``The results of a cross-country team's training run are graphed below. Which student has the greatest average speed?"
+\begin{enumerate}
+    \item \textit{Step 1: The average speed is the total distance divided by the total time.}
+    \item \textit{Step 1: To find the average speed, we need to divide the distance traveled by the time taken.}
+\end{enumerate}
+Although these two steps are phrased differently, they convey the exact same meaning. This redundancy suggests that retaining both is unnecessary.
+Several of these continuations could be pruned out without losing out on diversity.
+Our goal is therefore to retain trajectories that are semantically diverse,
+while improving KV cache sharing by removing redundant or similar trajectories which are unnecessary for attaining high accuracy. 
+
+To ensure that we retain diverse trajectories, we augment our cost model approach from Section \ref{sec:algo-kv} with an additional term that promotes retaining diverse trajectories.
+The goal is for the set of selected trajectories to cover the original semantic space of the sampled trajectories.
+However, similar to the challenges with estimating the impact of retaining a given trajectory on exploitable KV sharing, we can only estimate whether retaining a given trajectory improves coverage when considering the other trajectories that are retained.
+One possible approach for considering the diversity of trajectories that are retained when pruning to reduce KV cache size would be to estimate the pairwise similarity between trajectories and to then add a term to the cost model that penalizes pairwise similarity among the set of retained trajectories. 
+However, this approach would additionally introduce quadratic terms in the cost model, making the optimization objective quadratic rather than nonlinear.
+This would further make it infeasible for large beam widths.
+
+To more efficiently estimate the coverage of our selected trajectories without incorporating pairwise similarity computation directly into the cost model, we first cluster the trajectories and then estimate diversity of retained trajectories based on whether we retain trajectories across different clusters. 
+Our approach is visualized in Figure \ref{fig:main} (Right), where we ensure that semantically diverse trajectories are retained when we apply our pruning method to reduce the size of the tree.
+This approach ensures that we retain \textit{coverage} over the original semantic space of potential trajectories.
+To accomplish this, we first embed the last step for each sequence using a BERT model finetuned for embedding math sentences \cite{steinfeldt2024evaluation}.
+We then cluster these embeddings using  hierarchical agglomerative clustering from Scipy \cite{virtanen2020scipy} based on cosine similarity.
+We use a fixed distance threshold in order to determine the number of clusters.
+Note that our choice of similarity metric is arbitrary, and our algorithm is also compatible with alternate methods for measuring semantic similarity between the trajectories.
+
+After clustering trajectories, we then incorporate this into our objective as a coverage term, which accounts for how well our selected set of trajectories covers the possible solution space.
+Formally, we incorporate the diversity term into the objective function which we want to maximize at each step as follows:
+
+\begin{equation}
+    \label{eq:cost_model_v2}
+    \max_S( \frac{\sum_{i \in S} W_i}{\sum_{i \in A} W_i} 
+   \;-\;
+   \lambda_b \,\frac{|V_S|}{|V_A|} + \lambda_d \frac{|C_S|}{|C_A|})
+\end{equation}
+
+where $C_S$ and $C_A$ refer to the clusters covered by the selected trajectories and the total number of clusters, respectively; and $\lambda_d$ is a hyperparameter which controls the relative strength of the coverage term.
+The inclusion of this term ensures that we retain sufficient semantic diversity in order to facilitate exploration during the search process, which is critical for achieving high accuracy.
+As in Section \ref{sec:algo-kv}, after we apply our cost model to prune out trajectories, we re-apply REBASE \cite{wu2024inference} to sample continuations from each of the remaining trajectories. 

@@ -1,0 +1,346 @@
+\section{Implementation Details}\label{appendix:implementation_details}
+
+\subsection{Pre-training Model}
+
+\paragraph{Patch Embedding.} To generate patch embeddings, the 2D composite image $\mathcal{I} \in \mathbb{R}^{H \times W \times C}$ is processed using a convolutional layer with kernel size $(P, P)$ and stride $P$. This operation partitions $\mathcal{I}$ into $N = HW/P^2$ non-overlapping patches, which are reshaped into a sequence of embeddings in $\mathbb{R}^{N \times D}$. Here, $C$ represents the number of input channels, $(H, W)$ denotes the resolution of the input image, $P$ is the patch size, and $D$ is the patch embedding dimension.
+
+Unlike tokenization strategies that rely on fixed-size input grids, the use of convolutions allows the model to adapt to varying input resolutions. This is particularly useful in EO applications, where spatial resolutions can vary across datasets. While transformer-based architectures address sequence length variability through techniques like rotary embeddings \cite{su2021roformer}, ALiBi \cite{press2022train}, and relative position encodings \cite{shaw2018self}, convolutional patch embedding provides a structured inductive bias that benefits spatial feature extraction while maintaining translational invariance.
+
+\paragraph{Decoder Architecture.} The decoding process begins by reshaping the encoded token sequence from $\mathbb{R}^{N \times D}$ into an image-like feature representation at different resolutions. At each decoder stage $d \in {1,2,3,4}$, tokens are rescaled to $\frac{H}{2^{d-1}} \times \frac{W}{2^{d-1}} \times D_{p_d}$, where $D_{p_d} = 2^{d-1}D_p$ represents the channel dimension at each stage. This transformation involves an initial $1 \times 1$ convolution to adjust channel dimensions, followed by strided $3 \times 3$ convolutions for downsampling when $2^{d-1} \geq P$, or transpose convolutions when $2^{d-1} < P$.
+
+To reconstruct high-resolution embeddings, feature maps from deeper layers ($d=4$) are progressively upsampled using bilinear interpolation and refined through two $3 \times 3$ Conv-BatchNorm-ReLU operations before being concatenated with corresponding features from earlier transformer layers. A final $1 \times 1$ convolution ensures that the final output dimension matches $D_p$ when required.
+
+This architecture is instantiated as two separate decoders, outputting $\mathcal{O}^\mathcal{V}$ and $\mathcal{O}^\mathcal{H}$ at the highest resolution.
+
+\paragraph{Projection Head.} For the pixel-pixel alignment objective, we apply a lightweight two-layer $1 \times 1$ convolutional projection head to each output $\mathcal{O}^\mathcal{H}_d$. The first layer expands the feature dimension by a factor of two, followed by a second layer that projects it back to $D_p$. This design enhances feature expressiveness during training but, as observed in prior work \cite{xue2024projectionhead}, projection heads tend to overfit to the pretraining task, reducing their transferability to downstream applications. Consequently, we discard the projection head after training. In contrast, the pixel-waveform alignment output $\mathcal{O}^\mathcal{V}$ is directly used without an additional projection head, as its representation remains well-aligned with downstream tasks such as waveform retrieval and generation.
+
+\subsection{Waveform Processing Model}
+\paragraph{Waveform Encoder.} The waveform encoder consists of an input stem and three stages designed to progressively reduce the 1D waveform of length $L$ (i.e., $\mathcal{W} \in \mathbb{R}^{L \times 1}$) while increasing its feature representation capacity. First, the input stem processes the waveform using a $3 \times 1$ convolutional layer with a stride of 2. This initial operation halves the length of the waveform to \( L/2 \) and increases the channel dimension to 2. Following the input stem, the encoder comprises three stages, each containing three ResNet blocks. Each ResNet block is designed with two $3 \times 1$ convolutional layers, batch normalization, ReLU activations, and a skip connection. At the beginning of each stage, the first ResNet block incorporates a strided convolution in its initial layer to halve the waveform’s length and double the channel dimension. The subsequent blocks within the same stage operate with a stride of 1. By the end of the three stages, the waveform encoder reduces the input waveform’s length to \( L/16 \) while progressively increasing the channel dimension to 16. Thus, the waveform encoder $\mathcal{E}_w$ transforms a waveform of shape $\mathbb{R}^{L \times 1}$ into a latent representation $z \in \mathbb{R}^{L/16 \times 16}$.
+
+The alignment of the waveforms and the pixels is performed on this latent representation $z_e = \mathcal{E}_w(\mathcal{W})$. However, to adapt them to the outputs of $\mathcal{O}^\mathcal{V}$, we first apply an average pooling along the channel dimension, followed by a projection to the $\mathcal{O}^\mathcal{V}$ projection dimension (i.e., $D_p$) using a linear layer. In essence, this process transforms $z_e$ into $\mathcal{O}^\mathcal{W} \in \mathbb{R}^{D_p}$.
+
+\paragraph{Residual Vector Quantizer (RVQ).} The RVQ layer takes a segment from the latent waveform representation $z^i_e \in \mathbb{R}^{1/16}$, where $z^i_e$ is the $i^{th}$ row of the waveform latent representation, and iteratively quantizes it. It operates by first mapping each $z^i_e$ to the closest codebook vector in the first quantizer, then computing the residual (i.e., the difference between the input vector and the quantized approximation). This residual is passed to the next quantizer in the sequence, and the process is repeated for all $Q$ quantizers. At the end of the process, the latent waveform representation $z_e$ is converted into a discrete series of quantized residual vectors, which are summed to produce the final quantized waveform representation $z$. 
+%This approach regularizes the latent space by enforcing discrete representations while retaining sufficient detail for accurate reconstruction.
+
+\paragraph{Waveform Decoder.} The waveform decoder ($\mathcal{D}_w$) mirrors the structure of the encoder but operates in reverse order to reconstruct the waveform from its quantized latent representation $z$. Similar to the encoder, the decoder consists of three stages and an output stem. However, instead of using strided convolutions for downsampling, the decoder replaces them with transpose convolutions to progressively upsample the waveform. Each stage in the decoder increases the length of the waveform while halving the channel dimension, reversing the transformations applied by the encoder. By the end of the decoding process, the latent representation is transformed back into a waveform $\hat{\mathcal{W}}$ with length \( L \).
+
+\subsection{Multitemporal Image Processing Model}%\label{sec:multitemproal_ae}
+
+\paragraph{Multitemporal Image AE.} The AE has four processing and downsampling stages. In each stage we replace the conventional double Conv2D-BatchNorm-ReLU layers in UNets with a two-layer ConvLSTM followed by a BatchNorm layer and ReLU activation layer. This design choice is to explicitly model temporal correlations across time steps as mentioned earlier. Downsampling is performed using a strided Conv3D layer applied on the spatial dimension, while upsampling is performed using a trilinear upsampling operation also on the spatial dimension, followed by a Conv3D layer. As such, the model takes a multi-temporal input image $\mathcal{M} \in \mathbb{R}^{T \times H \times W \times C}$, where $T$ is the temporal dimension, and produces a feature map $\mathcal{X} \in \mathbb{R}^{T \times H \times W \times D_p}$. Finally, as this model is an autoencoder, the original input shape is recovered using a Conv3D layer producing $\mathcal{\hat{M}} \in \mathbb{R}^{T \times H \times W \times C}$. All Conv3D layers in the AE have a kernel of $3 \times 3$ on the spatial dimension.
+
+\subsection{Waveform Generation}\label{appendix:diffusion_math}
+Denoising diffusion models (DM) \cite{sohl2015dm} are generative models that learn a data distribution \( p_{\text{data}} \) by gradually denoising a noisy variable following a predefined noise schedule. Let \( \epsilon_\theta \) be a neural network. Its goal is to predict the original data \( x \) from a noisy version \( x_t \) generated by \( x_t = \alpha_t x_0 + \sigma_t \epsilon \), where \( \epsilon \sim \mathcal{N}(0, \mathbf{I}) \) is Gaussian noise, \( \alpha_t \) and \( \sigma_t \) are parameters of a noise scheduling function, and $t$ is a time step from $\{1,...,T\}$. 
+
+
+The corresponding objective of a DM can then be written as:
+
+\begin{equation}
+    L_{DM} = \mathbb{E}_{x_0 \sim p_{data}, \epsilon \sim \mathcal{N}(0,\mathbf{I}), t} \left[ \left\| y - \epsilon_\theta(x_t, t) \right\|_2^2 \right]
+\end{equation}
+
+where the target $y$ can be the input noise $\epsilon$, the original input $x$ variable, or the velocity $v = \alpha_t \epsilon - \sigma_t x$. DMs can also be parametrized by a condition $c \in \mathbb{R}^D$ in addition to the diffusion time $t$, and the corresponding objective becomes:
+\begin{equation}
+    L_{CDM} = \mathbb{E}_{x_0 \sim p_{data}, \epsilon \sim \mathcal{N}(0,1), t,c} \left[ \left\| y - \epsilon_\theta(x_t, t,c) \right\|_2^2 \right]
+\end{equation}
+
+Another class of diffusion models, known as Latent Diffusion Models (LDMs) \cite{rombach2022sd,shen2023naturalspeech2,ramesh2022hierarchical}, operate in a latent space rather than directly in the high-dimensional data space. By operating in a lower-dimensional latent space, LDMs significantly reduce the computational cost of training and inference compared to DMs, which operate in the original data space.  LDMs leverage the latent representation of data obtained by training an autoencoder, defined by an encoder $\mathcal{E}$ and a decoder $\mathcal{D}$. The autoencoder is trained such that $\hat{x} = \mathcal{D}(\mathcal{E}(x))$ is a reconstruction of the original data $x$. After training the autoencoder, a diffusion model is trained directly on the encoded data samples $z = \mathcal{E}(x)$. A new sample is then obtained by first sampling a representation $z$, and then $\mathcal{D}(z)$ yields $x$. 
+
+Following the LDM formulation, we learn a network $\epsilon_\theta$ conditioned on $\mathcal{O}^V_{\phi,\lambda}$, where $\phi$ and $\lambda$ are the waveform coordinates, that directly predicts a denoised waveform latent $z_0 \in \mathbb{R}^{\frac{L}{16}\times 16}$, where $z_0 = \mathcal{E}(\mathcal{W})$, by minimizing:
+\begin{equation}
+    \label{eq:cond_ldm}
+        L_{LDM} = \mathbb{E}_{z_0 \sim p(z_0), \epsilon \sim \mathcal{N}(0,1), t\sim U[1,T],\mathcal{O}^V_{\phi,\lambda}} \left[ \left\|\epsilon_\theta(z_t, t,\mathcal{O}^V_{\phi,\lambda})-z_0 \right\|_2^2 \right]
+\end{equation}
+In our formulation, the network $\epsilon_\theta(z_t,t,\mathcal{O}^V_{\phi,\lambda})$ is a 1D UNet model which takes the current noisy latent $z_t$, the time step $t$ as input, and the condition $\mathcal{O}^V_{\phi,\lambda}$ is integrated into the UNet via cross-attention at each layer. 
+To sample $z_0$ from the diffusion model, we start from a Gaussian noise $z_T$ and gradually denoise it into samples $z_{T-1},...,z_0$ using the ordinary differential equation (ODE) solver proposed by Karras et al. \yrcite{karras2022elucidating}, as we found that it produces high-quality samples with fewer denoising steps. 
+To make the sampled latent waveform $z_0$ better match its conditioning we use classifier-free guidance. Specifically, during training we randomly drop the conditioning for 50\% of the examples to make the model capable of conditional and unconditional denoising. In practice, we replace the conditioning signal with a random vector. Within the classifier-free guidance formulation, model predictions can be written as:
+
+\begin{equation}
+    \label{eq:classifier_free_guidance}
+    \hat{\epsilon_\theta}(z_t,t,\mathcal{O}^V_{\phi,\lambda}) = \epsilon_\theta(z_t,t) + s\cdot(\epsilon_\theta(z_t,t,\mathcal{O^V}_{\phi,\lambda})-\epsilon_\theta(z_t,t)) 
+\end{equation}
+where $s$ is the guidance scale. Setting $s$ to 0 is equivalent to unconditional sampling, while setting it to $\geq 1$ has shown to produce more coherent but less diverse results. Here we set $s$ to 3.
+Finally, to synthesize a waveform at any location $(\phi,\lambda)$ given a pixel embedding $\mathcal{O}^V_{\phi,\lambda}$ as a condition, we use eq. \ref{eq:classifier_free_guidance} to get $\hat{z_0}$, and leverage the frozen waveform decoder $\mathcal{D}_w$, where $\mathcal{D}_w(\hat{z_0})$ is a generated waveform.
+
+\section{Experimental Settings}\label{appendix:experimental_settings}
+
+\paragraph{Sentinel-2 Data.} We used Level-2A surface reflectance data (S2-L2A) from Google Earth Engine (GEE). The dataset includes bands at 10m (Blue, Green, Red, and NIR) and 20m (Red Edge 1-4, SWIR1, and SWIR2) spatial resolutions, all upscaled to 10m ground sampling distance (GSD) using cubic interpolation. We created two sets of mosaics: a single mosaic during the leaf-on season using the median of all available images from April to September 2020. This mosaic is used as input for the pre-trained model. The other set is used as input for the multitemporal AE and is comprised of three mosaics, each representing the median acquisitions of all images in a four-month span from October 2019 until September 2020. Cloudy pixels were filtered out using the S2 Cloud Probability dataset provided by SentinelHub in GEE.
+
+\paragraph{Sentinel-1 Data.} Sentinel-1 (S1) data were obtained from the Sentinel-1A and Sentinel-1B satellites, operating at the C-band (~6 cm wavelength). Images were collected in Interferometric Wide swath mode (IW) with VV and VH polarizations, derived from the high-resolution Level-1 ground range detected (GRD) product. The original 20m × 22m resolution was resampled to 10m × 10m GSD. Similar to S2, we also created two sets of mosaics. The S1 data were calibrated using the Sentinel SNAP toolbox, converting pixel values to backscattering coefficients ($\sigma^0$) in linear units and applying geometric correction using the 30m Shuttle Radar Topography Mission (SRTM) Digital Elevation Model (DEM). Finally, the backscattering coefficients $\sigma_\theta^0$ acquired at difference incidence angles $\theta$ were normalized to a common reference incidence angle set at $\sigma_{ref} = 40^\circ$ using the cosine correction equation (\citet{Baghdadi2001,TopouzelisSinghaKitsiou}):
+
+\begin{equation}
+    \sigma_ref^0 = \frac{\sigma_\theta^0 cos^2(\theta_{ref})}{cos^2(\theta)}
+\end{equation}
+
+\paragraph{GEDI Data.} The Global Ecosystem Dynamics Investigation (GEDI) is a full-waveform LiDAR sensor on the International Space Station (ISS), operational between 51.6$\deg$ N and 51.6$\deg$ S between April 2019 and March 2023, and continued operation on April 2024. GEDI measures the vertical structure of objects (e.g., vegetation) using three lasers emitting near-infrared light (1064 nm), one of the laser beams is split in two, and after applying optical dithering, this results in eight ground tracks spaced 600m apart, with each shot having a 25m footprint. For this study, we used GEDI Level 1B (L1B), Level 2A (L2A), and Level 2B (L2B) data from April 2019 to December 2021. From the L1B product we extracted the waveforms and their geolocation (i.e., latitude, longitude, and elevation), and the geolocation of the GEDI instrument for each shot. Finally, as the waveforms are stored as vectors of 1420 bins (1 bin = 0.15 m), we also extracted for each waveform the bin count, the signal start ($\mathcal{W}_{start}$) and signal end ($\mathcal{W}_{end}$). The latter two indicate the location of the canopy top and the end position of the waveform before the noise, respectively. From the L2A data product, we extracted the $RH_{98}$ (referred to $\mathcal{W}_{rh}$), which represents the estimated height of the tallest object within the waveform footprint, the canopy cover ($\mathcal{W}_{c}$). Finally, from the L2B data product, we extracted the Plant Area Index ($\mathcal{W}_{pai}$). 
+
+As the waveforms are affected by the atmospheric conditions at acquisition time, we followed the filtering scheme of Fayad et al. \yrcite{Fayad_etal_2024} to remove low-quality waveforms. Finally, due to the different waveform shapes between the leaf-off and leaf-on seasons, especially for those acquired over deciduous forests, we only considered waveforms acquired during the leaf-on season. This resulted in a GEDI dataset of $\approx$19 million waveforms and their associated metrics. 
+
+\paragraph{PureForest ($PF$).}The PureForest dataset was designed as a benchmark and provides ground truth patches for the classification of mono-specific forests in France \cite{gaydon2024pureforest}. It includes high-resolution imagery and corresponding annotations for more than 13K $50 \times 50$ m forest patches for 13 tree species.
+
+\paragraph{CLC+Backbone ($CLS_+$).}The $CLS_+$ A pan-European wall-to-wall land cover inventory for the 2021 reference year. The product is based on Sentinel 2 (i.e., optical) time series from 2020 to 2022 and a temporal convolutional neural network (TempCNN) \cite{Pelletier2019} serving as a classifier. The product is available as a 10 m raster and shows for each pixel the dominant land cover among the 11 basic land cover classes.
+
+\paragraph{PASTIS dataset.}A crop mapping dataset by Garnot \yrcite{garnot2021pastis} for 18 crop classes and 1 background class from the French Land Parcel Information System. The dataset contains 2433 $128 \times 128$ pixels densely annotated patches at 10 m resolution.
+
+\paragraph{Vertical Structure dataset.}For vertical structure evaluation, we evaluated our model on its ability to map at 10 m resolution: (1) forest heights ($\mathcal{W}_{rh}$), forest fractional canopy cover ($\mathcal{W}_c$), plant area index ($\mathcal{W}_{pai}$), and complete waveform ($\mathcal{W}$) retrieval or generation. For these products, we rely on the products derived from the GEDI dataset presented earlier.
+
+\section{Objective Functions.} \label{appendix:objective_functions}
+
+\paragraph{ZERO-CL Loss.}
+Let \( Z^A \in \mathbb{R}^{G\times D_p} \) represent a $L_2$ normalized pixel embeddings from $\mathcal{O}^\mathcal{V}$, where \( G \) is the number of waveforms in a minibatch and \(D_p \) is the feature dimension, and \( Z^B \in \mathbb{R}^{G \times D_p} \) denote their corresponding $L_2$ normalized waveform embeddings from $\mathcal{O}^\mathcal{W}$. The instance-wise contrastive loss is defined as:
+
+\begin{equation}
+    \label{zero_icl}
+    \mathcal{L}_{\text{Ins}} = \sum_{i=1}^{G} \left( 1 - \sum_{d=1}^{D_p} H^{A,\text{Ins}}_{i, d} \cdot H^{B,\text{Ins}}_{i, d} \right)^2
+\end{equation}
+\( H_{i,d} \) represents the $d^{th}$ feature value of the $i^{th}$ instance. $H^{\text{Ins}}$ is a zero-phase component analysis (ZCA) whitened embedding matrix defined as:
+\begin{equation}
+    \label{zca_whitening_ins}
+    H^{\text{Ins}} = W^{\text{Ins}} Z, \quad W^{\text{Ins}} = E^{\text{Ins}} \Lambda_S^{-1/2} E^\top
+\end{equation}
+where \( E^{\text{Ins}} \in \mathbb{R}^{G,G}\) and \( \Lambda_S \) are the eigenmatrix and diagonal of the eigenvalue matrix of the \emph{affinity matrix} $S=\frac{1}{D_p}ZZ^\top$, respectively.
+Similar to the instance-wise contrastive objective, the feature-wise contrastive loss is formulated as:
+
+\begin{equation}
+    \label{zero_fcl}
+       \mathcal{L}_{\text{Fea}} = \sum_{d}^{D_p} \left( 1 - \sum_{i}^{G} H^{A,\text{Fea}}_{i, d} \cdot H^{B,\text{Fea}}_{i, d} \right)^2
+\end{equation}
+Where $H^{\text{Fea}}$ is defined as:
+\begin{equation}
+    \label{zca_whitening_fea}
+    H^{\text{Fea}} = W^{\text{Fea}} Z^\top, \quad W^{\text{Fea}} = E \Lambda_C^{-1/2} E^\top
+\end{equation}
+where \( E \in \mathbb{R}^{D_p,D_p}\) and \( \Lambda_C \) are the eigenmatrix and diagonal of the eigenvalue matrix of the \emph{covariance matrix} $C=\frac{1}{G}Z^\top Z$, respectively.
+
+The overall loss $\mathcal{L}_{Zero-CL}$ is $\mathcal{L}_{\text{Fea}} + \mathcal{L}_{\text{Ins}}$.
+
+\paragraph{VICReg Loss.}
+Let \( Z^\mathcal{H} \in \mathbb{R}^{M\times D_{p}} \) represent an $L_2$ normalized pixel embedding from \( \mathcal{O}^\mathcal{H}\) and \( Z^\mathcal{T} \in \mathbb{R}^{M \times D_{p}} \) its corresponding $L_2$ normalized pixel embeddings from \( \mathcal{O}^\mathcal{T}\), with \( M = B \times H \times W \) the number of pixels in the mini-batch of size $B$.
+VICReg is expressed as a sum of three losses: a variance loss, an invariance loss, and a covariance loss. The variance loss is formulated as:
+\begin{equation}
+    \label{var_loss}
+    \begin{split}
+    & \mathcal{L}_{\text{var}} = \frac{1}{2} (v(Z^\mathcal{H})+v(Z^\mathcal{T})),\\
+    & v(Z) = \frac{1}{D_p}\sum_d^{D_p}\max\left(0,1-\sqrt{\frac{1}{M}\sum_i^M(Z_{i,d}-\overline{Z_d})^2+\epsilon}\right)
+    \end{split}
+\end{equation}
+where \( Z_{i,d} \) represents the $d^{th}$ feature value of the $i^{th}$ instance.
+
+The invariance loss is formulated as:
+
+\begin{equation}
+    \label{inv_loss}
+    \mathcal{L}_{\text{inv}}= \frac{1}{M} \sum_{i=1}^M \| Z_i^H - Z_i^T \|_2^2 
+\end{equation}
+The covariance loss is formulated as:
+\begin{equation}
+    \label{cov_loss}
+    \begin{split}
+    & \mathcal{L}_{\text{cov}} = c(Z^\mathcal{H}) + c(Z^\mathcal{T}), \\
+    & c(Z) = \frac{1}{D_p}\sum_{k\neq l}[cov(Z)]^2_{k,l} \\
+    & cov(Z) = \frac{1}{M-1}\sum_{i}^M(Z_i-\overline{Z})(Z_i-\overline{Z})^\top
+     \end{split}
+\end{equation}
+The overall loss term $\mathcal{L}_{\text{VICReg}}$ is then:
+\begin{equation}
+    \label{loss_vicreg}
+    \mathcal{L}_{\text{VICReg}} = \alpha_v \mathcal{L}_{\text{var}} + \beta_i\mathcal{L}_{\text{inv}} + \gamma_c \mathcal{L}_{\text{cov}}
+\end{equation}
+Following Bardes \yrcite{bardes2021vicreg} we set $\alpha_v$ and $\beta_i$ to 25.0 and $\gamma_c$ to 1.0.
+
+\section{Model Configuration and Optimization}\label{appendix:model_config_and_optim}
+\subsection{Model Configuration} The image model is pre-trained on $64 \times 64$ pixel sized images with 14 bands, a 16-layer transformer with 8 attention heads, a patch size of eight, 512 embedding dimensions, a feedforward layer with two linear layers with a hidden dimension of 2048, GeGLU activation, and 0.1 dropout and attention dropout rates. The two image decoders are identical and project the decoded image feature map to 64 embedding dimensions (i.e. $D_p = 64$). Finally, we set the window size $w$ of the NA layers to 19 pixels.
+
+The waveform AE is trained on 256 bin-long waveforms, with RVQ layers composed of eight quantizers, and each quantizer containing 512 codebook entries. As such, the waveform encoder encodes the waveforms into a $16 \times 16$ latent representation which is average pooled along the channel dimension and projected to 64 embeddings dimension for the pixel-waveform alignment. 
+
+The multi-temporal image AE is trained on three $64 \times 64$ pixel sized input images, each with 14 bands, and produces a similarly shaped feature map on the temporal and spatial dimensions, and 64 embeddings dimension. This output is then average-pooled on the temporal dimension for the pixel-pixel alignment.
+
+Finally, the diffusion model is trained on the $16 \times 16$ quantized waveform latents, which are first projected to 128 channels before being passed to the UNet model. 
+
+\subsection{Training, Inference, and Generation}
+DUNIA was pre-trained on a single NVIDIA A6000 48GB GPU with a batch size of 60 for 250K steps using the Lion optimizer \cite{chen2024LION}, a learning rate of $5\mathrm{e}{-5}$, weight decay of $0.4$, 5K warmup steps, and a cosine annealing schedule. For finetuning, we used AdamW \cite{loshchilov2017adamw} with a $2\mathrm{e}{-4}$ learning rate, a cosine annealing schedule, a batch size of 20, and trained until plateau. The diffusion model was trained with a batch size of 4096 for 100K steps using AdamW, a $1\mathrm{e}{-4}$ learning rate, 5K warmup steps, and a cosine annealing schedule. During inference, diffusion steps were set to 30. Both DUNIA and the diffusion model were regularized with the Switch EMA (SEMA) technique \cite{li2024sema}, maintaining an EMA with a decay rate of 0.9, updating every 5 steps, and replacing online model parameters every 1K steps with a SEMA coefficient of 0.9.
+
+\section{Ablation Study}\label{appendix:ablations}
+\subsection{Contrastive loss choice}
+We used two different loss functions for the Pixel-Pixel alignment and Pixel-Waveform alignment. \cref{table:cosine_sim_loss} shows that the cosine similarity (CS) using the VICReg loss for the pixel-waveform alignment only reaches a maximum of 0.56  for the positive pairs and 0.10 for the negative pairs, indicating poor alignment. On the other hand, using the ZERO-CL loss, the CS between the positive pairs reaches 0.86, and 0.35 between the negative pairs. We attribute the poor results for Pixel-Waveform alignment using the VICReg loss to the low number of available waveforms within a mini-batch. In contrast, for the Pixel-Pixel alignment, the CS for the positive pairs is 0.99, and 0.04 for the negative pairs using the VICReg loss. It decreases to 0.98 for the positive pairs and 0.45 for the negative pairs with ZERO-CL. Nevertheless, using ZERO-CL for both modalities increased training times exponentially due to the whitening transformation and the high number of available pixels within the mini-batch.         
+\begin{table}[h]
+\caption{Cosine similarity between positive pairs (+) and negative pairs (-) during training. P represents a pixel embedding, W represents a waveform embedding. Positive Pairs consist of a pixel embedding and its corresponding pixel/waveform embedding, while negative pairs are computed between a pixel embedding and other pixel/waveform embeddings within the mini-batch.\\}
+\label{table:cosine_sim_loss}
+\centering
+\begin{tabular}{lccccc}
+\toprule
+Loss & +P$\leftrightarrow$P & -P$\leftrightarrow$P & +P$\leftrightarrow$W & -P$\leftrightarrow$W \\
+\midrule
+VICReg & 0.99 & 0.04 & 0.56 & 0.10 \\
+ZERO-CL   & 0.98 & 0.45 & 0.86 & 0.35\\
+\bottomrule
+\end{tabular}
+
+
+\end{table}
+
+\subsection{Using a Shared Decoder}
+In our formulation, we used two different decoders for horizontal and vertical structural understanding. We hypothesized that a single real-valued embedding cannot simultaneously encode contrasting information, such as trees of the same species with different vertical structures. \cref{table:dual_vs_single_decoder} Shows that in the retrieval case, training a single decoder produces pixel embeddings with no semantic overlap with the waveforms with an average CS of -0.42, while the retrieved pixel embeddings given a pixel input are still highly similar. In the case of training separate decoders, retrieval performance is drastically different, with high correlations (0.99) between pixels and the retrieved waveforms.       
+
+\begin{table}[h]
+\caption{Average cosine similarity ($\overline{CS}$) between retrieved pixels and pixel queries (P$\leftarrow$P) and between retrieved waveforms and pixel queries (P$\leftarrow$W) for KNN=1.\\ }
+\label{table:dual_vs_single_decoder}
+\centering
+\begin{tabular}{lccccc}
+\toprule
+ & P$\leftarrow$P $\overline{CS}$ & P$\leftarrow$W $\overline{CS}$\\
+\midrule
+Shared decoder & 0.97 & -0.42\\
+Separate decoders   & 0.98 & 0.99\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Hierarchical VICReg Loss}
+The original VICReg loss proposed by Bardes et al. \citeyear{bardes2021vicreg} was applied between two views of the same input image. They later extended their work and applied it to local image features \cite{bardes2022vicregl}. Their results showed that better results were obtained when applying the VICReg loss on local features and at the instance level. Here, we further extend this work and apply it hierarchically to the decoder outputs between the pre-training model and the multi-temporal AE. Results in \cref{table:zero_shot_diff_vicreg} show significant improvements for both datasets when using this formulation. These results are also in line with the findings in Bardes et al. \citeyear{bardes2022vicregl}.   
+
+\begin{table}[h]
+\caption{Zero-shot classification performance ($wF1$) on the $PF$ and $CLC_+$ datasets using a model trained with multiple VICReg losses at different decoder levels ($\text{VICReg}_h$) against a single loss applied on the pixel-level embeddings from the last decoder layer ($\text{VICReg}_s$).\\ }
+\label{table:zero_shot_diff_vicreg}
+\centering
+\begin{tabular}{lccccc}
+\toprule
+ & $PF$ & $CLC_+$\\
+\midrule
+$\text{VICReg}_h$   & 76.0\% & 80.1\%\\
+$\text{VICReg}_s$   & 67.6\% & 74.2\%\\
+\bottomrule
+\end{tabular}
+
+\end{table}
+
+\subsection{Neighborhood Attention}
+The output of our pre-training model is composed of two neighborhood attention layers per output head, instead of the standard convolutional layers. This design choice allows each embedding to be modeled based on its local neighborhood instead of relying on small and fixed receptive fields. \cref{table:na_perf} shows an increase of 2.1\% ($wF1$) for the $CLC_+$ dataset and an $rmse$ decrease of 0.4 m for the $\mathcal{W}_{rh}$ dataset using this new configuration.       
+
+\begin{table}[h]
+\caption{Performance differences between a convolutional output layer (CNN) vs. a NA layer on the $CLC_+$ and $\mathcal{W}_{rh}$ datasets.}
+\label{table:na_perf}
+\centering
+\begin{tabular}{lccccc}
+\toprule
+ & $CLC_+$ & $\mathcal{W}_{rh}$\\
+\midrule
+CNN   & 72.1\% ($wF1$) & 2.4 ($rmse$)\%\\
+NA   & 74.2\% ($wF1$) & 2.0 ($rmse$)\%\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Embedding sensitivity to horizontal and vertical structures}
+Our results, either in the zero-shot setting or the fine-tuning setting used embeddings from $\mathcal{O}^{\mathcal{H}}$ for horizontal structure-related products (e.g., tree species identification, land cover mapping) and embeddings from $\mathcal{O}^{\mathcal{V}}$ for vertical structure-related products (e.g., canopy height mapping, waveform retrieval). We perform the same tests in the zero-shot setting, but reversing the query and retrieval embeddings for the other structure direction. \cref{table:reversed_embeddings} shows that relying on vertical structure data for products requiring horizontal understanding and vice versa performs poorly for the six tested products. This validates our design choice of cross-modal alignment with vertical structure data for Earth Observation products relying on this type of information.
+
+\begin{table}[H]
+\caption{Top-1 retrieval-based zero-shot classification performance of DUNIA with opposite direction query and retrieval embeddings. OG represents the original results from \cref{table:retrieval_performance} for S samples and KNN=5. \colorbox{cgreen!50}{\textcolor{cgreen!50}{---}} and \colorbox{cblue!50}{\textcolor{cblue!50}{---}} are DUNIA query embeddings from $\mathcal{O^V}$ and $\mathcal{O^H}$ respectively.}
+\label{table:reversed_embeddings}
+\begin{center}
+\begin{small}
+\begin{sc}
+
+\begin{tabular}{lcccccccc}
+\toprule
+Dataset & Metric & OG & DUNIA                                  \\
+\midrule                         
+\cellcolor{cblue!50}$\mathcal{W}_{rh}$                 &$rmse$ $(r)$             &2.0 (.93)   &4.3 (.63) \\
+\cellcolor{cblue!50}$\mathcal{W}_c$                    &$rmse$ $(r)$            &11.7 (.89)  &18.9 (.53) \\
+\cellcolor{cblue!50}$\mathcal{W}_{pai}$                &$rmse$ $(r)$            & 0.71 (.75) &1.6 (.42) \\
+\cellcolor{cgreen!50}$CLC_+$                  &$wF1$           &80.1\%        &35.1\%\\
+\cellcolor{cgreen!50}$PASTIS$                 &$OA$    &56.2\%  &0.0\%\\
+\cellcolor{cgreen!50}$PF$                     &$wF1$            &73.8\%        &56.1\% \\
+\bottomrule
+\end{tabular}
+\end{sc}
+\end{small}
+\end{center}
+\end{table} 
+
+
+\clearpage
+\section{Further Results}
+\begin{figure*}[!ht]
+\begin{center}
+%\framebox[4.0in]{$\;$}
+\resizebox{0.82\textwidth}{!}{%
+\includegraphics{Figures/fig_maps_lowe_res.png}%
+}
+\end{center}
+\caption{Maps produced through different models for three products: fractional canopy cover ($\mathcal{W}_{c}$), canopy height ($\mathcal{W}_{r}$), and land cover classes ($CLC_+$). Baseline represents reference maps from respectively: adapted FORMS \cite{schwartz2023forms} for $\mathcal{W}_c$, FORMS \cite{schwartz2023forms} for $\mathcal{W}_{rh}$ and $CLC_+$ \cite{clc}. DUNIA (ZS) represents maps obtained in the zero-shot setting, while DUNIA (FT) represents maps obtained in the fined-tuned setting. Best viewed zoomed-in (300+\%).}
+\label{fig:result_maps}
+\end{figure*}
+
+\begin{figure*}[!ht]
+\begin{center}
+%\framebox[4.0in]{$\;$}
+\resizebox{0.82\textwidth}{!}{%
+\includegraphics{Figures/high_vs_low_quey_samples.png}%
+}
+\end{center}
+\caption{Comparison of map qualities for the task of estimating the canopy height in the zero-shot setting using 50K $l$ GEDI samples as queries (left) vs. only 10K $l$ (right).}
+\label{fig:high_vs_low_samples}
+\end{figure*}
+
+
+
+% Define Python colors
+\definecolor{pyblue}{RGB}{31, 119, 180}
+\definecolor{pygreen}{RGB}{44, 160, 44}
+\definecolor{pygrey}{RGB}{128, 128, 128}
+
+% Macro to draw the sinewave legend
+\newcommand{\sinewavelegend}[2][pyblue]{
+    % #1: Color (default is Python Blue)
+    % #2: Scale
+    \tikz[baseline=-0.2ex, scale=#2]{
+        % First sinewave
+        \draw[thick, #1, samples=50, domain=0:pi] plot (\x,{sin(\x r)});
+        % Second sinewave
+        \draw[thick, #1, samples=50, domain=0:pi, xshift=3cm, yshift=0.15cm, xscale=0.5, yscale=1.5] plot (\x,{sin(\x r)});
+    }
+}
+
+\begin{figure*}[ht]
+\begin{center}
+%\framebox[4.0in]{$\;$}
+\resizebox{0.90\textwidth}{!}{%
+\includegraphics{Figures/Waveforms_set_1_low_res.png}%
+}
+\end{center}
+\caption{Uncurated list of retrieved (\sinewavelegend[pyblue]{0.1}) and generated waveforms (\sinewavelegend[pygreen]{0.1}) overlayed on a reference waveform (\sinewavelegend[pygrey]{0.1}). 'Correlation' is Pearson's correlation coefficient (r) between the reference waveform and the retrieved/generated waveform. Best viewed zoomed-in (200+\%)}
+\label{fig:result_waveforms}
+\end{figure*}
+
+\begin{figure*}[ht]
+\begin{center}
+%\framebox[4.0in]{$\;$}
+\resizebox{0.90\textwidth}{!}{%
+\includegraphics{Figures/Waveforms_set_2_low_res.png}%
+}
+\end{center}
+\caption{Uncurated list of retrieved (\sinewavelegend[pyblue]{0.1}) and generated waveforms (\sinewavelegend[pygreen]{0.1}) overlayed on a reference waveform (\sinewavelegend[pygrey]{0.1}). 'Correlation' is Pearson's correlation coefficient (r) between the reference waveform and the retrieved/generated waveform. Best viewed zoomed-in (200+\%)}
+\label{fig:result_waveforms_set_2}
+\end{figure*}
+
+\begin{figure*}[ht]
+\begin{center}
+%\framebox[4.0in]{$\;$}
+\resizebox{0.90\textwidth}{!}{%
+\includegraphics{Figures/Waveforms_set_3_low_res.png}%
+}
+\end{center}
+\caption{Uncurated list of retrieved (\sinewavelegend[pyblue]{0.1}) and generated waveforms (\sinewavelegend[pygreen]{0.1}) overlayed on a reference waveform (\sinewavelegend[pygrey]{0.1}). 'Correlation' is Pearson's correlation coefficient (r) between the reference waveform and the retrieved/generated waveform. Best viewed zoomed-in (200+\%)}
+\label{fig:result_waveforms_set_3}
+\end{figure*}
+
+\begin{figure*}[ht]
+\begin{center}
+%\framebox[4.0in]{$\;$}
+\resizebox{0.90\textwidth}{!}{%
+\includegraphics{Figures/Waveforms_set_4_low_res.png}%
+}
+\end{center}
+\caption{Uncurated list of retrieved (\sinewavelegend[pyblue]{0.1}) and generated waveforms (\sinewavelegend[pygreen]{0.1}) overlayed on a reference waveform (\sinewavelegend[pygrey]{0.1}). 'Correlation' is Pearson's correlation coefficient (r) between the reference waveform and the retrieved/generated waveform. Best viewed zoomed-in (200+\%)}
+\label{fig:result_waveforms_set_4}
+\end{figure*}

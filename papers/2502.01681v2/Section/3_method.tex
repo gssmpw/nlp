@@ -1,0 +1,233 @@
+\begin{figure}[]
+    \centering
+
+    \includegraphics[width=1\linewidth]{Figure/Overall_pipline.pdf}
+    
+    % \vspace{-5pt}
+    \caption{ The overall pipeline of our method. In our training pipeline, the embedding exchanging is implemented through the following two operations: \textbf{Push(GPU to CPU)}: After encoding a mini-batch, the online node embeddings are saved in offline historical embedding. \textbf{Pull(CPU to GPU)}: Before encoding a mini-batch, the offline historical embeddings are used to initialize the online node embeddings in the overlap region.}
+    \label{fig:Overall_pipline}
+    \vspace{-10pt}
+\end{figure}
+
+\section{Method}
+
+
+
+\subsection{Overview}
+
+The overall pipeline of our method is illustrated in Figure~\ref{fig:Overall_pipline}. The core idea of our method is to partition a large graph into small cones and encode these cones level by level, enabling the training of a graph transformer with sub-linear memory complexity. Section~\ref{sec:Graph_Partition} details the graph partitioning process. Section~\ref{sec:Observation} discusses our observations on overlap regions, and based on these observations, we propose the updating strategy in Section~\ref{sec:updating_strategy}. In Section~\ref{sec:transformer}, we show the model architecture and structural encoding of our sparse transformer. Section~\ref{sec:Training_Objective}  introduces our training objectives and a multi-task loss balancer that adjusts the weight of each component. Finally, Section~\ref{sec:Inference_Acceleration} introduces inference optimization techniques to further reduce the inference runtime and memory usage. 
+
+
+\vspace{-5pt}
+\subsection{Graph Partition}
+\label{sec:Graph_Partition}
+Given an AIG $\displaystyle \gG=(V,E)$, with node set $V$, and edge set $E\subseteq V\times V$, the AIG contains three type of nodes: primary input(PI), AND gate and NOT gate. The gate type can be easily identified by its in-degree: the in-degree of a PI is 0, the in-degree of an AND gate is 2, and the in-degree of a NOT gate is 1.
+We first compute the logic level of each gate in topological order according to the following equation:
+\vspace{-5pt}
+\begin{equation}
+level(v) =
+\begin{cases} 
+0 & \text{if } v \text{ is a PI} \\
+1 + \max\limits_{(u,v) \in E} level(u) & \text{otherwise}
+\end{cases}
+\vspace{-5pt}
+\end{equation}
+
+
+
+For an AIG, we define a partial order $\preccurlyeq_k$ that $u \preccurlyeq_k v$ if there exists a path from $u$ to $v$ with length less than or equal to $k$.
+Given a node $v\in V$, based on the partial order $\preccurlyeq_k$, we define a cone by $\mathbf{cone_k}(v)=\{u\in V: u \preccurlyeq_k v\}$. Since the maximum in-degree of any node in an AIG is 2, the maximum size of $\mathbf{cone_k}(v)$ is $2^{k+1}-1$.
+
+As illustrated in Figure~\ref{fig:Overall_pipline}, given an AIG $\displaystyle \gG=(V,E)$, with cone depth $k$ and stride $\delta<k$, we define the graph partition by Algorithm~\ref{alg:partition}. 
+Initially, we focus on gathering all the $cone^k_i$ that terminate at logic level $k$.  Moving forward with stride $\delta$, we continue collecting with output gates situated at level $k+\delta$. Note that the chosen value of $\delta$ is smaller than $k$ in order to guarantee an overlap between cones in different level. The aforementioned process is repeated iteratively until the partitioned areas cover the entire circuit.  
+
+
+
+
+
+\subsection{Observation and Motivation}
+\label{sec:Observation}
+
+
+\begin{minipage}{0.73\textwidth}
+    For Intra-Level overlap, \ie $cone^l_i \cap cone^l_j$, as shown in Figure~\ref{fig:intra}, note that if a gate $v$ is in the overlap region, then all the fan-in nodes of $v$ must be in the overlap region. Specifically, if $v \in cone^l_i \cap cone^l_j$, then $\forall u\in\{u\in cones^l: u \preccurlyeq_k v \}$, we have $u \in cone^l_i \cap cone^l_j$\review{, since $v$ share the same fan-in region in both $cone^l_i$ and $cone^l_j$}. This implies that when computing the embedding of a gate within the overlap region from scratch, the receptive field remains unchanged. When inference, since both the initialization method and model parameters are consistent, the embedding of these gates will be identical across different mini-batches. 
+\end{minipage}%
+% \hspace{10pt}
+\begin{minipage}{0.25\textwidth}
+    \begin{figure}[H]
+    \centering
+    \subfloat[]{
+    \centering
+    \includegraphics[width=1\linewidth]{Figure/Intra-level_overlap.pdf}
+    \label{fig:intra}
+    }
+    \\
+    \vspace{-10pt}
+    \subfloat[]{
+    \centering
+    \includegraphics[width=0.4\linewidth]{Figure/Inter-level_overlap1.pdf}
+    \vspace{-5pt}
+    \label{fig:inter1}
+    }
+    \hspace{-5pt}
+    \subfloat[]{
+    \centering
+    \includegraphics[width=0.4\linewidth]{Figure/Inter-level_overlap2.pdf}
+    \vspace{-5pt}
+    \label{fig:inter2}
+    }
+    \vspace{-10pt}
+    \caption{Observation.}
+\end{figure}
+\end{minipage}
+
+% For Intra-Level overlap, \ie $cone^l_i \cap cone^l_j$, note that if a gate $v$ is in the overlap region, then all the fan-in nodes of $v$ must be in the overlap region. Specifically, if $v \in cone^l_i \cap cone^l_j$, then $\forall u\in\{u\in cones^l: u \preccurlyeq_k v \}$, we have $u \in cone^l_i \cap cone^l_j$. This implies that when computing the embedding of a gate within the overlap region from scratch, the receptive field remains unchanged. When inference, since both the initialization method and model parameters are consistent, the embedding of these gates will be identical across different mini-batches. 
+% Therefore, each gate only needs to compute once during Intra-Level Updating.
+
+For Inter-Level overlap, \ie $cones^{l-\delta} \cap cones^l$, as illustrated in Figure~\ref{fig:inter1} and Figure~\ref{fig:inter2}, assume that we $v\in cones^{l-\delta}\cap cones^l$, we can define the receptive fields at different levels as follows: $R_{l-\delta}(v)=\{u\in cones^{l-\delta}: u\preccurlyeq_k v\}$ and $R_{l}(v)=\{u\in cones^{l}: u \preccurlyeq_k v\}$. According to the definition of $\preccurlyeq_k$, we observe that $R_{l}(v)\subseteq R_{l-\delta}(v)$, \review{in other words, $R_{l}(v)$ can be regarded as $R_{l-\delta}(v)$ restricted by $cones^l$.} This ensures that using historical embedding of nodes in $cones^{l-\delta}$ introduce a larger receptive filed. In contrast, computing the embedding of gate $v$ in $cones^l$ from scratch will restrict the receptive field to the current level, preventing it from capturing long-range dependencies from PIs. 
+\review{The receptive field affects the computations of the GNN tokenizer and sparse transformer, as they aggregate embeddings within the receptive field for node $v$.
+Therefore, this limitation on the receptive field will lead to significant estimation errors when performing function-related tasks~\citep{deng2024less,PolarGate}.}
+
+\vspace{-10pt}
+
+\begin{minipage}[]{0.47\textwidth}
+\begin{algorithm}[H]
+\renewcommand{\algorithmicrequire}{\textbf{Input:}}
+\renewcommand{\algorithmicensure}{\textbf{Output:}}
+\caption{Graph Partition}
+\label{alg:partition}
+\begin{algorithmic}[1]
+    \REQUIRE AIG $\displaystyle \gG=(V,E)$, cone depth $k$, stride $\delta<k$
+        \STATE $L \gets \max\limits_{v\in V}level(v) $, $l\gets k$
+        \WHILE{$l\leq L$}
+        \STATE $cones^l \gets list(), i\gets 0$
+        \FOR{$v$ in $\{v\in V:level(v)=l\}$}
+        \STATE Get sub-graph $cone^l_i\gets \mathbf{cone_k}(v)$
+        \STATE Add $cone^l_i$ to $cones^l, i\gets i+1$
+        \ENDFOR
+        \STATE $l\gets l+\delta$
+        \ENDWHILE
+        \FOR{$v$ in $\{v\in V: \text{out-degree}(v)=0\}$}
+        \STATE Get sub-graph $g\gets \mathbf{cone_k}(v)$
+        \STATE Add $g$ to $cones^{level(v)}$
+        \ENDFOR
+    \STATE \textbf{return} cones list $[cones^k, cones^{k+\delta}, ...]$
+\end{algorithmic}  
+\end{algorithm}%
+\end{minipage}
+\hspace{5pt}
+\begin{minipage}[]{0.47\textwidth}
+\begin{algorithm}[H]
+\renewcommand{\algorithmicrequire}{\textbf{Input:}}
+\renewcommand{\algorithmicensure}{\textbf{Output:}}
+\caption{Training Pipeline}
+\label{alg:training}
+\begin{algorithmic}[1]
+    \REQUIRE \hfill \\cone depth $k$, stride $\delta$,\\ partitioned cones $[cones^k, cones^{k+\delta},...]$, \\ mini-batch size $B$
+        \FOR{$l$ in $[k, k+\delta, ...]$}
+        \IF{$l \neq k$}
+        \STATE Inter-Level Updating on \\$[cones^k, cones^{k+\delta}, ..., cones^{l}]$
+        \ENDIF
+        \STATE $m\gets len(cones^l) / B$
+        \FOR{$i$ in range(0,$m$)}
+        \STATE sample mini-batch $batch^l_i$ in $cones^l$
+        \STATE Intra-Level Updating on $batch_i$
+        \ENDFOR
+        \ENDFOR
+\end{algorithmic}  
+\end{algorithm}%
+\end{minipage}
+
+\vspace{-10pt}
+\subsection{Updating Strategy}
+\label{sec:updating_strategy}
+
+After partition, we get cones with level in $[k, k+\delta, ...]$. As outlined in Algorithm~\ref{alg:training}, we encode the cones starting from the smaller levels and progressing to the larger ones. Based on the observation in the Section~\ref{sec:Observation}, we propose Intra-Level Updating for cones at the same level and Inter-Level Updating for cones at different levels. Figure~\ref{fig:Training} illustrates the detailed updating process when the mini-batch size is 1.
+
+
+\begin{minipage}{0.6\textwidth}
+\noindent\textbf{Intra-Level Updating} Given a cone list at the same level $cones^l=[cone^l_1, cone^l_2, ..., cone^l_n]$, we divide them into mini-batches $[batch^l_1, batch^l_2, ..., batch^l_m]$.
+When encoding $batch^l_i$, we first check if the gates in $batch^l_i$ have already been updated in the previous stage. If so, we retrieve their embeddings from the historical embeddings and remove all the in-edges of these gates, ensuring that their embedding will not be updated further in subsequent stages. We then send $batch^l_i$ to the model to compute the embedding of other gates, after which we will store these embedding in historical embedding and mark all the gates in $batch^l_i$ as updated in the following stage.
+\end{minipage}
+\hspace{3pt}
+\begin{minipage}{0.4\textwidth}
+    \centering
+    \includegraphics[width=0.9\textwidth]{Figure/Training_Detail.pdf}
+    \vspace{-5pt}
+    \captionof{figure}{The updating process when the mini-batch size is 1.}
+    \label{fig:Training}
+\end{minipage}
+
+
+\noindent\textbf{Inter-Level Updating} Given two lists of cones at different level $cones^{l-\delta}$ and $cones^l$, we ensure that $cones^{l-\delta} \cap cones^l \neq \emptyset$ due to the condition $\delta<k$ in the Algorithm~\ref{alg:partition}. This mechanism allows the message from the previous level to propagate to the current level and ensures that a gate $v$ can acquire the context information from \textit{PIs} to the current gate, \ie a gate $v$ can aggregate information from $\{u:u\preccurlyeq_\infty v\}$, which is consistent with the information propagation flow in AIGs. The updating method is similar with Intra-Level Updating: given a cone list $cones^l$, for the gates in $cones^{l-\delta} \cap cones^l$, we will retrieve their embedding from historical embedding and remove all the in-edges. For the updating of remaining gates, we leave them for Intra-Level Updating with $cones^l=[cone^l_1, cone^l_2, ..., cone^l_n]$.
+ 
+\vspace{-5pt}
+\subsection{GAT-based Sparse Transformer}
+\vspace{-5pt}
+\label{sec:transformer}
+\begin{minipage}{0.65\textwidth}
+    \noindent\textbf{GAT-based Sparse Attention} DAGformer~\citep{DAGformer} and DeepGate3~\citep{shi2024deepgate3} propose to use connective patterns as masks in transformers to effectively restrict attention in DAGs. Inspired by these approaches, we replace the Multi-head Attention module in the Transformer with a GAT module to ensure global aggregation while preserving the original transformer structure, as illustrated in Figure~\ref{fig:Transformer}. Given a node $v\in cone^l_i$, it should aggregate information from $\{u\in cone^l_i: u \preccurlyeq_k v \}$. To achieve this, we construct virtual edges $\Bar{E}$ defined as $\{(u, v): u \preccurlyeq_k v, u \in cone^l_i \}$, which has similar function to the attention masks in DAGformer and DeepGate3. The original graph, augmented with these virtual edges, \ie$ \Bar{\gG}=(V,E\cup\Bar{E})$, is then passed to the GAT-based sparse transformer to compute the embedding of each node.
+    
+\end{minipage}
+\hspace{3pt}
+\begin{minipage}{0.35\textwidth}
+    \centering
+    \includegraphics[width=0.8\textwidth]{Figure/Transformer.pdf}
+    \vspace{-10pt}
+    \captionof{figure}{Transformer Architecture}
+    \label{fig:Transformer}
+\end{minipage}
+
+
+\vspace{-5pt}
+\noindent\textbf{Structural Encoding} 
+In a circuit, the structure of a gate is determined by its logic level and connection pattern. Based on the aggregation mechanism of the tokenizer and sparse transformer, a gate can only acquire information from its fan-in region. However, this overlooks the out-edge pattern of a node, which is crucial for timing properties. To enhance the model's ability to capture structural information, we encode the logic level and out-degree of a gate as part of the initial structural embedding.
+Specifically, for a given node $v$, the structural encoding is computed by:
+\begin{equation}
+    SE(v)=Emb_l(level(v))+Emb_{and}(OutAND(v))+Emb_{not}(OutNOT(v)),
+\end{equation}
+where $Emb(\cdot)$ represents a linear layer, and $OutAND(\cdot)$ and $OutNOT(\cdot)$ denote the number of \textit{AND} gates and \textit{NOT} gates in $\{u:v\preccurlyeq_1 u, u\neq v \}$ respectively.
+
+\vspace{-5pt}
+\subsection{Training Objective}
+\label{sec:Training_Objective}
+\noindent\textbf{Multi-Task Training}  During the training phase of DeepGate4, we incorporate both gate-level and graph-level tasks, following the setup in DeepGate3~\citep{shi2024deepgate3}. To separate the functional and structural embeddings, we employ training tasks with distinct labels to supervise each component:
+\begin{equation}
+    L_{func} = L_{gate}^{prob} + L_{gate}^{tt\_pair} + L_{graph}^{tt} + L_{graph}^{tt\_pair} 
+\end{equation}
+\begin{equation}
+    L_{stru} = L_{gate}^{con} + L_{graph}^{size} + L_{graph}^{depth}+ L_{graph}^{ged\_pair} + L_{in}
+\end{equation}
+\begin{equation}
+    L_{all} = L_{func} + L_{stru}
+    \label{eq:overall_loss}
+\end{equation}
+For a detailed explanation of each component, please refer to Section~\ref{detailed_training_objective}.
+
+\noindent\textbf{Multi-Task Loss Balance} To stabilize the training process and balance the weights of each loss, inspired by previous works~\citep{gradnorm1,gradnorm2}, we introduce a loss balancer based on the gradient of the final layer of the sparse transformer. Given the last layer's weight $w$ and a loss $l_i$, we compute the gradient $g_i=\frac{\partial l_i}{\partial w}$. The gradient norm $\|g_i\|_2^\beta$ is computed by exponential moving average of $g_i$ with decay $\beta$. The balanced loss of $l_i$ is computed $\Tilde{l}_i = \frac{l_i}{\|g_i\|_2^\beta}$ and all components are summed to form the overall loss for training.
+
+\vspace{-5pt}
+\subsection{Inference Acceleration}
+\label{sec:Inference_Acceleration}
+\begin{figure}[!h]
+    \centering
+    \includegraphics[width=1\linewidth]{Figure/fused-dg4.pdf}
+    \vspace{-35pt}
+    % \caption{Comparison between Fused-GAT and our Fused-DG2 kernel. \textbf{Left}: Fused-GAT kernel suffers from thread waste and unnecessary computing softmax result when in-degree is 1, and there is also an overhead to synchronize softmax intermediate results between threads; \textbf{Right}: Fused-DG2 reallocated the thread workloads, where each thread within a warp is responsible for a portion of the feature dimensions, thus avoiding thread waste, eliminating synchronization overhead due to independently compute the attention score for each node. 
+    % Finally, skipping the computations significantly reduced the computation time. }
+    \caption{Comparison between Fused-GAT and our Fused-DG2 kernel. \textbf{Left}: Fused-GAT suffers from thread waste, unnecessary softmax computation when in-degree is 1, and synchronization overhead for softmax intermediate results  between threads; \textbf{Right}: Fused-DG2 reallocates thread workloads, with each thread within a warp handling a portion of feature dimensions, avoiding thread waste and eliminating synchronization by independently computing attention scores, significantly reducing computation time. Furthermore, we skip the softmax computations in certain cases.}
+    \vspace{-15pt}
+\end{figure}
+
+% While Fused-GAT has demonstrated excellent results, directly applying it to our model presents certain challenges. (1) In the GAT-transformer component, the in-degree of nodes increases exponentially with the number of cone layers due to virtual edge connections. The in-degree in the initial layers of a cone is 0, 1, or 2, while the in-degree of the source nodes in the cone can reach up to $2^{l} - 1$, l is 8 in our settings, so the . As a result, the approach of Fused-GAT, where each warp handles all aggregation computations for one node, leads to a significant work imbalance. (2) GNN of the DeepGate2 component adopts an aggregation mechanism similar to GAT; however, since the maximum in-degree for each node is 2, applying the Fused-GAT strategy would result in severe thread waste ((32 - 2) / 32 = 93.75\%). Additionally, its method for calculating softmax results is highly inefficient with synchronizing costs within threads, sequentially computing the max, sum, and $\alpha$. To address these two data characteristics, we have implemented optimizations accordingly. 
+Although the graph partitioning method provides the ability to train and infer on arbitrarily large graphs, as the number of nodes increases, the number of partitions also grows, significantly increasing the total computation time. 
+% At the same time, larger graphs in each minibatch generally lead to better training performance. 
+% Therefore, optimizing for speed and reducing memory usage remains necessary. 
+Fused-GAT~\citep{fusegat} has already demonstrated excellent results by storing intermediate variables at the node level rather than the edge level, making it particularly effective for graphs with numerous edges. 
+% In the GAT-based sparse transformer, virtual edges are added from earlier layers to later ones, which results in nodes with larger depths having higher in-degrees, requiring more time for aggregation, while nodes in shallower layers have fewer in-degrees and aggregate faster. However, since updated nodes are not revisited and there is significant overlap between cones, the in-degree distribution of the subgraphs input into the model becomes more balanced, making it suitable for direct use of Fused-GAT. 
+However, applying it directly to our tokenizer, \ie DeepGate2, presents certain challenges: (1) the GNN component of DeepGate2 uses an aggregation mechanism similar to GAT; however, since the maximum in-degree for each node is 2, applying the Fused-GAT strategy would result in severe thread waste ((32 - 2) / 32 = 93.75\%). (2) Fused-GAT calculates the softmax across many edges using the warp-level primitive \textit{shfl\_xor\_sync} to synchronize the computed sum and max values, introducing substantial synchronization overhead.
+
+% \textbf{Balanced workload within different rows.} We modified the Fused-GAT operator to support a more balanced workload. 
+
+\textbf{Efficient workload balance and skip computation.} We reassigned the thread computation tasks as Figure~\ref{sec:Inference_Acceleration} shows, where each thread is responsible for the aggregation of each node, calculating all \(\alpha\) values for incoming edges and performing the multiplication and accumulation, thereby avoiding the high softmax overhead, additionally, due to the characteristics of AIG graphs, where the number of edges is less than twice of nodes, storing intermediate variables at the node level is less efficient than directly storing edge information. Therefore, we switched to performing computations directly on the edges. Finally, we observed that when the in-degree is 1, we can skip the computation entirely, as the softmax result is straightforward, \ie $\alpha=1$. By applying these methods, we reduced both the model's inference time and memory consumption.
+

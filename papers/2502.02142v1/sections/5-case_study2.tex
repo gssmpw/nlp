@@ -1,0 +1,168 @@
+%%% START GUIDELINE %%%
+
+% 1) CASE STUDY - MATRIX MULTIPLICATION: Since doing accumulation using the memory is costly, need more data transport to hos for partial sums, we propose OURSHEME-suffix that applies exponential quantization which makes MMs into the form of the sum of four terms. each term refers to the number of occurances for an specific exponent. We break the method into 3 parts: 1- read weights 2- compute sum of product 3- update the occurance.
+
+% 2) p-p stage: after having an array that shows how many times each exponent occures, the result sent to the host for requantization. after all operations related to the current input finishes, the new input will send to the memory to start a new iteration.
+
+% 3) Clarify why we put 8b for counter -> put a table.
+
+% 4) Execution flow: Put figx that shows encoder layers execution time. We make GCP between num of enc/dec modules, since Decs need to be executed by the num of tokens -> slower -> only one psch will assign to the encoder, Talk about pipelining different executions.
+
+%% Methodology and Evaluation
+
+% 5) For the second case study: in case of performing MMs, we have chose 3 different LLMs with different workloads... we applied exponential quantization, keep accuracy drop less than 1%. Table x, shows the accuracy of models and their baseline in FP32 precision.
+
+% 6) For the second case study: Hardware baselines: TPU parameters, pLUTo: pLUTo 1: scaled version with different precision per each layer. pLUTO2: with all layers fixed at 4b precision.
+
+%%% END GUIDELINE %%%
+
+\section{Case study 2: LamaAccel}
+Attention-based models rely heavily on matrix multiplications to process input data, which involve numerous multiply and accumulate operations. These operations demand substantial data movement between memory and compute units. While LUT-based Processing-using-Memory (PuM) techniques can efficiently handle multiplication operations with negligible area overhead and minimal modifications to commodity memory, the accumulation process within memory presents a significant challenge. It requires extensive intra-bank (or subarray) data movement to reorganize data for accumulation, which diminishes the efficiency of PuM operations~\cite{transpim}. Many previous proposals address this challenge by integrating computational units within memory banks to perform accumulation and support hardware acceleration for DNNs~\cite{transpim,fulcrum,sal-pim}.
+
+We propose LamaAccel, an HBM-based accelerator for large language models (LLMs) that efficiently addresses the challenge of handling accumulation in dot-product operations without requiring significant modifications to the memory organization. LamaAccel employs the \textbf{exponential quantization} technique based on the DNA-TEQ approach to simplify the dot-product of activations and weights into the sum of four terms (see Equation~\ref{eqn:conv_extended}). Each term consists in a base $b$ to the power of different exponents ($int_{A_{i}}, int_{W_{i}}$, and $int_{A_{i}} + int_{W_{i}}$), as explained in Section~\ref{Exponential_quant}. The weights and activations are encoded using the format $\{S_{A/W}, int_{A/W}\}$, where $S_{A/W}$ denotes the sign of the real value prior to quantization, and $int_{A/W}$ is a 3- to 7-bit integer. For the rest of this section, when we talk about the precision of a given layer, we are referring to the precision of the exponent. The dot-product operations can be efficiently implemented by counting the frequency of each exponent's occurrence, including the addition of exponents as seen in term 1. This approach transforms the problem of memory-intensive dot-product operations into more memory-friendly addition and counting tasks, which are efficiently handled by our Lama technique.
+
+% The exponent is represented with the same precision as the layer, using the format $(S_{AorW}, int_{AorW})$, where $S_{AorW}$ denotes the sign of the real value prior to quantization, and $int_{AorW}$ is a 3- to 7-bit integer.
+
+We leverage Lama to efficiently perform addition and counting operations directly within memory. After counting all exponents involved in computing an output activation, the result is transferred to the HBM logic die for post-processing, where the data is re-quantized and sent back as a new activation for the next layer. This execution flow offers a key advantage: the number of unique exponents to be counted per output neuron is much smaller than the total number of dot-product partial results that would typically be accumulated, especially in higher-precision layers. For instance, in a 6-bit precision layer, only $2^6$ unique exponents have to be counted, significantly reducing the number of data transfers to the logic die and, hence, reducing the energy overhead.
+
+\subsection{LLM Layer Mapping}
+LamaAccel further leverages HBM's pseudo-channels to pipeline the execution of encoder and decoder blocks in large language models (LLMs), enabling simultaneous parallel processing of multiple inferences. Each pseudo-channel is dedicated to executing an individual encoder or decoder block, with each layer following an input-stationary dataflow for efficient execution. For LLMs used in text generation tasks that consist of both encoder and decoder blocks, the throughput of decoder blocks is lower due to the serialized token execution. To maintain a balanced pipeline, LamaAccel allocates a greater number of resources (pseudo-channels) to the decoder blocks, thereby accelerating their execution during inference.
+
+The layers within an encoder or decoder block are processed sequentially, utilizing the resources (i.e., banks) within each pseudo-channel. For fully-connected (FC) layers whose weights are statically known, the weights are pre-stored in the banks. For matrix-multiplication operations inside the self-attention blocks employing the $K$ and $V$ matrices, LamaAccel writes those matrices into the banks as if they were the weight parameters of FC layers, to compute the score matrix and the final attention output respectively.
+
+Within each bank, mat-level parallelism is employed to process computations related to different output neurons with the same activation concurrently. The degree of parallelism ($p$) and thus the number of output neurons processed in parallel varies depending on the precision of each layer and is adjusted dynamically.
+
+\subsection{Data Layout}\label{data_layout_casestudy2}
+LamaAccel employs the subarrays of a DRAM bank for three distinct purposes during the execution of a DNN layer. First, a group of subarrays (\textit{source subarrays}) is dedicated to storing the exponentially quantized weights of a layer. The exponent for each weight is pre-computed and stored statically. Each weight is stored in an 8-bit format as $(S_{W}, int_{W})$, with padding in the exponent. This fixed 8-bit format ensures compatibility with all possible precision levels across layers. Figure~\ref{fig:LamaAccel_datalayout}a (shown in purple) illustrates the organization of weights in one source subarray. Since each layer's execution follows an input-stationary dataflow, all the weights corresponding to an input index are stored in the same row of the subarray. The weights in each row are arranged so that in every column access, 16 weights for 16 different output neurons are fetched from all mats. For example, when activating row 0, corresponding to input activation 0, the first column access retrieves weights $W_{0,0}$ to $W_{0,15}$ corresponding to the first 16 output neurons.
+
+\begin{figure}[t!]
+\centering
+\includegraphics[width=0.99\columnwidth]{figures/LamaAccel_datalayout_new.pdf}
+%\vskip -0.15in
+\caption{LamaAccel data layout.}
+\label{fig:LamaAccel_datalayout}
+\vskip -0.15in
+\end{figure}
+
+The second group of subarrays (\textit{compute subarrays} shown in Figure~\ref{fig:LamaAccel_datalayout}b in green) is dedicated to storing the LUT data required during the computation of the sum of exponents ($int_{A} + int_{W}$) corresponding to the first term in Equation~\ref{eqn:conv_extended}. All exponent sums are pre-computed and stored as 8-bit padded results. For layers with up to 6-bit exponents, each mat can accommodate one LUT. In each row of a mat, all possible cases for a given input activation exponent ($int_{A}$) are covered, ensuring the maximum degree of parallelism ($p=16$). However, for layers with 7-bit precision exponents, storing all possible values related to a single input activation in the same row requires two mats, reducing the degree of parallelism to $p=8$. This is because a 7-bit exponent can yield $2^7$ possible values for the sum of exponents, which must be stored as 8-bit results. Consequently, a row needs 1024 bits to store these values, requiring two mats to accommodate the data.
+
+The third group of subarrays (\textit{counters subarrays} shown in Figure~\ref{fig:LamaAccel_datalayout}c in blue) is dedicated to tracking the occurrence of exponents for output neurons during the counting process. Each subarray updates the occurrences for $p$ output neurons simultaneously. Each output neuron ($ON_{i}$) requires three separate arrays of counters ($AC_{i}$) to track occurrences of the exponents ($int_{A_{i}}$, $int_{W_{i}}$, and $int_{A_{i}} + int_{W_{i}}$). The number of counters in each array varies depending on the layer's precision. For example, for 4-bit exponents, the array counter for $int_{A}$ contains $2^4$ counters. To determine the appropriate bitwidth for the counters, we analyzed the maximum occurrences of all possible exponents across the layers of our evaluated DNNs. This analysis showed that an 8-bit size per counter is sufficient to track the counts for each term without encountering numerical instability.
+
+% The shorter version (no added details about the counters size):
+% For example, for 4-bit exponents, the array counter for $int_{A}$ contains $2^4$ counters. Based on our dataset analysis, an 8-bit size per counter is sufficient to track the count for each term without encountering numerical instability.
+
+% The row address is determined by the group of output neurons currently being processed in parallel. Within each row, the specific counter in $AC_{i}$ to be updated is selected via column access. We aim to keep the three $AC_{i}$ for each output neuron in the same row as much as possible to take advantage of the open-page policy, allowing the row to remain open until all three array counters are updated with the exponent occurrence according to current input exponent.
+
+Each row of the counters subarray contains the array counters for different output neurons, allowing their occurrences to be updated simultaneously. Figure~\ref{fig:LamaAccel_datalayout}c illustrates the organization of the array counters in a subarray. For a layer precision of 3 and 4 bits, all array counters for an output neuron fit within a single mat, maintaining the parallelism degree of $p=16$, meaning that occurrences for the same term across 16 output neurons can be updated simultaneously. However, with 5-bit precision, two subarrays are required to fit all array counters while still preserving $p=16$. In the case of 6-bit precision, the array counters are distributed across two subarrays, providing a parallelism degree of $p=8$. For the highest precision of 7-bit, the parallelism degree decreases further to $p=4$, with the array counter placement following a similar organization to the 6-bit precision case. The total number of subarrays required for a given layer is determined by the number of output neurons and the parallelism level $p$.
+
+\subsection{Execution Flow}\label{ExecutionFlow_cs2}
+This section details how LamaAccel computes each term in Equation~\ref{eqn:conv_extended}. The bank structure in LamaAccel is similar to that in \textit{Case Study 1}, with two key enhancements. First, to accommodate the encoded input activation value {$S_{A_{i}}, int_{A_{i}}$} currently being processed for all output neurons, each bank is equipped with an 8-bit activation buffer. Second, each column address counter/latch is enhanced with an XNOR gate and a de-multiplexer, allowing it to increment or decrement the number of occurrences for each exponent based on the XNOR result of the input and weight signs. Additionally, the latch size of the column counters is extended from 5 bits (as used in commodity memories) to 8 bits, allowing it to store the number of occurrences of a given exponent. This extra size of the latch for each counter has been accounted for in the area overhead calculation of the column address counters, as discussed in Section~\ref{overhead}.
+
+% This section details how LamaAccel computes each term in Equation~\ref{eqn:conv_extended}. The bank structure in LamaAccel is similar to that in \textit{Case Study 1}, with one key enhancement: each column address counter/latch is equipped with an XNOR gate and a de-multiplexer. This enhancement supports the more complex operations needed to count the occurrences of each exponent within the terms. The column address counter reads the current occurrence data from the temporary buffer and updates the count (incrementing or decrementing) based on the XNORed signs of the input and weights. The updated count is then written back to the appropriate row in the counters subarray through the de-multiplexer. In addition, each bank includes an 8-bit activation buffer, which stores the encoded input activation for computations involving all output neurons in the bank. The column address counters access this buffer to retrieve the sign $S_{A_{i}}$ and the exponent $int_{A_{i}}$, which are used to select and update the corresponding counter.
+
+LamaAccel’s dataflow follows an \textit{input-stationary} approach, where the input activation remains stationary across the processing elements while computations for different output neurons are performed. In this scheme, for each iteration, a given input activation is broadcast to all banks within a pseudo-channel and stored in the activation latch, with each bank responsible for processing a subset of output neurons. By keeping the input activation constant and distributing the weight-related computations across banks, LamaAccel minimizes the need for data transfers and avoids the replication of weights across banks. This approach contrasts with weight-stationary dataflows, which replicate weights across multiple banks, leading to higher memory overhead. The memory controller in the logic die orchestrates the commands for output neuron computations in each bank based on the current input activation, ensuring efficient parallel execution across all banks in the pseudo-channel.
+
+% In each iteration, the same input activation is broadcast to all banks within the pseudo-channel and stored temporarily in the activation buffer. While this approach involves replicating input movement across banks, it avoids replicating weights across all banks, which would occur in other dataflows such as weight-stationary. LamaAccel’s input-stationary approach significantly reduces memory replication overhead, leading to superior performance.
+
+The execution flow is consistent across terms 1, 2 and 3, so we focus on detailing the process for the first term, which also involves the addition of exponents. The flow for terms 2 and 3 is similar but does not include the addition of exponents. The execution process in LamaAccel is divided into three key steps: (1) acquiring the weights associated with the output neurons being processed, (2) computing the sum of exponents, and (3) updating the number of occurrences of exponents. Each step operates with a different degree of parallelism ($p$), depending on the number of simultaneous operations that can be performed. This flexibility allows for efficient utilization of resources and optimized performance based on the specific requirements of each step.
+
+\textbf{Step 1: Weight Acquisition.} In this stage, the memory controller issues an ACT command to activate the row $\#i$th in the \textit{source subarray}, based on the \textit{positional index} $i$ of the currently processed activation exponent $int_{A_{i}}$. This row contains 1024 encoded weights ($W_{i,0}$ to $W_{i,1023}$) in HBM2, corresponding to 1024 different output neurons for the current input activation. Following the ACT command, an internal column access (ICA), is executed to fetch 16 weights, which are then stored in the temporary buffer. This stage mirrors the execution steps (\circled{1} and \circled{2}) for bulk multiplication, illustrated in Figure~\ref{fig:case_study1}, and supports a degree of $p=16$, facilitating efficient weight retrieval. Once the initial 16 weights are fetched, the corresponding computations for these weights are performed. Subsequent weights can be fetched without issuing a new ACT command, as the row remains open. This allows for retrieving 16 weights with only a single ICA command each time, reducing the overhead and enhancing energy efficiency.
+
+\textbf{Step 2: Computing the Sum of Exponents.} The process begins by performing a LUT activation for the row $\#int_{A_{i}}$th in the compute subarray, based on the \textit{value} of the activation exponent ($int_{A_{i}}$). Following this, the column address counters initiate the LUT retrieval operation using $p$ weight exponents ($int_{W}$) stored in the temporary buffer. Each mat outputs the sum of exponents, which is then stored in the temporary buffer. This continues until the sum for all weight exponents fetched in the first stage is fully computed. For layers with precision lower than 7-bit, LamaAccel supports the full parallelism degree ($p=16$), in which the mask logic is bypassed and all retrieved values are fetched during one ICA. However, in the case of 7-bit precision, $p$ is equal to 8 and so eight weight exponents are broadcast to all column address counters/latches -with each pair of consecutive column counters processing the same weight exponent- while the mask logic filters out invalid results. Overall, two ICAs are required to compute the sums for all stored weight exponents in the temporary buffer for 7-bit precision, and only one ICA for lower precisions. As previously mentioned, each iteration handles computations for a specific input activation across all output neurons in the layer. Since each row in the compute subarray contains all possible sum results for the current value of the activation exponent, the same row remains open during these iteration. This eliminates the need for repeated ACT commands when processing new sets of output neurons, requiring only ICA commands, which improves energy efficiency.
+
+\begin{figure*}[t!]
+\centering
+\includegraphics[width=1.0\textwidth]{figures/case_study2_stage3.pdf}
+%\vskip -0.15in
+\caption{Counting the occurrence of exponents.}
+\label{fig:step3}
+\vskip -0.15in
+\end{figure*}
+
+\textbf{Step 3: Counting the occurrence of Exponents.} In this step, the number of exponent occurrences is updated based on the XNOR result of the signs of the weights and input activations, denoted as $S_{W_{i}}S_{A_{i}}$. If the XNOR result is 1, the sign multiplication is negative and the corresponding occurrence count is decremented; otherwise, it is incremented. As shown in Figure~\ref{fig:step3}, the process is as follows: \textit{First}, the memory controller issues the ACT command to activate the row in the counters subarray where the array counter ($AC_{A+W}$) for 16 output neurons is stored. The precision of each layer determines whether the selected array counters fit within one row ($p=16$) or span multiple rows ($p=8,4$). If $p<16$ the counting step is repeated to cover all 16 output neurons processed in the previous steps. The corresponding occurrences are fetched and stored into the temporary buffer through one ICA (\circled{1}). \textit{Second}, the fetched occurrences are loaded into the column address counter/latch for being updated in the next cycle, as shown in \circled{2}. \textit{Third}, the XNOR of $S_{W_{i}} and S_{A_{i}}$ is computed for each occurrence by retrieving the signs from the temporary and activation buffers. Then, the counters are updated based on the XNOR result (\circled{3}). \textit{Forth}, the updated occurrences are written back into the temporary buffer. Thanks to the open-page policy, a new ACT command is not required, as the row is kept open (\circled{4}).
+
+% Flexibility for different precision to skip updating column counters for some precisions.
+% Note: This part is a candidate to be remove for sending the paper to ISCA.
+As described in previous sections, during a single ICA, each mat in the subarray provides an 8-bit value, selected through the column address counters/latches during the column selection process. During this stage, For layers where $p<16$, not all fetched occurrences from the 16 mats align with the target exponent occurrence counter in the array counter. This mismatch occurs because, depending on the layer's precision, the array counter for a given output neuron may span multiple mats. To address this, LamaAccel ensures that only column address counters with valid fetched occurrences perform the count up/down operation, while counters associated with non-valid occurrences remain in latch mode, preserving the fetched values without modification.
+
+After completing the computations for term 1 of the equation, LamaAccel proceeds to compute terms 2 and 3. If the array counters for these terms reside in the same row as the array counter $A+W$, no new ACT command is required to open a new row in the counters subarray. Otherwise, new ACT commands are issued to access the corresponding array counters for these terms.
+
+Once computations for all three terms for a given set of output neurons are complete, a PRECHARGE command closes the opened row in the counters subarray. This step is crucial for enabling the system to move on to the next set of output neurons, as each row in the counters subarray corresponds to a specific set of neurons. These steps are repeated within the current input activation iteration until all computations for all output neurons are completed. After processing all input activations for a layer, the values in the array counters are transferred to the logic die for post-processing, as detailed in Equation~\ref{eqn:conv_extended}, to produce the input activations for the next layer. Importantly, the next layer's computations can begin in a separate pseudo-channel containing the next layer's weights as soon as the first input activation is ready. This overlapping of post-processing and the next layer's computation helps reduce overall latency.
+
+\begin{table}[t!]
+%\scriptsize
+\caption{Baseline accuracy vs accuracy after performing exponential quantization for the evaluated LLM models. The average bitwidth is the mean each layer's exponents.}
+\label{t:LLMs}
+\vskip -0.20in
+\begin{center}
+\resizebox{1.0\columnwidth}{!}{%
+    \begin{tabular}{|c|c|c|c|c|c|}
+    \hline
+    \textbf{Network}       & \textbf{Task}        & \textbf{Baseline Acc}                  & \textbf{Quantized Acc} & \textbf{Avg bit} & \textbf{max SL}          \\
+    \hline
+      \multirow{2}{*}{\textbf{BERT-Base}}  &   SQuAD1    &  88.68\% (F1)                  & 88.13\%            &              6.45     & 384                      \\
+    
+        &   GLUE-SST2                      &  91.70\% (Exact match)                       & 90.82\%            &              3.48     & 128                      \\
+    \hline
+    \multirow{2}{*}{\textbf{BART-Large}}   &   CNN-DM    &  29.98\% (F1 Rouge L)          & 29.13\%            &              5.71     & 142                      \\
+    
+       &   MNLI                            &  90.17\%  (F1)                               & 89.34 \%           &              4.88     & 1024                     \\
+    \hline
+    \textbf{GPT-2-Small}  &   IMDB         &  94.46\%  (F1)                               & 94.16\%            &              6.03     & 1024                     \\
+    \hline
+    \end{tabular}%
+}
+\end{center}
+\vskip -0.20in
+\end{table}
+
+\subsection{Methodology}
+The hardware characteristics for LamaAccel are the same as those for the Lama evaluation platform, summarized in Table~\ref{t:configuration}. For LamaAccel we evaluate three widely-used attention models: BERT\cite{bert}, BART\cite{bart}, and GPT-2\cite{gpt-2}, across a range of representative NLP tasks, including text classification (IMDB~\cite{imdb} and MNLI~\cite{mnli}), question answering (SQuAD1.1~\cite{squad}), text summarization (CNN-DM~\cite{cnn-dm,cnn-dm2}), and sentimental analysis (GLUE-SST2~\cite{glue-sst2}). The BERT model corresponds to the base model consisting of 12 encoder blocks, while the BART model is the large version with both encoder and decoder blocks (12 encoders and 12 decoders). For GPT-2, we use the GPT-2 small model, which consists of 12 decoder blocks. All workloads are implemented in PyTorch using the HuggingFace Transformers library~\cite{huggingface}. 
+
+The models are exponentially quantized, with quantization parameters and layer precision determined using the search algorithm described in \cite{DNA-TEQ}, based on Equation~\ref{eqn:conv_extended}. The quantization ensures less than 1\% accuracy loss compared to the baseline models without requiring fine-tuning. Table~\ref{t:LLMs} presents the baseline accuracy in FP32 and the accuracy after quantization. Additionally, for each model, various tasks are evaluated, and the average exponent bitwidth for each task is also reported. 
+
+For performance and energy evaluations, we assume the workloads operate at their maximum sequence length, as indicated in Table~\ref{t:LLMs} under "Max SL". We employ the Lama simulator configured as described in the methodology of Case Study 1. The area overhead is consistent with that reported in Section~\ref{overhead}, with an additional area of $0.01 \ \text{mm}^2$ added to the HBM2 due to the extra components described in Section~\ref{ExecutionFlow_cs2}.
+
+% ...assuming the same bitwidth and parameters obtained from the search algorithm.
+
+For comparison with GPUs, we use as baseline a Nvidia RTX A6000. To measure GPU performance, we focus on the kernel execution time, excluding the data initialization overhead. Energy consumption is measured using Python bindings for {\fontfamily{cmss}\selectfont nvml} API~\cite{NVIDIA}. 
+
+For comparison with a TPU, we extend the ScaleSim~\cite{scale} simulator to model a TPU-like architecture using the specifications from the Google Edge TPU Coral~\cite{tpu-edge}, which has a $64 \times 64$ systolic array, a chip area of $43.29 \ \text{mm}^2$, and a frequency of 480 MHz, similar to the added components in LamaAccel's banks. We assume an 8MB global on-chip SRAM~\cite{tpu-edge-sram} and 1GB of off-chip LPDDR4 memory~\cite{tpu-edge-ddr4}, with all layers set to 8-bit integers.
+
+For comparison with previous PuM accelerators we implement pLUTo~\cite{pluto}, described in Section~\ref{pluto_background}, using the same dataflow and layer mapping as LamaAccel, with subarray-level parallelism set to 16 to match LamaAccel's bank-level parallelism. Given that pLUTo supports only 4-bit precision, we assume that all layers in the LLM workloads are uniformly quantized to 4-bit precision for a fair comparison. Although this uniform quantization does not guarantee that accuracy drops will remain below 1\% in the evaluated workloads, we overlook this limitation to maintain consistency with pLUTo's constraints.
+
+\subsection{Evaluation}
+Figure~\ref{fig:case_study2_evaluation_tpu} illustrates the speedup and normalized energy savings of a PuM baseline (pLUTo) and LamaAccel over TPU for three LLM workloads across different NLP tasks. LamaAccel consistently achieves significant speedups, from $3.4\times$ (BERT for SQuAD1) to $4.7\times$ (BERT for SST2), with an average improvement of $4.1\times$. Compared to pLUTo, LamaAccel delivers an average speedup of $1.7\times$ across all workloads. Notably, since pLUTo only supports up to 4-bit operand precision, all workloads in pLUTo are executed at 4-bit precision. In contrast, LamaAccel processes most workloads at higher average precision, yet still outperforms pLUTo in all cases, demonstrating better speedups even with higher precision.
+
+\begin{figure}
+    \centering
+    \begin{subfigure}{\columnwidth}
+        \centering
+        \includegraphics[height=2.8cm, width=8.1cm]{figures/TPU_speedup.pdf}
+    \end{subfigure}
+    %\vskip +0.03in
+    \begin{subfigure}{\columnwidth}
+        \centering
+        \includegraphics[height=2.9cm, width=8.2cm]{figures/TPU_normalized_energy.pdf}
+        %\vskip -0.15in
+        \label{fig:third}
+    \end{subfigure}
+    \caption{LamaAccel and pLUTo speedup and energy savings, normalized to TPU.}
+    \vskip -0.20in
+    \label{fig:case_study2_evaluation_tpu}
+\end{figure}
+
+For tasks performed with lower average bitwidth, the speedup achieved is generally higher. In all tasks except for the BART CNN text summarization, each pseudo-channel is assigned to a single encoder or decoder block. In BERT for SST2, with the lowest average bitwidth of 3.4, the speedup is higher than the rest of the workloads. For BART's text summarization on the CNN dataset, decoder blocks generate tokens sequentially, one token at a time, making the decoder blocks a bottleneck during inference. The bottleneck arises because each step depends on generating the previous token, which slows down the process. To address this, we allocate 2 pseudo-channels for the encoder blocks and the remaining resources for faster execution of the decoder blocks, ultimately achieving a speedup of $3.6\times$.
+
+Energy savings in LamaAccel are closely linked to the average precision of each LLM. As the precision of the model layers becomes lower, LamaAccel shows greater energy savings compared to the TPU baseline. BERT on the GLUE-SST2 task, which has the lowest average precision of 3.48 (see Table~\ref{t:LLMs}), achieves the highest energy saving of $9.2\times$. Conversely, BERT on the SQuAD task, with the highest average precision, results in a lower energy saving of $4.4\times$ compared to TPU. LamaAccel reduces the higher precision overhead by minimizing the number of ACT commands and exploiting the open-page policy, allowing for simultaneous operations across multiple output neurons. In the weight acquisition and sum computation stages, it reuses the already activated row, requiring only additional read commands. Since the energy cost of column accesses is much lower than that of new ACT commands, LamaAccel exhibits better energy efficiency than pLUTo. Additionally, during the counting phase, the mapping of array counters is designed to ensure that even with increased precision, the system maintains maximum efficiency in processing output neurons.
+
+In Figure~\ref{fig:case_study2_evaluation_gpu} LamaAccel performance per area is shown relative to the GPU baseline. The NVIDIA RTX A6000 features a die size of $628 \ \text{mm}^2$ on an $8 \ \text{nm}$ process, whereas LamaAccel occupies $53.15 \ \text{mm}^2$ on a $21 \ \text{nm}$ node, equivalent to the area of a single HBM2 stack. For this comparison, LamaAccel's technology node is not scaled to the GPUs, inherently favoring the GPU. Despite this, LamaAccel achieves an average of $7.2\times$ higher performance per area across workloads. In energy efficiency, LamaAccel outperforms the GPU baseline by $6.1\times$ to $19.2\times$, with higher savings in tasks using lower precision. While LamaAccel's inference throughput is lower than that of the GPU, primarily due to the limited resources in a single HBM2 stack compared to a high-end GPU, its scalable architecture allows throughput to scale linearly with additional HBM2 stacks, bringing it closer to the performance of high-end GPUs.
+
+\begin{figure}[t!]
+\centering
+\includegraphics[height=3.5cm, width=8.5cm]{figures/GPU_energy_speedup.pdf}
+%\vskip -0.15in
+\caption{Speedup and energy savings of LamaAccel normalized to the GPU. In the case of energy savings, higher is better.}
+\label{fig:case_study2_evaluation_gpu}
+\vskip -0.15in
+\end{figure}

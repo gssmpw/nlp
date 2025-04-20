@@ -1,0 +1,662 @@
+% This must be in the first 5 lines to tell arXiv to use pdfLaTeX, which is strongly recommended.
+\pdfoutput=1
+% In particular, the hyperref package requires pdfLaTeX in order to break URLs across lines.
+
+\documentclass[11pt]{article}
+
+% Change "review" to "final" to generate the final (sometimes called camera-ready) version.
+% Change to "preprint" to generate a non-anonymous version with page numbers.
+\usepackage[preprint]{acl}
+
+% Standard package includes
+% \usepackage{times}
+\usepackage{newtxmath}
+\usepackage{newtxtext}
+
+\usepackage{fix-cm}
+\usepackage{latexsym}
+
+
+% For proper rendering and hyphenation of words containing Latin characters (including in bib files)
+\usepackage[T1]{fontenc}
+% For Vietnamese characters
+% \usepackage[T5]{fontenc}
+% See https://www.latex-project.org/help/documentation/encguide.pdf for other character sets
+
+% This assumes your files are encoded as UTF8
+\usepackage[utf8]{inputenc}
+
+% This is not strictly necessary, and may be commented out,
+% but it will improve the layout of the manuscript,
+% and will typically save some space.
+\usepackage{microtype}
+
+% This is also not strictly necessary, and may be commented out.
+% However, it will improve the aesthetics of text in
+% the typewriter font.
+\usepackage{inconsolata}
+
+%Including images in your LaTeX document requires adding
+%additional package(s)
+\usepackage{graphicx}
+
+% If the title and author information does not fit in the area allocated, uncomment the following
+%
+%\setlength\titlebox{<dim>}
+%
+% and set <dim> to something 5cm or larger.
+
+%\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{standalone}
+\usepackage{tikz}
+\usepackage{pgfplots}
+\usepackage{siunitx}
+\sisetup{table-format=2.1,detect-all = true}
+\usepackage{multirow, xcolor, colortbl}
+\usepackage{soul}
+\usepackage{hhline}
+\usepackage{etoolbox}
+\usepackage[capitalize]{cleveref}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{relsize}
+\usepackage{threeparttable}
+\usepackage{tabularx}
+
+\pgfplotsset{compat=newest}
+\usepgfplotslibrary{groupplots}
+
+\robustify\bfseries
+\usetikzlibrary{positioning, patterns, fit}
+
+\usepackage{xspace}
+\newcommand\ours{SD-RA-IT\xspace}
+\newcommand\baseline{RA-IT\xspace}
+\newcommand\llamainstruct{Llama-3-Instruct\xspace}
+\newcommand\llamasmall{Llama-3-8B-Instruct\xspace}
+\newcommand\llamabig{Llama-3-70B-Instruct\xspace}
+\newcommand\llamahuge{Llama-3.1-405B-Instruct\xspace}
+\hyphenation{O-pen-As-sis-tant}
+
+\newcommand{\barlas}[1]{\textcolor{red}{Barlas: #1}}
+\newcommand{\matt}[1]{\textcolor{blue}{Matt: #1}}
+\newcommand{\xilun}[1]{\textcolor{purple}{Xilun: #1}}
+
+\title{Post-training an LLM for RAG? Train on Self-Generated Demonstrations}
+
+\author{
+  Matthew Finlayson\footnotemark[1]
+  \quad Ilia Kulikov\footnotemark[2]
+  \quad Daniel M. Bikel\footnotemark[2] \\
+  \bf \quad Barlas Oguz\footnotemark[2]
+  \quad Xilun Chen\footnotemark[2] 
+  \quad Aasish Pappu\footnotemark[2] \\
+  \footnotemark[1]University of Southern California
+  \quad \footnotemark[2]Meta, Inc.
+  \\
+  \texttt{mfinlays@usc.edu}\quad\texttt{aasish@meta.com}
+}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+  \input{abstract}
+\end{abstract}
+
+\begin{figure*}
+  \centering
+  \small
+  \input{fig/baseline}
+  \caption[Placeholder caption]{
+    An overview of existing of na\"ive retrieval-augmented instruction tuning 
+    (training on OOD data) 
+    and our proposed method: 
+    retrieval-augmented instruction tuning on self-generated demos.
+    Fine-tuning on out-of-distribution (OOD) instruction responses (highlighted \sethlcolor{pink}\hl{red}) from an outside source,
+    for example an existing annotated dataset, can degrade the model.
+    We use a model to generate its own correct, in-distribution responses (highlighted \sethlcolor{green}\hl{green}). 
+    Training on these yields better performance on downstream RAG tasks.
+  }
+  \label{fig1}
+\end{figure*}
+
+\section{Introduction}
+
+Typically, large language models (LLMs) must rely solely on knowledge learned during pre-training to perform downstream tasks like question answering.
+This situation becomes problematic when the task depends on knowledge that the model has not encountered or learned.
+A popular framework for mitigating this issue is to provide the model with \textit{contextual knowledge}, i.e., providing relevant information for the task as input.
+This crucial context typically comes from \emph{retrieval systems} that fetch documents from some database based on their relevance to the task.
+The combination of retrieval and language generation,
+known as retrieval-augmented generation (RAG),
+often outperforms LLMs without retrievals on downstream tasks,
+particularly for knowledge intensive tasks where parametric (i.e., learned during pre-training) knowledge fails.
+
+Integrating an LLM into a RAG system can be tricky,
+since the LLM may not properly leverage the additional context to improve performance.
+In particular, if the retrievals are irrelevant to the task, they may distract the LLM from the objective or cause the LLM to integrate incorrect information into its generations.
+The LLM may also fail to integrate the provided context even when it contains the solution to the task.
+We hypothesize that these shortcomings are caused by distributional mismatch between the model's training data and the RAG-style inputs it receives at test time.
+
+Several prior efforts have sought to better integrate LLMs into RAG systems 
+by fine-tuning them for the task.
+This usually involves training the model with in-context retrievals,
+and may be implemented during pre-training~\citep[e.g.,][]{guu2020retrieval},
+or as a post-training step~\citep{lin2024radit}.
+Since pre-training can be prohibitively expensive,
+we focus on the more accessible and common post-training methods.
+In particular, we concentrate on retrieval-augmented instruction tuning (\baseline) 
+where an LLM is fine-tuned on an instruction tuning dataset which has been modified to include one or more retrievals for each instance.
+
+One easy way to obtain a \baseline training set is to augment existing instruction-response pairs from an instruction tuning dataset with retrievals. This approach poses two significant challenges.
+First, there may be a misalignment between the retrieved content and the response, as the latter was created without reference to the retrieval and might even appear to contradict it. 
+Second---and this is a more general issue in fine-tuning---gold responses are often unlikely to be generated by the model, making them out-of-distribution (OOD).
+Training on OOD responses can inadvertently promote hallucination by compelling the model to generate outputs that conflict with its parametric knowledge~\citep{Lin2024FLAMEFA}.
+Consequently, \baseline may elicit undesirable LLM behavior.
+
+We propose to remedy the OOD response issue by replacing responses in a \baseline dataset
+with ones that match the capabilities and distribution of the LLM. 
+We accomplish this by obtaining \emph{self-generated demonstrations} (self-demos) from the model, as illustrated in \cref{fig1}.
+Our process consists of generating multiple outputs from the LLM conditioned on retrievals and instructions, then filtering for the outputs that match the gold responses (as judged by an LLM).
+Our generate-then-filter process retains ground truth supervision while matching the training data to the model distribution.
+To maximize the number of successful self-demos, we sample from multiple prompts and generate both with and without retrievals.
+If none of the response candidates match the gold response we instead select a refusal generated based on the context.
+Thus, we obtain self-demos that match the gold responses, are in-distribution for the LLM, and respect its parametric and contextual knowledge.
+
+We find that models obtained via self-demo retrieval-augmented instruction tuning (\ours) perform favorably on knowledge-intensive question answering tasks compared to other methods.
+Their answer attempts succeed at a higher rate, 
+and they better identify answers from retrievals.
+They accomplish this by abstaining from questions they will likely get wrong,
+and engage with retrievals to answer questions correctly.
+We also find that, while \baseline tends to degrade the LLM's performance when retrievals are not present (non-RAG settings), \ours improves model performance across both non-RAG and many-retrieval settings, even improving performance on contexts with many more retrievals than the model was explicitly trained to handle.
+
+\section{Related work}
+
+Our work builds upon several areas in RAG methods and post-training.
+
+\subsection{Training RAG-enabled LLMs}
+As retrieval-augmented generation (RAG) has garnered interest as an effective way to improve LLM performance~\citep{Lewis2020RetrievalAugmentedGF}.
+We focus on the setting where we prepend retrievals to the prompt, which is a common, simple method for incorporating retrievals into the context, 
+though alternative RAG architectures exist~\citep[e.g.,][]{shi2023replug}. 
+Our work builds upon previous studies which investigate how to train LLMs to better handle retrieved context.
+Some of these propose pre-training methods that boost RAG capabilities
+\citep{guu2020retrieval, Izacard2023AtlasFL, Shi2023InContextPL},
+while others fine-tune a LLM for better RAG capabilities~\citet{luo-etal-2023-search}.
+Our method targets the latter fine-tuning setting, where we hypothesize that out-of-distribution training examples cause performance degradation. 
+Our key insight is to self-generate demonstrations, 
+rather than using a teacher LLM~\citep{luo-etal-2023-search}
+or human-written responses~\citep{lin2024radit}.
+
+\subsection{Distilling prompted behavior}
+Our methodology has similarities with recent work on distilling the behavior of prompted language models back into the unprompted model.
+Note that this is different from distilling a larger model into a smaller one; instead, the prompted model and the target model for fine-tuning are the same.
+\citet{Yu2024DistillingS2} use prompting frameworks~\citep[e.g., Chain-of-Thought, System 2 Attention;][]{wei2022chain, weston20232attentionisneed}
+to generate training examples using a language model, 
+then do supervised fine-tuning (SFT) to distill the behavior under these prompts back into that same model.
+The resulting model exhibits behavior like the prompted models without requiring prompts. 
+Our work takes a similar approach for a similar goal,
+though we use automatically optimized prompts instead of hand-crafted prompting frameworks to generate training data,
+and we aim to specifically distill RAG capabilities rather than reasoning abilities.
+Our method, similar to the one in \citet{Yu2024DistillingS2},
+also requires filtering training examples for correctness.
+
+\subsection{Self-demo training \& learning to abstain}
+Our work is partly motivated by the hypothesis \citet{Lin2024FLAMEFA} and \citeposs{kang2024unfamiliar} hypothesis that out-of-distribution training data degrade LLM during post-training and encourage hallucinations.
+Similar to our work, \citet{Lin2024FLAMEFA} train LLMs on self-generated demonstrations, but with the goal of improving factuality.
+They also investigate using RAG as part of their training pipeline but not during inference.
+We also build on their work by introducing a filtering stage to ensure the quality and correctness of the self-generated instances before training on them. 
+
+A large body of existing literature investigates learning when to abstain from answering questions~\citep{wen2024know}.
+Our method for selecting self-demos resembles the simple method proposed by \citet{yang2023alignment}
+where training examples that the model answers incorrectly are replaced with refusals. 
+We incorporate and improve on their template-based refusal strategy by selecting self-generated refusals when none of the self-generated demonstrations are correct.
+By using self-generated refusals instead of template-based ones, we better align the training distribution with the LLM's own distribution.
+
+\begin{figure*}
+  \centering
+  \small
+  \input{fig/method}
+  \caption[Our method]{
+    Our method uses the reference model to generate response candidates for the retrieval-instruction pairs.
+    We then use the model along with the gold responses to filter the candidate responses for correct ones.
+    Finally, we replace the \sethlcolor{pink}\hl{OOD} responses in the training set 
+    with these \sethlcolor{green}\hl{in-distribution} self-generated responses (self-demos) and train on these. 
+  }
+  \label{fig:method}
+\end{figure*}
+
+\section{Method and Implementation}
+\label{sec:method}
+
+The goal of our method (outlined in \cref{fig:method}) is to take an instruction-tuned LLM as a reference model and equip it with improved RAG capabilities.
+Our method relies on the fact that instruction-tuned LLMs are already capable of several tasks,
+including self-prompting, self-evaluation, question answering, and some RAG abilities.
+We leverage these abilities to bootstrap a dataset of self-demonstrations to train on.
+
+We break the process of generating self-demos for \ours into discrete steps.
+First, we obtain an instruction tuning dataset augmented with retrievals.
+Second, we automatically generate a set of prompts for the LLM.
+Third, we generate three types of outputs:
+retrieval-augmented responses,
+responses without retrieval responses,
+and refusals.
+Fourth, we filter these responses for correctness with respect to the gold response, choosing the self-demo that is most correct, or a refusal when no outputs match the gold response.
+In this section we review of our implementation of these steps.
+
+
+\subsection{Models, infrastructure, and datasets}
+As our reference language models, we use state-of-the-art, open-weight, instruction-tuned models \llamasmall and \llamabig.
+Our method is designed to require only on the reference model; 
+no larger or more powerful model is required.
+We use the open-source libraries fairseq2 for training~\citep{balioglu2023fairseq2},
+and vLLM for inference~\citep{kwon2023efficient},
+and publicly release our training and inference scripts\footnotemark.
+
+\makeatletter
+\ifacl@anonymize
+\footnotetext{Link not provided for anonymity.}
+\else
+\footnotetext{\url{https://github.com/facebookresearch/RAM/tree/main/projects/sd-ra-it}}
+\fi
+\makeatother
+
+For convenience, we opt to use the retrieval-augmented instruction tuning dataset from \citet{lin2024radit},
+who describe the composition of their dataset in Table~1 of their paper.
+This dataset consists of instances which each contain an instruction, a human-written response (gold demonstration), and retrievals from Wikipedia~\citep{Izacard2023AtlasFL} and CommonCrawl\footnote{\url{https://commoncrawl.org}}.
+
+The instruction-response pairs come from multiple domains: dialogue, open-domain QA, reading comprehension, summarization, and reasoning.
+We use a mix of 10\% dialogue instances and 90\% randomly instances from other domains, following a similar split to that used in \citet{lin2024radit}.
+
+For retrievals, we re-use the retrieved documents from \citet{lin2024radit}
+which are retrieved using a DRAGON+
+retriever~\citep{lin2023traindragondiverseaugmentation}.
+
+\subsection{Automatic prompt generation}
+
+We sample response candidates from multiple prompts with the aim to achieve diversity and maximize the likelihood of correctness.
+We use automatic prompt optimization instead of hand-crafting prompts,
+saving time and improving their effectiveness.
+Prior research and existing libraries offer methods for automatically optimizing LLM prompts~\citep[e.g.,][]{khattab2022demonstrate, yuksekgonul2024textgrad, Reid2023AutomaticPO}\footnotemark.
+Due to the simplicity of our needs, we opt to implement a custom optimizer
+which roughly follows the iterative beam search formula found in the literature:
+we begin with a human-written system message then (1) use the system message and reference model to generate responses to a small training set of instructions, (2) use the model to score its own outputs on a scale 1-5 compared to the gold responses, (3) use the model to critique its own outputs then suggest a new system message, sampling several new candidate system messages, then finally (4) repeat the process with the new system message candidates, pruning the lowest-scoring prompts.
+\footnotetext{See \citet{AwesomeLLMPromptOptimization} for a comprehensive list of prompt optimization literature.}
+
+After a number of rounds, we use a validation set to obtain scores for all the system message candidates, then select the top-scoring system messages.
+We repeat this process for both retrieval-augmented instructions and standalone instructions.
+We additionally include a human-written system message instructing the model to refuse to all instructions.
+
+
+\subsection{Generating, filtering, and training on self-demonstrations}
+
+To obtain a self-demo for each instance in our training set,
+we first generate multiple output candidates using the system prompts collected in the previous step.
+We then use the reference model as a judge, giving it access to the gold response and prompting it to select the most correct output, or to select a refusal if none of the candidates are correct.
+In practice, we find that the judge struggles to choose between many candidates at once, so we select the best candidate via a single-elimination tournament.
+
+We try two common post-training methods for LLMs.
+The first, supervised instruction fine-tuning (SFT)
+minimizes cross-entropy loss on the response tokens.
+The second, direct preference optimization (DPO)
+takes two candidate responses, a preferred response and a rejected response, and optimizes the model to maximize the probability of the preferred response while minimizing the probability of the rejected response.
+We use a randomly selected self-demo candidate that was rejected during the self-demo generation process as the rejected response.
+
+\section{Experimental details}
+
+In this section we detail our methods and specific implementation choices. 
+
+\subsection{Benchmarks and Baselines}
+
+Our evaluation focuses on knowledge-intensive question-answering (QA) tasks.
+For this, we use the evaluation datasets from~\citet{lin2024radit}\footnotemark,
+since these datasets are popular for RAG evaluation.
+\citet{lin2024radit}
+provide multiple retrievals
+for each of the evaluation instances. 
+Each instance in these datasets consist of a question (e.g., ``who won the 2012 World Series'') and an answer (e.g., ``San Francisco Giants'').
+\footnotetext{Our evaluation datasets include the Pushshift.io Reddit dataset, a previously existing dataset extracted and obtained by a third party that contains preprocessed comments posted on the social network Reddit and hosted by Pushshift.io.} 
+
+We contextualize our model's performance with several baselines.
+First, we compare to the reference model from which our model was fine-tuned.
+Since the reference model is a fully-fledged instruction-tuned LLM with some pre-existing RAG capabilities, this is a strong baseline.
+Next, we instruction-tune (IT) the reference model without using any retrievals.
+This baseline is meant to control for the effect continued fine-tuning on our model's performance, and also to demonstrate the adverse effects of fine-tuning on OOD demonstrations.
+The third baseline, most similar to our method, is retrieval-augmented instruction-tuning (\baseline) on gold demonstrations.
+Both of our trained baselines (instruction tuning, \baseline) use cross-entropy loss as their training objective.
+We also experimented with using DPO for \baseline, using the model's own generations as the rejected response, but found in preliminary studies that this method catastrophically degrades model accuracy on all QA tasks, likely because the gold responses are too far outside the model's distribution. 
+
+\begin{table}
+  \centering
+  \small
+  \begin{threeparttable}
+  \begin{tabularx}{\linewidth}{lX}
+    \toprule
+    Acronym & Method \\
+    \midrule
+    IT & Instruction tuning \\
+    \baseline & Retrieval-augmented instruction tuning \\
+    \ours & Retrieval-augmented instruction tuning on self-demos (ours) \\
+    +DPO & DPO objective used instead of SFT \\
+    \midrule
+    & Dataset \\
+    \midrule
+    PSR & Pushshift.io Reddit~\citep{fan-etal-2019-eli5} \\
+    FEVER & \citet{thorne-etal-2018-fever} \\
+    HPQA & HotPotQA~\citep{yang-etal-2018-hotpotqa} \\
+    MMLU & \citet{hendrycks2021measuring} \\
+    NQ & \citet{kwiatkowski-etal-2019-natural} \\
+    TQA & Trivia QA~\citep{joshi-etal-2017-triviaqa} \\
+    T-REx & \citet{elsahar-etal-2018-rex} \\
+    WoW & Wizard of Wikipedia~\citep{dinan2018wizard} \\
+    zsRE & \citet{levy-etal-2017-zero} \\
+    \bottomrule
+  \end{tabularx}
+  \caption{A summary of method and dataset acronyms.}
+  \end{threeparttable}
+\end{table}
+
+\subsection{Metrics} 
+
+We aim to measure several properties of RAG models to holistically evaluate our proposed method.
+In particular, we hypothesize that our training will make LLMs more accurate on questions it chooses to answer, better at learning which questions to refuse, better at integrating knowledge from retrievals, and suffer less degradation from training on OOD demonstrations. 
+
+To measure these effects, we first label all test instances as one of \textit{correct} (if the model output matches the gold answer), \textit{refused} (if the model declines to answer), or \textit{incorrect}. 
+We also label the retrievals as \textit{relevant} or \textit{irrelevant}, 
+depending on whether the retrieval contains the answer to the question.
+We use an LLM-as-a-judge to label our test instances rather than rely on more traditional metrics like exact match.
+We do this because traditional metrics do not capture more nuanced properties of text like semantic equivalence and refusals. 
+We observe that our judge LLMs are highly reliable and accurate for straightforward tasks such as determining whether model generations match the gold labels.
+
+\begin{figure}
+  \small
+  \centering
+  \begin{tikzpicture}[yscale=0.5, xscale=1.5]
+    % Define colors
+    \draw (0,0) rectangle (2, 4) ;
+    \node[fill=white] at (1, 4) {Answerable};
+    \draw (2,0) rectangle (4, 4) ;
+    \node[fill=white] at (3, 4) {Unanswerable} ;
+    \draw (2, 1) arc[start angle=-90, end angle=90, radius=1cm] -- (2, 3) -- cycle;
+    \node[fill=white, rounded corners] at (2.5, 2) {Incorrect} ;
+    \draw (2, 3) arc[start angle=90, end angle=270, radius=1cm] -- (2, 1) -- cycle;
+    \node[fill=white] at (1.5, 2) {Correct} ;
+    \node[fill=white, rounded corners] at (2, 3) {Attempted} ;
+    \node[fill=white, rounded corners] at (2, 0) {All questions} ;
+  \end{tikzpicture}
+  \caption{
+    A categorization of test instances.
+    The box is divided into questions that the LLM can and cannot answer correctly,
+    while the oval represents questions that the LLM attempts.
+    Since we are more interested in reliability than raw accuracy on downstream tasks,
+    we use precision (\(\text{\# correct}/\text{\# attempted}\))
+    and recall (\(\text{\# correct}/\text{\# answerable}\)) as our main metrics.
+    % We use the number of false refusals 
+    % (refused, but with answers present in the context)
+    % as a proxy for the number of answerable but refused questions since we do not have direct access to counterfactual data.
+  }
+  \label{fig:diagnostic_testing}
+\end{figure}
+
+We use \llamabig as the judge LLM for 8B-parameter models,
+and \llamahuge as the judge for 70B-parameter models.
+Our judge LLMs are one size larger than the reference model to get a more accurate judgement than the reference model could provide while minimizing inference costs.
+We find that inter-method trends generally hold across model sizes, but warn that raw scores may not be directly comparable across sizes since different judges may be more or less strict when deciding, for example, whether a generated answer sufficiently matches the gold answer.
+
+Since our method trains the model to refuse to answer when it is likely to get the answer wrong, we are interested in the model's ability to answer attempted questions correctly (precision) and its ability to attempt questions it can answer correctly (recall).
+See Figure~\ref{fig:diagnostic_testing} for a visualization of these categories.
+We measure precision with \emph{answered accuracy}, i.e., \(\text{\# correct}/\text{\# attempted}\).
+Measuring recall (\(\text{\# correct}/\text{\# answerable}\)) is trickier 
+because we do not have direct counterfactual information about which questions the model \emph{would} get correct if it were to attempt to answer (we call this the \textit{counterfactual accuracy}). 
+As a proxy, we can count the number of \textit{false refusals} (the number of refused questions that had relevant retrievals), then measure recall as 
+\(\text{\# correct}/(\text{\# correct} + \text{\# false refusals})\).
+
+
+
+\section{Analysis and Results}
+
+We find that our method leads to favorable performance on knowledge-intensive question answering tasks across several metrics.
+Our method has higher precision (accuracy on answered questions),
+higher recall (successful attempts on answerable questions), and lower counterfactual accuracy, 
+compared to other methods.
+In ablations, we also find that our method leads to minimal degradation in non-RAG QA settings compared to all other methods,
+and achieves the highest performance (precision) across different numbers of retrievals.
+
+Refer to \cref{sec:more-results} for per-evaluation set breakdowns of the aggregated metrics (e.g., precision, recall) in this section. 
+
+\begin{table}
+  \centering
+  \small
+  \input{tab/prec_rec_f1}
+  \caption{Summary results for precision (accuracy on attempted questions), recall (accuracy on answerable questions) and F1, the harmonic mean of both. \ours methods (ours) consistently outperform baselines.} 
+  \label{tab:prec_rec_f1}
+\end{table}
+
+\subsection{Precision}
+\label{sec:precision}
+
+
+\begin{table*}
+\centering
+\footnotesize
+\renewcommand{\arraystretch}{1.25}
+  \input{tab/true_refusals}
+  \caption{For many inputs, \baseline attempts and hallucinates an answer while \ours refuses.}
+  \label{tab:refusal_examples}
+\end{table*}
+
+\begin{table*}
+  \centering
+  \small
+  \input{tab/accuracy}
+  \caption{Accuracy results are mixed across datasets and training strategies. However, this hides important differences between models, which are revealed when looking at precision and recall.
+  }
+  \label{tab:accuracy}
+\end{table*}
+
+
+As shown in the first column of \cref{tab:prec_rec_f1}, \textbf{training on self-demos leads to accuracy gains for answered questions} 
+(see \cref{tab:correctness_rate} for per-dataset results.)
+In other words, models trained with \ours are more likely than other baselines to answer correctly when attempting to answer. 	
+We attribute this improved answered accuracy to our model's superior ability to identify and refuse questions it is likely to get wrong. For concrete examples of this, see \cref{tab:refusal_examples}. 
+The other possible explanation would be that \ours causes the model to increase the total number of correct answers without increasing the number of incorrect ones, but \cref{tab:accuracy} rules this out by showing that the total number of correct answers does not systematically increase for any training strategy. 
+
+To further support the hypothesis that \ours teaches the model to refuse questions it will likely get wrong, 
+we would like to know the proportion of refused questions that the model \emph{could} have answered correctly, the lower the better.
+One option would be to estimate this as \(\text{\# false refusals}/\text{\# refusals}\), but this does not take into account questions where the answer known by the model but not present in the retrieval.
+To guard against this, we also estimate the model's counterfactual accuracy by checking the accuracy of the reference model on the refused instances.
+These two metrics turn out to be highly correlated,
+as shown in \cref{tab:counterfactual_metrics}, 
+and we find that the counterfactual accuracy on refused instances for \ours is consistently lowest out of all models across model sizes,
+indicating that the \textbf{answered accuracy gains are due to the \ours model refusing questions that it will likely get wrong.}
+
+\begin{table*}
+  \centering
+  \small
+  \input{tab/refuse}
+  \caption{
+    Change in refusal rates compared to the reference model (absolute change in percent) for different methods across evaluation sets. 
+    Most model refusal rates do not change much overall, with the exception that
+    instruction tuning 8B without retreivals (IT) decreases refusals,
+    while \ours on the 70B model increases refusals.
+  }
+  \label{tab:refusals}
+\end{table*}
+
+Though \ours achieves the highest precision among the baselines, 
+looking at differences in other metrics suggests that \textbf{different \ours models achieve high precision in different ways.}
+In particular, 70B \ours (without DPO)
+gets slightly fewer total answers correct compared to the \baseline model (see \cref{tab:accuracy}).
+This is driven by an increase in refusals, shown in Table~\ref{tab:refusals}, which include questions the model would likely answer correctly if attempted.
+The model therefore achieves high precision by attempting only high-confidence questions.
+On the other hand, \ours models that do not show significant refusal increase 
+must achieve higher precision through a more balanced combination of refusing questions it will get wrong,
+using the context to correctly answer more questions,
+and answering additional questions it would have otherwise refused. 
+
+\begin{table*}
+\centering
+\footnotesize
+  \begin{threeparttable}
+  \renewcommand{\arraystretch}{1.25}
+  \input{tab/false_refusals}
+    \begin{tablenotes}
+    \item[a] Some names and titles have been replaced with fictional ones.
+    \end{tablenotes}
+  \caption{Example outputs from 8B models trained with \baseline and \ours. For many of the inputs, \baseline completely ignores the question instead of attempting to answer it. Though we classify these as refusals, they are of much lower quality than the direct refusals from \ours shown in Table~\ref{tab:refusal_examples}. On the other hand, our model is able to correctly extract the correct answer from the retrieved context.}
+  \label{tab:answered}
+  \end{threeparttable}
+\end{table*}
+
+Observing the outputs of both the \ours and the \baseline models in Table~\ref{tab:answered}, 
+we find that many of the \baseline ``refusals'' are simply cases of the model completely ignoring the question.
+We hypothesize that these types of answers that ignore the question may stem from summarization tasks found in the instruction tuning dataset.
+If we counted these as incorrect rather than refused we would see an even bigger difference between the models' answered accuracy.
+In other words, our precision gains are likely \emph{underestimates}.
+The fact that our models do not suffer from this type of degenerate behavior (despite training on the same data) indicates that \textbf{\ours reduces the impact of low-quality training data.}
+
+
+
+\subsection{Recall}
+\label{sec:recall}
+
+\cref{tab:prec_rec_f1} shows that \ours outperforms all other models on recall, 
+i.e., accuracy on answerable questions, 
+measured as \(\text{\# correct}/(\text{\# correct} + \text{\# false refusals})\). 
+We attribute this to the fact that \ours reduces false refusals compared to \baseline, as discussed in the previous section
+(\cref{tab:false_refusals_with_baseline} gives a breakdown of false refusals by dataset.) 
+This supports our hypothesis that training on self-demos teaches the model to better incorporate relevant context compared to \baseline.
+
+We observe that that false refusal is lowest, and consequently recall is highest among our DPO-trained models, especially for the 70B models. 
+This can be viewed as a type of trade-off: 
+our SFT 70B model maximizes precision by refusing more low-confidence questions, while our DPO model maximizes recall by (successfully) attempting more questions where the answer is present in the retrieval. 
+Both strategies result in high F1 scores.
+
+\begin{table}
+  \centering
+  \small
+  \input{tab/counterfactual_metrics.tex}
+  \caption{Reference model accuracy on refused questions and false refusal rates. Lower is better. These two measures of counterfactual accuracy are highly correlated.}
+  \label{tab:counterfactual_metrics}
+\end{table}
+
+\subsection{Number of retrievals}
+
+It is often desirable for RAG systems handle simultaneous retrievals from multiple sources, as well as queries with no retrievals at all.
+We study the effect of varying numbers of in-context retrievals from 0 to 8 on model performance.
+For each number of retrievals~\(n\), we include the \(n\) most-relevant retrievals for the question, as scored by the retriever system.
+
+\cref{tab:multisource} shows that all models exhibit monotonic improvement as the number of retrievals increases, 
+even when the number of retrievals surpasses the number of retrievals trained on.
+Across the board, \ours (with or without DPO) achieves the highest performance.
+
+The ``0'' column of~\cref{tab:multisource},
+shows that both \textbf{\baseline and IT seriously degrade the LLM's performance (measured with precision)
+on QA without retrievals.}
+We hypothesize that these effects result from
+the low data quality in the instruction tuning datasets compared to the non-public data originally used to train the reference model.
+While \ours uses the same instruction tuning dataset, the self-generated responses prevent the model from actually learning to predict the lower-quality gold responses,
+better preserving the model's original distribution and causing no significant degradation in non-RAG settings. 
+
+\begin{table}
+  \centering
+  \small
+  \input{tab/retrievals}
+  \caption{Model performance (precision) under different numbers of retrievals. When retrievals are present, \baseline models outperform non-\baseline models.}
+  \label{tab:multisource}
+\end{table}
+
+\section{Discussion and conclusion}
+
+In this paper we found strong evidence that training on self-generated responses instead of gold ones consistently improves RAG models in QA settings.
+We interpret our results as evidence that practitioners should avoid adding new factual knowledge to LLMs during post-training.
+Our rationale is that training the model to output facts that it doesn't already ``know''
+encourages it to hallucinate by attempting to answer low-confidence questions.
+Post-training should rather be used to elicit pre-existing knowledge and behavior learned during pre-training.
+
+Our second major conclusion is that \ours enables successful training on low-quality datasets.
+Artifacts such as summarization tasks in the training data mean that na\"ive instruction tuning methods degrade model behavior. 
+By training on self-demos, \ours avoids teaching models to generate low-quality outputs while still allowing the model to benefit from the supervision and task adaptation aspects of the training data. 
+
+Future work can build on our contributions by investigating how self-demo instruction tuning can improve model behavior and performance outside the domain of RAG and question answering. 
+We are also interested in techniques that control the trade-off between precision and recall that we saw between 70B SFT and DPO models in \cref{sec:recall}.
+
+\section{Limitations}
+
+Our study's scope is limited to the RAG setting and QA-based evaluations of the Llama-3 family of models.
+Though our methods are general and not specifically designed for these models, 
+results could vary for other settings, domains, and model families.
+
+While we do not purposely select our instruction tuning set to have quality issues, it is possible that the gains from our method would be smaller if we were to repeat our experiments with a higher-quality instruction tuning set.
+
+
+\bibliography{main}
+
+\appendix
+
+\section{Fine-grained results}
+\label{sec:more-results}
+
+\cref{tab:answerable_accuracy,tab:counterfactual,tab:false_refusals_with_baseline,tab:f1,tab:correctness_rate}
+break down the aggregated metrics from the main section of the paper into per-evaluation-set results. 
+
+\bigskip
+\noindent Precision \dotfill \cref{tab:correctness_rate} \\
+Recall \dotfill \cref{tab:answerable_accuracy} \\
+F1 \dotfill \cref{tab:f1} \\
+False refusals \dotfill \cref{tab:false_refusals_with_baseline} \\
+Counteractual accuracy \dotfill \cref{tab:counterfactual} \\
+
+\begin{table*}
+  \centering
+  \small
+  \input{tab/correctness_rate}
+  \caption{Precision, as measured by accuracy on answered (not refused) questions, for all models and evaluation sets. \llamasmall fine-tuned with \ours consistently achieves higher precision (i.e., \(\text{\# correct}/\text{\# answered}\)) compared to all other methods, with \ours + DPO performing the best on average.}
+  \label{tab:correctness_rate}
+\end{table*}
+
+\begin{table*}
+  \centering
+  \small
+  \input{tab/answerable_accuracy}
+  \caption{
+    Recall, as measured by proportion of questions answered correctly when the answer is contained in the retrieved context (i.e., \textit{answerable accuracy}) for each model and evaluation set.
+    For 8B-parameter models, recall is highest for the \ours methods.
+    For 70B-parameter models, \ours sees less recall degradation compared to \baseline.
+  }
+  \label{tab:answerable_accuracy}
+\end{table*}
+
+\begin{table*}
+  \centering
+  \small
+  \input{tab/f1}
+  \caption{
+    F1-score, the harmonic mean of precision and recall, for each model and dataset.
+    F1 is a measure of performance that takes into account both the model's ability to answer attempted questions correctly, and its ability to attempt and correctly answer questions when the answer is present in the retrieved context.
+    On average and across sizes, \ours methods achieves the highest F1 score, demonstrating the superiority of training on self-generated demonstrations over gold labels.
+  }
+  \label{tab:f1}
+\end{table*}
+
+\begin{table*}
+  \centering
+  \small
+  \input{tab/false_refusals_with_baseline}
+  \caption{False refusal rates for \baseline and \ours. Lower is better. For the 8B model size, \ours consistently exhibits fewer false refusals than \baseline.}
+  \label{tab:false_refusals_with_baseline}
+\end{table*}
+
+\begin{table*}
+  \centering
+  \small
+  \input{tab/counterfactual}
+  \caption{
+    Counterfactual accuracy on refused questions (as estimated by the reference model, lower is better) for \llamasmall. Across datasets \ours (both SFT and DPO) consistently have lowest counterfactual accuracy, indicating that they are better at choosing questions to refuse.
+	% This is despite the fact that the \ours refuses \emph{fewer} questions on average.
+	}
+  \label{tab:counterfactual}
+\end{table*}
+
+
+\end{document}

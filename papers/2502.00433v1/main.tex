@@ -1,0 +1,563 @@
+\documentclass[10pt]{article}
+
+\usepackage{mystyle}
+
+
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{algorithm} % For the algorithm environment
+\usepackage{algpseudocode} % For algorithmic pseudocode
+\usepackage{amsmath} 
+\usepackage{multirow}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{titlesec}
+\usepackage{parskip}
+%\usepackage{enumitem}
+
+\usepackage{colortbl} % For cell color
+\usepackage{xcolor}   
+\definecolor{LightCyan1}{HTML}{E0FFFF}
+\definecolor{MistyRose}{HTML}{FFE4E1}
+\definecolor{mypink}{rgb}{.99,.91,.95}
+\definecolor{green}{HTML}{66ffd5}
+
+\newcolumntype{x}{>{\columncolor{LightCyan1}}c} 
+\newcolumntype{y}{>{\columncolor{mypink}}c}  
+\newcolumntype{z}{>{\columncolor{green}}c} 
+
+\RequirePackage[top=2.25cm, bottom=2.5cm, left=2.5cm, right=2.5cm, columnsep=0.65cm]{geometry}
+\raggedbottom
+
+\title{CAT Pruning: Cluster-Aware Token Pruning For Text-to-Image Diffusion Models}
+\author{Xinle Cheng\thanks{ Email to \texttt{adacheng@stu.pku.edu.cn}} \thanks{Peking University} \qquad Zhuoming Chen\thanks{Carnegie Mellon University} \qquad Zhihao Jia$^\ddagger$}
+\date{}
+
+\newcommand{\fix}{\marginpar{FIX}}
+\newcommand{\new}{\marginpar{NEW}}
+\newcommand{\ZJ}[1]{\textcolor{violet}{ZJ: #1}}
+\newcommand{\XL}[1]{\textcolor{blue}{XL: #1}}
+\begin{document}
+
+
+
+\maketitle
+
+\begin{abstract}
+Diffusion models have revolutionized generative tasks, especially in the domain of text-to-image synthesis; however, their iterative denoising process demands substantial computational resources. In this paper, we present a novel acceleration strategy that integrates token-level pruning with caching techniques to tackle this computational challenge.
+By employing noise relative magnitude, we identify significant token changes across denoising iterations. 
+Additionally, we enhance token selection by incorporating spatial clustering and ensuring distributional balance. Our experiments demonstrate reveal a 50\%-60\% reduction in computational costs while preserving the performance of the model, thereby markedly increasing the efficiency of diffusion models. The code is available at \href{https://github.com/ada-cheng/CAT-Pruning}{https://github.com/ada-cheng/CAT-Pruning}.
+
+\end{abstract}
+
+
+\begin{figure}
+    \centering
+    \includegraphics[width=\linewidth]{figs/teasor_v2.pdf}
+    \caption{\textbf{CAT Pruning in Stable Diffusion v3.} The top row depicts the standard denoising process of Stable Diffusion v3 over 28 inference steps, representing the baseline configuration. The bottom row demonstrates the generative performance of CAT Pruning, which achieves similar generative quality while reducing computation cost by 2$\times$ and end-to-end inference time by 1.90$\times$.}
+    \label{fig:teasor}
+\end{figure}
+
+\section{Introduction}
+
+Recent advancements in diffusion models \citep{ho2020denoisingdiffusionprobabilisticmodels,NEURIPS2021_49ad23d1,NEURIPS2019_3001ef25} have revolutionized generative tasks, especially in the realm of text-to-image synthesis \citep{Karras2022edm}. 
+Models such as Stable Diffusion 3 \citep{esser2024scalingrectifiedflowtransformers}, and Pixart \citep{chen2023pixartalpha,chen2024pixartdelta} have demonstrated their capability to produce diverse and high-quality images based on user inputs. Despite these successes, the iterative process required for denoising within these models often leads to lengthy and resource-intensive inference periods.
+
+To address computational constraints, existing approaches primarily emphasize either leveraging sparse computation \citep{NEURIPS2022_b9603de9,wang2024sparsedmsparseefficientdiffusion} to enhance speed or reducing sampling steps \citep{lu2024simplifyingstabilizingscalingcontinuoustime,song2023consistency,liu2024instaflowstephighqualitydiffusionbased} to decrease inference times. Recent advancements \citep{ma2023deepcache,ma2024learningtocache} strike a balance between these two by leveraging temporal consistency in diffusion models. They focus on the reuse of intermediate layer-wise features across multiple time steps. These methods cache features at predetermined timesteps and within specific blocks, thereby reducing computational overhead by reusing these cached features in subsequent timesteps instead of recomputing them. This approach has proven effective in decreasing the overall computational cost while maintaining generative quality.
+
+While most cache-and-reuse methods focus on bypassing certain \texttt{blocks}, thereby reducing the overall number of CUDA kernel launches to save computation, few explore optimizations at the intra-kernel level. Specifically, little attention has been given to reducing the latency within each individual kernel execution. Additionally, with the growing adoption of large-scale diffusion-based architectures which leverage DiT \citep{Peebles2022DiT} backbones for video generation \citep{liu2024mardinimaskedautoregressivediffusion,videoworldsimulators2024} and real-time game rendering \citep{chen2024diffusionforcingnexttokenprediction,oasis2024}, we observe that the inherent sparsity within transformer computation offers substantial potential for accelerating inference.
+
+As mentioned in \citep{song2021scorebasedgenerativemodelingstochastic,NEURIPS2019_3001ef25}, Diffusion involves solving a reverse-time SDE using a a time-dependent model. Intuitively, not all patches in an single image require the same precision when it comes to solving the SDE. 
+
+To carefully "bypassing" certain patches during the inference time with cache-and-reuse technique, we analyze the functionality of each block according to their timesteps and their depths in the network, and we find out that the selection of patches must exhibit consistency not only across layers but also across different time steps. Therefore, we derive a metric that quantifies token importance at each time step (every single forward of the model), enabling us to consistently select the same set of tokens across all layers. Intuitively, tokens that experience substantial changes during the current time step are likely to exhibit significant variations in their outputs at the subsequent step. To capture this dynamic, we empirically rank tokens based on their relative noise magnitude. 
+
+Moreover, to ensure consistency along the timestep axis, we track the staleness of each token based on the their selection frequencies to maintain distributional balance, following the exploration and exploitation trade-off \citep{Auer2002FinitetimeAO}. We find that  certain tokens exhibit synchronous changes across iterations, highlighting the importance of spatial inter-dependencies in token selection. We further capture the intricate relationships among tokens by using a clustering algorithm \citep{MacQueen1967SomeMF} and incorporate such cluster-wise selection with our previously mentioned metrics.
+
+Since our strategy involves selecting tokens based on their noise magnitude, the "cache-and-reuse" actually happens in the noise (output) space, which can be view as a special case of interpolating the output noises from 2 consecutive steps, a technique commonly employed in diffusion schedulers that use high-order solvers for more accurate sampling \citep{lu2022dpm,zheng2023dpmsolverv3improveddiffusionode}. In sum, we propose a novel acceleration strategy that combines token-level pruning with cache mechanisms. We update a subset of tokens at each iteration, taking into account relative noise magnitude, spatial clustering, and distributional balance.
+
+Our contributions can be listed as follows:
+
+\begin{itemize}
+    \item We observe that token pruning involves ranking token importance while ensuring consistent selection across timesteps and spatial dimensions.
+    \item We propose a simple method that accelerates diffusion models by doing pruning at token level according to relative noise magnitude, selection frequencies, and cluster awareness.
+    \item Our experimental results, evaluated
+on various standard datasets (PartiPrompts \citep{yu2022scalingautoregressivemodelscontentrich} and COCO2017 \citep{lin2015microsoftcococommonobjects}) and pretrained diffusion models (Stable Diffusion v3 \citep{esser2024scalingrectifiedflowtransformers} and Pixart-$\Sigma$ \citep{chen2024pixartsigma}), demonstrate that it produces comparable results with 50 \% MACs reduction at step 28 and 60 \% MACs reduction at step 50 relative to the full size models.
+\end{itemize}
+
+
+
+\section{Related Work}
+
+Diffusion models have emerged as powerful generative frameworks in computer vision. However, these models are compute-intensive, often constrained by the high computational cost. This computational bottleneck has led to a surge of research focused on accelerating diffusion models. Here, we highlight several major categories of approaches: parallelization, reduction of sampling steps, and model pruning.
+
+\textbf{Parallelization Methods}
+ Despite traditional techniques like tensor parallelism, recent works have introduced novel parallelization strategies specifically tailored to the characteristics of diffusion models. DistriFusion \citep{li2024distrifusiondistributedparallelinference}, for instance, hides the communication overhead within the computation via asynchronous communication and introduces displaced patch parallelism, while PipeFusion \citep{wang2024pipefusiondisplacedpatchpipeline} introduces displaced patch parallelism for Inference of Diffusion Transformer Models (DiT \citep{Peebles2022DiT}) and ParaDiGMS \citep{shih2023paradigms} rum sampling steps in parallel through iterative refinement.
+
+\textbf{Reducing Sampling Steps}
+One of the core challenges with diffusion models is the large number of sampling steps required to produce high-quality outputs, which directly translates to longer inference times. Recent advancements such as DPM Solver \citep{lu2022dpm,zheng2023dpmsolverv3improveddiffusionode} and Consistency Models \citep{song2023consistency,song2023improvedtechniquestrainingconsistency} aim to address this bottleneck by developing fast solvers for diffusion ODEs and directly mapping noise to data respectively.  Moreover, the reflow+distillation \citep{liu2022flowstraightfastlearning} approach in flow-based works \citep{lipman2022flow,tong2024improvinggeneralizingflowbasedgenerative} also provides another promising approach to one-step models \citep{liu2024instaflowstephighqualitydiffusionbased,yin2024one}.
+
+\textbf{Leveraging Computational Redundancy} %tgate, fora, deepcache, AT-EDM
+Recognizing the iterative nature of diffusion models and the minimal changes in feature representations across consecutive steps, a growing body of research has focused on developing cache-and-reuse mechanisms to reduce inference time. DeepCache \citep{ma2023deepcache} reuses the high-level features of the U-Net \citep{ronneberger2015unetconvolutionalnetworksbiomedical}. Block Cache \citep{wimbauer2023cache} performs caching at a per-block level and adjusts the cached values using a lightweight 'scale-shift' mechanism. TGATE \citep{liu2024faster,tgate} caches the output of the cross-attention module once it converges. FORA \citep{Selvaraju2024FORAFC} reuses the outputs from the attention and MLP layers to accelerate DiT inference. Another representative strategy lies in model compression, achieved through the exploitation of sparsity patterns \citep{NEURIPS2022_b9603de9,wang2024sparsedmsparseefficientdiffusion} and quantization techniques \citep{zhao2024viditqefficientaccuratequantization,fang2023structuralpruningdiffusionmodels,li2023qdiffusionquantizingdiffusionmodels}.
+
+\textbf{Concurrent Work}
+During this work, we noted a concurrent study \citep{zou2024acceleratingdiffusiontransformerstokenwise} that independently employs token-wise feature caching to accelerate diffusion models. While both approaches consider ``Cache Frequency," our CAT Pruning method ranks token importance based on ``noise" magnitude, eliminating the need for intermediate attention scores. This enables seamless integration with \textbf{online softmax} \citep{milakov2018onlinenormalizercalculationsoftmax, NEURIPS2022_67d57c32} for further \textbf{speedup} while also using \textbf{less memory}.
+
+\section{CAT Pruning: Cluster-Aware Token Pruning}
+Inspired by previous work that accelerates diffusion processes through the exploitation of feature redundancy, we propose cluster-aware token pruning for text-to-image diffusion models, which could synergize with existing methods that implement caching and reuse at the block and module levels.
+
+
+Applying token-level pruning requires addressing three key challenges. First, we need effective criteria to assess which tokens are critical to the diffusion process. Second, cached features must remain consistent across timesteps to avoid staleness and ensure reliable results. Finally, Token selection should be cluster aware, which means considering spatial structure, to prevent loss of details.
+
+
+
+
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\linewidth]{figs/new_overview.pdf}
+    \caption{\textbf{Method Overview.} At each iteration, tokens are dynamically selected using a combination of the clustering results, noise magnitude, and token staleness. Each part is elaborated in Sec~\ref{sec::noise mag}, Sec~\ref{sec::balance}, and Sec~\ref{sec::cluster}. It is worth noting that we perform clustering only once at step $t_0+1$ to avoid computational overhead.}
+    \label{fig:overview}
+\end{figure}
+\subsection{Token Pruning via Masking}
+
+\begin{algorithm}
+
+\end{algorithm}
+
+\label{sec::overview}
+
+
+\begin{table}[h!]
+\centering
+\begin{tabular}{>{\columncolor{LightCyan1}}c>{\columncolor{mypink}}l}
+
+\hline
+
+\multicolumn{1}{c}
+
+{\textbf{Notation}} & \multicolumn{1}{c}{\textbf{Description}} 
+\\
+\hline
+$h$    & Hidden states \\ 
+
+$T_{s,t}$  & Tokens selected at the iteration t \\ 
+
+$T_{u,t}$  & Tokens unselected at iteration t\\ 
+
+$n_t$    & Noise predicted at iteration $t$ \\ 
+
+$t_0$  & The step before token pruning starts \\ 
+
+
+$f_t$ & A function which maps token to its frequency at step t \\ 
+
+
+$N$ & Total denoising steps  \\ 
+
+$\alpha$ & Percentage of tokens being unpruned  \\
+\hline
+\end{tabular}
+\caption{Notations used in the paper. %\ZJ{Let's add the iteration number $t$ into $T_s$ and $T_u$. Meanwhile, I don't think we need $RN_t$, since we can just use $n_t - n_{t_0}$ instead.} 
+}
+\label{tab:note}
+\end{table}
+
+We describe our Algorithm using the notations from Table~\ref{tab:note}:
+%\paragraph{Anchor Step.} The anchor step refers to the process of modifying the model's output, specifically by masking the output of a particular model layer.
+%\paragraph{Masking the Output}For each iteration $t$ in steps after Anchor Step, we only update the \texttt{hidden\_states} of the unmasked part.
+\paragraph{Relative Noise Magnitude}
+We utilize the variation in noise across timesteps to select tokens. Specifically, we introduce the concept of \textit{Relative Noise Magnitude}, defined as the difference between the current predicted noise and the noise at step $t_0$, which is defined as $n_t - n_{t_0}$ and quantifies the relative change in noise.
+
+Algorithm~\ref{alg:attn} is an example of how our method applies to the attention mechanism, though it can also be extended to other modules. We use attention here as an illustrative case, and Algorithm~\ref{alg:find_indices} describes how we get $T_s$ at each iteration.
+\begin{algorithm}
+\caption{Attention Forward Pass in CAT Pruning}
+\label{alg:attn}
+\begin{algorithmic}[1]
+
+\State  $Q, K, V \gets \texttt{Update}(T_s)$
+\State Compute attention: 
+\[
+\text{Attention}(Q, K, V) \gets \text{softmax}\left(\frac{QK^\top}{\sqrt{d_k}}\right)V
+\]
+\For{$i \in T_{s,t}$}
+    \State $h_t[i] \gets MLP(Attention(Q,K,V))$  \Comment{Update hidden states of selected tokens}
+\EndFor
+\For{$i \in T_{u,t}$}
+    \State $h_t[i] \gets h_{t-1}[i]$  \Comment{Reuse hidden states for unselected tokens}
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+%\textit{Attention Forward Pass.}
+%For the attention module, we update only the \texttt{h} of the selected tokens ($T_{\text{s}}$):
+%\begin{align*}
+%    Q, K, V &= \texttt{Update}(T_{\text{s}})
+%\end{align*}
+
+%The attention output is then computed as:
+%\begin{align*}
+%    \text{Attention}(Q, K, V) = \text{softmax}\left(\frac{QK^\top}{\sqrt{d_k}}\right)V
+%\end{align*}
+
+%\textit{Final Output.}
+%For tokens that are not selected ($T_{\text{unselected}}$), we reuse the predicted noise from the previous iteration:
+%\begin{align*}
+  %  n_t[i] &= n_{t-1}[i], i \in T_u
+%\end{align*}
+
+%Here, $t-1$ refers to the previous iteration during inference.
+
+
+% better give a figure example of attn calculation
+\subsection{Correlation Between Predicted Noise and Historical Noise}
+\label{sec::noise mag}
+
+Previous work has demonstrated that the changes in \textbf{features} across consecutive denoising steps are minimal. This observation motivates our decision to update only a subset of token features at each step, thereby reducing computations.
+
+Furthermore, \textbf{PFDiff} ~\citep{wang2024pfdifftrainingfreeaccelerationdiffusion} has pointed out a notably high similarity in \textbf{model outputs} for the existing ODE solvers in diffusion probabilistic models (DPMs), especially when the time step size $\Delta t$ is not extremely large. Building on these two phenomena, we selectively update features for tokens that exhibit substantial changes in their output values, while skipping the feature update and reusing the predicted noise from the previous iteration for the remaining tokens. This reduces computational overhead while maintaining accuracy.
+
+We further observe that the relative magnitude of the noise predicted by the model is correlated with the relative magnitude of historical noise. Specifically, $n_t- n_{t_{0}}$ is proportional to $n_{t-1}- n_{t_{0}}$. We demonstrate this by plotting the $\mathbf{L_2}$ norm of relative noise magnitude derived from different prompts and steps in Figure~\ref{fig:scatterplot}.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\linewidth]{figs/plot_pearson.png}
+    \caption{Scatter plot showing the norm of the relative noise at the current step versus the norm of the relative noise at the previous step. We calculate and visualize the Pearson correlation coefficient between these two values.}
+    \label{fig:scatterplot}
+\end{figure}
+
+
+
+\paragraph{Proposition 1.} Selecting tokens with larger relative noise in the current step increases the likelihood that these tokens will exhibit a larger relative noise in subsequent steps.
+
+Given that $t$ is the subsequent step of $t_0$, we provide a proof at timestep $t$ (the simpliest case as for time-step) to substantiate this claim in the appendix.
+
+
+
+\subsection{Balancing Noise-Based Token Selection with Distributional Considerations}
+\label{sec::balance}
+
+In previous iterations, we selected tokens for update based on their relative noise magnitude. While this method is effective in identifying significant changes, it narrows the selected tokens to a specific subset practically. 
+
+Inspired by the similarity between the denoising process and SGD \citep{Bottou2010LargeScaleML}, we propose to track the staleness of tokens based on the frequency of each token's selection, which is akin to staleness-aware techniques used in asynchronous SGD algorithms \citep{Dean2012LargeSD,Zhang2015StalenessAwareAF,Zheng2016AsynchronousSG}.
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=\linewidth]{figs/fig_distri.pdf}
+    \caption{\textbf{Visualization of Results Based on Noise Magnitude alone.} Selecting tokens purely by noise magnitude causes the indices to center around the teddy bear’s body (as shown in the first row), resulting in noticeable noise artifacts (second row) in the background and a lack of smoothness in the predicted noise.}
+    \label{fig:distri}
+\end{figure}
+We visualize the specific indices selected, the predicted noises, and the final generated images when tokens are chosen solely based on the magnitude of change. As shown in Figure~\ref{fig:distri}, repetitively focusing on certain tokens degrades the overall image by introducing inconsistencies and unbounded staleness. 
+
+Following the \textit{exploration and exploitation} ~\citep{Auer2002FinitetimeAO,Sutton1998ReinforcementLA} trade-off commonly used in reinforcement learning (RL) algorithms, we propose a more distributional-balanced (also staleness-aware) selection strategy. By incorporating the trade-off manually, we ensure that while tokens with significant noise changes are given certain priority, there is still a promising exploration of other tokens.
+
+
+For the \textit{exploration} part, we perform \textbf{Frequency Monitoring} track the selection of each token. To be more specific, we employ an exponentially weighted moving average (EWMA) to prioritize recent selections over earlier ones when measuring frequency:
+    \begin{align}
+        f_0 &= I_0, \\
+        f_n &= a \times f_{n-1} + I_n,
+    \end{align}
+    where \( f_t \) shows the moving average at integer time \( t \geq 0 \), and \( I_t \) is an indicator function that equals 1 when the token is selected at step \( t \).
+The \textit{exploitation} part continues to use $n_t- n_{t_{0}}$ as a criterion.
+
+
+
+
+As shown in Figure~\ref{fig:distri_aware}, considering the staleness of each token leads to smoother output noise and a final image that closely resembles the one generated by the full-size model.
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=\linewidth]{figs/distri_balanced.pdf}
+    \caption{\textbf{Visualization of Results Based on Noise Magnitude and Token Staleness.} Incorporating both staleness and noise magnitude in token selection yields a more balanced selection distribution, resulting in improved outputs with notably smoother backgrounds and smoother predicted noises.}
+    \label{fig:distri_aware}
+\end{figure}
+
+
+\subsection{Clustering Gives Rise to More Spatial Details}
+\label{sec::cluster}
+
+
+
+So far, our ultimate goal is to approximate the output image using token pruning. However, it happens that tokens at certain positions tend to change synchronously across iterations. 
+
+
+We observe that tokens with spatial adjacency tend to require similar selection frequencies. To verify this, we perform an ablation study where consecutive rows of the output are selected at each iteration (i.e. step $t_0+1$: row 1,2, step $t_0+2$: row 3,4). As demonstrated in Figure~\ref{fig:abl}, a simple sequential token selection strategy (column 3) yields strong results, even when masking 70\% of the tokens. Furthermore, incorporating clustering information (column 2) enhances detail preservation compared to its non-clustering counterpart, outperforming the naive sequential strategy. For example, in row 1, column 1, there is a lack of windows; in row 1, column 3, the windows appear blurry. In row 2, column 1, there is an inconsistent smile; in row 2, column 3, the heart is missing. However, column 2 does not have these issues, as it maintains spatial consistency and incorporates many details.
+
+
+
+
+Therefore, we maintain that the proposed pruning algorithm should also take the spatial co-relation into account so as to better appoximate the final output. To achieve this requirement, questions arise such as:
+\begin{enumerate}
+    \item How should we split the output into several spatial co-related clusters?
+    \item What value should we grant each spatial cluster?
+    \item How to perform token selection inside each cluster?
+\end{enumerate}
+
+\textbf{Enforcing Spatial-awareness while Clustering}
+Simple clustering is agnostic to spatial relations, which is essential to the performance. There are several approaches for spatial-aware clustering on graphs, including graph cuts \citep{Shi1997NormalizedCA} and GNN-based methods \citep{bianchi2020mincutpool}. We opt for positional encodings to enforce spatial-awareness due to their simplicity and low computational overhead.
+Our customized Positional Encoding is formulated as:
+\begin{equation}
+    \label{eq::3}
+    {pos\_enc}(i \cdot w + j, :) = \begin{cases} 
+\frac{i}{h}, & \text{if } 1 \leq k \leq \frac{d}{2} \\
+\frac{j}{w}, & \text{if } \frac{d}{2} + 1 \leq k \leq d
+    \end{cases}
+\end{equation}
+where $i$ and $j$ denote the row and column, respectively, and $d$ is the dimension of the noise magnitude.
+
+After adding this positional encoding, we perform KMeans \citep{MacQueen1967SomeMF} using $L_2$ as the clustering metric. We visualize the clustering (n=20) results of several different prompts in Figure~\ref{fig:clustering_results}.
+
+% add figures
+
+
+\textbf{Graph Pooling Fosters Inter-cluster Consistency}
+Meanwhile, we hope the value of each cluster preserves the feature of specific patches as well as its neighbors, and therefore we introduce 1 light-weighted Graph Pooling Layer, which is not trainable.
+
+\textbf{Preserves Distributional Balance within Each Cluster}
+Practically, we notice that it's also beneficial to introduce distributional balance inside each cluster. Thus for each selected cluster(each with $\sim 200$ tokens, we choose tokens according to their noise magnitude as well as their selection frequencies. This part is not included in Algorithm~\ref{alg:find_indices} just for simplicity.
+
+\textbf{Summary of Algorithm}
+
+Our algorithm proceeds as Algorithm \ref{alg:find_indices}:
+
+\begin{algorithm}[H]
+\caption{Finding Indices for CAT Pruning}\label{alg:find_indices}
+\begin{algorithmic}[1]
+\State \textbf{Input:} $i$, $t_0$, $n_i$, $n_{t_0}$
+\State $indices \gets []$
+\State $RN \gets n_i - n_{t_0}$
+\If{$i == t_0 + 1$}
+    \State $clusters \gets KMeans(pos\_enc+n_i- n_{t_{0}})$ \Comment{Cluster noise}
+    \State $graph\_scores \gets pool(clusters, n_i- n_{t_{0}}+pos\_enc)${\Comment{Aggregate cluster scores}}
+    \State $top\_clusters \gets topk(graph\_scores)$
+    \For{each $c \in top\_clusters$}
+        \State $indices \gets indices \cup topk((n_i- n_{t_{0}})[j], \text{ for } j \in c)$
+    \EndFor
+
+\Else
+    \State $graph\_scores \gets pool(clusters, pos\_enc+n_i- n_{t_{0}})$ \Comment{Use clusters from $t_0 + 1$}
+    \State $top\_clusters \gets topk(graph\_scores)$
+    \For{each $c \in top\_clusters$}
+        \State $indices \gets indices \cup topk((n_i- n_{t_{0}})[j], \text{ for } j \in c)$
+    \EndFor
+    \State $indices \gets indices \cup topk(-f_i(j), for j \notin indices )$ \Comment{Add stale tokens}
+\EndIf
+\State \textbf{return} $indices$
+\end{algorithmic}
+\end{algorithm}
+%\begin{enumerate}
+%    \item Compute the current noise magnitude for each token: \texttt{MSE}(\texttt{noise\_t}, \texttt{noise\_t0}), where \( t_0 \) is the anchor step.
+%    \item Incorporate positional encodings as outlined in  Eq~\ref{eq::3}.
+%    \item Perform clustering using K-means with L2 distance and \(n = 20\).
+%    \item Represent the 20 clusters as nodes and apply max graph pooling over them.
+%    \item Select the top-\(k\) clusters based on pooled outputs.
+%    \item Within each selected cluster, make token selection by considering both noise magnitude and selection frequency as outlined in Sec~\ref{sec::noise mag} and Sec~\ref{sec::balance}.
+%\end{enumerate}
+\vspace{-10pt}
+\begin{figure}[H]
+    \setlength{\abovecaptionskip}{5pt}
+    \setlength{\belowcaptionskip}{0pt}
+    \centering
+    \includegraphics[width=\linewidth]{figs/abl.pdf}
+    
+    \caption{\textbf{Comparative Analysis of Token Selection Strategies.} The first colomn displays images generated by selecting tokens based on noise magnitude and distributional balance. The second colomn incorporates clustering information for enhanced spatial coherence. The third colomn shows results from a naive strategy of sequential token selection. All strategies have pruned 70\% tokens, where $t_0 = 8, N = 28$.\\}
+    \label{fig:abl}
+\end{figure}
+
+\vspace{-28.5pt}
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\linewidth]{figs/cluster_res.pdf}
+    \caption{\textbf{The clustering results of different prompts.} For each token, clustering is performed based on its relative noise magnitude with positional encoding. We use the K-means algorithm with $L_2$ distance as the clustering metric. }
+    \label{fig:clustering_results}
+\end{figure}
+
+\section{Experiments}
+
+\subsection{Setups}
+\textbf{Models} We evaluate our method on several pretrained Diffusion Models: Stable Diffusion v3 and Pixart-$\Sigma$, which feature superior performance of text-to-image synthesis over various metrics.
+
+\textbf{Datasets} We select datasets that are adopted to evaluate text-to-image tasks, including MS-COCO 2017\citep{lin2015microsoftcococommonobjects} and PartiPrompts \citep{yu2022scalingautoregressivemodelscontentrich}, which contain 5K prompts and 1.6K prompts respectively.
+
+\textbf{Implementation Details} We evaluate our methods using 28 and 50 sampling steps, respectively. For both Stable Diffusion 3 and Pixart-$\Sigma$. We employ classifier-free guidance \citep{Ho2022ClassifierFreeDG} with guidance strengths of 7.0 and 4.5, consistent with their official demo settings. All inferences are performed in float16 precision on a single Nvidia A100 GPU. Both models generate images at a resolution of 1024 × 1024, reflecting real-world scenarios.
+
+\textbf{Baselines} We use both the output of the standard diffusion model and AT-EDM \citep{wang2024atedm} as baselines, and the latter is a token pruning technique. For AT-EDM, we implement its algorithm under the same token budget with our algorithm, which is starting token pruning at step 9 and pruning 70 \% tokens at each iteration. Specifically, since AT-EDM is actually designed for SD-XL, which utilizes token pruning and similarity-based copy, and in practical 30\% token budget is not suitable for similarity-based copy, so we combine the token selection algorithm in AT-EDM and the cache-and-reuse mechanism as a baseline.
+
+\textbf{Metrics}
+We report the following metrics: MACs, Throughput, Speed, and CLIP Score. MACs (Multiply-Accumulate Operations) highlights how CAT Pruning reduces computation. Meanwhile, the CLIP Score reveals the alignment between the generated outputs and the textual descriptions.
+
+
+\subsection{Main Results}
+\textbf{Analysis of Different Levels of Sparsity}
+In Figure~\ref{fig:sparse_abl_1} and Figure~\ref{fig:sparse_abl_2}, we present visualizations of generated images across various prompts and sparsity levels, characterized by the percentage of unpruned tokens, denoted as $\alpha$. As $\alpha$ increases, the generated content progressively approximates that of the full-sized model. Notably, there is little perceptible difference between $\alpha = 0.3$, $0.5$, $0.8$, and $\alpha = 1.0$ (the standard diffusion model output). However, at $\alpha = 0.2$, degradation becomes evident, such as the reduced number of windows and a missing eye in in Figure~\ref{fig:sparse_abl_2} compared to the standard output. Based on these observations, we select $\alpha = 0.3$ as the optimal value for all subsequent evaluations, striking a balance between model performance and computational efficiency. %We use 25 \% token-budget for tokens in top clusters, while 75 \% for tokens with less frequencies.
+
+\vspace{-1pt}
+\begin{figure}
+    \centering
+    \includegraphics[width=\linewidth]{figs/fig_sparse_abl_1.pdf}
+    \caption{\textbf{Qualitative Results with different sparsity and different prompts.} In these cases, even $\alpha = 0.2$ gives strong results. }
+    \label{fig:sparse_abl_1}
+\end{figure}
+\begin{figure}
+    \centering
+    \includegraphics[width=\linewidth]{figs/fig_sparse_abl_2.pdf}
+    \caption{\textbf{Qualitative Results with different sparsity and different prompts.} We find $\alpha = 0.3$ a sweet spot for the tradeoff between computation efficiency as well as the image quality.}
+    \label{fig:sparse_abl_2}
+\end{figure}
+% add a table of quality evaluation
+\textbf{Speedups}
+The results in Tab.~\ref{tab:28} demonstrate the performance of our method at 28 sampling steps. For Stable Diffusion 3 on the PartiPrompts dataset, we achieve a significant reduction in total computation, from 168.28T to 90.28T, yielding a 1.90$\times$ speedup while maintaining a comparable CLIP Score~\citep{Radford2021LearningTV,hessel2022clipscorereferencefreeevaluationmetric}. Similarly, for Pixart-$\Sigma$, our method delivers a 1.65$\times$ speedup with negligible impact on CLIP Score.
+
+We further evaluate our method under the $N=50$ setting: we could achieve about $2\times$ speedup while maintaining the overall performance and getting better CLIP Score compared to AT-EDM\citep{wang2024atedm}.
+
+Note that CAT Pruning consistently achieves better speedup than AT-EDM. One reason for this is that our method does not rely on the attention map when ranking tokens. This enables the direct use of \texttt{scaled\_dot\_product\_attention}, making it more compatible with other speedup techniques.
+
+
+
+\begin{table*}[h!]
+\centering
+\resizebox{\textwidth}{!}{ % Resizes the table to fit the width of the text
+\begin{tabular}{lxxxxyyyy}
+
+\toprule
+\multirow{2}{*}{\textbf{Method}} & 
+\multicolumn{4}{c}{\textbf{PartiPrompts}} & 
+\multicolumn{4}{c}{\textbf{COCO2017}} \\
+\cmidrule(lr){2-5} \cmidrule(lr){6-9}
+& \textbf{MACs} $\downarrow$ & \textbf{Throughput} $\uparrow$ & \textbf{Speed} $\uparrow$ & \textbf{CLIP Score} $\uparrow$ & \textbf{MACs} $\downarrow$ & \textbf{Throughput} $\uparrow$ & \textbf{Speed} $\uparrow$ & \textbf{CLIP Score} $\uparrow$ \\
+\midrule
+SD3 - 28 steps  & 168.28T & 0.233 & 1.00 $\times$ & \textbf{32.33} & 168.28T & 0.234 & 1.00 $\times$ & \textbf{32.47} \\
+%SD3 - 28 steps \texttt{torch.compile}  & 168.28T& 0.143& 1.20$\times$& 32.33  \\
+Ours - 28 steps   & \textbf{90.28T} & \textbf{0.444} & \textbf{1.90 $\times$} & 32.03 & \textbf{90.28T} & \textbf{0.438} & \textbf{1.87 $\times$} & 32.21 \\
+AT-EDM - 28 steps & 93.48T & 0.313 & 1.34 $\times$ & 31.07 & 93.48T & 0.313 & 1.34 $\times$ & 30.59 \\
+\midrule
+Pixart-$\Sigma$ - 28 steps & 120.68T & 0.301 & 1.00 $\times$ & \textbf{31.12} & 120.68T & 0.301 & 1.00 $\times$ & \textbf{31.36} \\
+Ours - 28 steps & \textbf{60.08T} & \textbf{0.498} & \textbf{1.65 $\times$} & 31.06 & \textbf{60.08T} & \textbf{0.478} & \textbf{1.59 $\times$} & 30.02 \\
+AT-EDM - 28 steps & 62.08T & 0.469 & 1.55 $\times$ & 24.30 & 62.08T & 0.450 & 1.50 $\times$ & 14.66 \\
+\bottomrule
+\end{tabular}
+}
+\caption{Comparison of different methods on PartiPrompts and COCO2017 datasets. All methods here adopt 28 sampling steps.}
+\label{tab:28}
+\end{table*}
+
+
+
+\begin{table*}[h!]
+\centering
+\resizebox{\textwidth}{!}{ % Resizes the table to fit the width of the text
+\begin{tabular}{lxxxxyyyy}
+\toprule
+\multirow{2}{*}{\textbf{Method}} & 
+\multicolumn{4}{c}{\textbf{PartiPrompts}} & 
+\multicolumn{4}{c}{\textbf{COCO2017}} \\
+\cmidrule(lr){2-5} \cmidrule(lr){6-9}
+& \textbf{MACs} $\downarrow$ & \textbf{Throughput} $\uparrow$ & \textbf{Speed} $\uparrow$ & \textbf{CLIP Score} $\uparrow$ & \textbf{MACs} $\downarrow$ & \textbf{Throughput} $\uparrow$ & \textbf{Speed} $\uparrow$ & \textbf{CLIP Score} $\uparrow$ \\
+\midrule
+SD3 - 50 steps  &300.50 T &0.131 & 1.00 $\times$& \textbf{32.92}&300.50 T & 0.132 & 1.00 $\times$ & \textbf{32.20}\\
+%SD3 - 50 steps \texttt{torch.compile}  & 168.28T& 0.143& 1.20$\times$& 32.33  \\
+Ours - 50 steps   &\textbf{136.70 T} &\textbf{0.281} & \textbf{2.15 $\times$} & 32.72 &\textbf{136.70 T}& \textbf{0.275} & \textbf{2.10 $\times$} & 32.18 \\
+AT-EDM - 50 steps &143.42T&0.183&1.40 $\times$ & 28.48&143.42T&0.181&1.38 $\times$&28.20\\
+\midrule
+Pixart-$\Sigma$  - 50 steps& 215.40T & 0.169 &1.00 $\times$ & \textbf{31.41}& 215.40T &0.169 & 1.00 $\times$ & \textbf{31.20}\\
+Ours - 50 steps & \textbf{88.24 T} & \textbf{0.343} & \textbf{2.03 $\times$} & 31.36 & \textbf{88.24 T }& \textbf{0.324} &  \textbf{1.92 $\times$} & 30.62\\
+AT-EDM - 50 steps &92.44T &0.291&1.72 $\times$&17.08 &92.44T& 0.297 & 1.76 $\times$ &11.00\\
+\bottomrule
+\end{tabular}
+}
+\end{table*}
+
+
+
+\subsection{Additional Metrics}
+We further evaluate our method on the ImageNet \citep{5206848} dataset by calculating the FID score. To prepare the dataset for text-to-image models, we first add captions of the form ``\texttt{a photo of a 〈class name〉}” to the images. We then randomly sample 1,000 images from the validation set and resize them to 1024×1024 for FID calculation. We report our results in Table~\ref{tab:imagent}. We observe that CAT Pruning reduces the latency while preserving the quality of the model.
+
+\subsection{Combination with Other Acceleration Methods}
+Cat Pruning can be combined with other acceleration methods such as DeepCache. We combine it with DeepCache \citep{ma2023deepcache}, where we apply the 1:N strategy (here N = 2) and enable Cat Pruning after step 8 to enable further speedups. The results in Table~\ref{tab:combination} show that CAT Pruning could be integrated seamlessly with DeepCache, with a speedup of 2.03$\times$.
+\begin{table}[H]
+\centering
+
+\begin{tabular}{lzzz}
+
+\toprule
+\multirow{1}{*}{\textbf{Method}} & 
+\multicolumn{3}{c}{\textbf{ImageNet}}  \\
+\cmidrule(lr){2-4}  & \textbf{Throughput} $\uparrow$ & \textbf{Speed} $\uparrow$ & \textbf{FID} $\downarrow$\\
+\midrule
+SD3 - 28 steps &0.235&1.00 $\times$& \textbf{71.94} \\
+Ours - 28 steps &\textbf{0.446} &\textbf{1.87 $\times$}& 72.43\\
+AT-EDM - 28 steps &0.314 &1.33 $\times$& 79.60 \\
+\bottomrule
+\end{tabular}
+
+\caption{Comparison of different methods on ImageNet. All methods here adopt 28 sampling steps and $\alpha = 0.3$.  For each column, we report the best result in bold.}
+\label{tab:imagent}
+\end{table}
+\begin{table}[H]
+\centering
+
+\begin{tabular}{lzzz}
+
+\toprule
+\multirow{1}{*}{\textbf{Method}} & 
+\multicolumn{3}{c}{\textbf{ImageNet}}  \\
+\cmidrule(lr){2-4} & \textbf{Throughput} $\uparrow$ & \textbf{Speed} $\uparrow$ & \textbf{FID} $\downarrow$\\
+\midrule
+SD3 &  0.235&1.00$\times$&\textbf{71.94}\\
+Ours + DeepCache  & \textbf{0.478}&\textbf{2.03$\times$}&72.49\\
+
+
+\bottomrule
+\end{tabular}
+
+\caption{ Comparison of different methods on ImageNet. All methods here adopt 28 sampling steps and $\alpha = 0.3$.}
+\label{tab:combination}
+\end{table}
+
+\section{Conclusion }
+In this paper, we introduce a novel acceleration strategy for diffusion models that combines token-level pruning with cache mechanisms. By selectively updating a subset of tokens at each iteration, we significantly reduce computational overhead while preserving model performance. 
+
+Our experiments demonstrated that the proposed method effectively maintains generative quality, achieving up 50\% reduction in MACs at 28-denosing-step and 60 \% at 50-denosing-step. We evaluated our approach on standard datasets and pretrained diffusion models, showing that it produces results comparable to the original models.
+
+
+
+
+
+\bibliographystyle{ims}
+\bibliography{main}
+\appendix
+\section{Appendix}
+
+\subsection{Proof of Propositon 1.}
+Let $T_{s,t-1}$ and $T_{u,t-1}$ denote the selected and unselected token sets, respectively. At step $t-1$, we assume:
+\vspace{-5pt}
+\[
+\texttt{n}[i], \quad i \in T_{s,t-1} > \texttt{n}[i], \quad i \in T_{u,t-1}
+\]
+\vspace{-3pt}
+For the hidden states $h$ at step $t$:
+\vspace{-0.5pt}
+\begin{align*}
+    h_t[T_{{u,t}}] &= h_{t-1}[T_{{u,t}}], \\
+    h_t[T_{{s,t}}] &= \texttt{Update}(T_{{s,t}})
+\end{align*}
+\vspace{-2pt}
+Thus, $h$ for the unselected tokens remains unchanged, while the selected tokens are changed based on their current activations using a model specific function \texttt{Update}.
+
+\vspace{-2pt}
+From this, we have:
+
+\vspace{-10pt}
+\[
+\text{MSE}(h_t, h_{t-1})[i], \quad i \in T_{\text{s,t}} > \text{MSE}(h_t, h_{t-1})[i], \quad i \in T_{\text{u,t}}
+\]
+
+\vspace{-5pt}
+Since the predicted noise is a function of the hidden states, the magnitude of the predicted noise relative to noise at step $t_0$ is directly tied to the change in hidden states.
+
+
+As a result, at each step, we select tokens based on their relative noise magnitude.
+
+
+\end{document}
+
+

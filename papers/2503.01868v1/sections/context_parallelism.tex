@@ -1,0 +1,119 @@
+\section{Training Multi-Hybrids on Long Sequences}\label{sec:context_parallelism}
+
+\paragraph{Notation}
+
+In the following, we consider an input of shape $[\tOne, \tH, \tL]$, with batch size $\tOne$, hidden size $\tH$ and length $\tL$ and omit the leading $\tOne$. The discussion can be safely extended to inputs with larger batch sizes following standard data parallelism. For a CP group consisting of $\tNcp$ devices, the input is sharded along the sequence dimension and split across each of the devices in the group, so that each rank holds an input shard of shape $[\tH, \tLoverNcp]$. 
+
+
+\subsection{Background}
+\textit{Context parallelism} (CP) refers to a collection of distributed training techniques designed to handle the growing size of models and the increasing dimension of their inputs by processing segments of the full input sequence. Context parallelism complements other distributed training techniques such as data parallelism, tensor parallelism, sequence parallelism\footnote{Context and sequence parallelisms refer to different techniques by popular convention. Sequence parallelism distributes the sequence outside tensor parallel regions e.g., normalization layers}, pipeline parallelism and other strategies for partitioning of model parameters, gradients and optimizer states \citep{rajbhandari2020zero,zhao2023pytorch}.
+
+% Context parallelism revolves around the idea of handling input shards with a total of $\tOne {\times} \tH {\times} \tLoverNcp$ elements on each CP rank to efficiently process extremely long inputs.
+
+\paragraph{\texttt{All-to-all} context parallelism} 
+
+In \texttt{a2a} context parallelism, each device is allowed to exchange data with every other device in the context parallel group to reconstruct the entire input sequence and hold hidden dimension splits on each CP rank instead. Concretely, the $\tNcp$ shards of shape $[\tH, \tLoverNcp]$ are redistributed among all devices, such that each device ends up with shards of shape $[\tHoverNcp \tL]$ instead. This allows each rank to independently carry out sequence mixing (e.g., attention, or convolutions). It is important to emphasize that the hidden dimension must be split in such a way that no additional communication is required to successfully complete the operation. Extended background is provided in Section \ref{sup-sec:ulysses}.
+
+% Since the backward pass propagates gradients following the inverse order of operations, it requires two additional \texttt{a2a} calls to send the gradients to the devices where the corresponding shards originally came from.
+
+\paragraph{\texttt{Point-to-point} context parallelism} 
+
+While \texttt{a2a} CP allows processing long inputs across multiple devices, the cost of running the operator over the whole sequence can still be very expensive. Furthermore, naive {\tt a2a} can lower utilization without appropriate overlap of communication and computation, as {\tt a2a} calls can take a significant amount of time with larger message sizes. To overcome some of these issues, \textit{point-to-point} ($\texttt{p2p}$) context parallelism allows ranks to exchange data directly with a single peer at a time rather than broadcasting to all devices. These schemes essentially perform several rounds of blocked computation and communication. 
+Section \ref{sup-sec:p2p-att} describes the common ring-based algorithm for attention \citep{liu2023ring}.
+% As a result, computing self attention on shards of size $[\mathtt{1,H//N_{CP}, L}]$ can still be very expensive.
+
+
+
+
+
+
+% In the early days of Deep Learning, when models and single inputs were small enough to fit in a single GPU, \textit{Data Parallelism} (DP) was sufficient to scale training across multiple devices. In DP, a copy of the whole model is loaded on each GPU, and the batched inputs of shape $[\mathtt{B,\ H,\ L}]$ are split across $\mathtt{N_{DP}}$ devices across the batch dimension. During the forward pass, inputs of shape $[\mathtt{B//N,\ H,\ L}]$ are passed on each GPU. During the backward pass, the gradients are synced across all GPUs and each copy of the model is updated.
+
+% As the size of both the inputs and models used grow, DP is not longer sufficient for training and inference. As a consequence, many other parallelism strategies have been developed to further split model and input parts across multiple devices. Context Parallelism (CP) --also sometimes referred to as Sequence Parallelism-- divides the sequence dimension of an input tensor $[\mathtt{1,\ H,\ L}]$ across $\mathtt{N_{CP}}$ devices, such that each device only handles inputs of size $[\mathtt{1,\ H, L//N_{CP}}]$ at all times.\footnote{DP is the most efficient form of parallelization as communication only occurs across model gradients. This is different from CP as well as other parallelization techniques, where communication happens on each operation, e.g., each self-attention operation. Consequently, we assume that DP has been applied up to a point that $\mathtt{B}{=}\mathtt{C_{DP}}$, before considering CP.} By doing so, it is possible to extend the long-context capabilities of Foundational Models.
+
+% \textbf{Algorithms for Context Parallelism.} Algorithms for context parallelism can be classified according to their communication strategy for sharing information among the $\mathtt{N_{CP}}$ devices in the Context Parallel group. These can be either \texttt{all-to-all} (\texttt{a2a}) or \texttt{point-to-point} (\texttt{p2p}).
+
+% \subsubsection{\texttt{all-to-all} Context Parallelism} 
+
+% In \texttt{a2a} context parallelism, each device exchanges data with every other device in the CP group so that the entire input sequence is reconstructed and then split across the hidden dimension. Concretely, during the forward pass, an input of shape $[\mathtt{1,\ H, L//N_{CP}}]$  is exchanged in such a way that each device ends up with data of shape $[\mathtt{1,\ H//N_{CP}, L}]$. Importantly, this process is not merely a reshape. Instead, actual data transfer occurs among all devices. Once this redistribution is complete, each device performs computations on each split on the corresponding subset of the hidden channels. To this end, it is important to consider that the hidden dimension is split in such a way that no additional communication is required when processing it. For example, in the case of self-attention, where operations happen independently over each head, the hidden dimension $\mathtt{H}$ is divided such that $\mathtt{num\_heads // H_{CP}}$ are hold on each device. Once the operation is complete, a second $\texttt{a2a}$ exchange is used to transform the output following the shape of the input $[\mathtt{1,\ H, L//N_{CP}}]$ for the following layers.% call is performed to reconstruct the output following the same input as the input, i.e., $[\mathtt{1,\ H, L//N_{CP}}]$.
+
+% \textit{Backward-pass.} During the backward pass, gradients flow backwards following the information that lead to the output. Consequently, it follows that the backward pass also requires two $\texttt{a2a}$ calls during its execution. 
+
+% \subsubsection{\texttt{point-to-point} Context Parallelism} 
+
+% In $\texttt{p2p}$ context parallelism, each device in the Context Parallel group exchanges data directly with a single peer at a time, rather than broadcasting to all devices. Arguably, the most popular implementation of $\texttt{p2p}$ context parallelism is Ring-Attention [CIT]. Here, devices are arranged in a ring, each holding a portion of the query of shape $[\mathtt{1,\ H, L//N_{CP}}]$. During the Ring Attention process, devices pass along portions of the key and value tensors, each of shape  $[\mathtt{1,\ H, L//N_{CP}}]$ following the ring arrangement. The self-attention operation is then performed between the query portion stationed in each device and the transmitted key-value portions. After $\mathtt{N_{CP}}$ steps, each consisting of $\mathtt{N_{CP}}$ parallel $\mathtt{p2p}$ calls, each query will have seen all key-value portions and the full attention operation is concluded. 
+
+% \textit{Backward-pass.} Similarly to the \texttt{a2a} case, gradients must be sent backwards following the same communication strategy across devices. Specifically, the backward pass incurs in additional $\mathtt{N_{CP}}$ steps of $\mathtt{N_{CP}}$ parallel $\mathtt{p2p}$ calls. % to the corresponding  the same number of communications 
+
+% \subsection{Should we use \texttt{a2a} or \texttt{p2p} Context Parallelism?}
+% A natural question that emerges from these different types of CP is whether there is a predominantly best alternative. This is a difficult question that encompasses several factors. From a technical perspective, the main factors that decide one over the other are (\textit{i}) the number of communication calls that must be performed, (\textit{ii}) the size of the information that is exchanged among devices, and (\textit{iii}) the complexity of the operations finding place within each device.% Additionally, one might consider the human effort required for the implementation.
+
+% In the case of self-attention, the complexity of the self-attention operation grows quadratically relative to the sequence length. For a2a and p2p operations, the sequence length corresponds to $\mathtt{L}$ and $\mathtt{L//N_{CP}}$, respectively. From this standpoint, a p2p based operation may seem as the best solution. However, it is important to keep in mind that in the p2p case, the self-attention operation must be computed $\mathtt{N_{CP}}$ times, whereas in the a2a case, this must happen only once. In terms of the amount of information that must be moved around, both approaches have similar requirements for self-attention.
+
+% In conclusion, there is no clear best between both methods, and differences can result from the hardware and communication infrastructure used. Therefore, it is recommended that multiple alternatives are tried out in particular settings to evaluate performance metrics.
+
+\subsection{Context Parallel Hyena Operators}
+
+
+
+%In this section we discuss our Context Parallel implementation for the short, medium and long hyena layers used in StripedHyena-2.
+Sequence mixing in Hyena operators is implemented via convolutions with different filter lengths, which need to be addressed appropriately when implementing context parallelism. We first present the general \texttt{a2a} and \texttt{p2p} CP formulations for general causal convolutions, followed by modifications specifically tailored to FFT convolutions.%  the core formulation for both of these operators in a general manner. Subsequently, we discuss the implementation of both \texttt{p2p}-based and \texttt{a2a}-based CP formulations and discuss their operability and benefits for both conventional and FFT convolutions.
+
+\paragraph{\texttt{All-to-all} convolutions (Fig.~\ref{fig:a2a_convs})}
+
+Let us consider an input sharded along the sequence dimension over $\tNcp$ ranks, such that each rank holds a split of shape $[\tH, \tLoverNcp]$. Analogous to the general \texttt{a2a} context parallel formulation, we perform communication across all CP ranks so that input shards of shape $[\tHoverNcp, \tL]$ are held on each device, then convolve\footnote{Both causal and non-causal convolutions are supported in this case.} each shard within the context parallel region. Finally, we perform an additional {\tt a2a} operation.
+
+For convolutional operators in multi-hybrids, additional considerations are needed. First, filters can be stored or materialized directly inside each context parallel region. In \textsf{Hyena-SE}, each context parallel rank stores $\tHoverNcp$ filters in the depthwise case, without grouping. Care must be taken to ensure filter groups are not split across context parallel ranks. In \textsf{Hyena-MR} and \textsf{Hyena-LI}, computation of the filters can be run in each context parallel region, keeping implicit or regularization parameters sharded. If {\tt a2a} parallelism is used as the scheme of choice for the inner convolution, gating can be performed outside the context parallel region, to avoid communication overheads.
+
+% \begin{equation*}\label{eq:a2a}
+% \begin{aligned}
+% y_t^{\alpha} &= ({\color{red!70}q_t^{\beta}} {\color{blue!70}G^{\beta}_{t t'}} {\color{red!70}k_{t'}^{\beta}} v_{t'}^{\beta}) M^{\beta \alpha}
+% \end{aligned}
+% \end{equation*}
+
+
+During the backward pass, gradients must be sent back to their incoming ranks during the forward call. Consequently, this involves calling two additional {\tt a2a} calls, plus the backward function on the convolutional operation on each rank.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.99\textwidth]{figures/a2a_v2.pdf}
+    \caption{Diagram of computation and communication in \texttt{all-to-all convolutions}. This context parallelism strategy can be used in both inner hyena convolutions (corresponding to multiplication with $G_{t t'}$,  Eq. \ref{eq:hyena_structure}) or featurizer convolutions ($T_{tt'}$, $H_{tt'}$, $K_{tt'}$). Filters are stored or computed in each context parallel rank to avoid communication overheads. The convolution inside the context parallel region can be computed with any algorithm e.g., FFT-based or direct.}
+    \label{fig:a2a_convs}
+\end{figure}
+
+\begin{note}{colback=blue!5}
+    \textbf{[Extension] \texttt{All-to-all} channel-pipelined convolutions:} One drawback of {\tt a2a} methods is that communication latency can create bottlenecks when the message size is large, with a small fraction of time spent on compute. For {\tt a2a}, this occurs when model size and sequence length grows. One strategy is to pipeline {\tt a2a} calls and asynchronously overlap compute and communication using CUDA streams. Instead of pipelining over sequence length \citep{yao2024training}, we explore pipelining over channels to hide some of the communication latency. Concretely, we chunk inputs $[\tH, \tLoverNcp]$ into ${\tt N_{pipe}}$ segments and run an asynchronous loop of {\tt a2a} calls, scheduling to overlap compute and following {\tt a2a} call.
+\end{note}
+
+
+
+
+
+\paragraph{{\tt Point-to-point} convolutions (Fig.~\ref{fig:p2p_convs})} Analogous to the self-attention case, \texttt{p2p} context parallel causal depthwise convolutions implements context parallelism while using communication with a single peer at a time. Let us consider the usual sharded input, with each rank holding $[\tH, \tLoverNcp]$, to be causally convolved with a filter $[\tH, \tK]$. We detail the depthwise case, but the grouped depthwise case can be obtained as a simplification. For FIR filters, one can exploit locality of the operation to simplify the implementation compared to {\tt p2p} attention. In particular, the causal convolution can be performed locally on most of the input elements without the need for communication. Only the first $\mathtt{\ell_h{-}1}$ elements on each shard rely on computation to be performed on a different rank, namely the last $\mathtt{\ell_h{-}1}$ elements of the previous shard. Note that each rank keeps or materializes copies of the convolutional filters, since each rank is responsible for computing convolutions across all $\tH$ channels. This is in contrast to {\tt a2a} schemes, which have ranks operate on chunks of channels independently. Figure \ref{fig:p2p_convs} provides a schematic of the algorithm.
+
+
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.75\textwidth]{figures/p2p_v2.pdf}
+    \caption{Diagram of computation and communication in \texttt{point-to-point convolutions}. This approach is best suited for FIR convolutions in \textsf{Hyena-SE} and \textsf{Hyena-MR}.}
+    \label{fig:p2p_convs}
+\end{figure}
+
+\begin{note}{colback=blue!5}
+    \textbf{[Extension] \texttt{Point-to-point} convolutions with overlapping communication:} Since only the first $\mathtt{\ell_h - 1}$ elements of each shard require inputs located on a different rank, we overlap local operations and \texttt{p2p} communication to further improve utilization. This process is illustrated in Supplementary Figure ~\ref{sup-fig:overlapping_comm}. Instead of waiting for the overlap segment to arrive before computing the convolution, we start the local convolution with a zero-padded input and simultaneously start the communication of the previous segment. Once communication is concluded, an additional convolution over the right-padded overlap of shape $[\tOne, \tH, \mathtt{2}\mathtt{(\ell_h{-}1)}]$ and the convolutional kernel is performed. The result of this convolution is subsequently added to the first $\mathtt{\ell_h - 1}$ elements of the previous output. Interestingly, this algorithm relies on similar decomposition techniques as those involved in our two-stage block convolution approach (Section \ref{sec:kernel_optimizations}). 
+\end{note}
+
+\begin{note}{colback=blue!5}
+\textbf{[Extension] \texttt{Point-to-point} FFT Convolutions:}
+%
+While the previous CP algorithms can also be used for \textsf{Hyena-LI}, convolutions with long filters are generally implemented via Fast Fourier Transform (FFT) algorithms. FFT convolution relies on the fact that convolution is equivalent to multiplication in the Fourier domain:
+\begin{equation}
+    (x * h) = \mathsf{F}^{-1}(\mathsf{F}(x) \circ \mathsf{F}(h)), \label{eq:fft_conv}
+\end{equation} where $\mathsf{F}, \mathsf{F}^{-1}$ are the Fourier and inverse Fourier transform, respectively. 
+
+FFTs require access to the entire input sequence. At first glance, one could think it mandatory to host the whole sequence in a single rank. Interestingly, it is possible to compute both the Fourier and inverse Fourier transform --and thus the FFT convolution-- in a $\mathtt{p2p}$ fashion without ever hosting the whole sequence on a single device, by introducing communication during iterative steps of the FFTs.  Unfortunately, without further optimizations, we generally observed {\tt a2a} approaches to be faster for \textsf{Hyena-LI}. For completeness, we report the derivation in Appendix \ref{appx:p2p_fftconv}).
+
+
+\end{note}
+

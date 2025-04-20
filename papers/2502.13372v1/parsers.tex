@@ -1,0 +1,136 @@
+\section{Semantic Parser}
+
+\subsection{Semantic Parsing Pipeline}
+\label{sec:semantic_parser}
+%% define single motion
+The goal of our semantic parsing pipeline is to convert a natural language description of motions into a verification program written in our motion verification DSL.
+%
+The primary challenge is to map each part of a natural language sentence into corresponding predicates with appropriate parameters. 
+%
+As shown in Figure~\ref{fig:parser}, our semantic parsing pipeline consists of five stages: 
+(1) we resolve object and motion co-references (e.g. identifying that ``it'' refers to ``the black square''),
+(2) we break the input prompt into atomic sentences, each of which describes a single motion (e.g. breaking down ``it rotates, while expanding'' into ``it rotates'' and ``while [it] expanding''),
+(3) we extract a set of predicates from information contained within each atomic sentence (e.g. \texttt{type(m, "rotate")} and \texttt{magnitude(m, 90)} from ``rotates by 90 degrees'',
+(4) we add timing predicates that constraint the relative sequencing of motions by examining timing-related phrases, and
+(5) we compose the final verification program by using logical operators to chain predicates together.
+% \maneesh{Instead of intra- and inter- sentence processing stages we should give those two stages more descriptive names. Stage 4 seems to be about sequencing and stage 3 about single motions, or some such.}
+
+%% dependendy parsing
+Our pipeline works with natural language sentences in the format of their dependency parsing trees.
+We use a roberta-based transformer
+model~\cite{liu2019roberta} trained as a dependency parser~\cite{honnibal2020spacy} to convert a sentence into a tree rooted at its main verb.
+Each node is a word and the edge between the node and its parent is decorated with the grammatical dependency relationship between them. 
+Other linguistic information like a word’s part of speech and lemma is also stored with a node.
+For example, ``the square translates'' will be converted into a tree rooted at the verb ``translate''.
+The noun ``square`` becomes the child of ``translate'' with the dependency tag as \textit{nsubj}, the nominal subject of the verb.
+
+
+
+\subsection{Semantic Parser}
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=\textwidth]{figs/fig_parser.pdf}
+    \caption{
+        The processing pipeline of our semantic parser. 
+    }
+    \label{fig:parser}
+\end{figure*}
+
+
+
+\subsubsection{Stage 1: Resolve object and motion co-references}
+The goal of this stage is to identify segments of text that refer to the same objects or motions, as it is common to refer to previously mentioned entities in natural language.
+%
+To resolve co-references to objects, we use the fastcoref model~\cite{otmazgin2022fastcoref}.
+As shown in Figure~\ref{fig:parser}, this places ``the black square'' and ``it'' in the same co-reference cluster.
+%
+For motion co-references, we identify \textit{motion verbs}, defined as verbs that are synonyms of either ``translate'', ``rotate'', or ``scale,'' and compare the content of their subtrees that each acts as a modifier for one of the seven attributes of the motion entailed by that verb.
+If the content of the subtrees describing the same attribute match, we mark these verbs as co-references of each other.
+For example, for the prompt ``The black square spins. While the square is rotating, the circle scales up.'' we would categorize ``spins'' and ``is rotating'' as co-references as they share the same motion type (rotation) and the same subject (the black square).
+Note that verbs referencing previous motions need to sit within a subordinate clause (e.g. ``is rotating'' is within a adverbial clause), as we assume verbs in main clauses always introduce new motions.
+% matching algorithm
+% NOTE: More specifically, we first find pairs of verbs that are synonyms of each other, where the first verb in a pair appears earlier in the prompt and is in a main clause, and the second verb appears later and is in a subordinate clause.
+
+% Take Example Input 2, we are going to compare the dependency parse trees of “the black square spins” and “while the square is rotating”
+
+\subsubsection{Stage 2: Split motion sentences into atomic ones}
+Our motion verification DSL is designed to chain together predicates that put constraints on \textit{single motions} and their temporal relationships, where we define a \textit{single motion} to mean a motion entity consisting of the seven attributes listed in Table~\ref{fig:table_predicate}.
+%
+Our semantic parser builds on the assumption that people would use a motion verb to introduce a new motion. 
+Because English has syntactic structures that allow multiple verbs to be in the same sentence (``rotates'' and ``expanding'' in Figure~\ref{fig:parser}), the goal of this stage is to split them into atomic sentences that each only contain one motion verb as the tree root.
+%
+% splitting
+For a given dependency parse tree, we find all motion verb nodes.
+If any two of these nodes are directly connected and neither node is a co-reference of another motion, then we remove the edge between them.
+This might leave one of the verbs without an object, such as the verb ``expanding'' in Figure~\ref{fig:parser}.
+In this case, we look for the closest node with the dependency tag \textit{nsubj} (nominal subject) or \textit{dobj} (direct object) in the original tree and attach it to the dangling verb (e.g. adding ``it'' to ``expanding'').
+
+%% collapsing
+The English language also allows the use of an auxiliary verb in addition to the main verb to introduce a motion, such as “animate the square to rotate” and “make the square expand”.
+The dependency trees of these constructions will have these non-motion verbs (``animate'' and ``make'') as roots.
+We resolve this by combining the pair of main and auxiliary verb into one node and reattaching their original subtrees to be under the combined node.
+
+\subsubsection{Stage 3: Extract motion attribute predicates}
+The goal of this stage is to extract information from each atomic sentence to output a set of predicates that put constraints on various attributes of a single motion described by that sentence.
+
+%% root as type and child
+We first classify the root verb node into one of ``translate'', ``rotate'', and ``scale'' to build the predicate \texttt{type(m, <type>)}.
+Then, we find the verb node's direct subtree with a \textit{nsubj} or \textit{dobj} as the content of that subtree contains information about \texttt{agent()}.
+Within that subtree, we look for words that describe the color and shape of that object and use those words as parameters for the \texttt{shape()} and \texttt{color()} predicates.
+If a node within that subtree has a lemma of ``every'', ``each'', and ``all'', we mark this agent as plural and use \texttt{all()} later instead of \texttt{iota()}.
+
+%% each subtree is a modifier
+For the rest of the direct subtrees, we assume that each acts as modifiers that add additional constraints to the motion.
+%% relative
+We first search within those subtrees to look for mentions of other objects and build predicates for them with the same process described above.
+These objects act as reference objects to be used as parameters for various predicates.
+%%
+In order to map the contents of direct subtrees to corresponding predicates in our DSL, we use SetFit~\cite{tunstall2022setfit} to fine-tune a sentence transformer on a multi-label vocabulary dataset of attribute descriptions we curated manually (e.g. mapping ``upwards'' to \texttt{direction()}).
+%% conflation
+The key reason behind a multi-label classifier is to handle the linguistic phenomenon of ``conflation'', where a single expression can contain multiple categories of constraints.
+For example, our transformer-based classifier will map ``expanding'' in Figure~\ref{fig:parser} to both \texttt{type()} and \texttt{direction()}, as it signals an upward scaling motion.
+
+%% subtree splitting
+There are cases where different prepositional phrases are not directly being attached to the verb, although it is semantically modifying it.
+In those cases, our transformer classifier will not be able to classify the subtree into any categories. 
+To address this, we split it into smaller trees at each prepositional node, and resubmit each tree segment into the transformer for classification.
+\jiaju{short example here?}
+
+%% extract parameters
+After a subtree is being mapped to corresponding predicates, we extract relevant parameters for the predicates as follows:
+\jiaju{might want to shorten this}
+
+% \vspace{-5mm}
+% \begin{description}
+\begin{description}[style=unboxed,leftmargin=0.5cm]
+    \item[\texttt{direction()}]
+    We use another fine-tuned sentence transformation to classify the subtree text into one or more of \{up, down, left, right, clockwise, counterclockwise, x-axis, y-axis\}.
+    If the type of motion is translation, we map up to [0,1], down to [0, -1], left to [-1, 0], and right to [1, 0].
+    If the type of motion is rotation, we map clockwise to ``clockwise'' and counterclockwise to ``counterclockwise''.
+    If the type of motion is scaling, we map up to +1, down to -1, x-axis to [1,0], and y-axis to [0,1]. If no axis is specified, then we use [1,1]. We then output the final direction is up/down * axis. For example, ``up in x'' is [1, 0]
+    
+    \item[\texttt{magnitude()}]
+    We look for node with the part of speech \textit{NUM} and use that as the parameter if the motion type is translate or rotate
+    If the type is scale, we do NUM $\cdot$ axis with the axis vector obtained from before
+    
+    \item[\texttt{origin()}]
+    We check if the subtree text contains a string pattern of (num1, num2) and use those as absolute parameters.
+    If a reference object has been extracted from this subtree, we use that as the parameter instead.
+    
+    \item[\texttt{duration()}]
+    We look for node with type “nummod” or parts of speech as NUM and use that as the parameter.
+    
+    \item[\texttt{post()}]
+    We use a separate transformer classifier to convert the subtree text to its corresponding spatial concept predicate, with arguments being the current motion agent and the reference object.
+\end{description}
+
+\subsubsection{Stage 4: Add timing constraints}
+The goal of this stage is to parse out words or phrases that add timing constraints between any two single motions.
+For each atomic sentence’s dependency parse tree, we again use the fine-tuned sentence transformer to classify its subtrees that have not been process in the last stage. 
+We only handle one label at this stage: timing
+If a timing subtree is found, we use another transformer classifier to map the subtree text into one of the timing predicates in our verification DSL \jiaju{be more specific?}.
+\jiaju{Add details about how parameters are determined}
+
+\subsubsection{Stage 5: Write an motion verification program}
+We output the final program by using \texttt{and} to join together predicates that belong to the same variables.
+We use \texttt{exists} for a motion if it’s not involved in any timing predicates, and use \texttt{iota} otherwise.

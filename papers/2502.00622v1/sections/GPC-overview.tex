@@ -1,0 +1,57 @@
+%!TEX root = ../main.tex
+
+\section{Overview of Generative Predictive Control}
+\label{sec:gpc}
+
+Let $I_t$ be the information vector summarizing the state of the robot and the environment up to time step $t$. For state-based robot control, $I_t := x_t$ is the (low-dimensional) state of the robot and its environment (e.g., poses); for vision-based robot control, $I_t := o_{t-H:t}$ is the history of (high-dimensional) visual observations where each $o_t$ is a single (or multi-view) image(s). Let $a_t$ be the robot action at time $t$ and $a_{t:t+T}$ be an \emph{action chunk} of length $T+1$. Our goal is to design a robot control policy that decides $a_{t:t+T}$ based on $I_t$ to solve certain tasks (e.g., described by language instructions). 
+
+Let us formalize the three modules of \nameshort.
+
+\textbf{Generative policy training}. We ask humans to teleoperate robots to solve the tasks. The expert demonstrations are then divided into clips of data containing pairs of state information and action chunks, i.e., a dataset $\calD_{\expert}^P = \{ I_t^{i} \leftrightarrow a_{t:t+T}^{i} \}_{i=1}^{N_\expert}$ with number of samples $N_\expert$. Policy learning becomes a supervised learning problem with input $I_t$ and output $a_{t:t+T}$.\footnote{It is also common to include language instructions as input to the policy as in vision-language-action (VLA) models~\cite{kim2024openvla}. \nameshort can generalize to VLAs in a straightforward way. We exclude language here to focus on motion planning.} In \nameshort, we follow the diffusion policy learning framework~\cite{chi2023diffusion}. Specifically, we feed $I_t$ into a network that parametrizes the score function of the conditional distribution $p(a_{t:t+T} |I_t)$, using which Gaussian noise vectors are gradually diffused to expert action chunks. The score function network is trained using denoising prediction~\cite{ho2020denoising}. Policy learning leads to a policy network $\calP(\cdot)$ that predicts action chunks $a_{t:t+T}$ given state information $I_t$. It is important to note that $\calP(\cdot)$ is \emph{stochastic} and effectively a sampler from the (approximate) conditional distribution $p(a_{t:t+T} | I_t)$, meaning that given $I_t$, we can draw many possible action chunks $(a_{t:t+T}^{(1)},\dots, a_{t:t+T}^{(K)})$ from $\calP(\cdot)$. We call each action chunk $a_{t:t+T}$ an \emph{action proposal}.
+% We will leverage this in online planning.
+
+\textbf{Predictive world modeling}. The fact that $\calP(\cdot)$ is stochastic leads to a natural question: which one of the $K$ action proposals should be selected? The world model precisely aims to answer this question by predicting the future consequences of each action proposal. To build the world model, we need pairs of $(I_t,a_{t:t+T})$ (current state information plus an action chunk) and $I_{t+1:t+T+1}$ (future state information). The expert demonstrations used for policy training already contain such pairs, i.e., a dataset $\calD_\expert^W = \{(I^i_t, a^i_{t:t+T}) \leftrightarrow I_{t+1:t+T+1}^i \}_{i=1}^{N_\expert}$. Nevertheless, as we show in \S\ref{sec:experiments}, if we train the world model only using $\calD_\expert^W$, the predictive power of the world model is insufficient to guide action proposal selection. One can collect more expert demonstrations to enlarge the datasets, but it can be expensive. Instead, we posit that \emph{random exploration} data are not only easier to collect, but also rich in dynamics. Therefore, we collect another exploration dataset $\calD^W_\explore =\{(I^i_t, a^i_{t:t+T}) \leftrightarrow I_{t+1:t+T+1}^i \}_{i=1}^{N_\explore}$ where humans (or any other controllers) are asked to randomly perturb the system without solving any tasks. In control theory terminology, the goal of this is to perform ``system identification'' with ``sufficient excitation''~\cite{lennart1999system}. We combine the two datasets $\calD^W := \calD^W_\expert \cup \calD^W_\explore$ to train the world model. Details of the design of the world model architecture are deferred to \S\ref{sec:world-model}. For now, the reader can assume we obtain a model $\calW(\cdot)$ that predicts the future $I_{t+1:t+T+1}$ conditioned on the current state information and the action proposal $(I_t, a_{t:t+T})$.
+
+\textbf{Online planning}. We now formalize the two online planning algorithms, namely \gpcrank and \gpcopt, that combine the policy $\calP(\cdot)$ and the world model $\calW(\cdot)$ (\cf Fig.~\ref{fig:overview}). We assume a reward model $\calR(\cdot): I_{t+1:t+T+1} \rightarrow r_{t}$ is available that predicts the reward given the future state information, e.g., a small neural network that is separately trained.
+
+\begin{enumerate}[label=(\roman*)]
+    \item \gpcrank is based on the simple intuition to pick the action proposal with highest reward. Formally, we sample $K$ action proposals from the policy
+    \bea \label{eq:sample}
+    (a_{t:t+T}^{(1)},\dots, a_{t:t+T}^{(k)}, \dots, a_{t:t+T}^{(K)}) \sim \calP(I_t),
+    \eea
+    and output the best proposal by passing them through the world model $\calW(\cdot)$ and computing respective rewards:
+    \bea \label{eq:rank}
+    \pi(I_t) = a_{t:t+T}^{(k_\star)}, \quad k_\star \in \argmax_{k=1,\dots,K} \ \calR(\calW(I_t, a_{t:t+T}^{(k)})),
+    \eea
+    where we used the notation $\pi(\cdot)$ to denote the online policy in contrast to the offline policy $\calP(\cdot)$. The underlying assumption of \gpcrank is that, due to distribution shifts, the optimal action chunk at test time may not have the highest likelihood in $\calP(\cdot)$, and thus may need more samples to be discovered. The world model---assuming it is learned from a richer distribution because of random exploration---will pick up the optimal action chunk through~\eqref{eq:rank}. A nice property of \gpcrank is that it can be easily parallelized. 
+    \item \gpcopt takes a different perspective by directly solving the reward maximization problem given the world model:
+    \bea \label{eq:max-reward}
+    \max_{a_{t:t+T}} \calR(\calW(I_t, a_{t:t+T})),
+    \eea 
+    where the action chunk are viewed as decision variables. The difficulty is, however, problem~\eqref{eq:max-reward} can be highly nonconvex due to the nonlinearity and nonsmoothness of $\calW(\cdot)$ and $\calR(\cdot)$. Fortunately, the pretrained policy $\calP(\cdot)$ comes to rescue because it narrows down the search space by providing good initializations to solve~\eqref{eq:max-reward}, i.e., warmstarts. Formally, we sample an action chunk $\hat{a}_{t:t+T}$ from $\calP(\cdot)$ and perform $M$ steps of gradient ascent starting from $\hat{a}_{t:t+T}$ (assuming $\calR(\cdot)$ is differentiable):
+    \bea \label{eq:ascent}
+    \hspace{-4mm} \hat{a}_{t:t+T}^{(0)} := \hat{a}_{t:t+T} \sim \calP(I_t), \text{ and for }\ell = 1, \dots, M \text{ do:} \nonumber
+    \\
+    \hspace{-4mm} \hat{a}_{t:t+T}^{(\ell)} = \hat{a}_{t:t+T}^{(\ell-1)} + \eta^{(\ell)} \nabla_{a_{t:t+T}} \calR(\calW(I_t, \hat{a}_{t:t+T}^{(\ell-1)})),
+    \eea 
+    where $\eta^{(\ell)}>0$ are step sizes.
+    The online policy outputs the final optimized action chunk
+    \bea \label{eq:gpc-opt}
+    \pi(I_t) = \hat{a}_{t:t+T}^{(M)}.
+    \eea
+    Since the gradients in~\eqref{eq:ascent} are readily available from automatic differentiation, gradient ascent can be carried out using off-the-shelf optimizers like ADAM. Readers familiar with the optimal control literature will recognize \gpcopt is the classical single shooting algorithm~\cite{diehl2011numerical}. Compared to \gpcrank which evaluates the world model $K$ times, \gpcopt evaluates the world model $M$ times. The former can be parallelized but the latter cannot.
+\end{enumerate}
+
+\gpcrank and \gpcopt can be combined. We can sample $K$ action proposals from $\calP(\cdot)$ and for each proposal perform reward maximization according to~\eqref{eq:ascent}, leading to $K$ optimized action chunks. We pick the optimized action chunk with highest reward. \gpcrankopt can be viewed as solving the optimization~\eqref{eq:max-reward} from multiple initializations~\cite{sharony2024learning}, and requires $K\times M$ evaluations of the world model. 
+
+We provide a succinct summary of \nameshort in Algorithm~\ref{alg:gpc}. 
+
+% \yd{Maybe adding pseudocode this combined algorithm (our final one) could potentially be helpful}
+
+\input{sections/alg-gpc}
+
+\begin{remark}[Connection with Offline RL]\label{offline-rl}
+    It is worth noting that the composition of the reward model $\calR(\cdot)$ and the world model $\calW(\cdot)$ can be identified as the so-called Q-value function in offline RL, as they predict the reward of an action chunk $a_{t:t+T}$ given the current information $I_t$. However, there are three subtle differences between \nameshort and offline RL. (a) \nameshort learns an explicit dynamics model instead of just approximating the Q-value function (this is similar to model-based offline RL). (b) The composition of $\calR(\cdot)$ and $\calW(\cdot)$ provides a Q-value function for ``action chunks'' while the usual Q-value function involves a single action. (c) \nameshort learns the dynamics model using diverse trajectories (without rewards), instead of only expert demonstrations. In \S\ref{sec:experiments}, we compare \nameshort with an offline RL method adapted from single action to action chunk and show that \nameshort outperforms offline RL.
+\end{remark}
+
+The above overview of \nameshort highlights the importance of the world model in both ranking and optimizing action proposals. Indeed, the concept of a learned world model dates back to early pioneering works on deep visual foresight~\cite{finn2017deep}. In the next section, we will show that modern diffusion models are the key enabler for learning (near) physics-accurate visual world models that were not possible before. 

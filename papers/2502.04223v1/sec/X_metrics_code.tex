@@ -1,0 +1,241 @@
+\subsection{Reference code for confusion matrix metrics}
+
+\begin{lstlisting}[
+    caption=iou\_conf\_mat.py,
+    basicstyle=\tiny,
+    language=python,
+    keepspaces=true,
+    showspaces=false,
+    showstringspaces=false
+]
+from typing import Optional
+
+import torch
+from scipy.optimize import linear_sum_assignment
+from torchvision.ops.boxes import box_iou
+
+
+def compute_iou_confusion_matrix(
+        target_boxes: torch.Tensor,
+        pred_boxes: torch.Tensor,
+        target_classes: torch.Tensor,
+        pred_classes: torch.Tensor,
+        num_classes: int,
+        iou_threshold: float = 0.5,
+        confusion_matrix: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    Computes the confusion matrix for the given bounding boxes and classes.
+    Will compute the IoU, and assign the best matching boxes to each other
+    using Hungarian Matching.
+    If the IoU is less than the threshold, the box will be considered as a
+    false positive.
+
+    Args:
+        target_boxes: tensor of shape (num_targets, 4<x1, y1, x2, y2>)
+        pred_boxes: tensor of shape (num_preds, 4<x1, y1, x2, y2>)
+        target_classes: tensor of shape (num_targets,)
+        pred_classes: tensor of shape (num_preds,)
+        num_classes: number of classes
+        iou_threshold: threshold for iou
+        confusion_matrix: tensor of shape  (num_classes + 1, num_classes + 1),
+            where +1 is the unmatched (background) class. The rows are 
+            the target classes, and the columns are the predicted classes.
+            If None, a new tensor will be created.
+    
+    Returns:
+        confusion_matrix: tensor of shape (num_classes + 1, num_classes + 1),
+            where +1 is the unmatched (background) class. The rows are 
+            the target classes, and the columns are the predicted classes.
+    """
+    if confusion_matrix is None:
+        confusion_matrix = torch.zeros(
+            num_classes + 1, num_classes + 1, dtype=torch.int64
+        )
+
+    if (target_boxes.ndim == 0 or len(target_boxes) == 0) and \
+            (pred_boxes.ndim == 0 or len(pred_boxes) == 0):
+        return confusion_matrix
+    elif pred_boxes.ndim == 0 or len(pred_boxes) == 0:
+        for i in target_classes:
+            confusion_matrix[i, -1] += 1
+        return confusion_matrix
+    elif target_boxes.ndim == 0 or len(target_boxes) == 0:
+        for j in pred_classes:
+            confusion_matrix[-1, j] += 1
+        return confusion_matrix
+
+    iou = box_iou(target_boxes, pred_boxes)
+    iou[~(iou > 0)] = 0
+
+    target_idx, pred_idx = linear_sum_assignment(-iou.cpu().numpy())
+    # Find unassigned indexes
+    # pred_idx is sorted!
+    pred_idx = torch.tensor(pred_idx, dtype=torch.int64)
+    target_idx = torch.tensor(target_idx, dtype=torch.int64)
+    unassigned_pred = torch.ones(len(pred_classes), dtype=torch.bool)
+    unassigned_pred[pred_idx] = False
+    unassigned_target = torch.ones(len(target_classes), dtype=torch.bool)
+    unassigned_target[target_idx] = False
+
+    for i in range(len(target_classes)):
+        if unassigned_target[i]:
+            confusion_matrix[target_classes[i], -1] += 1
+    for j in range(len(pred_classes)):
+        if unassigned_pred[j]:
+            confusion_matrix[-1, pred_classes[j]] += 1
+
+    iou_mask = iou > iou_threshold
+    for i, j in zip(target_idx, pred_idx):
+        if iou_mask[i, j]:
+            confusion_matrix[target_classes[i], pred_classes[j]] += 1
+        else:
+            confusion_matrix[target_classes[i], -1] += 1
+            confusion_matrix[-1, pred_classes[j]] += 1
+
+    return confusion_matrix
+\end{lstlisting}
+
+\begin{lstlisting}[
+    caption=conf\_mat.py,
+    basicstyle=\tiny,
+    language=python,
+    keepspaces=true,
+    showspaces=false,
+    showstringspaces=false
+]
+from typing import Optional, Sequence
+import torch
+
+
+class ConfusionMatrix:
+    # NxN confusion matrix
+    confusion_matrix: torch.Tensor
+
+    # True positive for each class. The true positives represent the number of
+    # predictions that were matched to a target.
+    tp: torch.Tensor
+
+    # False positive for each class. The false positives represent the number of
+    # predictions that were not matched to a target.
+    fp: torch.Tensor
+
+    # False negative for each class. The false negatives represent the number of
+    # targets that were not matched to a prediction.
+    fn: torch.Tensor
+
+    # True negative for each class. The true negatives represent the number of
+    # predictions that were not matched to a target.
+    tn: torch.Tensor
+
+    # Total number of predictions for each class
+    sum_preds: torch.Tensor
+
+    # Total number of targets for each class
+    sum_targets: torch.Tensor
+
+    # The sum of the confusion matrix.
+    samples: torch.Tensor
+
+    # The sum of the true positives.
+    correct: torch.Tensor
+
+    # Precision for each class
+    _class_precision: Optional[torch.Tensor] = None
+
+    # Recall for each class
+    _class_recall: Optional[torch.Tensor] = None
+
+    def __init__(self, confusion_matrix: torch.Tensor, last_is_no_match: bool) -> None:
+        """
+        Args:
+            confusion_matrix: tensor of shape (num_classes + 1, num_classes + 1),
+                where +1 is the unmatched (background) class. The rows are the
+                target classes, and the columns are the predicted classes.
+            last_is_no_match: If true, expect the last column/row to be the no
+                match class.
+        """
+        self.confusion_matrix = confusion_matrix
+        self.samples = self.confusion_matrix.sum()
+        self.sum_preds = self.confusion_matrix.sum(dim=0)
+        self.sum_targets = self.confusion_matrix.sum(dim=1)
+        self.tp = self.confusion_matrix.diag()
+        if last_is_no_match:
+            # The counts are over all, but only consider the positive classes
+            self.sum_preds = self.sum_preds[:-1]
+            self.sum_targets = self.sum_targets[:-1]
+            self.tp = self.tp[:-1]
+        self.fp = self.sum_preds - self.tp
+        self.fn = self.sum_targets - self.tp
+        self.tn = self.samples - self.sum_preds - self.sum_targets + self.tp
+        self.correct = self.tp.sum()
+
+    @property
+    def precision(self) -> torch.Tensor:
+        """
+        Returns the precision for each class.
+        """
+        if self._class_precision is None:
+            self._class_precision = self.tp / torch.clamp(self.tp + self.fp, min=1)
+        return self._class_precision
+
+    @property
+    def recall(self) -> torch.Tensor:
+        """
+        Returns the recall for each class.
+        """
+        if self._class_recall is None:
+            self._class_recall = self.tp / torch.clamp(self.tp + self.fn, min=1)
+        return self._class_recall
+
+    @property
+    def f1(self) -> torch.Tensor:
+        """
+        Returns the F1 score for each class.
+        """
+        return 2 * self.precision * self.recall / (self.precision + self.recall)
+
+    @property
+    def accuracy(self) -> torch.Tensor:
+        """
+        Returns the accuracy for each class.
+        """
+        return (self.tp + self.tn) / (self.tp + self.tn + self.fp + self.fn)
+
+    @property
+    def macro_precision(self) -> torch.Tensor:
+        """
+        Returns the macro precision.
+        """
+        return self.precision.mean()
+
+    @property
+    def balanced_accuracy(self) -> torch.Tensor:
+        """
+        Returns the balanced accuracy. This equals the macro recall.
+        "how likely will an individual of that class be classified correctly?"
+        """
+        return self.recall.mean()
+    
+    @property
+    def macro_f1(self) -> torch.Tensor:
+        """
+        Returns the macro F1 score. 
+        "high Macro-F1 values indicate that the algorithm has good performance
+        on all the classes, whereas low Macro-F1 values refers to poorly
+        predicted classes."
+        """
+        return (
+            2 * self.macro_precision * self.balanced_accuracy / 
+            (1/self.macro_precision + 1/self.balanced_accuracy)
+        )
+
+    @property
+    def overall_accuracy(self) -> torch.Tensor:
+        """
+        Returns the overall accuracy. This equals the micro-F1, micro-precision,
+        and micro-recall.
+        """
+        return self.correct / self.samples
+
+\end{lstlisting}

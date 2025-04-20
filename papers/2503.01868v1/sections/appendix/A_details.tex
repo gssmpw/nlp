@@ -1,0 +1,430 @@
+\section*{Author Contributions}
+\noindent
+
+M.P. conceptualized the research; M.P. implemented the first version of the training infrastructure; J.K., E.N., D.W.R., G.Bri., B.Y., A.T., D.P.B., G.Bro., B.L.H., M.P., contributed to pretraining infrastructure; J.K., E.N., G.Bri., and M.P. designed pretraining experiments; M.P., E.N., designed the architectures; M.P. derived and implemented the first version of the two-stage block kernel; J.K. optimized the kernel and wrote the backward pass; S.M., M.P., extended the theory in section 3; D.W.R., B.Y., M.P., derived and implemented context parallelism for hyena and attention layers; D.W.R., derived and implemented the point-to-point scheme for spatial and FFT convolutions; M.P., G.Bri., A.V., wrote and optimized the inference stack; A.X.L., contributed to inference stack; C.R., P.D.H., B.L.H., S.E., M.P., supervised the project.
+
+
+\section{Appendix: Additional Results}
+
+\subsection{Additional Algorithms for Direct Convolution on Tensor Cores}\label{sec:two_stage_algo_tensor_cores}
+
+Modern GPU accelerators include \emph{tensor cores} capable of high-throughput dense matrix multiplications (\texttt{GEMM}). In the context of the two-stage block algorithm described in Section~\ref{sec:two_stage_algo}, an effective strategy is to recast small matrix-vector products into larger \texttt{GEMM} kernels that better exploit these tensor units. Below, we focus on a \emph{single group of $d_g$ channels}, which all share one depthwise FIR filter of length $\ell_h$. We assume $\ell_h \le 2\,\ell_b$, so only two $(\ell_b\times \ell_b)$ Toeplitz blocks are needed for the filter:
+\[
+    H_0, \quad H_1 \;\in\; \RR^{\ell_b \times \ell_b}.
+\]
+These blocks respectively handle the “current-chunk” taps and the “spillover” taps from the preceding chunk. We provide here a different algorithm to transform direct convolutions into {\tt GEMMs}, even without grouping. The idea is to parallelize across the chunks, rather than channels.
+
+\paragraph{Block decomposition and dimensions.} Let $\hat{X}_n \;\in\; \RR^{\ell_b \times d_g}$, $\hat{Y}_n \;\in\; \RR^{\ell_b \times d_g}$
+denote the $n$-th input and output blocks (or \emph{chunks}) for the group. Here, $\ell_b$ is the block size along the time dimension, and $d_g$ is the number of channels in the group. According to the two-stage block convolution framework (cf.\ Section~\ref{sec:two_stage_algo}), each output block is given by
+%
+\begin{equation}
+\label{eq:two_stage_tensor_core_single_group}
+    \hat{Y}_n 
+    \;=\;
+    H_0 \,\hat{X}_n
+    \;+\;
+    H_1 \,\hat{X}_{n-1},
+    \qquad
+    n \;=\; 0,1,\dots,\bigl\lceil \tfrac{\ell}{\ell_b} \bigr\rceil - 1,
+\end{equation}
+%
+with the convention that $\hat{X}_{-1} = 0$ (i.e., the “previous chunk” is zero for $n=0$). In particular, $H_0$ and $H_1$ are constant for all chunks $n$ once the filter has been fixed. Differently from the grouped algorithm proposed in the main text, this approach parallelizes across chunks, requiring the a reshape on the input.
+
+\paragraph{Mapping to tensor cores.}
+Equation \eqref{eq:two_stage_tensor_core_single_group} naturally translates into two matrix-matrix multiplications plus an elementwise addition:
+\[
+    \hat{Y}_n
+    \;=\;
+    \underbrace{H_0\,\hat{X}_n}_{(\ell_b\times \ell_b)\,\times\,(\ell_b\times d_g)}
+    \;+\;
+    \underbrace{H_1\,\hat{X}_{n-1}}_{(\ell_b\times \ell_b)\,\times\,(\ell_b\times d_g)}.
+\]
+Because $H_0$ and $H_1$ remain unchanged for all $n$, the following procedure can be used to implement \eqref{eq:two_stage_tensor_core_single_group} efficiently on GPUs:
+%
+\begin{enumerate}
+    \item \textbf{Filter preload}  
+    Load $H_0$ and $H_1$ from global memory into low-latency on-chip memory (e.g., shared memory). This is a one-time overhead amortized across all chunks.
+    \item \textbf{Chunk read}  
+    Read the current chunk $\hat{X}_n$ (and the previous chunk $\hat{X}_{n-1}$ if $n>0$) from global memory into local registers or shared memory. 
+    \item \textbf{Tensor-core \texttt{GEMM}}
+    Perform the matrix multiplications $H_0 \,\hat{X}_n$ and $H_1 \,\hat{X}_{n-1}$ on the tensor cores, accumulating the two partial results into $\hat{Y}_n$.
+    \item \textbf{Output writeback}  
+    Write the output block $\hat{Y}_n$ to global memory.
+\end{enumerate}
+%
+\paragraph{Cost model}
+The floating-point cost per chunk follows directly from \eqref{eq:two_stage_tensor_core_single_group}. Each chunk output $\hat{Y}_n$ requires two matrix multiplications of dimension $(\ell_b \times \ell_b)$ by $(\ell_b \times d)$ for a total of $2\,\ell_b^2\,d$ floating-point operations. Summing over all $\lceil \ell/\ell_b \rceil$ chunks, the total floating-point operations per sequence (for a single group) is $2\,\ell_b^2\,d\,\lceil \ell/\ell_b \rceil$.
+
+% \paragraph{Memory Traffic.}
+% By storing $H_0$ and $H_1$ on-chip, the principal global memory transfers for each chunk are
+% \begin{equation}\label{eq:memory_transfers}
+%     \underbrace{\ell_b \cdot d}_{\text{read }\hat{X}_n}
+%     \;+\;
+%     \underbrace{\ell_b \cdot d}_{\text{read }\hat{X}_{n-1}\ (n>0)}
+%     \;+\;
+%     \underbrace{\ell_b \cdot d}_{\text{write }\hat{Y}_n}.
+% \end{equation}
+% Hence, the total memory traffic grows \emph{linearly} in the sequence length $\ell$, rather than in the filter length $\ell_h$.
+
+% \paragraph{Extension to Multiple Groups.}
+% Although each group of $d$ channels has its own $H_0$ and $H_1$ matrices, modern GPUs can schedule these computations in parallel across different groups. A common implementation strategy is to assign each group to one GPU thread block (or warp-level unit), allowing each group's filter blocks to reside persistently in shared memory. This approach retains the benefits of temporal locality while leveraging hardware concurrency for multiple groups.
+
+\subsection{Context Parallel Methods}
+
+\subsubsection{All-to-All Attention}\label{sup-sec:ulysses}
+
+In the case of self-attention, where channels ${\tt D}$ are split into groups (heads), and operations happen independently over each head, the sharding is done such that an integer number of heads is held on each device. Once the operation is complete, a second $\texttt{a2a}$  exchange is used to return to the input shape of $[\mathtt{1,H, L//N_{CP}}]$. {\tt a2a} context parallelism has been used in attention parallelization strategies, such as DeepSpeed Ulysses \citep{jacobs2023deepspeed}.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.99\textwidth]{figures/a2a_self_attn.pdf}
+    \caption{Diagram of computation and communication in \texttt{all-to-all self-attention}. Attention heads are split across devices such that an integer number of heads is held on each device. Then, self-attention is performed locally on each device and subsequently, the output is exchanged across all ranks to reconstruct the original shape of the input.}
+    \label{fig:a2a_self_attn}
+\end{figure}
+
+
+\subsubsection{Point-to-Point Attention}\label{sup-sec:p2p-att}
+
+Ring attention methods propose a $\texttt{p2p}$ solution for self-attention. For simplicity, let us assume that the query, key and value projections of the input are all of same size as the input shape $[\mathtt{\tH, \tLoverNcp}]$. Ring-Attention arranges CP ranks in a ring, each holding a portion of the query. Consequently, Ring Attention (RA) \citep{liu2023ring} passes portions of the key and value tensors, each of shape $[\mathtt{\tH, \tLoverNcp}]$ following the ring arrangement. At each stage, self-attention is performed between the query stationed in each device and the transmitted key-value portions. Global statistics are updated online on each device based on each upcoming key value portions to compute the softmax. After $\tNcp$ steps, each consisting of $\tNcp$ parallel $\mathtt{p2p}$ calls, the shards of the queries held on each device will have seen all key-value portions, and each device will hold a shard of the final attention result. Combining this result with the online softmax operation, full attention operation can be concluded without ever holding the whole sequence on a single device.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.99\textwidth]{figures/p2p_ring_attn.pdf}
+    \caption{Diagram of computation and communication in \texttt{(point-to-point) ring self-attention}. The key and value chunks are communicated in a ring arrangement until all devices have seen all of the chunks. Once all chunks have been seen, partial results can be reduced to complete the attention operation.}
+    \label{fig:p2p_ring_self_attn}
+\end{figure}
+
+
+\subsubsection{Considerations for Causal Models.}\label{sup-sec:causal} When causal transformers are used, e.g., for autoregressive tasks, computations follow a triangular structure. \citet{brandon2023striped} noticed that this triangular structure causes load imbalances in Ring-Attention in causal autoregressive settings. To overcome this problem, they propose to shard the input across CP devices using $2{\times}$ as many shards as CP ranks and accommodate $2$ shards on each CP rank using their introduced \textit{striped ordering}. For example, for $\{\vec{x}_{j}\}_{j=1}^{2 \tNcp}$ shards with $\tNcp{=}\mathtt{4}$, shards are organized as: $[\vec{x}_{0}, \vec{x}_{4}]$, $[\vec{x}_{1}, \vec{x}_{5}]$, $[\vec{x}_{2}, \vec{x}_{6}]$, $[\vec{x}_{3}, \vec{x}_{7}]$ on each rank respectively. \citet{dubey2024llama} proposed an improved load balancing strategy for the training of Llama-3 by distributed shards following a \textit{zig-zag splitting}. Specifically, for the same case with $\{\vec{x}_{j}\}_{j=1}^{2 \tNcp}$ shards and $\tNcp{=}\mathtt{4}$, shards are organized as: $[\vec{x}_{0}, \vec{x}_{7}]$, $[\vec{x}_{1}, \vec{x}_{6}]$, $[\vec{x}_{2}, \vec{x}_{5}]$, $[\vec{x}_{3}, \vec{x}_{4}]$ on each rank respectively.
+
+For the training of StripedHyena 2, we adopt the zig-zag splitting of \citet{dubey2024llama}. We note that the choice of sharding strategy has no major implications for any of the \texttt{a2a} and \texttt{p2p} CP strategies introduced before. For \texttt{a2a}, the zigzag arrangement must now be considered when reconstructing the sequence. For \texttt{p2p}, two buffers must be kept on each rank, each representing the attention operation on each split.%the main difference is that the zigzag arrangement must be considered  the only difference caused by this different splitting strategy is the direction on which s
+
+% While zig-zag splitting is utilized to balance load in self-attention operations, we modify our CP implementations of convolutional operators to support zig-zag splitting as well. This in order to additional unnecessary reshape operations between attention and Hyena layers. Fortunately, just as for self-attention, zigzag splitting does not have major implications for any of our \texttt{a2a} and \textit{p2p} implementations. 
+
+% For \texttt{a2a}, the zigzag arrangement must be considered when reconstructing the sequence. For \texttt{p2p}, the exchange of overlapping regions becomes bidirectional, with one split passing its overlapping section to the left, and the other to the right. Since we overlap communication, these do not have any impact on performance.
+
+
+\subsubsection{Point-to-point FFT Convolutions}\label{appx:p2p_fftconv}
+
+As mentioned in the main text, the idea behind \texttt{p2p} Context Parallelism is to perform an operation over an input of shape [$\tOne, \tH, \tL$] sharded along the sequence dimension onto $\tNcp$ devices, each holding a shard of shape [$\tOne, \tH, \tLoverNcp$], without ever holding the whole sequence on a single device. 
+
+% An advantage of \texttt{p2p} FFT convolutions is that it reduces the complexity of the operation from $\mathcal{O}(\tL \log \tL)$ to $\mathcal{O}(\tLoverNcp \log (\tLoverNcp))$.
+
+This section heavily relies on the FFT derivation and the multiple Radix-$N$ algorithms presented in \citet{takahashi2019fast}. We refer interested readers to that textbook for additional details.
+
+\paragraph{Primer on the Fast Fourier Transform.} 
+
+The name Fast Fourier Transform (FFT) comes from an algorithm that, as its name indicates, allows computing the Discrete Fourier Transform fast. Computing the Discrete Fourier Transform naively has quadratic complexity. However, the FFT is able to achieve the same result with $\mathcal{O}(\tL \log \tL)$ complexity, by using a divide and conquer formulation. 
+
+To understand the FFT, we start from the Discrete Fourier Transform (DFT) defined as:
+\begin{equation}
+y(k) = \mathrm{DFT}_l(x) = \sum_{j=0}^{l-1} x(j)\omega_l^{jk}, \quad 0 \leq k \leq l-1,
+\label{eq:dft}
+\end{equation}
+where \(\omega_l {=} e^{-2\pi i / l}\) and \(i {=} \sqrt{-1}\), applied to an input $x$ of length $l{=}4$. The DFT of $x$ can be calculated as:
+% \begin{equation}
+% \begin{aligned}
+% y(0) &= x(0)\omega^0 + x(1)\omega^0 + x(2)\omega^0 + x(3)\omega^0, \\
+% y(1) &= x(0)\omega^0 + x(1)\omega^1 + x(2)\omega^2 + x(3)\omega^3, \\
+% y(2) &= x(0)\omega^0 + x(1)\omega^2 + x(2)\omega^4 + x(3)\omega^6, \\
+% y(3) &= x(0)\omega^0 + x(1)\omega^3 + x(2)\omega^6 + x(3)\omega^9,
+% \end{aligned}
+% \label{eq:first_form}
+% \end{equation}  
+% which can be expressed more simply in a matrix-vector product form as:
+\begin{equation}
+\begin{bmatrix}
+y(0) \\ 
+y(1) \\ 
+y(2) \\ 
+y(3)
+\end{bmatrix}
+=
+\begin{bmatrix}
+\omega^0 & \omega^0 & \omega^0 & \omega^0 \\ 
+\omega^0 & \omega^1 & \omega^2 & \omega^3 \\ 
+\omega^0 & \omega^2 & \omega^4 & \omega^6 \\ 
+\omega^0 & \omega^3 & \omega^6 & \omega^9
+\end{bmatrix}
+\begin{bmatrix}
+x(0) \\ 
+x(1) \\ 
+x(2) \\ 
+x(3)
+\end{bmatrix}.
+\label{eq:second_step}
+\end{equation}
+Importantly, the terms $\omega_l^{jk}$ are not independent. In fact, there is a relation $\omega_l^{jk} {=} \omega_l^{jk \bmod l}$, which we can use to rewrite Eq.~\ref{eq:second_step} as follows:
+\begin{equation}
+\begin{bmatrix}
+y(0) \\ 
+y(1) \\ 
+y(2) \\ 
+y(3)
+\end{bmatrix}
+=
+\begin{bmatrix}
+1 & 1 & 1 & 1 \\ 
+1 & \omega^1 & \omega^2 & \omega^3 \\ 
+1 & \omega^2 & \omega^0 & \omega^2 \\ 
+1 & \omega^3 & \omega^2 & \omega^1
+\end{bmatrix}
+\begin{bmatrix}
+x(0) \\ 
+x(1) \\ 
+x(2) \\ 
+x(3)
+\end{bmatrix}.
+\end{equation}
+At this point, we can observe that there are several values that repeat themselves. Using some algebra and reorganizing the position of the output positions in the vector, we arrive at the following decomposition:
+\begin{equation}
+\begin{bmatrix}
+y(0) \\ 
+y(2) \\ 
+y(1) \\ 
+y(3)
+\end{bmatrix}
+=
+\begin{bmatrix}
+1 & \omega^0 & 0 & 0 \\ 
+1 & \omega^2 & 0 & 0 \\ 
+0 & 0 & 1 & \omega^1 \\ 
+0 & 0 & 1 & \omega^3
+\end{bmatrix}
+\begin{bmatrix}
+1 & 0 & \omega^0 & 0 \\ 
+0 & 1 & 0 & \omega^0 \\ 
+1 & 0 & \omega^2 & 0 \\ 
+0 & 1 & 0 & \omega^2
+\end{bmatrix}
+\begin{bmatrix}
+x(0) \\ 
+x(1) \\ 
+x(2) \\ 
+x(3)
+\end{bmatrix}.
+\label{eq:final_matrix_form_example}
+\end{equation}
+Looking at this decomposition, we observe two important things: First, the first of the matrices is a blockwise matrix, corresponding to two DFTs of half the size of the initial sequence length. In the general case, it holds that, an $l$-point DFT can be decomposed onto two $\frac{l}{2}$-point DFTs followed by some arithmetic operations.\footnote{While this observation is already enough for us to describe \texttt{p2p} FFT convolutions, it is worth noticing that the FFT repeats this process until the input can no longer be split, i.e., $l{=}2$. This recursive split procedure is that makes the FFT fast.} Specifically, for an input $x$ of length $l$, divided onto two chunks $x(j)$, $x(j + l / 2)$, its DFT is given by:
+\begin{equation}
+\begin{aligned}
+y(k) &= \mathrm{DFT}_{l/2}\big(x(j) + x(j + l/2)\big) \\
+y(k + 1) &= \mathrm{DFT}_{l/2}\left(\omega^j_l (x(j) - x(j + l/2))\right).
+\end{aligned}
+\label{eq:fft_decomposition}
+\end{equation}
+Secondly, it is important to note that while the values of $x$ are organized sequentially in Eq.~\ref{eq:final_matrix_form_example}, the values of its DFT $y$ have been permuted following a bit reversal order. In the general case, there exist two types of FFT depending on whether the input is assumed to be organized sequentially --in which case the output is bit reversed--, or whether the input is assumed to be bit reversed --in which case the output is organized sequentially. These are known as \textit{Decimation-in-Frequency} (DiF) and \textit{Decimation-in-Time} (DiT) FFT algorithms, respectively. Equation \ref{eq:fft_decomposition} depicts the DiF FFT algorithm.
+
+\paragraph{Butterfly diagrams.} A powerful, intuitive way to visualize the flow of data in DiF and DiT FFTs are butterfly diagrams. Butterfly diagrams illustrate the data exchange in DiF and DiT FFTs, which are based on two operations:
+
+\par\vspace{-1em} % Force a new paragraph and reduce vertical space
+
+\noindent
+\begin{minipage}[t]{0.45\textwidth}
+\begin{equation}\label{eq:butterfly:DiF}
+\begin{aligned}
+&\textbf{DiF Butterfly:}\\
+&X = X + Y, \\
+&Y = (X - Y) \ \omega^j \\
+\end{aligned}
+\end{equation}
+\end{minipage}
+%
+\begin{minipage}[t]{0.45\textwidth}
+\begin{equation}\label{eq:butterfly:DiT}
+\begin{aligned}
+&\textbf{DiT Butterfly:}\\
+&X = X + \omega^j\ Y, \\
+&Y = X - \omega^j\  Y  \\
+\end{aligned}
+\end{equation}
+\end{minipage}
+
+The butterfly diagrams of DiF and DiT Fast Fourier Transforms are shown in Fig.~\ref{fig:butterfly}.
+%
+\begin{figure}[t]
+  \centering
+  \begin{subfigure}[b]{0.45\textwidth}
+    \includegraphics[width=\textwidth]{figures/butterfly_dif.pdf}
+    \caption{DiF-FFT butterfly diagram}
+    \label{fig:dit}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}[b]{0.45\textwidth}
+    \includegraphics[width=\textwidth]{figures/butterfly_dit.pdf}
+    \caption{DiT-FFT butterfly diagram}
+    \label{fig:dif}
+  \end{subfigure}
+  \caption{Butterfly diagrams for DiT and DiF FFTs.}
+  \label{fig:butterfly}
+\end{figure}
+
+\paragraph{The inverse DFT.} The inverse DFT (iDFT) is defined as:
+\begin{equation}
+x(j) = \mathrm{iDFT}_l(y) = \frac{1}{l}\sum_{k=0}^{l-1} y(k)\omega_l^{-jk}, \quad 0 \leq j \leq l-1.
+\end{equation}
+When compared to the DFT (Eq.~\ref{eq:dft}), we observe that the only differences are (i) the normalization factor $\frac{1}{l}$, and (ii) the minus sign in the $\omega^{-jk}$. Luckily, this means that the exact same operation as well as butterfly diagrams can be used, with two minor modifications: all $\omega^j$ terms are exchanged by an $\omega^{-j}$ term, and the normalization by $\frac{1}{l}$ must be considered.  
+
+\subsubsection{Point-to-point FFT Convolutions with CP{=}2}
+
+Looking at the FFT formulation, we can observe that the FFT is computed by performing independent FFTs on two independent splits of the input, followed by some point-wise operations over these splits. Interestingly, this setting exactly resembles the case of a distributed \texttt{p2p} setting, where each split is held in a different device. Nonetheless, there is an important impediment due to the organization of the data \textit{after} the FFT is performed. Assuming the conventional sequential splitting of the input across CP ranks, once a distributed FFT is performed, the output of the FFT would be bit-reversed across all ranks. Consequently, in order to restore the sharding distribution of the input, an additional \texttt{a2a} call would be required.
+
+Luckily, this permutation of the output is not a problem when performing FFT Convolutions. Since the FFT convolution is composed of an FFT followed by an inverse FFT, it is sufficient to use a forward (DiF) FFT --that generates a bit-reversed output-- followed by a DiF inverse FFT algorithm to generate an output that follows the same organization as the input. As a result, after the FFT convolution is finished, both the input and the output will be sharded in the same manner.
+
+Listing~\ref{listing:minimal_fftconv} shows a minimalist reference implementation of the \texttt{p2p} FFT convolution with simulated sharding for $\tNcp{=}2$.
+
+% Importantly, since Deep Learning libraries such as \texttt{PyTorch} natively provide functions to compute the FFT with CUDA support, it is not necessary to implement the whole FFT by hand. Instead, we can rely on such hardware-aware implementations to compute the FFT on each device efficiently.% We remove the communication code here for simplicity.
+
+\begin{listing}
+\begin{minted}{python}
+def bit_reversal(xarray: torch.Tensor, size: int, log2length: int):
+    """Applies a bit-reversal permutation to the input array."""
+    reversed_indices = vectorized_bit_reversal_indices(size, log2length, xarray.device)
+    return xarray[..., reversed_indices]
+
+def dif_radix2_fft(x: torch.Tensor):
+    """Applies the radix-2 Decimation-in-Frequency (DIF) FFT to the input.
+
+    Parameters:
+    - x (torch.Tensor): The input tensor of shape [B, H, L]
+
+    Returns:
+    - tuple(torch.Tensor, torch.Tensor): The sharded bit-reversed fft of the input.
+    """
+    # Split the input (to simulate a CP group of size 2).
+    _x_0, _x_1 = rearrange(x,"... (n1 n2) -> ... n1 n2", n1 = 2, n2 = N // 2).unbind(dim=-2)
+
+    # Twiddle factors
+    k = torch.arange(N // 2, device=x.device)
+    W = torch.exp(-1j * 2.0 * torch.pi * k / N)
+
+    # Apply butterfly operations
+    x_0 = _x_0 + _x_1
+    x_1 = (_x_0 - _x_1) * W
+
+    # Compute FFT on both halves.
+    fft_x_0 = torch.fft.fft(x_0, dim=-1), N // 2, int(math.log2(N // 2)))
+    fft_x_1 = torch.fft.fft(x_1, dim=-1), N // 2, int(math.log2(N // 2)))
+    return fft_x_0, fft_x_1
+
+def dif_radix2_ifft(fft_x_0, fft_x_1: torch.Tensor):
+    """Applies the radix-2 iFFT assuming that the input is a bit-reversed FFT, and returns 
+       a non-reversed input tensor, i.e., x = dif_radix2_ifft(dif_radix2_fft(x))."""
+
+    # Compute iFFT on both halves (it internally performs normalization by 1 / n // 2). 
+    _x_0 = torch.fft.ifft(fft_x_0, dim=-1)
+    _x_1 = torch.fft.ifft(fft_x_1, dim=-1)
+
+    # Twiddle factors
+    k = torch.arange(N // 2, device=_x_1.device)
+    W = torch.exp(1.j * 2.0 * torch.pi * k / N)
+
+    # Apply butterfly operations
+    x_0 = _x_0 + W * _x_1
+    x_1 = _x_0 - W * _x_1
+
+    # Normalize by seq. length of this stage (2) & concat results for verification.
+    return 0.5 * torch.cat([x_0, x_1], dim=-1)
+
+assert torch.allclose(x, dif_radix2_ifft(dif_radix2_fft(x)).real)
+\end{minted}
+\caption{Minimal implementation of the FFT and iFFT with a simulated CP group of size \texttt{2}.}
+\label{listing:minimal_fftconv}
+\end{listing}
+
+\subsection{Extending \texttt{p2p} FFT Convolutions to larger CP sizes} 
+The previous section illustrates how a \texttt{p2p} FFT convolution can be computed for a CP group with $\tNcp{=}2$ devices. In this section, we show how to extend this procedure to CP groups with $\tNcp{>}2$ devices.
+
+\paragraph{Radix-$\tN$ FFT.} Before we continue, we must introduce the concept of a Radix-$\tN$ FFT algorithm. Simply put, a Radix-$\tN$ FFT algorithm computes a $l$-point FFT by decomposing it onto $\tN$ independent $l \mathtt{//} \tN$-point FFTs followed by pointwise operations. In other words, a Radix-$\tN$ FFT algorithm generalizes the splitting process illustrated in the previous section for a value of $\tN{=}2$ to values $\tN{>}2$. Furthermore, just as for the Radix-\texttt{2} FFT algorithm, there exist DiT and DiF implementations for several values of \texttt{N}. \citet{takahashi2019fast} provides an exceptional description of Radix-$\tN$ FFT algorithms for $\tN\in[\mathtt{3},\mathtt{4},\mathtt{5},\mathtt{8}]$, and many algorithms exist for many other values of $\tN$, e.g., $\tN{=}\mathtt{16}$ \citep{bouguezel2004improved, huang2012high}. An important difference from the $\tN{=}\mathtt{2}$ case, is that the Radix-$\tN$ algorithms introduces $\tN$ different sets of twiddle factors. For $\tN{=}\mathtt{2}$, we had two sets of values $W_{0j}=[\omega_{0\times0}, ... , \omega_{(\frac{l}{2}-1)\times0}] = [1, ..., 1]$, and $W_{1j}=[\omega_{0\times1}, ... , \omega_{(\frac{l}{2} -1)\times1}] = [1, \omega^1, \omega^2, ..., \omega^{\frac{l}{2}}]$ applied to the first and second splits, respectively (Fig.~\ref{fig:butterfly}). For a general value of $\tN$, we utilize $\tN$ sets of twiddle factors, $\{W_{nj}\}_{n=0}^{\tN-1}$, defined as $W_{nj}=[\omega_{0\times n}, ..., \omega_{(\frac{l}{\tN}-1)\times n}]$.
+
+\paragraph{Extension to $\tNcp{>}2$ devices.} Following the same formulation used for $\tN{=}2$, we can compose a DiF Radix-$\tN$ FFT and an inverse DiF Radix-$\tN$ FFT to perform convolutions in a distributed setting. Specifically, given an input of shape $[1, \tH, \tL]$ sharded on a CP group with $\tNcp$ devices, the \texttt{p2p} FFT convolution is implemented by using Radix-$\tNcp$ (DiF) FFT and inverse (DiF) FFT algorithms to compute the FFT convolution without holding the whole sequence in a single device. Schematic butterfly diagrams for the implementation of \texttt{p2p} FFT convolutions for $\tNcp{=}\mathtt{4}$, and $\tNcp{=}\mathtt{8}$ devices are provided in Figs.~\ref{fig:fftconv_cp4},~\ref{fig:fftconv_cp8}. 
+
+
+\begin{figure}[t]
+  \centering
+  \begin{subfigure}[b]{0.49\textwidth}
+    \includegraphics[width=1\textwidth]{figures/DFT-4.pdf}
+    \caption{\texttt{p2p} FFT for $\tNcp{=}4$ devices.}
+    \label{fig:fftconv_cp4_fft}
+  \end{subfigure}
+  \begin{subfigure}[b]{0.49\textwidth}
+    \includegraphics[width=1\textwidth]{figures/iDFT-4.pdf}
+    \caption{\texttt{p2p} inverse FFT for $\tNcp{=}4$ devices.}
+    \label{fig:fftconv_cp4_ifft}
+  \end{subfigure}
+  \caption{Butterfly diagrams for the distributed \texttt{p2p} FFT and  inverse FFT for $\tNcp{=}4$. $\boldsymbol{\mathrm{x}}_{0}, ..., \boldsymbol{\mathrm{x}}_{3}$ represent the shards of the input $\boldsymbol{\mathrm{x}}$ held on each CP rank. Devices are represented by the vertical lines. Note that after the FFT, the outputs $\{\boldsymbol{\mathrm{y}}_{j}\}_{j=0}^3$ are bit-reversed over CP ranks. However, after combining it with the inverse FFT, the same sharding distribution as the input is obtained. FFT convolutions are computed by performing the FFT of both the input and the (sharded) convolutional kernel, multiplying them in the Fourier domain, and returning the result back to the spatial domain.}
+  \label{fig:fftconv_cp4}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \begin{subfigure}[b]{0.8\textwidth}
+    \includegraphics[width=1\textwidth]{figures/DFT-8.pdf}
+    \caption{\texttt{p2p} FFT for $\tNcp{=}\mathtt{8}$ devices.
+    \vspace{4mm}}
+    \label{fig:fftconv_cp8_fft}
+  \end{subfigure}
+  \begin{subfigure}[b]{0.8\textwidth}
+    \includegraphics[width=1\textwidth]{figures/iDFT-8.pdf}
+    \caption{\texttt{p2p} inverse FFT for $\tNcp{=}\mathtt{8}$ devices.}
+    \label{fig:fftconv_cp8_ifft}
+  \end{subfigure}
+  \caption{Butterfly diagrams for the distributed \texttt{p2p} FFT and  inverse FFT for $\tNcp{=}\mathtt{8}$. $\boldsymbol{\mathrm{x}}_{0}, ..., \boldsymbol{\mathrm{x}}_{7}$ represent the shards of the input $\boldsymbol{\mathrm{x}}$ held on each CP rank. Devices are represented by the vertical lines. Note that after the FFT, the outputs $\{\boldsymbol{\mathrm{y}}_{j}\}_{j=0}^7$ are bit-reversed over CP ranks. However, after combining it with the inverse FFT, the same sharding distribution as the input is obtained. FFT convolutions are computed by performing the FFT of both the input and the (sharded) convolutional kernel, multiplying them in the Fourier domain, and returning the result back to the spatial domain.}
+  \label{fig:fftconv_cp8}
+\end{figure}
+
+
+\subsection{Two-Pass Algorithm}\label{sup-sec:kernel}
+
+
+\textbf{Backward kernel}: To compute filter gradients in the backward pass, one requires global accumulation. Instead of limiting the computation to a single kernel, we implement gradient calculation using back-to-back kernels. The first performs a partial accumulation of the filter gradient by block, maintaining the same overall structure as the forward kernel, while the second kernel calculates the final result as a reduction of these partial gradients. Importantly, we take care to write out the partially accumulated gradients in coalesced format to enable a simple vectorized reduction as a second step.  
+
+\paragraph{Fast materialization of Toeplitz factors}
+In the listing below, we report code to efficiently materialize the Toeplitz factors using Triton. 
+
+\begin{listing}
+\begin{minted}{python}
+
+import triton
+import triton.language as tl
+
+@triton.jit
+def toeplitz_idx(
+    FILTER_LEN: tl.constexpr,
+    CHUNK_SIZE: tl.constexpr,
+    TOEPLITZ_TYPE: tl.constexpr = "toeplitz",
+):
+
+    if TOEPLITZ_TYPE == "zeroth_factor":
+        r_idx = tl.arange((FILTER_LEN - 1), CHUNK_SIZE + (FILTER_LEN - 1))[None, :]
+    elif TOEPLITZ_TYPE == "first_factor":
+        r_idx = (
+            tl.arange((FILTER_LEN - 1), CHUNK_SIZE + (FILTER_LEN - 1))[None, :]
+            - CHUNK_SIZE
+        )
+    else:
+        tl.static_assert(False, "Invalid ToeplitzType")
+    c_idx = tl.arange(0, CHUNK_SIZE)[:, None]
+    idx = r_idx - c_idx
+    return idx
+
+@triton.jit
+def load_toeplitz(
+    h_ptr,
+    FILTER_LEN: tl.constexpr,
+    CHUNK_SIZE: tl.constexpr,
+):
+    t_idx = toeplitz_idx(FILTER_LEN, CHUNK_SIZE, "toeplitz")
+    mask = (0 <= t_idx) & (t_idx < FILTER_LEN)
+
+    T = tl.load(
+        h_ptr + group_num * FILTER_LEN + t_idx,
+        mask=mask,
+        other=0.0,
+        eviction_policy="evict_last",
+    )
+
+    return T
+\end{minted}
+\caption{Masked loading of Toeplitz matrix factors $T_h^{(0)}$ and $T_h^{(1)}$ in Triton.}
+\end{listing}

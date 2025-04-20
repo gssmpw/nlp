@@ -1,0 +1,129 @@
+\section{Implementation Details}
+\label{appx:details}
+
+For SimPO fine-tuning, we randomly sample 2K document and question pairs from the LongCite-45k data, without using any ground-truth responses and citations. We generate the our own best-of-N responses with our Algorithm~\ref{alg:best_of_n} to obtain the preference data, and train for one epoch. We sample another 100 examples as development set to pick the best learning rate from \{1e-7, 3e-7, 5e-7, 7e-7\}. We keep other hyperparameters the same as the original SimPO~\citep{meng2024simpo}. We follow the same prompt format used in \citet{zhang2024longcite}\footnote{\url{https://github.com/THUDM/LongCite}} to keep the comparison fair.
+For the iterative SimPO experiment, in each iteration, we sampled a new, non-overlapping subset of 2K examples to ensure no data repetition across iterations. For self-supervised SFT, we generate 11K citation data unsupervisedly from ContextCite outputs as described in Appendix~\ref{appx:cc}, trained with a larger learning rate 7e-6. 
+
+We use the SimPO source code~\footnote{\url{https://github.com/princeton-nlp/SimPO}} built from Huggingface Transformers~\citep{wolf-etal-2020-transformers} for the finetuning experiments, as well as Liger-Kernel~\citep{hsu2024ligerkernelefficienttriton}\footnote{\url{https://github.com/linkedin/Liger-Kernel}} to enable memory efficient training for long-context examples in LongCite-45K without tensor parallelization. 
+We run all the finetuning experiments on with 8$\times$A100 GPUs of 80 GB memory on a single node. The batch size is set to 1 per GPU due to the long context examples.
+We set our max context length to 25600 to prevent OOM. For the data examples longer than 25600, we perform truncation, starting from removing the sentences that are the most far away from the sentences cited by the ground truth annotation, so as to keep the impact of truncation to be minimum.
+
+When evaluating the citation length, as well as calculating the token length limit of 384 for excluding long BoN candidates, we follow \citet{zhang2024longcite} to use GLM4-9B’s tokenizer to count tokens.
+
+In \Cref{sec:offpolicy}, the denoising citation examples are done by randomly shifting existing citation spans by 3-10 positions in sentence indices.
+
+\section{Obtaining Citations from ContextCite}
+\label{appx:cc}
+
+In this section, we first describe how the ContextCite method~\citep{cohen2024contextcite} estimates continuous attribution scores for each sentence in the context. We then explain a simple heuristic for extracting citations (i.e., selecting a subset of context sources) from these scores.
+
+\subsection{ContextCite}
+
+Given a language model $p_\text{LM}$, a context $C$, a query $Q$ and a generated response $R$, ContextCite aims to quantify how each \emph{source} in the context $C = \{c_1, c_2, \dots, c_{|C|}\}$ contributes to the generated response $R$ (in our case, the sources are sentences). 
+To do so, ContextCite performs several random context ablations.
+We begin by introducing some notation to describe these ablations.
+Let $v \in \{0,1\}^{|C|}$ be an ablation vector whose $i$-th entry toggles whether source $c_i$ is included ($v_i=1$) or excluded ($v_i=0$).
+We write $\ablate(C,v)$ to denote a modified version of the original context $C$ in which sources for which $v_i=0$ are omitted.
+ContextCite seeks to understand how the probability of generating the original generated response,
+\[
+f(v) := p_\text{LM}(R \,\mid\, \ablate(C, v), Q),
+\]
+changes as a function of the ablation vector $v$.
+
+\paragraph{Attribution via Surrogate Modeling.}
+Directly measuring $f(v)$ for all $2^{|C|}$ ablation vectors is infeasible for large $|C|$.
+Hence, ContextCite seeks to identify a \textit{surrogate model} $\hat{f}(v)$ that is easy to understand and approximates $f(v)$ well.
+To simplify this surrogate modeling task, ContextCite applies a logit transform to $f$, which maps values in $(0,1)$ to $(-\infty,\infty)$):
+\[
+g(v) := \sigma^{-1}(f(v)) \;=\; \log\!\Bigl(\frac{f(v)}{1 - f(v)}\Bigr).
+\]
+ContextCite then approximates $g(v)$ using a sparse linear function,
+\[
+\hat{g}(v) \;=\; \hat{w}^\top v + \hat{b}.
+\]
+Notice that resulting weights $\hat{w} \in \mathbb{R}^{|C|}$ encode the importance of each source $c_i$ to the probability of generating the original response;
+they can be interpreted directly as attribution scores (higher scores suggest greater importance).
+
+\paragraph{Finding a Surrogate Model via \textsc{Lasso}.}
+
+To learn the parameters $\hat{w}$ and $\hat{b}$ of the surrogate model, ContextCite randomly samples a small number of ablation vectors and measures the corresponding probabilities of generating the original response. 
+It then uses this ``training dataset'' to fit a sparse linear model with $\textsc{Lasso}$.
+Concretely, it learns a surrogate model with the following three steps:
+\begin{enumerate}
+    \item Sample $n$ ablation vectors $\{v_i\}_{i=1}^n$ uniformly at random from $\{0,1\}^{|C|}$.
+    \item For each sample $v_i$, compute $g(v_i) = \sigma^{-1}(f(v_i))$ by running the LM with only the sources specified by $v_i$ and measuring the (sigmoid) probability of $R$.
+    \item Solve a Lasso regression problem to find $\hat{w}$ and $\hat{b}$:
+    \[
+    \hat{w}, \hat{b} \;=\; \arg\min_{w,\,b}\; \frac{1}{n} \sum_{i=1}^n \bigl(g(v_i) - w^\top v_i - b\bigr)^2 \;+\; \lambda \|w\|_1,
+    \]
+    where $\lambda$ controls sparsity (larger $\lambda$ drives more coefficients to zero).
+\end{enumerate}
+In \citet{cohen2024contextcite}, typical choices of $n$ range from $32$ to $256$, balancing computation time (requires $n$ LM forward passes) and accuracy.
+If there are multiple statements $\{r_1, r_2, ..., r_{|R|}\}$ in $R$, the same method can also be applied by focusing only on a subset of tokens in $R$.
+
+\subsection{Heuristic Citation Extraction}
+\label{subsec:heuristic}
+
+In our setting, we would like a discrete list of cited sentences for each generated statement, rather than a score for every sentence.
+We will now describe how to convert the attribution scores $\hat{w}$ into a discrete subset $C' \subseteq C$ of citations. Let $t$ be a threshold, $p$ be a cumulative probability mass cutoff, and $k$ be a maximum citation limit.
+
+\paragraph{Thresholding and Merging.}
+\begin{enumerate}
+    \item \textbf{Filtering:} Include only those sources $c_i$ whose attribution score $\hat{w}_i \ge t$. 
+    \item \textbf{Merging Adjacent Sources:} If multiple \textit{consecutive} sources in the original text each exceed $t$, merge them into a single “span” $S_j$. We assign this merged span the maximum score among its constituents:
+    \[
+    \hat{w}(S_j) = \max_{c_i \,\in\, S_j} \hat{w}_i.
+    \]
+    Here, adjacency is defined by the original ordering in $C$. For instance, if $c_2$ and $c_3$ both pass the threshold and appear consecutively, we merge them into a single span $S_j$.
+\end{enumerate}
+
+\paragraph{Softmax Normalization.}
+Let $\{S_j\}$ be the set of spans (or single sources) that survived the threshold. We normalize their scores into a probability distribution:
+\[
+\hat{w}'(S_j) \;=\; \frac{\exp\bigl(\hat{w}(S_j)\bigr)}{\sum_{i} \exp\bigl(\hat{w}(S_i)\bigr)},
+\]
+so that $\sum_{j} \hat{w}'(S_j) = 1$.
+
+\paragraph{Top-$p$ Selection.}
+To avoid including too many low-value sources, we adopt a greedy approach:
+\[
+\text{Add spans in order of descending } \hat{w}'(S_j)\text{, stopping once } \sum_{S_j \in C'} \hat{w}'(S_j) \,\ge\, p.
+\]
+
+\paragraph{Top-$k$ Filtering.}
+Finally, if $|C'| > k$, we take only the $k$ highest-scoring spans. 
+
+We set $t=1.5$, $p=0.7$, $k=4$ in the experiment.
+When generating supervised fine-tuning (SFT) data, we discard any example for which more than 30\% of its statements have no any citations that can survive threshold $t$. This ensures the dataset emphasizes cases where the LM’s response can be tied to explicit context sources. 
+We take the LongCite-45K document and question pairs to generate the responses by Llama-3.1-8B-Instruct itself, and then obtain citations with ContextCite (256 calls), transformed into the statement/citation format of LongCite-45K. Finally, we collect $\sim11\text{K}$ examples used for SFT.
+
+\section{Length Balancing}
+\label{appx:length}
+
+To prevent the model from simply generating longer citations rather than focusing on citation correctness, we apply a \emph{length balancing} procedure to align the total citation length in our two training responses: a \emph{chosen prediction} and a \emph{reject prediction}. First, we find the citation string (e.g., \texttt{[435-437]}) enclosed in \texttt{<cite>...</cite>} tags for each statement. We then measure each string’s total citation ``coverage'', which means the total number of cited sentences in these intervals.
+
+If a \emph{reject prediction} has a total coverage lower than the corresponding \emph{chosen prediction}, we insert additional citations around nearby sentence indices to match the \emph{chosen} coverage. Conversely, if the \emph{reject} coverage is larger, we randomly remove some of its intervals. We ensure new or inserted citations do not overlap existing intervals and keep them within a small window of 5–10 sentences away from the original citations to maintain realism. Finally, the \emph{reject} and \emph{chosen} will have matched coverage. This approach discourages the model from trivially learning to cite more sentences, instead prompting it to learn \emph{where} and \emph{how} to cite evidence more accurately. Our ablation in Section~\ref{sec:balance} shows that this length balancing technique significantly improves final citation quality.
+
+\section{Comparison with \emph{Claude Citations} API}
+\label{appx:claude}
+
+On January 23rd, 2025, Claude announced an API specialized for providing citations along with responses: \emph{Claude Citations}\footnote{\url{https://www.anthropic.com/news/introducing-citations-api}}. We also try to evaluate this API on the LongBench-Cite benchmark. Since the implementation details and resource requirements (e.g., training data) of Claude Citations are not publicly available yet, and it relies on a significantly larger and more powerful LLM, Claude-3.5-Sonnet, which potentially has over 100 billions of parameters, we consider it as a topline of the benchmark rather than a baseline.
+
+When evaluating it on Chinese examples from LongBench-Cite, we found that the API does not split Chinese text properly. As a result, it cites large passages when processing Chinese examples, leading to an average citation length of approximately 800 tokens per citation.
+
+To address this issue, we pre-segment the text ourselves using exactly the same method as our approach following LongCite~\citep{zhang2024longcite}, which uses NLTK and Chinese punctuation segmentation. We then run the Claude Citations API, as it supports both non-segmented and pre-segmented document inputs. The evaluation was conducted using the latest version of \texttt{claude-3-5-sonnet-20241022}.
+
+As shown in Table~\ref{tab:claude_cite}, Claude Citations achieves an overall F1 score of 81.3, which is higher than all other models we have tested.
+However, the performance of Claude Citations is not consistent over all datasets. For example, it is worse than \ours on LongBench-Chat and GovReport. The main improvement of Claude is from the DuReader dataset, while the results on other datasets are comparable to the results of \ours. Given the fact that \ours leverages a much smaller 8B model compared to the Claude-3.5-Sonnet model, the result of \ours is very impressive, demonstrating its potential to serve as a strong alternative to proprietary solutions.
+
+\input{tables/claude_citations}
+
+\section{More Qualitative Examples}
+\label{appx:qual}
+
+We further show more qualitative examples in Table~\ref{tab:q1},\ref{tab:q2}, and \ref{tab:q3}, to represent the cases where \ours is better as well as where the LongCite-8B direct sampling baseline is better. In Table~\ref{tab:q1}, \ours BoN avoid the cited irrelevant sentence (42, 47-50) by the baseline, while further including a correct citation (23) that are not found by the baseline. In Table~\ref{tab:q2}, both \ours BoN and the baseline cites too many irrelevant sentences (391-393) but \ours BoN's citation is slightly better. In Table~\ref{tab:q3}, \ours BoN wrongly includes 30 and misses 70, but the baseline is slightly better and only wrongly includes 71.
+
+\input{tables/appx_q1}
+\input{tables/appx_q2}
+\input{tables/appx_q3}
+

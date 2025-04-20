@@ -1,0 +1,129 @@
+\section{Information bottleneck-regularized EDL}
+We begin by adopting an information-theoretic perspective on neural networks and introduce the IB objective. We then explain how to regularize EDL with IB and why the final IB-EDL objective effectively mitigates overconfidence.
+
+\subsection{A Careful examination of the information bottleneck criterion} \label{sec:objective_ib}
+
+\textbf{A high-level view of IB:} Let $X$ be the input random variable and $Y$ represent the random variable of the target token. We also introduce an intermediate representation $Z$, which serves as a stochastic encoding of $X$. In the context of EDL, $Z$ can take various forms, such as the internal features of any LLM layer, the pre-evidence $\etv$ (i.e., model output), evidence $\ev$, Dirichlet parameters $\alv$, or token probabilities $\piv$. Choosing different forms of $Z$ corresponds to selecting features that capture different levels of abstraction. We will discuss our selection of $Z$ in \cref{sec:reg_edl_with_ib}. Since input data often contains redundant or irrelevant information, which may hinder the generalization ability of $Z$, it is essential for $Z$ to retain the most predictive information about $Y$ while discarding irrelevant information from $X$. This trade-off leads to better generalization. The Information Bottleneck method~\citep{tishby99information,tishby2015deep} formalizes this principle through the concept of mutual information. Specifically, the IB objective is: 
+\begin{equation}
+    \begin{aligned}
+        \max_{\thetav} I(Z, Y; \thetav) - \beta I(Z, X; \thetav),
+    \end{aligned}
+    \label{eq:ib_objective}
+\end{equation}
+where $I(\cdot, \cdot)$ represents mutual information (MI), and $\beta > 0$ is a hyperparameter controlling the trade-off between relevance and compression. Since $Z$ is computed by the model $f$, optimizing the model’s parameters $\thetav$ is equivalent to optimizing $Z$. The term $I(Z, Y; \thetav)$ promotes $Z$ to be predictive of $Y$, while $I(Z, X; \thetav)$ encourages $Z$ to ignore irrelevant information from $X$. For simplicity, we omit the model parameters $\thetav$ in the following equations.
+
+The mutual information terms in \cref{eq:ib_objective} are generally intractable. To address this, \citet{alemi2017deep} proposed to derive more tractable variational bounds. Following \citet{wieczorek2020difference}, we assume the Markov chain $X - Z - Y$\footnote{\citet{alemi2017deep} initially derive the objective using the Markov chain $Z - X - Y$ but implement it with $X - Z - Y$.\citet{wieczorek2020difference} directly derive the lower bound from $X - Z - Y$.} to derive the IB objective. Detailed derivations for the following equations are provided in \cref{sec:app:derivation_of_bounds}.
+
+\textbf{Upper bound of $I(Z, X)$:} To derive a variational upper bound on $I(Z, X)$, we first expand it as:
+\begin{equation*}
+    \begin{aligned}
+         I(Z, X) &= \int p(\xv, \zv) \log \frac{p(\zv | \xv)}{p(\zv)} \dd \zv \dd \xv = \mathbb{E}_{p(\zv| \xv)} \mathbb{E}_{p(\xv)} [\log p(\zv | \xv)] - \mathbb{E}_{p(\zv)}[\log p(\zv)].
+    \end{aligned}
+\end{equation*}
+Computing $p(\zv) = \int p(\zv, \xv) \dd \xv$ is challenging as it involves marginalizing over $\xv$. Instead,~\citet{alemi2017deep} suggest approximating it using a predefined prior $r(\zv)$. We will discuss how to choose $r(\zv)$ in \cref{sec:reg_edl_with_ib}. By utilizing the Kullback–Leibler divergence $\dkl{p(\zv) || r(\zv)} \geq 0$, we obtain:
+\begin{equation}
+    \begin{aligned}
+        I(Z, X) \leq \int p(\zv| \xv) p(\xv) \log \frac{p(\zv | \xv)}{r(\zv)} \dd \zv \dd \xv = \mathbb{E}_{p(\xv)} \left[\dkl{p(\zv | \xv) \| r(\zv)}\right].
+    \end{aligned}
+    \label{eq:izx_upper_bound}
+\end{equation}
+
+\textbf{Lower bound of $I(Z,Y)$:} \citet{wieczorek2020difference} derive the following lower bound:
+\begin{equation}
+    \begin{aligned}
+        I(Z, Y) &= \mathbb{E}_{p(\xv, \yv)} \mathbb{E}_{p(\zv | \xv, \yv)} \left[\log p(\yv | \zv) \right] + H(Y) \\
+        &\geq \mathbb{E}_{p(\xv)} \mathbb{E}_{p(\yv | \xv)} \mathbb{E}_{p(\zv | \xv)}\left[\log p(\yv | \zv) \right],
+    \end{aligned}
+    \label{eq:iyz_lower_bound_1}
+\end{equation}
+where $H(\cdot)$ denotes the Shannon entropy. By plugging the upper bound from \cref{eq:izx_upper_bound} and lower bound from \cref{eq:iyz_lower_bound_1} into \cref{eq:ib_objective}, and flipping the $\max$ to a $\min$, the IB objective becomes 
+\begin{equation}
+    \begin{aligned}
+        \min_{\thetav} \ - \mathbb{E}_{p(\xv)} \mathbb{E}_{p(\yv | \xv)} \mathbb{E}_{p(\zv | \xv)}\left[\log p(\yv | \zv) \right] + \beta \ \mathbb{E}_{p(\xv)} \left[\dkl{p(\zv | \xv) \| r(\zv)}\right],
+    \end{aligned}
+    \label{eq:loss_ib}
+\end{equation}
+where the expectations can be approximated using Monte Carlo samples. In the following paragraph and \cref{sec:reg_edl_with_ib}, we will discuss how to compute $p(\yv | \zv)$, $p(\zv | \xv)$, and how to select the prior $r(\zv)$.
+
+\textbf{Challenges when applying IB to an internal layer of an LLM:} Previous works, such as \citet{alemi2017deep}, typically apply IB to an intermediate layer within the neural network, treating the features at that layer as the hidden variable $Z$. In this scenario, the earlier layers (a.k.a. the \emph{encoder}) learn $p(\zv | \xv)$. However, since $\zv$ represents the features at an intermediate layer, the true distribution $p(\yv | \zv)$ is unknown in practice. As a result, \citet{alemi2017deep} use the later layers (the \emph{decoder}) to learn a distribution $q(\yv | \zv)$ to approximate $p(\yv | \zv)$. The approximate distribution $q(\yv | \zv)$ serves as a substitute for $p(\yv | \zv)$ in \cref{eq:iyz_lower_bound_1}. However, we argue that directly substituting $p(\yv | \zv)$ with $q(\yv | \zv)$ in \cref{eq:iyz_lower_bound_1} requires a more careful examination. Specifically, 
+expanding \cref{eq:iyz_lower_bound_1} yields:
+\begin{equation}
+    \begin{aligned}
+        I(Z,Y) &\geq \mathbb{E}_{p(\xv)} \mathbb{E}_{p(\yv|\xv)} \mathbb{E}_{p(\zv | \xv)}[\log p(\yv |\zv)] 
+        =  \mathbb{E}_{p(\xv)} \mathbb{E}_{p(\yv|\xv)} \mathbb{E}_{p(\zv | \xv)}\left[\log 
+        \left( q(\yv |\zv) \ \frac{p(\yv | \zv)}{q(\yv | \zv)} \right)\right] \\
+        &= \underbrace{\mathbb{E}_{p(\xv)} \mathbb{E}_{p(\yv|\xv)} \mathbb{E}_{p(\zv | \xv)}\left[\log q(\yv |\zv) \right]}_{\text{(i)}} + \underbrace{\mathbb{E}_{p(\xv)} \mathbb{E}_{p(\yv|\xv)} \mathbb{E}_{p(\zv | \xv)} \left[ \log \frac{p(\yv | \zv)}{q(\yv | \zv)} \right]}_{\text{(ii)}}. \\
+    \end{aligned}
+\end{equation}
+Term (i) is used for training the model in \citet{alemi2017deep}, including both the encoder and decoder. Term (ii) represents the gap between term (i) and the true lower bound in \cref{eq:iyz_lower_bound_1}. Crucially, \textbf{term (ii) is not necessarily non-negative}. If term (ii) is negative, it undermines the assumption that term (i) serves as a valid lower bound on $I(Z, Y)$. This calls into question its suitability as a training objective. Term (ii) remains small only when the model is well-trained so that $q(\yv|\zv)$ closely approximates $p(\yv|\zv)$. In summary, when introducing IB at an intermediate layer within an LLM and substituting $p(\yv | \zv)$ with $q(\yv | \zv)$, we lose control over whether the training objective truly remains a lower bound on $I(Z, Y)$. In the next section, we present our strategy to address this challenge.
+
+\subsection{Regularizing EDL with IB}\label{sec:reg_edl_with_ib}
+So far we have not introduced how to apply IB to the EDL pipeline: $\xv \rightarrow f(\xv; \thetav) \rightarrow \etv \rightarrow \ev \rightarrow \alv \rightarrow \piv \rightarrow \yv$. In this section, we focus on two key questions: \textbf{(1) What should the hidden variable $Z$ be in IB-EDL?} In other words, where in the EDL pipeline should we introduce IB? \textbf{(2) What prior distribution $r(\zv)$ should we select?}
+
+\textbf{Choice of hidden variable $Z$:} As highlighted in \cref{sec:objective_ib}, a key challenge in applying IB \emph{within} a neural network is the potential violation of the lower bound. We address this by choosing the pre-evidence as the hidden variable $Z$, i.e., $\zv = \etv \in \mathbb{R}^C$. By doing so, we can \emph{exactly evaluate} $p(\yv|\zv)$ from the pipeline $\etv \rightarrow \ev \rightarrow \alv \rightarrow \piv \rightarrow \yv$. Specifically, given $\etv$, we can compute $\alv = \ev + \bm{1} = \text{SoftPlus}(\etv) + \bm{1}$, from which $\piv \sim \text{Dir}(\piv; \alv)$ and $\yv \sim \text{Cat}(\yv; \piv)$ follow. 
+As a result, there is no need to learn $q(\yv | \zv)$, allowing us to directly use the lower bound in \cref{eq:iyz_lower_bound_1} (and hence \cref{eq:loss_ib}) as the training objective, which only involves $p(\yv | \zv)$. In other words, by choosing $\zv = \etv$, we skip the step of learning an approximated distribution $q(\yv | \zv)$ and ensure that we are maximizing a valid lower bound of $I(Z, Y)$. Next, we proceed to compute this bound, namely the first term in \cref{eq:loss_ib}, which can be analytically computed as:
+\begin{equation}
+    \begin{aligned}
+         \libnll &:=- \mathbb{E}_{p(\xv)} \mathbb{E}_{p(\yv|\xv)} \mathbb{E}_{p(\zv | \xv)}[\log p(\yv |\zv)] \\
+         &= \mathbb{E}_{p(\xv)} \mathbb{E}_{p(\yv|\xv)} \mathbb{E}_{p(\zv | \xv)}\left[ \sum_{j=1}^C y_j ( \log(\alz) - \log(\alj))\right],
+    \end{aligned}
+\end{equation}
+where we have omitted the dependency of $\alv$ on $\zv = \etv$. Furthermore, our method can be further enhanced by integrating the finding of \citet{sensoy2018evidential}, suggesting the MSE loss as a practically more stable objective. This can be analytically computed from $\alv$ (and $\etv$) as follows:
+\begin{equation}
+    \begin{aligned}
+        \libmse &:= \mathbb{E}_{p(\xv)}\mathbb{E}_{p(\yv | \xv)} \mathbb{E}_{p(\zv | \xv)}\left[ ||\yv -\piv||_2^2 \right] \\
+        &=\mathbb{E}_{p(\xv)} \mathbb{E}_{p(\yv | \xv)} \mathbb{E}_{p(\zv | \xv)}\left[\sum_{j=1}^C \left(y_j - \frac{\alj}{\alz}\right)^2 + \frac{\alj (\alz - \alj)}{\alz^2 (\alj + 1)} \right].
+    \end{aligned}
+    \label{eq:loss_ib_mse}
+\end{equation}
+\textbf{Choice of prior $r(\zv)$:} Having defined $\zv = \etv$, we now require a suitable prior $r(\zv)$ for $\zv$. Notably, $\etv$ is the output of the LLM, and recent studies~\citep{zhang2021fine,hashemi2021gaussian} suggest that activation distributions in the later layers of neural networks tend to resemble Gaussian distributions more closely than those in earlier layers. Additionally, the pre-evidence $\etv$ represents the LLM's output values, typically ranging from -2 to 2. Therefore, a standard Gaussian prior, $z_j \sim \Norm{0, 1} \ \forall j$, represents a reasonable choice.\footnote{Alternatively, we can also choose $\zv = \ev = \text{SoftPlus}(\etv)$; however, the prior will be a truncated Gaussian.} Given that $\zv = \etv$ follows a Gaussian distribution, we leverage the LLM $f$ to learn the mean and covariance of this $\zv$'s distribution. Typically, an LLM comprises a sequence of transformer layers, denoted as $g$, followed by a linear head $h$, such that $f = h \circ g$. To model the Gaussian distribution, we double the number of output neurons in $h$, partitioning it into two equal-sized functional parts. One part, $h^{\mu}$, predicts the Gaussian mean, while the other, $h^{\sigma}$, predicts the variances. Since $h^\mu$ and $h^\sigma$ predictors share the same features from $g$, both predictions can be computed in a single forward pass. We define $\muv = h^{\mu}(g(\xv))$ and $\sigmav = \text{SoftPlus}(h^{\sigma}(g(\xv)))$, yielding $p(\zv | \xv; \thetav) = \mathcal{N}(\zv ; \muv, \diag{\sigmav})$. Then the second term in \cref{eq:loss_ib} becomes: 
+\begin{equation}
+    \begin{aligned}
+        \libinfo := \mathbb{E}_{p(\xv)} \left[\dkl{p(\zv | \xv) \| r(\zv)}\right] \propto \frac{1}{2} \mathbb{E}_{p(\xv)}\left[\| \muv \|_2^2 + \| \sigmav \|_2^2 - 2 \sum_{j=1}^C \log(\sigma_j) \right].
+    \end{aligned}
+    \label{eq:loss_ib_info}
+\end{equation}
+\textbf{Overall IB-EDL loss and its interpretation:} The final IB-EDL objective is:
+\begin{equation}
+    \begin{aligned}
+        \min_{\thetav} \  \libmse + \beta \ \libinfo.
+    \end{aligned}
+\end{equation}
+Importantly, \cref{eq:loss_ib_info} imposes a $\ell_2$-regularization on $\muv$, i.e.\ the mean of $\etv$, and thus on $\alv$. \emph{Therefore, IB-EDL penalizes the LLM for generating large $\alv$ that lead to over-confident predictions}. 
+% Another key difference compared to previous EDL methods is that IB-EDL replaces additional regularization, such as $\lreg$ from \cref{eq:loss_reg}, with $\libinfo$.
+\subsection{Practical implementation}
+\begin{algorithm}[t]
+    \caption{IB-EDL training and inference pseudocode.}
+    \label{algo:ib_edl}
+    \begin{algorithmic}[1]
+        \Require{Data $(\xv, \yv)$, LLM $f = h \circ g$, weight $\beta$, sample size $K$, binary flag \istraining.}
+        \State $\muv, \sigmav \gets (h \circ g) (\xv)$; and compute $\libinfo$ with $\muv, \sigmav$. \Comment{Predict $p(\etv | \xv)$ using the LLM.} 
+        \State Draw $\{\etv^{(k)}\}_{k=1}^K$ from $\Norm{\etv ; \muv, \diag{\sigmav}}$. \Comment{Parallelized in PyTorch.}
+        \If{\texttt{IsTraining}} \Comment{At training time.}
+            \State Compute $\libmse$ for each $\etv^{(k)}$ and take the \textbf{average}. \Comment{\cref{eq:loss_ib_mse}. Also parallelized.}
+            \State Backpropagate \textbf{averaged} $\libmse + \beta \ \libinfo$.
+        \Else \Comment{At inference time.}
+            \State Compute \textbf{average} $\etv \gets \frac{1}{K} \sum_{k=1}^K \etv^{(k)}$; and $\alv \gets \text{SoftPlus}(\etv) + 1$; and $\hat{\pi}_j \gets \alpha_j / \alz \ \forall j$.
+            \State Final prediction $\hat{y} \gets \arg \max_j \hat{\pi}_j$. Uncertainty mass: $u \gets C / \alz$.
+        \EndIf
+    \end{algorithmic}
+\end{algorithm}
+In this subsection, we focus on the implementation of IB-EDL, so \emph{we use $\etv$ instead of $\zv$}.  \cref{eq:loss_ib_mse} requires sampling $\etv$ from the predicted distribution $\Norm{\etv ; \muv, \diag{\sigmav}}$ and using the sampled $\etv$ to compute $\alv$. To handle the non-differentiable sampling operation, we apply the reparameterization trick~\citep{kingma2014auto}, allowing gradients to flow through the LLM parameters $\thetav$. For each input $\xv$, we sample $K$ (e.g. $K=20$) pre-evidences $\etv$ and compute the average loss derived from them (see \cref{algo:ib_edl}). At inference time, we also sample $K$ values  and compute the average $\etv$.
+% The sampling and averaging operations are well optimized in CUDA. 
+The extra time cost is minimal compared to the inference time of the LLM (detailed in \cref{sec:ablation_study}). 
+
+\subsection{Variational Bayes-based EDL as a special case of IB-EDL}
+Some EDL methods~\citep{chen2018variational, joo2020being} are based on a variational Bayes (VB) perspective
+% where the goal is to align the \emph{posterior} Dirichlet distribution with some target distribution. 
+and can be seen as a special case within the IB-EDL framework. 
+More formally:
+
+\begin{proposition} 
+The VB-based EDL methods, which minimize $\mathbb{E}_{p(\xv, \yv)}\left[\dkl{p(\piv | \xv ; \thetav) || p(\piv | \yv)} \right]$, are a special case of IB-EDL when the hidden variable is chosen as $\zv = \piv$ (i.e. token probabilities) and the prior $r(\zv)$ is chosen as $\Dir{\zv; \yv \odot \alv + (\onev - \yv)}$. 
+\label{prop:vb_as_ib_edl}
+\end{proposition}
+
+The proof is detailed in the \cref{sec:app:proof_proposition}. In the experiments, we will also compare our method with VID~\citep{chen2018variational}, a representative EDL method from this category.
+
+
+

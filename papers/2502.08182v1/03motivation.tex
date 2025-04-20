@@ -1,0 +1,218 @@
+%-------------------------------------------------------------------------------
+\section{Motivation}
+%-------------------------------------------------------------------------------
+
+This section presents prior memory offloading approaches for LLM serving~(\S\ref{sec:prior}), 
+and explains why they are insufficient to handle requests associated with SLOs~(\S\ref{sec:kept}, 
+\S\ref{sec:estimating}, \S\ref{sec:bandwidth}). 
+
+Unless otherwise mentioned, we conduct all the experiments in this section 
+with an NVIDIA A10 GPU with 24GB memory.  
+%
+The PCIe bandwidth is 24GB/s.
+%
+% refer to the background
+We use TPOT and TTFT as latency SLOs~(\S\ref{sec:slo})
+%
+The more detailed experimental setup is presented in \S\ref{sec:expsetup}. 
+
+
+\subsection{Prior Offloading Approaches}
+\label{sec:prior}
+% 
+There have been only a few prior mechanisms for
+offloading LLM state to CPU memory during inference.
+%
+Among them, the most relevant ones are \deepspeed Inference~(\deepspeed afterwards)~\cite{zero-infer} and \flexgen~\cite{flexgen}, 
+while others are orthogonal to \sys, as discussed in \S\ref{sec:relwk}. 
+%
+
+%
+\deepspeed and \flexgen work as follows. 
+%
+\deepspeed keeps only the state of the layer currently being computed in GPU memory while offloading all other states to host memory. 
+%
+Unlike \deepspeed, \flexgen offloads a fixed portion of the state~(referred to as the offloaded portion) for all layers to host memory. 
+%
+\flexgen selects an offloaded portion that maximizes inference throughput and decides the exact offloaded portion upon receiving a serving request. 
+%
+The decision is made by solving a linear programming problem, taking as input various factors, such as model size, batch size, sequence length of the serving request, and the transfer speed between the host and the GPU memory.
+%
+
+Naturally, offloading is prone to performance overhead, where the computation 
+may need to wait for the offloaded state to be ready in the GPU memory. 
+%
+Both \deepspeed and \flexgen mitigate this overhead by overlapping data transfer with computation: they prefetch the offloaded state of the next layer while computing the current layer. 
+
+%
+However, the design of 
+\deepspeed and \flexgen does not consider an important aspect: the latency SLO 
+of the serving requests. 
+%
+Such a limitation is rooted in their design. 
+% 
+As a result, as we elaborate next, \deepspeed suffers from frequent SLO violations, while \flexgen has to estimate for the worst case to avoid SLO violations, 
+thereby underutilizing host memory and failing to achieve optimal throughput. 
+%
+
+\subsection{Keeping Minimal LLM State in GPU}
+\label{sec:kept}
+%
+With \deepspeed, SLO violations are due to its key design choice 
+that only keeps the minimal absolutely necessary 
+LLM state in GPU memory~(\ie, the state of the current layer). 
+%
+This design maximizes host memory usage, but the inference performance heavily 
+hinges on that the computation of the current layer can cover 
+the transfer time of the next layer. 
+%
+
+\begin{figure}[t]
+    \centering
+    \vspace{0.6cm}
+    \resizebox{\columnwidth}{!}{%
+        \input{figures/moti1.tex} % 插入 TikZ 图
+ }
+    \caption{(a) Serving latency (normalized by the target SLO) with \deepspeed.  
+ (b) The average computation and transfer time for a single layer. 
+ Model: Qwen2-beta-7B, sequence length: 256, batch size: 4. 
+ }
+    \label{fig:moti1}
+\end{figure}
+
+\begin{figure}[t]
+    \centering
+    \resizebox{0.6\columnwidth}{!}{
+        \input{figures/moti1b.tex} % 插入 TikZ 图
+ }
+    \caption{Throughput of \sys and \deepspeed with varying batch sizes. Model: Qwen2-beta-7B}
+    \label{fig:moti1c}
+\end{figure}
+
+
+Unfortunately, for most modern LLMs, the computation 
+is much shorter than the transfer time of a layer. 
+%
+We demonstrate this in Figure~\ref{fig:moti1} (b), where the transfer time is 3.5\X and 13.8\X longer than the computation time for the prefill and decoding phase, respectively. 
+%
+As a result, as shown in Figure~\ref{fig:moti1} (a), \deepspeed increases the
+serving latency by up to 9.5\X, resulting in frequent SLO violations for all evaluated models. 
+%
+In addition to latency, since the GPU waits for the data most of the time, 
+such an approach also reduces throughput by up to 8.2\X, as shown in Figure~\ref{fig:moti1c}. 
+
+This is a major limitation since, for many user-facing LLM tasks, such as those discussed in \S\ref{sec:slo}, meeting the latency SLO is the top priority. 
+%
+Even a single SLO violation incurs a severe economic loss, thus defeating the purpose of minimizing operational costs in offloading approaches. 
+%
+Therefore, \deepspeed is limited to only those LLM tasks that do not require human interactions. 
+
+
+\noindent \textbf{Obvervation \#1: Keeping only one layer in GPU, as done by \deepspeed, 
+is prone to severe SLO violations.}
+
+
+
+
+%-------------------------------------------------------------------------------
+
+\subsection{Estimating Execution Time}
+\label{sec:estimating}
+
+
+
+As discussed in \S\ref{sec:prior}, the optimization goal of \flexgen is to 
+maximize serving throughput. 
+%
+To evaluate \flexgen in our target scenario, we made a slight modification to 
+the decision algorithm in \flexgen: it now takes a target SLO as input 
+and output maximum offloaded portion. 
+%
+We verify that this modified, SLO-aware version of \flexgen functions correctly and can successfully meet the specified SLOs. 
+%
+For simplicity, we uses \flexgen to refer to this modified version throughout the rest of the paper. 
+
+We found that a fundamental limitation of \flexgen is that it decides 
+the offloaded portion~(\S\ref{sec:prior}) statically~(before 
+the requests are actually executed); 
+in other words, \flexgen cannot adjust the offloaded portion during execution based on current system status. 
+%
+Therefore, to avoid SLO violations, with \flexgen, one has to conservatively estimate for the worst case, making \flexgen underutilize host memory but rather uses much more GPU memory than necessary. 
+%
+As a result, \flexgen often fails to achieve the optimal performance, as shown in Figure~\ref{fig:moti2b}.  
+%
+The SLO is the TPOT when running without offloading. 
+%
+In this case, \flexgen uses 2.1\X less host memory than \sys, and thus supports smaller batch sizes, leading to 1.9\X throughput reduction. 
+%
+We note that this is the best case for \flexgen and a more relaxed SLO 
+makes the throughput difference even larger. 
+
+With \flexgen, an important factor for underutilizing host memory is that \flexgen statically estimates serving latency using peak GPU performance. 
+%
+This is necessary to avoid SLO violations since the estimated value is the theoretical lower bound of the serving latency. 
+%
+However, as shown in Figure~\ref{fig:moti2}, the estimated latency  
+is much shorter than the real one. 
+%
+This makes \flexgen offload a smaller amount of model state than is necessary to host memory, since \flexgen mistakenly believes that 
+the computation time is not long enough to overlap the transfer time of the larger
+model state. 
+
+\begin{figure}[t]
+    \centering
+    \resizebox{\columnwidth}{!}{
+        \input{figures/moti2.tex} % 插入 TikZ 图
+ }
+    \caption{The actual serving latency vs. the one estimated by \flexgen. Model: OPT-13B.
+ }
+    \label{fig:moti2}
+\end{figure}
+
+\begin{figure}[t]
+    \centering
+    \resizebox{\columnwidth}{!}{
+        \input{figures/moti2b.tex} % 插入 TikZ 图
+ }
+    \caption{Comparison of \sys and FlexGen in (a) Memory usage on the offloading devices and (b) Throughput. Model: OPT-13B.}
+    \label{fig:moti2b}
+\end{figure}
+
+
+
+\noindent \textbf{Obvervation \#2: Estimating model execution time 
+using peak GPU performance, as with \deepspeed, is inaccurate and 
+heavily underutilizes host memory.}
+
+
+
+%-------------------------------------------------------------------------------
+
+\subsection{Bandwidth Contention}
+\label{sec:bandwidth}
+
+Another important factor for \flexgen to underutilize host memory is 
+the contention on transfer bandwidth between host and GPU memory. 
+%
+Specifically, to minimize operational costs, the current industry practice is to place multiple GPUs on a single machine node. 
+%a
+However, some of these GPUs share a single PCIe bus~(which connects the host and GPUs), and thus contends for the PCIe bandwidth~\cite{pciecontention, pciecontention2}. 
+% cite some papers on the PCIe contention caused by GPUs. 
+%
+As a result, the available bandwidth to transfer LLM state for each 
+individual GPU fluctuates during serving a request. 
+
+With \flexgen, in the presence of bandwidth contention, to meet SLO, 
+one must again estimate the worst case:  
+%
+each GPU only gets $1/n$ of the bandwidth, where $n$ is the number of GPUs that share a PCIe bus.  
+%
+However, for a given GPU, the available bandwidth may fluctuate but is often much larger than the worst-case one, since other GPUs may be idle, or do not 
+fully utilize their share of the bandwidth. 
+%
+As a result, \flexgen overestimates the transfer time, again offloading a smaller amount of LLM state than is necessary to host memory. 
+
+
+
+\noindent \textbf{Observation \#3: \flexgen statically estimates the PCIe bandwidth under contention, thereby underutilizing the host memory.}
+

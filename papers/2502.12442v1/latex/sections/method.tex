@@ -1,0 +1,82 @@
+\section{Method} 
+In this section, we introduce our logic-aware RAG system, named HopRAG. An overview of this system is illustrated in Figure \ref{fig:overview}.
+\label{sec:method}
+\begin{figure*}[htbp!]
+\centering
+  \includegraphics[width=\textwidth]{latex/figures/overview_nm.pdf}
+  \caption{The workflow of HopRAG. \textbf{Left:} At indexing time, we first utilize \textit{Query Simulation} to generate pseudo-queries for each passage and then apply \textit{Edge Merging} to connect passages with directed logical edges. \textbf{Right:} At retrieval time, we employ a \textit{Retrieve-Reason-Prune} pipeline. We first retrieve through purely similarity-based retrieval, then run reasoning-augmented graph traversal to explore the neighborhood, and finally prune the search by a novel metric \textit{Helpfulness} considering both textual similarity and logical importance.}
+  \label{fig:overview}
+\end{figure*}
+\subsection{Problem Formulation}
+
+Given a passage corpus $P=\{p_1, p_2, ..., p_N\}$ and a query $q$ which requires the information from multiple passages in $P$, the task is to design (1) a graph-structured RAG knowledge base that not only stores all the passages in corpus $P$ but also models the similarity and logic between passages; (2) a corresponding retrieval strategy that can hop from indirectly relevant passages to truly relevant passages for better retrieval. Finally, with the query $q$ and $k$ passages as context ${C}=\{p_{i_1},p_{i_2},...,p_{i_k}\}$, the LLM generates the response \(\mathcal{O} \sim \mathcal{P}(\mathcal{O}|q, {C}) \).
+
+\subsection{Graph-Structured Index}
+We construct a graph-structured index $G=(\mathcal{V},\mathcal{E})$ where we store each passage in a vertex to get vertex set $\mathcal{V}$ and capture the logical relations between passages to establish directed edge set $\mathcal{E} = \{\langle v_i,e_{i,j},v_j\rangle | v_i,v_j\in \mathcal{V} \}$ for multi-hop reasoning ($\mathcal{E}  \subset \mathcal{V} \times \mathcal{V}$). To identify the relations between passages and establish the graph-structured index, we utilize query simulation to dig out the logical relations between passages and leverage textual similarity for efficient edge merging.
+
+\paragraph{Query Simulation}
+To fully explore the logical relations between passages and bridge the inherent gap between queries and passages \citep{wang_qaencoder_2024}, we generate a series of pseudo-queries for each passage to explicitly capture the logical relations. Specifically, we adopt LLM to generate two groups of pseudo-queries for each passage: (1) $m$ out-coming questions $Q_i^+= \bigcup_{1 \le j \le m} \{q_{i,j}^{+} \}$ that originate from the passage but cannot be answered by itself; (2) $n$ in-coming questions $Q_i^-= \bigcup_{1 \le j \le n} \{q_{i,j}^{-}\}$ whose answers are within the passage. The prompts are in Appendix \ref{prompt}. 
+
+We extract keywords from $Q_i^+$ and $Q_i^-$ using named entity recognition $\text{NER}(\cdot)$ for sparse representation, and embed these questions into semantic vectors using an embedding model $\text{EMB}(\cdot)$ for dense representation. This results in sparse representations $K_i^+= \bigcup_{1 \le j \le m}\{k_{i,j}^{+} \}$ and $K_i^-= \bigcup_{1 \le j \le n}\{k_{i,j}^{-}\}$, and dense representations $V_i^+=\bigcup_{1 \le j \le m} \{v_{i,j}^{+}\}$ and $V_i^-=\bigcup_{1 \le j \le n} \{v_{i,j}^{-}\}$. We further define out-coming triplets as $r_{i,j}^+:=(q_{i,j}^{+},k_{i,j}^{+},v_{i,j}^{+})$ and in-coming triplets $r_{i,j}^-:=(q_{i,j}^{-},k_{i,j}^{-},v_{i,j}^{-})$. Each passage $p_i$ is a vertex $v_i$, featured with out-coming triplets $R_i^+= \bigcup_{1 \le j \le m} \{r_{i,j}^{+}\}$ and in-coming triplets $R_i^-= \bigcup_{1 \le j \le n} \{r_{i,j}^{-} \}$. 
+
+\paragraph{Edge Merging}
+Given the out-coming and in-coming triplets, we match paired triplets via hybrid retrieval and establish directed edges between passages.
+%The similarity between out-coming and in-coming question triplets is calculated, and the most similar pair is identified to create a directed edge $\langle v_s,e_{s,t^*},v_{t^*} \rangle$, where $e_{s,t^*}$ is defined by the combined attributes of the question triplets.
+For each out-coming triplet $r_{s,i}^+$ of source vertex $v_s$, the most matching in-coming triplet $r_{t^*,j^*}^-$ is determined as follows:
+\begin{equation}
+\label{sim}
+\begin{aligned}
+    \text{SIM}(r_{s,i}^{+}, r_{t,j}^{-}) &= \frac{\frac{|k_{s,i}^{+} \cap k_{t,j}^{-}|}{|k_{s,i}^{+} \cup k_{t,j}^{-}|}+\frac{v_{s,i}^{+} \cdot v_{t,j}^{-}}{||v_{s,i}^{+}|| \cdot ||v_{t,j}^{-}||}}{2} \\
+    r_{t^*,j^*}^- &= \arg\max_{r_{t,j}^{-}  } \text{SIM}(r_{s,i}^{+}, r_{t,j}^{-})
+\end{aligned}
+\end{equation}
+
+We then build the directed edge $\langle v_s,e_{s,t^*},v_{t^*} \rangle$ with aggregated attribution, where $e_{s,t^*}:=({q_{t^*,j^*}^{-}},{k_{t^*,j^*}^{-}\cup k_{s,i}^{+}},{v_{t^*,j^*}^{-}})$.
+
+
+\subsection{Reasoning-Augmented Graph Traversal }
+For more accurate and complete responses, HopRAG's retrieval strategy leverages the reasoning ability of LLMs to explore the neighborhood of probably indirectly relevant passages based on the logical relations in the graph structure so as to hop to relevant ones.  As shown in Algorithm \ref{ragt}, by reasoning over the questions on out edges $e_{i,j}$ of a current vertex $v_{i}$ and then choosing to hop to the most promising vertex $v_{j}$, we realize reasoning-augmented graph traversal for better retrieval performance. 
+
+\paragraph{Retrieval Phase} To start the local search over the graph for query $q$, we first use $\text{NER}(\cdot)$ and $\text{EMB}(\cdot)$ to get the keywords $ k_{q}$ and vector $v_{q}$ of $q$, which will be used for hybrid retrieval to match $top_k$ similar $\langle v_i,e_{i,j},v_j \rangle $ edges, following Equation \ref{sim}. With each head vertex $v_j$ from these edges we initialize a context queue $C_{queue}$ for breadth-first local search \citep{voudouris2010guided}. 
+
+\paragraph{Reasoning Phase} To fully exploit the logical relations over the graph and hop from indirectly relevant vertices to relevant ones, we introduce breadth-first local search which utilizes the LLM to choose the most appropriate neighbor for each $v_j$ in $C_{queue}$ to append to the tail of the queue. Specifically, for each $v_j$ in $C_{queue}$ in each round of hop, we leverage LLM to reason over all the questions from its out edges  
+% $ \{e_{j,k}|e_{j,k}=({q_{k,n}^{-}},{k_{k,n}^{-}\cup k_{j,m}^{+}},{v_{k,n}^{-}}),\langle v_j,e_{j,k},v_k\rangle \in \mathcal{E},v_j \in C_{queue},v_k \in \mathcal{V}\}$ 
+to choose one $e_{j,k}$ with the question which the LLM regards as the most helpful for answering $q$ and append the tail vertex $v_k$ to $C_{queue}$.  
+
+After hopping from each vertex in the current $C_{queue}$ we can expand the context with $top_k$ logically more relevant vertices, from which we continue to conduct the next round of hop. By conducting $n_{hop}$ rounds of hop, we realize reasoning-augmented graph traversal that expands the context to $(n_{hop}+1)\times top_k$ vertices. We use a counter $C'$ to track the number of arrivals of each vertex during the traversal.
+
+\paragraph{Pruning Phase} To avoid including too many intermediate vertices during the traversal, we introduce a novel metric Helpfulness $H(\cdot)$  that integrates similarity and logic to re-rank and then prune the traversal context $C'$ with arrival counts. We calculate $H_i$ following Equation \ref{H} for each $v_i$ in $C'$ and keep the $top_k$ vertices with the highest $H_i$, where hybrid textual similarity $\text{SIM}(v_i, q)$ follows Equation \ref{sim} to calculate the average lexical and semantic similarity between the passage in $v
+_i$ and query $q$; and $\text{IMP}(v_i,C')$ is defined as the normalized number of arrivals of $v_i$ in $C'$ during traversal (Equation \ref{Imp}). With $H_i$ for each $v_i$ in $C'$, we prune $C'$ by keeping $top_k$ vertices with the highest $H$ and get final context $C$.
+
+\begin{equation}
+    H_i=\frac{\text{SIM}(v_i, q)+\text{IMP}(v_i,C')}{2}
+    \label{H}
+\end{equation}
+\begin{equation}
+    \text{IMP}(v_i, C') = \frac{C'[v_i]}{\sum_{v_j \in C'} C'[v_j]}
+    \label{Imp}
+\end{equation}
+\begin{algorithm}
+  \SetAlgoLined
+  \KwIn{$q$, $top_k$, $n_{hop}$}
+  \KwOut{$C$}
+ $v_{q}$ $\leftarrow$ EMB($q$)\;$  k_{q}$ $\leftarrow$ NER($q$)\;
+  $C_{queue}\leftarrow$ Retrieve($v_{q}$, $k_{q}$)\;
+  $C'\leftarrow $Counter$(C_{queue})$\;
+  \For{$i \leftarrow 1,2,...,n_{hop}$ }{
+  \For{j $\leftarrow 1,2,...,\mid C_{queue}\mid $} {
+  $v_j\leftarrow $ $C_{queue}$.dequeue()\;
+  $v_k \leftarrow$ Reason($\{\langle v_j,e_{j,k},v_k\rangle\}$)\;
+\eIf{$v_k$  not in $C'$}{
+$C_{queue}$.enqueue($v_k$)\;
+$C'$[$v_k$]=1\;
+      }{
+      $C'$[$v_k$]+=1\;
+      }
+  }
+  }
+  $C$=Prune($C'$,$v_{q}$,$k_q$,$top_k$)\;
+  \Return $C$
+  \caption{Reasoning-Augmented Graph Traversal}
+  \label{ragt}
+\end{algorithm}

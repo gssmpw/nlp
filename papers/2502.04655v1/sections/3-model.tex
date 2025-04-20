@@ -1,0 +1,265 @@
+% !TeX root = ../camera.tex
+
+\begin{figure*}[tbp]
+  \centering
+  \includegraphics[width=\linewidth]{architecture_v8.pdf}
+  \caption{
+    Overview of the IC-Mamba Architecture for social media engagement prediction. 
+    (left panel) The model first takes three types of inputs (interval-censored social engagement, post content, and user metadata). 
+    These inputs are tokenized through a linear tokenization layer. 
+    The tokenized sequence (combination of temporal embedding, positional embeddings and user embeddings) is processed through N-stacked \icmamba blocks.
+    (right panel) Each \icmamba block contains a selective SSM mechanism and parallel Conv1d operations to handle input and time-interval vectors simultaneously. 
+    Lastly, the processed features go through normalization and linear layers to generate the final social engagement predictions.
+  }
+  \label{fig:overall_archi}
+\end{figure*}
+
+\section{Interval-Censored Mamba (IC-Mamba)}
+\label{sec: ic-mamba-method} 
+
+This section introduces \icmamba, our proposed approach for engagement prediction illustrated in \cref{fig:overall_archi}.
+We begin with the problem statement (\cref{subsec:problem-statement}) and then detail the key components of our architecture:
+% We present the overall architecture of \icmamba in \cref{fig:overall_archi}.
+the time-aware positional embeddings (\cref{subsec:time-aware-embed}), 
+the content and sequence embeddings (\cref{subsec:context-sequence-embed}), 
+interval-censored state space modeling (\cref{subsec:interval-censored-SSM}), 
+the pretraining strategies (\cref{subsec:ic-mamba-pretrain}), and 
+the two-tier architecture that enables predictions at both post and opinion levels (\cref{subsec:two-tier-arch}).
+
+\subsection{Problem Statement}
+\label{subsec:problem-statement}
+Let $\mathcal{E}$ denote a social outbreak event with associated posts $\mathcal{P} = \{p_1, p_2, \dots, p_N\}$. For each post $p \in \mathcal{P}$, we define a tuple $(t_0, x, u, o, H)$ where $t_0$ denotes the original posting time; $x$ represents the textual content; $u$ captures the user metadata; $o \in \mathcal{O}$ indicates the opinion class from the set of possible opinions $\mathcal{O}$; and the interval-censored engagement history is defined as $H = \{(t_j, e_j)\}_{j=1}^{m}$, with 
+$m$ as the total number of observation intervals. Each $e_j$ is a $d$-dimensional vector capturing different types of engagement at observation time $t_j$, with intervals $\Delta t_j = t_{j+1} - t_j$ between consecutive observations -- see also \cref{fig:sample_ic_mamba} for how these quantities interact.
+See \cref{tab:notations} for a complete reference of mathematical notations used in this work.
+
+
+Given an observation window $\tau_{obs}$ (e.g., 1 day), let $H_{\tau_{obs}}(p) = \{(t, e) \in H \mid t_0 \leq t \leq t_0 + \tau_{obs}\}$ denote the initial interval-censored engagement history. Let $\Delta t$ be a fixed time interval (e.g.,\ 5 minutes) and $T$ be the prediction horizon (e.g.,\ 28 days). Our goal is to predict the engagement trajectory at regular intervals: $\{\hat{e}(t_0 + \tau_{obs} + k\Delta t)\}_{k=1}^{K}$, where $K = \lfloor T/\Delta t \rfloor$ represents the number of prediction points.
+
+% {
+% Let $\mathcal{E}$ denote a social outbreak event. 
+% Within this event, we consider a set of $N$ social media posts, denoted as $\mathcal{P} = \{p_1, p_2, \dots, p_N\}$. 
+% For each post $p_i \in \mathcal{P}$, we define the following -- see also \cref{fig:sample_ic_mamba} for how these quantities interact.
+% \begin{itemize} 
+% \item $t_{i,0}$: The original posting time of post $p_i$. 
+% \item $T_i = \{t_{i,1}, t_{i,2}, \dots, t_{i,m_i}\}$: The observed times of engagement events for post $p_i$, where $t_{i,j}$ is the time of the $j$-th engagement event, and $m_i$ is the total number of observed engagement events.
+% \item $[t_{i,j-1}, t_{i,j}]$: The interval-censored period between consecutive observations, \hl{where engagement counts are unknown}\mar{Unknown or known? Also, how does this link to $\tau_j$ in \cref{fig:sample_ic_mamba}}.
+% \item $e_{i,j} \in \mathbb{N}^d$: The $d$-dimensional vector of social engagements (likes, comments, shares, emojis) received at time $t_{i,j}$.
+% \item $x_i$: The textual content of post $p_i$. 
+% \item $u_i$: The user metadata associated with post $p_i$ (e.g., user profile information). 
+% \item $o_i \in \mathcal{O}$: The opinion expressed in post $p_i$, where $\mathcal{O}$ is a set of opinion classes. 
+% \end{itemize}}
+% \mar{Now I really think we should transform this into a notation table instead and refer to it when necessary.}
+
+%$\mathcal{H}_{i}(\tau_k)$
+% \replace{
+Using this setup, we address two primary tasks. 
+(1) Social Engagement Prediction: We predict engagement at both individual and collective levels. 
+\emph{Post level}: Predict the engagement trajectory $\hat{e}(t_0 + \tau_{\text{obs}} + k\,\tau_{\text{step}})_{k=1}^{K}$ at regular intervals $\tau_{\text{step}}$ up to horizon $T$ (with $K = \lfloor T/\tau_{\text{step}} \rfloor$), as well as the total cumulative engagement over $T$. 
+\emph{Opinion level:} For a given opinion \(o\), predict the collective trajectory ${\hat{E}_o(t_0 + \tau_{obs} + k\tau_{\text{step}})}_{k=1}^{K}$ , where $\hat{E}_o$ is the sum of engagements across all posts $\mathcal{P}_o$ expressing $o$. 
+(2) Opinion Classification: We learn a mapping $f: (x, u, H_{\tau_{obs}}) \mapsto \mathcal{O}$ that assigns a post to an opinion class based on its content $x$, user metadata $u$, and engagement history $H_{\tau_{obs}}$.
+
+
+
+% \noindent Using this setup, we address two main learning tasks:
+% \begin{enumerate}
+%     \item Social Engagement Prediction:
+%     Predicting social engagement at both individual and collective levels:
+%     \begin{itemize}
+%         \item At post level:  Predicting both the engagement trajectory ${\hat{e}(t_0 + \tau_{obs} + k\tau_{\text{step}})}_{k=1}^{K}$ at regular intervals $\tau_{\text{step}}$ up to horizon $T$, where $K = \lfloor T/\tau_{\text{step}} \rfloor$, and the total cumulative engagement over horizon $T$.
+%         \item At opinion level:  For a given opinion $o$, predict the collective engagement trajectory ${\hat{E}_o(t_0 + \tau_{obs} + k\tau_{\text{step}})}_{k=1}^{K}$ of all posts $\mathcal{P}_o$ expressing that opinion, where $\hat{E}_o$ represents the sum of engagement across posts in $\mathcal{P}_o$ at each timestep.
+%     \end{itemize}
+%     \item Opinion Classification:
+%     The task involves determining a mapping $f: (x, u, H_{\tau_{obs}}) \mapsto \mathcal{O}$ that assigns each post to an opinion class based on its content $x$, user metadata $u$, and engagement history $H_{\tau_{obs}}$.
+% \end{enumerate}
+% }
+% {Given prediction time points $\mathcal{T}_p = \{\tau_1, \tau_2, \dots, \tau_K\}$\mar{What are these? You never defined them. I thought that $\tau$ were lengths of intervals} and interval-censored engagement history $\mathcal{H}_{i,k} = \{(t_{i,j}, e_{i,j}) \mid t_{i,0} \leq t_{i,j} \leq t_{i,0} + \tau_k\}$, we address three tasks:
+% \begin{enumerate}
+% \item Post-level Engagement Prediction: For each post $p_i$, predict its future cumulative engagement vector $\hat{E}{i}(t)$ at time $t > t{i,0} + \tau_k$, given its censored history up to $\tau_k$.
+% \item Opinion-level Engagement Prediction: For each opinion class $o \in \mathcal{O}$, predict its collective engagement influence at time $t > t_{i,0} + \tau_k$, using the censored histories up to $\tau_k$ of all posts expressing that opinion.
+% \item Opinion Classification: For each post $p_i$, predict its opinion class $o_i$ based on its content $x_i$, user metadata $u_i$, and engagement history $\mathcal{H}_{i,k}$.
+% \end{enumerate}
+% }
+% \TODO{MAR}{I wonder if it does not make more sense to group the two types of engagement prediction (post, opinion) together and the opinion classification separately.} 
+
+\subsection{Time-aware Positional Embeddings}
+\label{subsec:time-aware-embed}
+
+The temporal dynamics of social media engagement operate at multiple scales -- from rapid initial spread to long-term influence patterns. 
+To capture these multi-scale dynamics, we introduce a dual strategy featuring Relative Temporal Encoding (RTE) and Absolute Temporal Encoding (ATE).
+RTE captures temporal relationships between two time points $t$ and $t_{ref}$ as
+$RTE(t, t_{ref}) = \sin\left(\frac{t - t_{ref}}{\sigma}\right)$, where $\sigma$ is a learnable parameter that allows the model to adapt to varying engagement velocities.
+ATE is capturing predictions to the global event timeline by mapping each time point $t$ into a sinusoidal embedding space:
+\begin{equation*}
+ATE(t) = \left[\sin\left(\frac{t}{10000^{2i/d}}\right), \cos\left(\frac{t}{10000^{2i/d}}\right)\right]_{i=0}^{d/2-1}.
+\end{equation*}
+
+These embeddings combine through a learnable projection:
+\begin{equation*}
+PE(t, t_{ref}) = W_p \begin{bmatrix} RTE(t, t_{ref}) \\ ATE(t) \end{bmatrix},
+\end{equation*}
+which is then modulated by observed engagement
+$EPE(t, t_{ref}, e) = PE(t, t_{ref}) \odot \bigl(1 + \log\left(1 + e\right)\bigl)$,
+ where $\odot$ denotes element-wise multiplication, and $e$ is the engagement vector at time $t$.
+
+This engagement-sensitive embedding enables the model to learn characteristic temporal patterns associated with different levels of social impact.
+For each post $p \in \mathcal{P}$ and a prediction time $\tau_k$, we construct a \textit{time-aware embedding sequence} $TE^k(p) \in \mathbb{R}^{(m_k + 1) \times d}$ as $
+TE^k(p) = \left[EPE(t_{j}, \tau_k, e_{j}) \mid (t_j, e_j) \in H_{\tau_{obs}}(p)\right] \cup \left[PE(\tau_k, \tau_k, 0)\right]$, where $H_{\tau_{obs}}(p) = \{(t, e) \in H \mid t_0 \leq t \leq t_0 + \tau_{obs}\}$ is the observed engagement history within the observation window $\tau_{obs}$.
+
+\subsection{Content and Sequence Embedding}
+\label{subsec:context-sequence-embed}
+
+To create a unified representation of social media posts, we must handle both textual content and temporal patterns. 
+We use a byte-level BPE tokenizer~\citep{black2022gptneoxb} to process the social media text, enabling us to embed the multi-modal information (content, user metadata, and temporal dynamics) into a single sequence representation:
+$SE(p) = {Encoder}([CLS] \oplus [x] \oplus [SEP] \oplus [u] \oplus [SEP] \oplus [T] \oplus [SEP] \oplus [{e_j}])$.
+Here, $Encoder$ is a transformer-based function, $x$ is the post text, $u$ is user metadata, $T = \{t_0, t_1, \dots, t_{m}\}$ is the post's timeline of engagement events, $\{e_j\}$ are engagement counts, and $[CLS]$ and $[SEP]$ are special tokens.
+Note that the $Encoder$ function maps the input sequence to a fixed-dimensional space $\mathbb{R}^d$, where $d$ is the embedding dimension. 
+This allows for building uniform representations regardless of the posts' content or engagement history length.
+
+\subsection{Interval-Censored State Space Modeling}
+\label{subsec:interval-censored-SSM}
+
+Here, we extend the Mamba architecture to incorporate time intervals within the state space model. 
+Standard SSMs assume regular sampling intervals, which fails to capture social media engagement's irregular and censored nature (see \cref{fig:sample_ic_mamba}). 
+We address this through three key components: interval-aware state representation, time-dependent transitions, and selective state updates.
+
+\noindent\textbf{Interval-aware State Representation.}
+For each observation time $t_j$ in the engagement history $H_{\tau_{obs}}(p)$, we construct an interval-aware vector $v_j \in \mathbb{R}^{4d}$:
+\begin{equation*}
+        v_j = [\Delta t_j^-; \log(1 + e_j); \Delta t_j^+; \log(1 + \hat{e}_{j+1})],
+\end{equation*}
+where $\Delta t_{j}^- = t_{j} - t_{j-1}$ captures the time since the last observation, 
+$e_{j}$ is the current engagement vector, 
+$\Delta t_{j}^+ = t_{j+1} - t_{j}$ is the forward interval length, and 
+$\hat{e}_{j+1}$ is the predicted next engagement vector.
+
+To maintain a consistent representation when transitioning from variable-length historical intervals to fixed-length prediction intervals, at each prediction time point $\tau_k$, we construct: $v_k = [\tau_k - t_j; \log(1 + e_j); \tau_{k+1} - \tau_k; \log(1 + \hat{e}_k)]$,
+using the last observed engagement $(t_{j}, e_{j})$ in $H_{\tau_{obs}}$.
+
+\noindent\textbf{Time-Dependent State Transitions.}
+We handle varying-length censored intervals by modifying the standard SSM architecture to incorporate time-dependent state transitions. 
+For a hidden state dimension $D_h$ and input dimension $D$, our model becomes:
+\begin{align*}
+    \mathbf{A}_t(\Delta t) &= \exp(\Delta t \cdot \tilde{\mathbf{A}}_t) \in \mathbb{R}^{D_h \times D_h}, \\ 
+    \mathbf{h}_t &= \mathbf{A}_t(\Delta t) \mathbf{h}_{t-1} + \mathbf{B}_t \mathbf{x}_t, \quad\quad \mathbf{y}_t = \mathbf{C}_t^T \mathbf{h}_t,
+\end{align*}
+where $\mathbf{h}_t \in \mathbb{R}^{D_h}$ is the hidden state at time $t$, $\mathbf{x}_t \in \mathbb{R}^D$ is derived from the interval-aware vector $v_j$, and the matrix exponential $\exp(\Delta t \cdot \tilde{\mathbf{A}}_t)$ enables smooth interpolation across censored intervals.
+
+\noindent\textbf{Selective State Processing.}
+We integrate the temporal embeddings (${TE}^k(p)$) and interval-aware vectors through parallel pathways:
+\begin{equation*}
+        [\mathbf{X}, \boldsymbol{\Delta}, \mathbf{B}, \mathbf{C}] = \text{Projection}\left(\mathbf{V}, {TE}^k(p)\right) \in \mathbb{R}^{L \times (D + 1 + 2N)}
+\end{equation*}
+where $L$ is the sequence length, $\mathbf{V} \in \mathbb{R}^{L \times 4d}$ is the sequence of interval-aware vectors, and ${TE}^k(p)$ provides temporal context. 
+The selective SSM mechanism then processes as follows:
+\begin{equation*}
+\mathbf{Y} = \text{SSM}(\tilde{\mathbf{A}}, \mathbf{B}, \mathbf{C}, \mathbf{X}, \boldsymbol{\Delta}) \in \mathbb{R}^{L \times D},
+\end{equation*}
+
+The final output is modulated through a gating mechanism:
+\begin{equation*}
+\text{Output} = \mathbf{Y} \odot \sigma \bigl(\text{Conv1d}(\mathbf{X})\bigl) \in \mathbb{R}^{L \times D},
+\end{equation*}
+where $\sigma$ is the Silu activation function~\citep{elfwing2018sigmoid} and Conv1d~\citep{gu2021combining} captures local engagement patterns.
+
+
+
+\subsection{IC-Mamba Pretraining}
+\label{subsec:ic-mamba-pretrain}
+
+% To leverage the full potential of our interval-censored architecture, we introduce a pretraining strategy that enables the model to learn general temporal dynamics from large-scale social media data.
+Creating labeled sets of misinformation and disinformation campaigns is a human-time-intensive process, and often, the resulting training sets are too small to allow training an architecture such as \icmamba from scratch.
+%We introduce $\mathcal{D}$ a pretraining strategy that leverages $1.78$ million posts and their social engagement timelines, totaling over $153$ million timelines, from the two datasets we use in this paper: SocialSense~\citep{kong2022slipping} and DiN (detailed in Section~\ref{subsec:datasets}):
+\cref{alg:pretraining} outlines the pretraining procedure for \icmamba.
+We introduce $\mathcal{D} = \{(p_i, H_i, x_i, u_i)\}_{i=1}^M$, a pretraining dataset comprising $1.78$ million posts and their associated social engagement timelines -- totaling over $153$ million timelines -- collected from the two datasets SocialSense~\citep{kong2022slipping} and DiN (detailed in Section~\ref{subsec:datasets}).
+Here $M$ is the number of posts and $H_i = \{(t_{i,n}, e_{i,n})\}_{n=1}^{m_i}$ with $|H_i| = m_i$ represents the complete engagement history for post $p_i$.
+
+%Remove this part for now, looks duplciate.
+%\subsubsection{Interval-Censored Sequence Construction}
+%For each post's engagement history $\mathcal{H}_i$ of length $m_i$, we compute interval-aware vectors:
+%\begin{equation}
+%v_{i,j} = [\Delta t_{i,j}^-; \log(1 + e_{i,j}); \Delta t_{i,j}^+; \log(1 + e_{i,j+1})]
+%\end{equation}
+%where intervals and engagements are as defined in Section 3.3.
+
+
+\noindent\textbf{Objective Function.}
+We define two objective functions that we combine for pretraining.
+
+\emph{Engagement Prediction Loss.} 
+For each post, we train the model to predict the next engagement vector:
+\begin{equation}
+  \label{eq:loss_next_pred}
+        \mathcal{L}_\text{pred} = \frac{1}{|\mathcal{P}|} \sum_{p \in \mathcal{P}} \sum_{j=0}^{m-1} \|\hat{e}_{j+1} - e_{j+1}\|^2 \enspace,
+\end{equation}
+where $\hat{e}_{j+1} \in \mathbb{R}^d$ is the predicted engagement vector.
+
+\emph{Temporal Coherence Loss.} 
+We enforce consistent state transitions across intervals:
+\begin{equation}
+  \label{eq:loss_interval}
+        \mathcal{L}_\text{temp} = \frac{1}{|\mathcal{P}|} \sum_{p \in \mathcal{P}} \sum_{j=0}^{m-1} \|\mathbf{h}_{j+1} - \exp(\Delta t_j^+ \cdot \tilde{\mathbf{A}}_t)\mathbf{h}_j\|^2 \enspace,
+\end{equation}
+where $\mathbf{h}_j \in \mathbb{R}^{D_h}$ is the hidden state at time $t_j$ and the exponential term comes from our SSM formulation.%todo:ref
+
+The pretraining loss combines these objectives from \cref{eq:loss_next_pred} and \cref{eq:loss_interval} as $\mathcal{L}_\text{total} = \mathcal{L}_\text{pred} + \lambda \mathcal{L}_\text{temp}$,
+where $\lambda$ is a hyperparameter balancing the two losses.
+% 
+% \noindent\textbf{Training Procedure.}
+
+
+\begin{algorithm}[t]
+\caption{\icmamba Pretraining}
+\label{alg:pretraining}
+\begin{algorithmic}[1]
+\State Initialize parameters $\theta = \{\tilde{\mathbf{A}}, \mathbf{B}, \mathbf{C}, \mathbf{W}_p, \theta_\text{Encoder}\}$
+\For{epoch $= 1$ to $N_\text{epochs}$}
+    \For{batch $\mathcal{B} \subset \mathcal{D}$}
+        \State Construct interval-aware vectors $\{\mathbf{v}_{j}\}_{j \in \mathcal{B}}$ 
+        \State Compute temporal embeddings $\{TE^k(p)\}_{p \in \mathcal{B}}$
+        \State $[\mathbf{X}, \boldsymbol{\Delta}, \mathbf{B}, \mathbf{C}] \gets \text{Projection}(\{\mathbf{v}_{j}\}, \{TE^k(p)\})$
+        \State $\mathbf{H} \gets \text{SSM}(\tilde{\mathbf{A}}, \mathbf{B}, \mathbf{C}, \mathbf{X}, \boldsymbol{\Delta})$
+        \State $\hat{\mathbf{E}} \gets \text{MLP}(\mathbf{H})$
+        \State Compute $\mathcal{L}_\text{pred}$ (\cref{eq:loss_next_pred}) and $\mathcal{L}_\text{temp}$ (\cref{eq:loss_interval})
+        \State Update $\theta$ using $\nabla_\theta(\mathcal{L}_\text{pred} + \lambda \mathcal{L}_\text{temp})$
+    \EndFor
+\EndFor
+\State \Return $\theta$
+\end{algorithmic}
+\end{algorithm}
+
+  
+\subsection{Two-Tier \icmamba Architecture}
+\label{subsec:two-tier-arch}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.85\linewidth]{images/2-tier_v8.pdf}
+  \caption{
+    Two-Tier \icmamba Architecture. The bottom-tier model ($\text{IC-Mamba}_{1}$) learns post-level representations from historical ($H$), content ($x$), and user ($u$) features, while the top-tier model ($\text{IC-Mamba}_2$) captures temporal dependencies across intervals $\delta t$ to jointly predict individual post virality and aggregate narrative engagement dynamics.
+    %\TODO{MAR}{New comment: figure caption is uninformative. Please detail it!}
+  }
+  \label{fig:2tier_ic-mamba}
+\end{figure}
+
+It is desirable to model and predict the engagement dynamics of a group of posts expressing the same opinion -- dubbed \emph{the engagement of an opinion}.
+% To capture both individual post dynamics and collective opinion influence, 
+We propose a hierarchical two-tier architecture, showcased in \cref{fig:2tier_ic-mamba}.
+The intuition of the two-tier \icmamba model is that the first tier ($\text{IC-Mamba}_{1}$) models the arrival of engagement on an individual post. 
+The second tier ($\text{IC-Mamba}_2$) models the arrival of posts within an opinion.
+
+\noindent\textbf{Post-Level Processing.}
+In the first tier, for each opinion $o$, we process all posts $p_i \in \mathcal{P}_o$ individually using the $\text{IC-Mamba}{1}$ model:
+\begin{equation}
+\label{eq:tier-1-icmamba}
+        \mathbf{h}_i = \text{IC-Mamba}_{1}(H_{\tau_{obs}}(p_i), x_i, u_i), \quad \forall p_i \in \mathcal{P}_o
+\end{equation}
+where $H{\tau_{obs}}(p_i)$ is the interval-censored engagement over observation window and $\mathbf{h}_i$ the hidden state representation of post $p_i$.
+
+\noindent\textbf{Group-Level Dynamics.}
+In the second tier, we model the temporal interactions between posts sharing opinion $o$. 
+By ordering posts in $\mathcal{P}_o$ chronologically by posting time $t_i^{\mathrm{p}}$, we capture the inter-post intervals $\delta t_i = t_{i+1}^{\mathrm{p}} - t_i^{\mathrm{p}}$ between posts in the group. 
+The group-level dynamics are modeled using $\text{IC-Mamba}_2$ with $\mathbf{h}_i$ from \cref{eq:tier-1-icmamba}:
+\begin{equation*}
+\mathbf{z}_o = \text{IC-Mamba}_2({(\mathbf{h}_i, \delta t_i)}).
+\end{equation*}
+

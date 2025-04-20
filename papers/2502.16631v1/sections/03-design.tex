@@ -1,0 +1,90 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\input{figures/tex/criu-gpu-checkpoint-arch}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Transparent GPU Checkpointing}\label{sec:design}%
+Several open-source tools enable transparent checkpointing of Linux processes running on the CPU~\cite{hhargrove2006berkeley,ansel2009dmtcp,criu}, of which Checkpoint/Restore in Userspace (CRIU) is the most widely used and actively maintained. However, a key limitation of CRIU is that, out of the box, it does not support saving and restoring the state of external hardware devices such as GPUs~\cite{shukla2022singularity,eiling2022cricket}. To address this limitation, we extend the functionality of CRIU with \textit{plugins} (\autoref{sec:gpu-plugins}) that handle GPU state. In comparison to the previous work (utilizing device-proxy mechanisms to intercept, log, and replay API calls~\cite{eiling2022cricket,eiling2023cricket,shukla2022singularity,gupta2024just}), we leverage recently introduced driver capabilities to enable transparent GPU checkpointing~\cite{bhardwaj2021drm,gurfinkel2024checkpointing}. Our aim is to enable \textit{fully transparent} checkpointing that supports a wide range of GPU devices and avoids the performance overheads and limitations of API interception (\autoref{sec:background}).
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{GPU Plugins}\label{sec:gpu-plugins}
+%
+Checkpointing of CUDA~\cite{gurfinkel2024checkpointing} and ROCm~\cite{bhardwaj2021fast} applications is achieved through driver capabilities that capture and restore the GPU state (e.g., memory) associated with the target processes. Since this functionality is specific to GPU-accelerated applications and not required for other (e.g., CPU-only) workloads, we implement it as dynamically loadable shared libraries (\textit{plugins}), which can be optionally installed. When these plugins are installed, they are loaded during CRIU's initialization phase and utilized to handle GPU resources. ~\Cref{fig:criu-gpu-checkpoint-arch} illustrates the checkpoint/restore mechanisms with CUDA (\autoref{sec:cuda-plugin}) and AMD GPU (\autoref{sec:amd-gpu-plugin}) plugins. These plugins implement callbacks that are executed at specific stages (known as \textit{hooks}; \autoref{sec:plugin-hooks}) during the checkpoint and restore operations. In addition, each plugin defines \textit{initialization} and \textit{exit} callback functions. The initialization function is called when the plugin is loaded, with an argument specifying the current CRIU operation (\textit{dump}, \textit{pre-dump}, or \textit{restore}). Similarly, the plugin's exit function is invoked at the end of the checkpoint/restore operation, with an argument indicating whether the operation has been successful. This allows the plugins to perform cleanup tasks or, in the event of an error, restore the target processes to their original state.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsubsection{CUDA Plugin}\label{sec:cuda-plugin}%
+The CUDA plugin utilizes a checkpointing utility called \texttt{cuda-checkpoint}~\cite{cuda-checkpoint} to perform a set of actions (\textit{lock}, \textit{checkpoint}, \textit{restore}, \textit{unlock}) for all tasks running on NVIDIA GPUs.
+%
+In particular, these actions are used to enable transparent GPU checkpointing as follows:
+\begin{enumerate}[label=\itshape(\roman*\upshape),nosep]
+    \item \textit{Locking} all CUDA APIs affecting the GPU state of the target processes and waiting for active operations (e.g., stream callbacks) to complete. \sys uses a timeout (10 seconds by default) with this action to avoid indefinite blocking. If the timeout expires, \sys attempts to restore all CPU and GPU tasks to their original state.
+
+    \item \textit{Checkpointing} the GPU state of CUDA tasks into host memory allocations managed by the driver, and releasing all GPU resources held by the application.
+\end{enumerate}
+%
+Executing these steps results in the CUDA tasks entering a \textit{checkpointed} state without direct reference to GPU hardware.
+%
+This allows to perform checkpoint/restore operations with CRIU similar to a CPU-only workloads.
+%
+It is important to note that a standalone invocation of the \texttt{cuda-checkpoint} tool does not handle the state of processes and threads running on the CPU, which can result in undefined behavior.
+%
+For example, multi-threaded workloads, such as Ollama~\cite{morgan2023ollama}, use error-handling mechanisms that detect unresponsive GPU tasks and restart them.
+% 
+To prevent inconsistencies and undefined behavior, \sys ensures that all CPU and GPU tasks are suspended (locked) before checkpointing their state.
+% 
+This is achieved through the Linux ptrace seize with interrupt mechanism~\cite{linux-ptrace}, which halts the execution of relevant processes and threads running on the CPU, allowing \sys to capture their state in a unified CPU-GPU snapshot.
+%
+Restoring the state of CUDA applications has the following steps:
+%
+\begin{enumerate}[label=\itshape(\roman*\upshape),nosep]
+    \item \textit{Restore} resources such as device memory back to the GPU, memory mappings to their original addresses, and reconstruct CUDA objects (e.g., streams and contexts).
+    \item \textit{Unlock} driver APIs, allowing the CUDA application to resume execution on the GPU.
+\end{enumerate}
+% 
+In addition, a boolean flag is set in the inventory image of the snapshot indicating whether it contains GPU state, allowing for compatibility checks and optimizations during restore.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\input{figures/tex/plugins-checkpoint-workflow}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsubsection{AMD GPU Plugin}\label{sec:amd-gpu-plugin}
+The AMD GPU plugin enables transparent checkpoint/restore using input/output control (\texttt{ioctl}) operations with the Kernel Fusion Driver (KFD). These operations are used to pause and resume the execution of GPU processes, as well as to capture and restore their state, which consist of memory buffer objects (BOs), queues, events, and topology.
+
+GPU-accessible BOs are kernel-managed device (VRAM) and system (graphics translation table) memory, user-managed memory (userptr), and special apertures for signaling (doorbell) and control registers (MMIO). The saved BO properties include buffer type, handle, size, virtual address, device file offset for CPU mapping, and memory contents.
+
+GPU work is typically submitted through user-mode queues with associated user- and kernel-managed memory buffers.
+Checkpointing requires preempting and saving the state of all queues belonging to the process.
+This includes queue type (compute or DMA), kernel-managed control stack, memory queue descriptor, read/write pointers, doorbell offset, and architected queueing language (AQL) pointer.
+The state stored in user-managed BOs includes ring buffer (commands), AQL queue, completion tracking (end-of-processing) buffer, and context save area (preempted shader state).
+%
+For checkpoint/restore of GPU-to-host signaling events, the allocated event IDs and their signaling state are saved and restored, while the event slot contents are included in the memory data.
+%
+During checkpointing, the plugin performs the following \texttt{ioctl} operations:
+\begin{enumerate}[label=\itshape(\roman*\upshape), nosep]
+    \item \texttt{PROCESS\_INFO} -- collecting metadata about the process, pausing its execution, and evicting all queues
+
+    \item \texttt{CHECKPOINT} -- capturing the GPU state described above
+
+    \item \texttt{UNPAUSE} -- restores the evicted queues
+\end{enumerate}
+%
+For security reasons, KFD allows these \texttt{ioctl} calls to be performed only by the same process that opened the \texttt{/dev/kfd} file descriptor, and requires \texttt{CAP\_CHECKPOINT\_RESTORE} or \texttt{CAP\_SYS\_ADMIN} capability.
+% 
+The plugin performs the following operations during restore:
+\begin{enumerate}[label=\itshape(\roman*\upshape),nosep]
+    \item \texttt{RESTORE}: reinstates the checkpointed state of processes
+    \item \texttt{RESUME}: resumes execution of processes on the GPU
+\end{enumerate}
+
+Checkpointed applications can only be restored on systems with compatible GPU topology with the same number, type, memory size, VRAM accessibility by the host, and connectivity between GPUs.
+When restoring on a different system or with different subset of GPUs on the same system, the unique GPU identifiers (GPUIDs) might be different during restore. These identifiers are based on properties like the instruction set and compute units. To address this, the plugin performs a translation of the GPUIDs used by the restored processes that applies to all KFD ioctl calls.
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsubsection{Plugin Hooks}\label{sec:plugin-hooks}
+CRIU provides a set of hooks for checkpointing external resources such as UNIX sockets, file descriptors, mountpoints, and network devices. These hooks serve as an API that can be used with plugins to extend the existing functionality.
+
+\stitle{AMD GPU Plugin Hooks.} CRIU provides two hooks for handling checkpoint and restore operations with device files: \texttt{DUMP\_EXT\_FILE} and \texttt{RESTORE\_EXT\_FILE}. When checkpointing ROCm applications, these hooks are invoked for the \texttt{/dev/kfd} and \texttt{/dev/dri/renderD*} device nodes. The obtained KFD file descriptor is used by the plugin to perform \texttt{ioctl} calls to manage memory, queues, and signals, while per-GPU device render node files are utilized to handle CPU mapping of VRAM and GTT BOs. Two additional plugin hooks have been introduced to enable checkpoint/restore of AMD GPU device virtual memory areas (VMA): \texttt{HANDLE\_DEVICE\_VMA} and \texttt{UPDATE\_VMA\_MAP}. These hooks allow the plugin to translate device file names and mmap offsets to newly allocated ones during restore. In particular, these offsets identify BOs within a render node device file, and the translation mechanism allows a process to be restored on a different GPU. A \texttt{RESUME\_DEVICES\_LATE} hook has been introduced to finalize the restore of userptr mappings and resume execution on the GPU for each restored process, after CRIU's restorer PIE code has restored all VMAs.
+
+\stitle{CUDA Plugin Hooks.} Similarly, two additional plugin hooks have been introduced to invoke \textit{lock} and \textit{checkpoint} actions with the \texttt{cuda-checkpoint} utility for processes running on NVIDIA GPUs: \texttt{PAUSE\_DEVICES} and \texttt{CHECKPOINT\_DEVICES}. The \textit{pause} hook is called immediately before the target CPU processes are frozen. This hook is used by the CUDA plugin to place the corresponding GPU tasks in a \textit{locked} state, halting any pending work and preparing them to be checkpointed. Following this, the \textit{checkpoint} hook is called after all CPU and GPU processes are frozen/locked state to checkpoint their GPU state into host memory. The CUDA plugin also utilizes the \texttt{RESUME\_DEVICES\_LATE} hook to \textit{restore} the state of processes from host memory to the GPU and perform the \textit{unlock} action to resume their execution.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Checkpoint/Restore Workflow}
+The sequence of operations described above for AMD GPU and CUDA plugins is illustrated in \Cref{fig:plugins-checkpoint-workflow}. Each plugin uses a different method for checkpointing the GPU state of applications. For CUDA applications, \circled{1} performs a \textit{lock} action that halts the execution of device API calls. Similarly, the AMD GPU plugin invokes a KFD ioctl call to collect metadata, pause execution, and the evict queues for the target ROCm application. \circled{2} checkpoints the GPU state to host memory for CUDA applications. In contrast, at this stage the AMD GPU plugin saves the GPU state into a set of checkpoint files. \circled{3} continues with traditional checkpoint operations for CUDA applications as the GPU state is included in host memory. The AMD GPU plugin at this stage invokes a KFD ioctl call to resume the state of queues. The restore functionality has analogous sequence operations as described in \Cref{sec:gpu-plugins}.

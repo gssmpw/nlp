@@ -1,0 +1,639 @@
+\documentclass[conference]{IEEEtran}
+\usepackage[T1]{fontenc}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage[misc]{ifsym}
+\usepackage{amsmath}
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{mwe}
+\usepackage{amsmath}
+\usepackage{float}
+\usepackage[table,xcdraw]{xcolor}
+\newcommand{\corr}{(\Letter)}
+
+%gkj - check if this is allowed in ECML format
+\usepackage[numbers]{natbib}
+
+% N.B.: do not change anything above this line. If you require additional packages, please load them directly after this line.
+\usepackage{mwe}
+% N.B.: you may delete the preceding line. It is used to display an example image in this template.
+
+\begin{document}
+
+\title{\textit{KVCrush:} \underline{K}ey \underline{V}alue \underline{C}ache size-\underline{r}eduction \underline{u}sing \underline{s}imilarity in \underline{h}ead-behaviour}
+
+%\titlerunning{\textit{KVCrush}}
+\author{Gopi Krishna Jha, Sameh Gobriel, Liubov Talamanova,  Alexander Kozlov, Nilesh Jain\\
+\textit{Intel Corporation} \\
+}
+
+%\authorrunning{G.K. Jha et al.}
+%\institute{Intel Corporation}
+
+\maketitle
+\sloppy
+\begin{abstract}
+Key-value (KV) caching has emerged as a crucial optimization technique for accelerating inference in large language models (LLMs). By allowing the attention operation to scale linearly rather than quadratically with the total sequence length, KV caching significantly enhances generation throughput~\citep{h2o}. However, due to large context lengths in the modern LLMs, the memory footprint of the KV is a huge bottleneck for model deployment directly impacting the model's batch size, hindering its ability to deliver high-throughput~\citep{scissorhands}. Existing research addresses this challenge using several techniques, such as discarding low-attention tokens, quantization, and matrix approximation which typically lead to a negative impact on the model accuracy. 
+
+In this paper, We propose \emph{KVCrush} technology which can be combined with many KV compression technologies to improve the model accuracy at a much smaller memory. \emph{KVCrush} provides an alternate representation scheme for key-value states, along with a low-overhead token pruning algorithm that accounts for the token distribution in the KV cache, which in turn allows for a a smaller footprint while maintaining the accuracy of the model. Based on our results, \emph{KVCrush} reduces \textit{LongBench}~\cite{longbench} KV Cache size by $4\times$ with less than $1\%$ accuracy drop and achieves state-of-the-art average accuracy with minimal overhead, incurring less than $0.5\%$ total inference latency. \emph{KVCrush} not only outperforms the accuracy of state-of-the-art importance-based token retention schemes but is also compatible with typical practical LLM deployments using KV cache paging schemes such as vLLM and mixed precision quantization.    
+
+\end{abstract}
+
+\section{Introduction}
+\label{introduction}
+
+%\deleted[id=SG]{Transformers have revolutionized the field of natural language %processing, enabling significant advancements in generative %AI~\cite{transformer1}~\cite{transformer2}.} 
+
+Generative AI models, such as large language models (LLMs), have revolutionized the computing industry. These models boast an extensive number of parameters and consistently achieve state-of-the-art performance across various downstream tasks \cite{sun2019bert4rec} \cite{memrec} \cite{dosovitskiy2020image} \cite{raffel2020exploring}. However, the current trend of model size growth toward multi-trillion parameters~\cite{isaev2023scaling} — with models growing by one estimate~\cite{gholami2024ai} at a staggering rate of $410\times$ every 2 years— poses huge challenges for deploying them in practice. For instance, GPT-175B~\cite{gpt3} requires 325GB of memory just to load the model weights. Additionally, not only do inferences for these models strain the platform compute and memory resources (both in terms of bandwidth and capacity), but typically, this is also coupled with strict latency requirements (in the order of tens of milliseconds) which further complicates the problem and poses a significant engineering challenge for efficiently delivering high inference throughput while maintaining low latency for user requests.
+
+%\deleted[id=SG]{A key component of transformers is the attention mechanism, which %allows the model to weigh the importance of different tokens in the input sequence.} 
+LLMs typically consist of stacked transformer decoder layers, with the self-attention module being a critical building block. This module weigh the importance of different tokens capturing their contextual information by attending token pairs at different positions within the input sequence. Nevertheless, self attention matrix multiplication is compute intensive and has a quadratic computational complexity with respect to sequence length\cite{allyouneed} which significantly impacts the inference throughput, especially for longer sequences\cite{survey}. 
+
+\begin{figure}[htp]
+\centering
+     \includegraphics[width=0.45\textwidth]{figures/kvcache.png}
+     \caption{ An illustration of the key-value caching mechanism}
+    \label{fig:kvcache}
+\end{figure}
+
+\begin{figure*}[htp]
+\centering
+     \includegraphics[width=0.80\textwidth]{figures/kvcrush_flow.png}
+     \caption{ KVCrush flow. The total cache budget $B$ is divided into $B_{important}$ for storing pivotal tokens, determined by the specific KV cache compression algorithm used (e.g., H20, SnapKV, PyramidKV), and $B_{representative}$ for storing representative tokens. These representative tokens act as proxies for evicted tokens and are selected using a low-overhead grouping algorithm to ensure better context representation.}
+    \label{fig:kvcrush_flow}
+\end{figure*}
+
+KV Cache has emerged as the de facto solution to this issue, converting the time complexity of token generation from quadratic to linear, albeit with increased memory
+overhead proportional to the context length. This mechanism is crucial for autoregressive tasks, where the model generates one output token at a time. As shown in Figure~\ref{fig:kvcache}, and since in the decode phase each token depends on the key and value tensors of all previous tokens (including the input tokens’ KV tensors computed at prefill, and all new KV tensors computed until the current time step). To avoid recomputing all these tensors for all tokens at each time step, a KV cache is used to cache the values in memory, and for every iteration, when new elements are computed, they are simply added to the running cache to be used in the next iteration.
+
+\begin{equation}
+\resizebox{0.95\columnwidth}{!}{%
+    $\text{KV Memory} = 2 \cdot B \cdot N_{L} \cdot N_{H} \cdot L_{\text{seq}} \cdot D \cdot precision$
+}
+\label{eq:kv_cache}
+\end{equation}
+
+The scalability of KV caching becomes a critical issue as models grow larger and more complex. The total memory used by a KV cache can be determined using Equation~\ref{eq:kv_cache}, where $B$ is the batch size, $N_{L}$ represents the number of layers in the model, $N_{H}$ represents the number of attention heads used, $D$ represents the dimensionality of the embeddings, $L_{seq}$ is the length of context in tokens, $precision$ is the number of bytes per value stored (e.g. 4B for FP32) and the factor $2$ is because two matrices for K and V are needed. As a result, for a given model, the KV cache size grows linearly with the maximum sequence length in the input context and the batch size, which, in practice, can result in an enormous KV cache size.
+
+For instance, consider the OPT-175B model with its impressive 175 billion parameters, which consumes approximately 325 GB of memory. However, when using a batch size of 128 and a sequence length of only 8K, the KV cache requires around 4608 GB of memory. This is an order of magnitude (12X) larger than the model weights themselves. The issue of KV cache size has become increasingly prominent and is a significant cost factor in deploying large language models (LLMs). This is true, especially with the recent trend of LLMs models that have been meticulously developed to scale up to handle extremely long context (for example, Google’s Gemini-pro-1.5 has shown to support a staggering 1M token context length~\cite{Gemini}  
+
+Several approaches have been proposed to mitigate the memory bottleneck associated with KV caching. Recent research have explored different optimizations of KV caching, including approaches such as low-rank decomposition of the KV cache(e.g., ~\cite{decomp}) or pruning non-essential KV cache~\cite{h2o, snapkv, scissorhands, fastgen}, however, most of these techniques struggle to maintain the accuracy of the model at a smaller KV cache footprint when compared to the full model. 
+
+To address this challenge, we introduce \emph{KVCrush}, a novel KV cache optimization, that provides an alternate representation scheme for key-value states, along with a low-overhead token pruning algorithm that accounts for the token distribution in the KV cache. \emph{KVCrush}, in turn, allows for a a smaller footprint while maintaining the accuracy of the model and can be easily combined with many KV Cache compression technologies, furthermore, \emph{KVCrush} also works seamlessly with KV cache paging schemes (such as vLLM~\cite{vllm}) and mixed precision quantization~\cite{mixed} typically used in practical deployments. The technical contributions of this work can
+be summarized as follows:
+\begin{itemize}
+    \item \textbf{Hardware-Efficient Alternative Representation of Tokens:} We leverage attention score patterns across heads to generate a binary feature vector for each token. This binary alternative representation is much smaller than the original key and value vectors, yet it preserves enough semantic information, to convey token importance and similarities, which we use to prune or retain the tokens very efficiently.
+    \item \textbf{Accuracy-aware Low-Overhead KV Optimization Algorithm:} Our algorithm
+    leverages the alternative binary representation of tokens and an \textit{anchor point} to bucketize tokens into representative groups, using very efficient low-overhead distance calculations that scale linearly with the number of tokens. This approach ensures that different token groups are represented in the reduced KV memory footprint and maintaining the inference accuracy of the model.  
+    \item We show that \emph{KVCrush} can be \textbf{efficiently combined} with other KV cache optimizations technologies for compression, quantization, and paging making it easily deployable in practice.  
+    \item We show that for a given memory budget, \emph{KVCrush} can yield \textbf{better accuracy} than the SOTA KV cache compression schemes alone. We also show \emph{KVCrush} can achieve \textbf{better compression} than other compression techniques for iso-accurate models, In particular, \emph{KVCrush} reduces the \textit{LongBench}~\cite{longbench} KV Cache size by $4\times$ with less than $1\%$ drop in accuracy w.r.t. to the full cache.
+    \item We demonstrate that \emph{KVCrush} is a highly efficient technique, incurring minimal overhead. It achieves state-of-the-art average accuracy on the \textit{LongBench}, with less than $0.5\%$ overhead in total inference latency.
+\end{itemize}
+
+
+
+\begin{figure*}[htp]
+\centering
+     \includegraphics[width=0.9\textwidth]{figures/kvCrushRep.png}
+     \caption{Generating binary representation of tokens to be consumed by KVCrush eviction algorithm}
+    \label{fig:kvcrush_rep}
+\end{figure*}
+
+\section{Related Work}
+\label{background}
+
+%\subsection{Background}
+%\subsubsection{Memory Bottlenecks for LLM Inference and KV Caching}
+%Generative AI models, such as large language models (LLMs), have revolutionized the computing industry. These models boast an extensive number of parameters and consistently achieve state-of-the-art performance across various tasks. However, the current trend toward multi-trillion parameter models [6]- with models growing by 410x every 2 years [7]- poses financial challenges for smaller and medium-sized players. The sheer size of these models (for instance, GPT-175B requires 325GB of memory just to load its weights) renders traditional optimization techniques like prefetching, dataflow, and caching ineffective. Additionally, LLMs during inference strain compute and memory resources (both bandwidth and capacity) for the platform. Meeting strict latency requirements (in the order of 50-100ms) further complicates delivering high throughput while maintaining low latency.
+
+%LLMs typically consist of stacked transformer decoder layers, with the self-attention module being a critical component. This module captures contextual information by attending to different positions within sequences. However, the quadratic computational complexity of the attention module with respect to sequence length significantly impacts performance, especially for longer sequences. As a solution, KV caching has become the de facto optimization for inference, allowing the attention operation to scale linearly rather than quadratically in total sequence length.
+
+%\subsubsection{KV Cache Footprint in LLMs}
+%To speed up calculations, KV cache stores previously used key-value pairs in memory. This eliminates the need to recompute these values every time.   
+
+%The KV cache size grows linearly with the maximum sequence length in the input context and the batch size. In practice, this can result in an enormous KV cache size. For instance, consider the OPT-175B model with its impressive 175 billion parameters, which consumes approximately 325 GB of memory. However, when using a batch size of 128 and a sequence length of 8K, the KV cache requires around 4608 GB of memory. This is an order of magnitude (12X) larger than the model weights themselves.
+ 
+%The issue of KV cache size has become increasingly prominent and is a significant cost factor in deploying large language models (LLMs). Reducing KV cache memory footprints in LLMs without sacrificing accuracy poses a challenge. 
+
+
+Techniques to reduce the size of KV Caches have received substantial research attention in recent years. Broadly speaking, we can divide these into three categories: 
+
+\subsection{Quantizing KV Cache}
+Quantization is the process of reducing the precision of a model’s parameters and activations to lower bit-widths to save memory and computational resources. Quantization can be categorized into post-training quantization (PTQ) and quantization-aware training (QAT), with PTQ often preferred for large language models due to its lower resource requirements. \cite{xiao2023smoothquant}, \cite{liu2024llmqat}, and \cite{sheng2023flexgen} demonstrated that quantizing queries, keys, and values to INT8 enables efficient attention operations. However, these methods apply quantization uniformly across all KV cache tokens, and thus will typically negatively impact the model generation accuracy.
+
+On the other hands, research work such as \cite{mq1}, \cite{mq2}, \cite{mq3}, \cite{mikv} employ mixed precision quantization to allocate different number of bits to various model components or tensors, and thus enable a more efficient compression. This methods leverage the insight that different parts of a model exhibit varying levels of sensitivity to quantization. 
+
+As we discuss later in details, \emph{KVCrush} is running on the KV cache to determine the subset of tokens to retain or to evict. As a result, it is complementary to quantization technology used. The (mixed)-precision used to represent each token can be easily combined with KV-crush by assigning different precision bits to the set of retained tokens based on the "importance" of the token as we will explain. 
+
+\subsection{Sharing KV Cache}
+Multi-Query Attention (MQA)  and Grouped Query Attention (GQA)  are techniques developed to address the memory footprint issues LLMs allowing to share KV caches across heads. MQA, introduced by \citep{mqa}, reduces memory usage by sharing key and value representations across all attention heads, which enhances memory efficiency and inference speed, at the expense of generation quality. GQA, proposed by \citep{gqa}, extends this concept by grouping query heads to share KVs, balancing memory reduction with better performance retention. However, GQA involves higher training costs and complexity. Both methods offer trade-offs between memory efficiency and model performance, with MQA favoring memory savings and GQA providing a more balanced approach. 
+
+Intuitively, \emph{KVCrush} is completely orthogonal to these sharing schemes of the KV cache. Our technology is applicable to the deployed KV cache irrespective of whether this cache is shared and grouped across attention heads or not. 
+
+\subsection{Evicting inconsequential Keys and Values} \label{related:kv_eviction}
+This category is the closest related work to \emph{KVCrush}. In this research category  different methods aim to prune key-value (KV) pairs from cache after input processing, aiming to enhance decoding efficiency. By evicting tokens out of KV cache, memory consumption is reduced, facilitating support for larger batch sizes and longer context windows. 
+
+Different strategies for KV pruning and selectively dropping tokens from the KV cahce have been proposed in recent research work, For example, In StreamLLM~\cite{streamingllm}, only the most recent tokens and attention sinks (first few tokens) are retained. H2O \cite{h2o} and Scissorhands \cite{scissorhands} utilize attention-based metrics to determine eviction, with H2O summing attention weights and Scissorhands considering the frequency of attention surpassing a threshold. FastGen \cite{fastgen} combines these methods with heuristics for special tokens. SnapKV~\cite{snapkv} similarly depends on attention weights to prune the KV cache, but addresses the efficiency during prefill with long context, and due to the complexity of computing attention score for the whole context, it limits the observation window to the final tokens of the input prompt, thus reducing the complexity from $O(L^2)$ to $O(L)$, where $L$ is the context length, while it used max pooling to retain neighboring KVs. PyramidKV \cite{pyramidkv} builds on SnapKV by configuring variable eviction rates across layers, with more aggressive pruning in later layers where attention is less evenly distributed. 
+
+The common drawback across these existing methods is that the model accuracy drops with the higher the KV compression ratio. These works concentrate solely on finding a set of pivotal tokens (the specifics of the algorithms to select these will vary) and evict the rest of the tokens which shrink the KV cache size but at the expense of a negative impact on the model generation quality. \emph{KVCrush} addresses this drawback by trying to represent the evicted tokens in the final KV cache. It ensures that different token groups are represented in the reduced KV memory footprint, and thus can sustain the accuracy. As a result, \emph{KVCrush} can be combined with many existing methods to remedy the accuracy drop at the same KV cache budget. We present results in Section~\ref{experiments}, combining \emph{KVCrush} with state-of-the-art research, showing the improved performance of our technology at the same compression ratio.
+
+\begin{figure*}[t]
+\centering
+     \includegraphics[width=0.80\textwidth]{figures/kvcrush_grouping.png}
+     \caption{ KVCrush KV Eviction}
+    \label{fig:kvcrush_grouping}
+\end{figure*}
+
+
+        
+
+        \begin{table*}[ht!]
+        \resizebox{\textwidth}{!}
+        {
+            \begin{tabular}{@{}ccc@{}}
+            \toprule
+            \textbf{Benchmarks}                  & \textbf{LongBench}             & \textbf{lm-eval-harness}                  \\ \midrule
+            \textbf{Experiments}                 & RQ3, RQ5                       & RQ1, RQ2, RQ4                             \\
+            \textbf{Datasets} &
+              \begin{tabular}[c]{@{}c@{}}narrativeqa, qasper,   multifieldqa\_en, hotpotqa, 2wikimqa, \\      musique, gov\_report, qmsum, multi\_news, trec, triviaqa, \\      samsum,  passage\_count,   passage\_retrieval\_en,   repobench-p\end{tabular} &
+              GSM8K and XSUM \\
+            \textbf{Models} &
+              Mistral-7B-Instruct-v0.2, Meta-Llama-3-8B-Instruct &
+              Phi-3-mini-4k-instruct, Meta-Llama-3-8B-Instruct,  Llama-2-7b-chat-hf \\
+            \textbf{Baselines}                   & FullKV, H2O, SnapKV, PyramidKV & H2O                                       \\
+            \textbf{Paging Mode}                 & Token Level, Chunk Level       & Page Level (Page Size = 32)                               \\
+            \textbf{Total Cache Budget (tokens)} & 2048                           & 672 = 32(initial)+512(middle)+128(recent) \\
+            \textbf{Cache Budget Partitioning}   & 25\% KVCrush + 75\% Baseline   & Best of (25\%+75\%) and (75\% and 25\%)   \\
+            \textbf{Cuda Version}                & 12.2                           & 12.2                                      \\
+            \textbf{Pytorch Version}             & '2.4.1+cu121'                  & '2.4.1+cu121'                             \\ \bottomrule
+            \end{tabular}
+        }
+        \caption{Experimental settings used for evaluation}
+        \label{table:settings}
+        \end{table*}
+
+        \begin{table*}[ht!]
+        \resizebox{\textwidth}{!}
+        {
+        \begin{tabular}{|c|c|cc|cc|cc|}
+        \hline
+                                   & Cache Budget: 512 & \multicolumn{2}{c|}{\textbf{Phi-3-mini-4k-instruct}}                                                                           & \multicolumn{2}{c|}{\textbf{Meta-Llama-3-8B-Instruct}}                                                                         & \multicolumn{2}{c|}{\textbf{Llama-2-7b-chat-hf}}                                 \\ \hline
+                                   & hh-cl             & \multicolumn{1}{c|}{\textbf{Strict}}                                     & \textbf{Flexible}                                   & \multicolumn{1}{c|}{\textbf{Strict}}                                     & \textbf{Flexible}                                   & \multicolumn{1}{c|}{\textbf{Strict}}              & \textbf{Flexible}            \\ \hline
+        \textit{H2O}               & 512-0             & \multicolumn{1}{c|}{70.7}                                                & 79.3                                                & \multicolumn{1}{c|}{74.9}                                                & 74.7                                                & \multicolumn{1}{c|}{0.209}                        & 0.225                        \\ \hline
+        \textit{kvcrush.random}    & 128-384           & \multicolumn{1}{c|}{{\color[HTML]{00B050} 75.4}}                         & {\color[HTML]{00B050} 80.9}                         & \multicolumn{1}{c|}{{\color[HTML]{00B050} 76.2}}                         & {\color[HTML]{00B050} 76.2}                         & \multicolumn{1}{c|}{{\color[HTML]{00B050} 0.211}} & {\color[HTML]{00B050} 0.226} \\ \hline
+        \textit{kvcrush.mean}      & 128-384           & \multicolumn{1}{c|}{\cellcolor[HTML]{FFFFFF}{\color[HTML]{00B050} 75.2}} & \cellcolor[HTML]{FFFFFF}{\color[HTML]{00B050} 80.6} & \multicolumn{1}{c|}{\cellcolor[HTML]{FFFFFF}{\color[HTML]{00B050} 76.5}} & \cellcolor[HTML]{FFFFFF}{\color[HTML]{00B050} 76.4} & \multicolumn{1}{c|}{{\color[HTML]{00B050} 0.21}}  & {\color[HTML]{00B050} 0.229} \\ \hline
+        \textit{kvcrush.alternate} & 128-384           & \multicolumn{1}{c|}{\cellcolor[HTML]{FFFFFF}{\color[HTML]{00B050} 74.6}} & \cellcolor[HTML]{FFFFFF}{\color[HTML]{00B050} 80.9} & \multicolumn{1}{c|}{\cellcolor[HTML]{FFFFFF}{\color[HTML]{00B050} 75.7}} & \cellcolor[HTML]{FFFFFF}{\color[HTML]{00B050} 75.6} & \multicolumn{1}{c|}{{\color[HTML]{00B050} 0.212}} & {\color[HTML]{00B050} 0.227} \\ \hline
+        \end{tabular}
+        }
+        \caption{GSM-8K Accuracy using different anchor points in KVCrush. KVCrush outperforms the baseline H2O even using generic anchor points like random, mean and alternate 0s and 1s. Here hh and cl represents the cache budget used by H2O and KVCrush respectively.}
+        \label{table:anchor}
+        \end{table*}
+
+
+
+
+\section{KVCrush}
+\label{sec:kvcrush}
+The basic flow of KVCrush is shown in Figure~\ref{fig:kvcrush_flow}. Given a certain total budget $B$ for the KV Cache, this is split into two smaller portions, $B_{important}$ represents the cache budget available to store the set of pivotal tokens. This set is determined based on the specifics of KV cache compression algorithm used (e.g. H20, SnapKV, PyramidKV, etc.). While $B_{representative}$ represents the cache budget available to store along a set of representative tokens, these act as proxies of the evicted tokens, and are selected based on low-overhead grouping algorithm (discussed in Section~\ref{kvcrush.grouping}) to ensure better representation of the whole context.   
+
+\subsection{KVCrush Alternative Token Representation} \label{kvcrush.rep}
+In the KV cache tokens are represented as floating-point vectors of size $D$ each. $D$ is the size of embedding length and is typically not small. For example, for GPT-3~\cite{gpt3} D is 2048 dimensions while for LLaMA-65B~\cite{llama} it is set at 4096 dimensions. As previously mentioned, KVCrush will try to group tokens in order to select representative tokens from each group. As a result, it is essential to minimize the overhead of the grouping algorithm. The running time of any clustering algorithm in $D$ dimensions will be proportional to the value of $D$.  
+
+To minimize this overhead, KVCrush tries to have an alternative representation of each token with a vector of length $<< D$. The main challenge is how to find this smaller  representation and yet still preserve sufficient semantic information of the tokens to be able to differentiate and group them based on their contextual relationship.
+
+KVCrush draws some insights of alternative token representation from the FastGen research~\cite{fastgen}. The authors in this work demonstrated that distinct attention heads exhibit unique structural patterns and attend to different tokens differently. For example, some attention heads will attend more to special tokens, others will attend more to locality among tokens, others will attend more to punctuation, etc.
+
+Building on these findings we can deduce that the attention score of a certain token across $H$ tokens is a vector of length $H$ and will represent good semantic information about the contextual properties of that token. Keeping in mind that $H<<D$, where for example, $H$ is 96, 128 for GPT-3~\cite{gpt3} and LLaMA-65B~\cite{llama}, respectively.       
+
+To reduce the grouping overhead even more, KVCrush takes the alternative token representation one step further. Instead of using a floating point vector of size $H$ each, it converts that into a binary vector of size $H$ replacing the floating point with a single bit. The main insight here is, for a given head and for any given KV  compression algorithm the binary decision of whether to retain or evict the token (i.e. whether this token is pivotal or not) maintains the sematic information of the token importance (a combination of attention score, recency, etc.) with respect to the remaining tokens in the current context.  
+
+Figure~\ref{fig:kvcrush_rep} depicts how KVCrush generates the alternative binary  representation of size $H$ for the input tokens and it can be summarized in the following steps:   
+\begin{itemize}
+    \item \textbf{Compute the attention weight matrix} using the query and key matrix. The attention score is computed. It should be noted that attention computation has to be done anyway during inference. \emph{KVCrush} uses the attention values without recomputation.
+    \item \textbf{Apply a threshold per attention head} For each attention head the attention weight is normalized and a binary value is used to indicate whether the the token is retained or evicted by the corresponding compression algorithm. For example, the H20 algorithm~\cite{h2o} to achieve $2\times$ compression ratio sets a threshold representing the 50th percentile of attention score on the attention weight matrix. Any tokens with higher attention will be retained (bit = 1) and those with lower attention will be discarded (bit = 0)
+    \item \textbf{Collate one \textit{selection bit} per head} form the binary feature vector for a given token by collating all bits across the different $H$ attention heads of the model.
+\end{itemize}
+
+\subsection{KVCrush Token Grouping and Cache Eviction} \label{kvcrush.grouping}
+ 
+ As previously mentioned, KVCrush will select $B_{representative}$ tokens that act as proxies of the evicted tokens based to keep in the KV Cache. The selection is based on a low-overhead grouping algorithm built on top of the alternative binary representation of tokens. Figure~\ref{fig:kvcrush_grouping} depicts the main steps of this weak clustering algorithm to form token groups and can be summarized as follows:  
+
+\begin{itemize}
+\item The clustering algorithm takes a set of $S$ tokens each represented with a binary vector of length $H$ as input, it selects $B_{representative}$ tokens where $B_{representative} < S$ vectors as output
+\item	An arbitrary anchor point is first selected (ideally, the anchor point should be centrally placed to all $S$ vectors in an $H$ dimension space). In our experiments we present results for 3 different (low-overhead) selection of anchor points (random, alternate and mean). 
+\item	For each of the $S$ input vectors, hamming distance is Computed with respect to the anchor point. The binary representation of $S$ tokens makes the hamming distances very low overhead and efficiently computed on the fly using masked $H$ comparisons.
+\item	Each token is then assigned to one bucket out of set of $B_{representative}$ available. The selected bucket is the one with the the lowest hamming distance.   
+. \item	After the bucketization of all $S$ tokens to their corresponding buckets, One representative vector is selected (in random) from each bucket and all the other ($S-B_{representative}$) remaining tokens are dropped. Those retained tokens, in addition to the $B_{important}$ tokens retained by the KV Compression algorithm represent the final $B$ tokens of the KV cache.
+ \end{itemize}
+
+ It should be mentioned however, that we described KVCrush grouping algorithm using Hamming distance computations with respect to ONE anchor point, and thus, token pruning only requires $S$ Hamming distance comparisons instead of using $O(S^2)$ distance computations required by standard clustering algorithms. In section~\ref{sec:kmeans_comparison} we present results for using a higher overhead clustering algorithm on accuracy and latency of \emph{KVCrush}. 
+
+
+\begin{figure}[htp]
+        \centering
+             \includegraphics[width=0.49\textwidth]{figures/kvcrush_cache_budget_partitioning.png}
+             \caption{Impact of cache budget partitioning on Accuracy gain. For some workloads like \textit{narrativeqa}, the optimal cache budget can be as high as $90\%$, whereas for others, it generally falls between $20\%$ and $50\%$ of the available budget.}
+            \label{fig:cache_budget_partitioning}
+    \end{figure}
+
+    \begin{figure*}[htbp]
+    \centering
+    \begin{subfigure}[b]{0.49\textwidth}
+        \centering
+        \includegraphics[width=0.97\linewidth]{figures/kmeans_acc.png}
+        \caption{Accuracy deficit w.r.t. Full-KV Baseline}
+        \label{fig:kmeans_acc}
+    \end{subfigure}
+    \begin{subfigure}[b]{0.49\textwidth}
+        \centering
+        \includegraphics[width=0.97\linewidth]{figures/kmeans_latency.png}
+        \caption{Normalized inference Latency on Intel® Xeon® Platinum 8470 Processor}
+        \label{fig:kmeans_latency}
+    \end{subfigure}
+    \caption{Accuracy-Latency trade-off of kmeans using GSM8K dataset. KMeans achieves slightly higher accuracy than \emph{KVCrush} but incurs around $200\%$ more overhead in inference latency, whereas \emph{KVCrush} offers a reasonable accuracy improvement over the pure H2O baseline with minimal overhead of less than $0.5\%$.}
+    \label{fig:kmeans}
+    \end{figure*}
+
+    
+
+\section{Experiments}
+\label{experiments}
+
+
+We organize our experiments to answer the following questions:
+\begin{itemize}
+    \item \textbf{RQ1}: What impact do \emph{KVCrush} settings, such as the cache budget partitioning and anchor points, have on accuracy? 
+    \item \textbf{RQ2}:How does the accuracy versus latency trade-off of \emph{KVCrush} compare to traditional clustering algorithms like k-means?
+    \item \textbf{RQ3}: What are the accuracy implications of integrating \emph{KVCrush} with other KV eviction algorithms such as H2O, SnapKV, and Pyramid KV?
+    \item \textbf{RQ4}:Is \emph{KVCrush} effective in paged KV cache settings?
+    \item \textbf{RQ5}:  How does the accuracy of \emph{KVCrush} compare to other state-of-the-art KV eviction algorithms? 
+\end{itemize}
+\subsection{Experimental Setup}
+We summarize experimental setup used for evalution in table~\ref{table:settings}.
+\subsubsection{Baselines}
+    We compare \emph{KVCrush} with the following baselines. 
+    \begin{itemize}
+            \item \textbf{FullKV} uses the full KV Caches with zero eviction.
+            \item \textbf{H2O \citep{h2o}} uses attention weights sum to determine eviction, keeping top n tokens for each layer.
+            \item \textbf{SnapKV \citep{snapkv}} limits the observation window to the final tokens of the input prompt, while using max pooling to retain neighboring KVs.
+            \item \textbf{PyramidKV \citep{pyramidkv}} builds on SnapKV by configuring variable eviction rates across layers, with more aggressive pruning in later layers where attention is less evenly distributed.
+    \end{itemize}
+
+    
+.
+    \subsubsection{Datasets}
+    In our comparative analysis, we benchmarked our results against baselines across 16 datasets from the \textit{LongBench} suite~\cite{longbench}, encompassing a diverse array of tasks and domains such as single-document question answering, multi-document question answering, summarization, few-shot learning, and coding. These datasets feature input lengths ranging from 2K to 18K tokens. Additionally, for other experiments, we utilized the GSM-8K and XSUM datasets from the \textit{lm-eval-harness} framework ~\cite{lmevalharness}.
+    \subsubsection{Models}
+    In our evaluation of \emph{KVCrush}, we employed the \textit{LLaMa-3-8B-Instruct} and \textit{Mistral-7B-Instruct-v0.2} models on the \textit{LongBench} test suite. Additionally, we used the \textit{LLaMa-3-8B-Instruct} and \textit{Phi-3-mini-4k-instruct} models on the lm-eval-harness evaluation framework.
+
+    \begin{figure*}[htbp]
+        \centering
+        \begin{subfigure}[b]{0.475\textwidth}
+        \centering
+            \includegraphics[width=\linewidth]{figures/kvcrush_integration_token.png}
+            \caption{Token Level Eviction}
+            \label{fig:kvcrush_int_token}
+        \end{subfigure}
+        \begin{subfigure}[b]{0.475\textwidth}
+        \centering
+            \includegraphics[width=\linewidth]{figures/kvcrush_integration_chunk.png}
+            \caption{Chunk (size: 8 tokens) Level Eviction}
+            \label{fig:kvcrush_int_chunk}
+        \end{subfigure}
+        \caption{Accuracy change analysis of integrating KVCrush with other KV Eviction methods using 2wikimqa dataset. KVCrush can enhance the accuracy of other KV Compression methods at both the token and chunk levels.}
+        \label{fig:kvcrush_int}
+\end{figure*}
+
+\begin{figure*}[htp]
+        \centering
+        \begin{subfigure}[b]{0.475\textwidth}
+        \centering
+            \includegraphics[width=\linewidth]{figures/paged_gsm8k_phi3.png}
+            \caption{GSM8K Accuracy using Phi-3-mini-4k-instruct}
+            \label{fig:paged_gsm8k_phi3}
+        \end{subfigure}
+        \begin{subfigure}[b]{0.475\textwidth}
+        \centering
+            \includegraphics[width=\linewidth]{figures/paged_xsum_phi3.png}
+            \caption{XSUM Accuracy using Phi-3-mini-4k-instruct}
+            \label{fig:paged_xsum_phi3}
+        \end{subfigure}
+        \begin{subfigure}[b]{0.475\textwidth}
+        \centering
+            \includegraphics[width=\linewidth]{figures/paged_gsm8k_llama3.png}
+            \caption{GSM8K Accuracy using Meta-Llama-3-8B-Instruct}
+            \label{fig:paged_gsm8k_llama3}
+        \end{subfigure}
+        \begin{subfigure}[b]{0.475\textwidth}
+        \centering
+            \includegraphics[width=\linewidth]{figures/paged_xsum_llama3.png}
+            \caption{XSUM Accuracy using Meta-Llama-3-8B-Instruct}
+            \label{fig:paged_xsum_llama3}
+        \end{subfigure}
+        \caption{Accuracy change w.r.t. full cache baseline for Paged H2O and KVCrush using GSM8K and XSUM datasets. Paged-KVCrush outperfms paged-H2O on both these datasets and models.}
+        \label{fig:kvcrush_paged}
+\end{figure*}
+
+\begin{table*}[ht]
+        \resizebox{\textwidth}{!}
+        {
+            \begin{tabular}{@{}|c|cccccccccccccccc|@{}}
+            \toprule
+             &
+              \multicolumn{3}{c|}{\textbf{Single   Document QA}} &
+              \multicolumn{3}{c|}{\textbf{Multi   Document QA}} &
+              \multicolumn{3}{c|}{\textbf{Summarization}} &
+              \multicolumn{3}{c|}{\textbf{Few Shot Learning}} &
+              \multicolumn{2}{c|}{\textbf{Synthetic}} &
+              \multicolumn{1}{c|}{\textbf{Code}} &
+              \textbf{} \\ \midrule
+             &
+              \multicolumn{1}{c|}{\rotatebox[origin=c]{90}{narrativeqa}} &
+              \multicolumn{1}{c|}{\rotatebox[origin=c]{90}{qasper}} &
+              \multicolumn{1}{c|}{\rotatebox[origin=c]{90}{multifieldqa\_en}} &
+              \multicolumn{1}{c|}{\rotatebox[origin=c]{90}{hotpotqa}} &
+              \multicolumn{1}{c|}{\rotatebox[origin=c]{90}{2wikimqa}} &
+              \multicolumn{1}{c|}{\rotatebox[origin=c]{90}{musique}} &
+              \multicolumn{1}{c|}{\rotatebox[origin=c]{90}{gov\_report}} &
+              \multicolumn{1}{c|}{\rotatebox[origin=c]{90}{qmsum}} &
+              \multicolumn{1}{c|}{\rotatebox[origin=c]{90}{multi\_news}} &
+              \multicolumn{1}{c|}{\rotatebox[origin=c]{90}{trec}} &
+              \multicolumn{1}{c|}{\rotatebox[origin=c]{90}{triviaqa}} &
+              \multicolumn{1}{c|}{\rotatebox[origin=c]{90}{samsum}} &
+              \multicolumn{1}{c|}{\rotatebox[origin=c]{90}{psg\_count}} &
+              \multicolumn{1}{c|}{\rotatebox[origin=c]{90}{psg\_ret\_en}} &
+              \multicolumn{1}{c|}{\rotatebox[origin=c]{90}{repobench-p}} &
+              Average \\ \midrule
+             &
+              \multicolumn{1}{c|}{18409} &
+              \multicolumn{1}{c|}{3619} &
+              \multicolumn{1}{c|}{4559} &
+              \multicolumn{1}{c|}{9151} &
+              \multicolumn{1}{c|}{4887} &
+              \multicolumn{1}{c|}{11214} &
+              \multicolumn{1}{c|}{8734} &
+              \multicolumn{1}{c|}{10614} &
+              \multicolumn{1}{c|}{2113} &
+              \multicolumn{1}{c|}{5177} &
+              \multicolumn{1}{c|}{8209} &
+              \multicolumn{1}{c|}{6258} &
+              \multicolumn{1}{c|}{11141} &
+              \multicolumn{1}{c|}{9289} &
+              \multicolumn{1}{c|}{4206} &
+              7839 \\ \midrule
+            Compression   (x) &
+              \multicolumn{1}{c|}{9.0} &
+              \multicolumn{1}{c|}{1.8} &
+              \multicolumn{1}{c|}{2.2} &
+              \multicolumn{1}{c|}{4.5} &
+              \multicolumn{1}{c|}{2.4} &
+              \multicolumn{1}{c|}{5.5} &
+              \multicolumn{1}{c|}{4.3} &
+              \multicolumn{1}{c|}{5.2} &
+              \multicolumn{1}{c|}{1.0} &
+              \multicolumn{1}{c|}{2.5} &
+              \multicolumn{1}{c|}{4.0} &
+              \multicolumn{1}{c|}{3.1} &
+              \multicolumn{1}{c|}{5.4} &
+              \multicolumn{1}{c|}{4.5} &
+              \multicolumn{1}{c|}{2.1} &
+              4 \\ \midrule
+             &
+              \multicolumn{16}{c|}{\textbf{Mistral-7B-Instruct-v0.2   (Cache Budget: 2048)}} \\ \midrule
+            \textbf{FullKV} &
+              \multicolumn{1}{c|}{\textbf{26.85}} &
+              \multicolumn{1}{c|}{\textbf{33.06}} &
+              \multicolumn{1}{c|}{\textbf{49.44}} &
+              \multicolumn{1}{c|}{\textbf{43.02}} &
+              \multicolumn{1}{c|}{\textbf{27.33}} &
+              \multicolumn{1}{c|}{\textbf{18.78}} &
+              \multicolumn{1}{c|}{\textbf{32.87}} &
+              \multicolumn{1}{c|}{\textbf{24.21}} &
+              \multicolumn{1}{c|}{\textbf{27.05}} &
+              \multicolumn{1}{c|}{\textbf{71.00}} &
+              \multicolumn{1}{c|}{\textbf{86.23}} &
+              \multicolumn{1}{c|}{\textbf{42.90}} &
+              \multicolumn{1}{c|}{\textbf{2.75}} &
+              \multicolumn{1}{c|}{\textbf{86.98}} &
+              \multicolumn{1}{c|}{\textbf{54.41}} &
+              \textbf{41.79} \\ \midrule
+            H2O &
+              \multicolumn{1}{c|}{25.10} &
+              \multicolumn{1}{c|}{30.67} &
+              \multicolumn{1}{c|}{48.29} &
+              \multicolumn{1}{c|}{40.89} &
+              \multicolumn{1}{c|}{25.98} &
+              \multicolumn{1}{c|}{15.57} &
+              \multicolumn{1}{c|}{28.06} &
+              \multicolumn{1}{c|}{23.48} &
+              \multicolumn{1}{c|}{26.78} &
+              \multicolumn{1}{c|}{60.50} &
+              \multicolumn{1}{c|}{\cellcolor[HTML]{FFFFFF}{\color[HTML]{00B050} \textbf{86.33}}} &
+              \multicolumn{1}{c|}{42.48} &
+              \multicolumn{1}{c|}{2.57} &
+              \multicolumn{1}{c|}{82.73} &
+              \multicolumn{1}{c|}{52.92} &
+              39.49 \\ \midrule
+            SnapKV &
+              \multicolumn{1}{c|}{26.15} &
+              \multicolumn{1}{c|}{{\color[HTML]{00B050} \textbf{32.38}}} &
+              \multicolumn{1}{c|}{49.54} &
+              \multicolumn{1}{c|}{41.66} &
+              \multicolumn{1}{c|}{27.54} &
+              \multicolumn{1}{c|}{\cellcolor[HTML]{FFFFFF}{\color[HTML]{00B050} \textbf{19.43}}} &
+              \multicolumn{1}{c|}{29.58} &
+              \multicolumn{1}{c|}{23.83} &
+              \multicolumn{1}{c|}{26.70} &
+              \multicolumn{1}{c|}{71.00} &
+              \multicolumn{1}{c|}{86.31} &
+              \multicolumn{1}{c|}{43.07} &
+              \multicolumn{1}{c|}{2.89} &
+              \multicolumn{1}{c|}{85.89} &
+              \multicolumn{1}{c|}{53.87} &
+              41.32 \\ \midrule
+            PyramidKV &
+              \multicolumn{1}{c|}{25.82} &
+              \multicolumn{1}{c|}{31.67} &
+              \multicolumn{1}{c|}{49.20} &
+              \multicolumn{1}{c|}{41.19} &
+              \multicolumn{1}{c|}{27.01} &
+              \multicolumn{1}{c|}{19.37} &
+              \multicolumn{1}{c|}{29.15} &
+              \multicolumn{1}{c|}{23.89} &
+              \multicolumn{1}{c|}{26.72} &
+              \multicolumn{1}{c|}{71.00} &
+              \multicolumn{1}{c|}{86.28} &
+              \multicolumn{1}{c|}{\cellcolor[HTML]{FFFFFF}{\color[HTML]{00B050} \textbf{43.24}}} &
+              \multicolumn{1}{c|}{\cellcolor[HTML]{FFFFFF}{\color[HTML]{00B050} \textbf{2.73}}} &
+              \multicolumn{1}{c|}{85.06} &
+              \multicolumn{1}{c|}{53.57} &
+              41.06 \\ \midrule
+            KVCrush* &
+              \multicolumn{1}{c|}{{\color[HTML]{00B050} \textbf{26.20}}} &
+              \multicolumn{1}{c|}{32.09} &
+              \multicolumn{1}{c|}{{\color[HTML]{00B050} \textbf{49.86}}} &
+              \multicolumn{1}{c|}{{\color[HTML]{00B050} \textbf{41.86}}} &
+              \multicolumn{1}{c|}{{\color[HTML]{00B050} \textbf{28.33}}} &
+              \multicolumn{1}{c|}{18.85} &
+              \multicolumn{1}{c|}{{\color[HTML]{00B050} \textbf{29.62}}} &
+              \multicolumn{1}{c|}{{\color[HTML]{00B050} \textbf{24.22}}} &
+              \multicolumn{1}{c|}{{\color[HTML]{00B050} \textbf{27.05}}} &
+              \multicolumn{1}{c|}{{\color[HTML]{00B050} \textbf{71.00}}} &
+              \multicolumn{1}{c|}{86.26} &
+              \multicolumn{1}{c|}{43.01} &
+              \multicolumn{1}{c|}{2.71} &
+              \multicolumn{1}{c|}{{\color[HTML]{00B050} \textbf{86.06}}} &
+              \multicolumn{1}{c|}{{\color[HTML]{00B050} \textbf{54.13}}} &
+              {\color[HTML]{00B050} \textbf{41.42}} \\ \midrule
+             &
+              \multicolumn{16}{c|}{\textbf{LLaMa-3-8B-Instruct  (Cache Budget: 2048)}} \\ \midrule
+            \textbf{FullKV} &
+              \multicolumn{1}{c|}{\cellcolor[HTML]{FFFFFF}\textbf{25.56}} &
+              \multicolumn{1}{c|}{\cellcolor[HTML]{FFFFFF}\textbf{31.95}} &
+              \multicolumn{1}{c|}{\cellcolor[HTML]{FFFFFF}\textbf{39.71}} &
+              \multicolumn{1}{c|}{\cellcolor[HTML]{FFFFFF}\textbf{43.56}} &
+              \multicolumn{1}{c|}{\cellcolor[HTML]{FFFFFF}\textbf{35.63}} &
+              \multicolumn{1}{c|}{\cellcolor[HTML]{FFFFFF}\textbf{21.18}} &
+              \multicolumn{1}{c|}{\cellcolor[HTML]{FFFFFF}\textbf{28.58}} &
+              \multicolumn{1}{c|}{\cellcolor[HTML]{FFFFFF}\textbf{23.27}} &
+              \multicolumn{1}{c|}{\cellcolor[HTML]{FFFFFF}\textbf{26.75}} &
+              \multicolumn{1}{c|}{\cellcolor[HTML]{FFFFFF}\textbf{74.00}} &
+              \multicolumn{1}{c|}{\cellcolor[HTML]{FFFFFF}\textbf{90.48}} &
+              \multicolumn{1}{c|}{\cellcolor[HTML]{FFFFFF}\textbf{42.30}} &
+              \multicolumn{1}{c|}{\cellcolor[HTML]{FFFFFF}\textbf{4.80}} &
+              \multicolumn{1}{c|}{\cellcolor[HTML]{FFFFFF}\textbf{69.25}} &
+              \multicolumn{1}{c|}{\cellcolor[HTML]{FFFFFF}\textbf{53.92}} &
+              \textbf{40.73} \\ \midrule
+            H2O &
+              \multicolumn{1}{c|}{25.42} &
+              \multicolumn{1}{c|}{26.43} &
+              \multicolumn{1}{c|}{38.87} &
+              \multicolumn{1}{c|}{42.82} &
+              \multicolumn{1}{c|}{32.91} &
+              \multicolumn{1}{c|}{20.02} &
+              \multicolumn{1}{c|}{25.09} &
+              \multicolumn{1}{c|}{23.26} &
+              \multicolumn{1}{c|}{26.11} &
+              \multicolumn{1}{c|}{58.50} &
+              \multicolumn{1}{c|}{90.56} &
+              \multicolumn{1}{c|}{41.57} &
+              \multicolumn{1}{c|}{5.20} &
+              \multicolumn{1}{c|}{69.50} &
+              \multicolumn{1}{c|}{54.10} &
+              38.69 \\ \midrule
+            SnapKV &
+              \multicolumn{1}{c|}{\cellcolor[HTML]{FFFFFF}{\color[HTML]{00B050} \textbf{25.70}}} &
+              \multicolumn{1}{c|}{\cellcolor[HTML]{FFFFFF}{\color[HTML]{00B050} \textbf{29.96}}} &
+              \multicolumn{1}{c|}{38.93} &
+              \multicolumn{1}{c|}{43.90} &
+              \multicolumn{1}{c|}{35.05} &
+              \multicolumn{1}{c|}{20.44} &
+              \multicolumn{1}{c|}{\cellcolor[HTML]{FFFFFF}{\color[HTML]{00B050} \textbf{26.89}}} &
+              \multicolumn{1}{c|}{23.43} &
+              \multicolumn{1}{c|}{26.17} &
+              \multicolumn{1}{c|}{74.00} &
+              \multicolumn{1}{c|}{90.56} &
+              \multicolumn{1}{c|}{41.96} &
+              \multicolumn{1}{c|}{5.54} &
+              \multicolumn{1}{c|}{69.25} &
+              \multicolumn{1}{c|}{\cellcolor[HTML]{FFFFFF}{\color[HTML]{00B050} \textbf{56.16}}} &
+              40.53 \\ \midrule
+            PyramidKV &
+              \multicolumn{1}{c|}{25.53} &
+              \multicolumn{1}{c|}{29.89} &
+              \multicolumn{1}{c|}{38.67} &
+              \multicolumn{1}{c|}{43.90} &
+              \multicolumn{1}{c|}{35.04} &
+              \multicolumn{1}{c|}{21.60} &
+              \multicolumn{1}{c|}{26.80} &
+              \multicolumn{1}{c|}{\cellcolor[HTML]{FFFFFF}{\color[HTML]{00B050} \textbf{23.51}}} &
+              \multicolumn{1}{c|}{26.37} &
+              \multicolumn{1}{c|}{73.50} &
+              \multicolumn{1}{c|}{90.56} &
+              \multicolumn{1}{c|}{42.21} &
+              \multicolumn{1}{c|}{5.08} &
+              \multicolumn{1}{c|}{69.25} &
+              \multicolumn{1}{c|}{55.36} &
+              40.48 \\ \midrule
+            KVCrush* &
+              \multicolumn{1}{c|}{25.62} &
+              \multicolumn{1}{c|}{29.48} &
+              \multicolumn{1}{c|}{\cellcolor[HTML]{FFFFFF}{\color[HTML]{00B050} \textbf{39.56}}} &
+              \multicolumn{1}{c|}{\cellcolor[HTML]{FFFFFF}{\color[HTML]{00B050} \textbf{44.05}}} &
+              \multicolumn{1}{c|}{\cellcolor[HTML]{FFFFFF}{\color[HTML]{00B050} \textbf{36.20}}} &
+              \multicolumn{1}{c|}{\cellcolor[HTML]{FFFFFF}{\color[HTML]{00B050} \textbf{21.62}}} &
+              \multicolumn{1}{c|}{26.24} &
+              \multicolumn{1}{c|}{23.28} &
+              \multicolumn{1}{c|}{\cellcolor[HTML]{FFFFFF}{\color[HTML]{00B050} \textbf{26.52}}} &
+              \multicolumn{1}{c|}{\cellcolor[HTML]{FFFFFF}{\color[HTML]{00B050} \textbf{74.00}}} &
+              \multicolumn{1}{c|}{\cellcolor[HTML]{FFFFFF}{\color[HTML]{00B050} \textbf{90.56}}} &
+              \multicolumn{1}{c|}{\cellcolor[HTML]{FFFFFF}{\color[HTML]{00B050} \textbf{42.24}}} &
+              \multicolumn{1}{c|}{\cellcolor[HTML]{FFFFFF}{\color[HTML]{00B050} \textbf{5.83}}} &
+              \multicolumn{1}{c|}{\cellcolor[HTML]{FFFFFF}{\color[HTML]{00B050} \textbf{69.50}}} &
+              \multicolumn{1}{c|}{54.49} &
+              \cellcolor[HTML]{FFFFFF}{\color[HTML]{00B050} \textbf{40.61}} \\ \bottomrule
+            \end{tabular}
+        }
+        \caption{Performance comparison of KVCrush with PyramidKV, SnapKV and H2O on LongBench for LlaMa-3-8B-Instruct, Mistral-7B-Instruct-v0.2. KVCrush* (when paired with the top-performing KV compression method) achieves the highest accuracy across most datasets and the best average accuracy on both the \textit{LLaMa-3-8B-Instruct} and \textit{Mistral-7B-Instruct-v0.2} models.}
+        \label{table:baseline_compare}
+        \end{table*}
+
+\subsection{Tuning KVCrush for accuracy and efficiency (RQ1)}
+    \subsubsection{Selecting Anchor Points in KVCrush}
+    \emph{KVCrush} employs an anchor point within the same binary space (a binary vector with a length equal to the number of heads) to form clusters of tokens based on their hamming distance to this anchor. We present our experiments with anchor points in Table~\ref{table:anchor}. \emph{KVCrush} outperforms the baseline H2O even using generic anchor points like random, mean and alternate 0s and 1s.
+
+    
+    
+    
+    
+    \subsubsection{Cache budget partitioning}
+    As discussed in Section~\ref{sec:kvcrush}, the cache budget $B$ allocated for the KV Cache is divided into two distinct segments: $B_{important}$, which is utilized by the baseline method to identify tokens with high attention weights, and $B_{representative}$, which is employed by \emph{KVCrush} to select representative tokens. 
+    
+     Figure~\ref{fig:cache_budget_partitioning} illustrates the impact of varying the percentage of the budget allocated to \emph{KVCrush} on overall accuracy. For certain workloads, such as \textit{narrativeqa}, the optimal cache budget can reach up to $90\%$ of the total budget. In contrast, for other workloads, the optimal budget typically ranges between $20\%$ and $50\%$ of the available budget. In Section~\ref{sec:rq5}, we compared our method with baseline approaches using a static cache budget partitioning scheme, allocating a fixed $25\%$ of the total budget to \emph{KVCrush}. This approach could potentially be enhanced by dynamically partitioning the budget based on attention weights distribution, which we plan to explore in future work. 
+     
+
+
+\subsection{KMeans vs KVCrush (RQ2)}
+\label{sec:kmeans_comparison}
+    
+    Traditional clustering algorithms exhibit significant inefficiencies in KV Cache compression due to two primary factors. Firstly, the large size of input vectors poses a challenge. For instance, in a typical Llama3-8B model, each input key (or value) vector comprises 128 FP16 values. By employing \textit{kvcrush.representation}, a binary vector of length 32 (corresponding to the number of heads) is generated to represent each token (key-value pair). This approach not only reduces the data size by a factor of 64 but also enables faster distance computations using Hamming distances. Secondly, the time complexity associated with clustering algorithms for data grouping is substantial. Utilizing \textit{kvcrush.grouping}, the selection of values to be retained in the cache is achieved in $O(2SD)$ time, in contrast to the $O(tS^2D)$ time complexity of k-means clustering.
+
+    In Figure~\ref{fig:kmeans}, we compare \emph{KVCrush} and KMeans in terms of accuracy and inference latency using the GSM8K dataset. While KMeans achieves slightly higher accuracy than \emph{KVCrush} (Figure~\ref{fig:kmeans_acc}), it incurs approximately $200\%$ additional overhead in the inference latency pipeline. In contrast, \emph{KVCrush} provides a reasonable accuracy improvement over the pure H2O baseline, with an insignificant overhead of less than $0.5\%$.
+
+
+
+
+\subsection{Accuracy implications of integrating KVCrush with other methods(RQ3)}
+We assess the impact on accuracy when integrating \emph{KVCrush} with other methods, utilizing cumulative attention-weights as the importance metric. As illustrated in Figure~\ref{fig:kvcrush_flow}, \emph{KVCrush} can be seamlessly integrated with these methods, which prioritize selecting important tokens, while \emph{KVCrush} emphasizes selecting representative tokens based on the head behavior of these tokens (or pages). Figure~\ref{fig:kvcrush_int} demonstrates the accuracy improvement provided by \emph{KVCrush} to the baseline methods for the \textit{2wikimqa} dataset. Figure~\ref{fig:kvcrush_int_chunk} demonstrates that \emph{KVCrush} can enhance the accuracy of baseline methods even when it evicts chunks instead of individual tokens.
+
+\subsection{Evalution of KVCrush in Paged KV settings (RQ4)}
+To evaluate \emph{KVCrush} in paged KV settings, we utilized an H2O baseline that aggregates the row-wise sum of attention weights at the page level to evict low-importance pages. For \emph{KVCrush}, the binary vector of a page is formed by concatenating the binary head vectors of all tokens within that page. Figure~\ref{fig:kvcrush_paged} shows that Paged-\emph{KVCrush} outperforms paged-H2O on both GSM8K and XSUM datasets.
+
+\subsection{Accuracy vs Baselines (RQ5)}
+\label{sec:rq5}
+The accuracy of \emph{KVCrush}, in comparison with baseline methods, is detailed in Table~\ref{table:baseline_compare}. For this evaluation, a cache budget of 2048 was used. \emph{KVCrush} employs a static cache budget partitioning scheme, wherein $25\%$ of the total budget (i.e., 512) is allocated to \emph{KVCrush} for selecting representative tokens. The remaining $75\%$ is distributed to the accompanying method (H2O, SnapKV, or PyramidKV) for selecting high-attention tokens. The key insights are as follows:
+
+\begin{itemize}
+    \item \emph{KVCrush} when coupled with the best performing KV compression method (between H2O, SnapKV and PyramidKV) achieves the best accuracy for most of the datasets on both  \textit{LLaMa-3-8B-Instruct} and \textit{Mistral-7B-Instruct-v0.2} models.
+
+    \item Using \textit{Mistral-7B-Instruct-v0.2}, it is the \textbf{only} method to achieve iso-accuracy  w.r.t. FullKV baseline on \textit{qmsum} and \textit{multi-news} datasets.
+
+    \item \emph{KVCrush} achieves the best average accuracy on both \textit{LLaMa-3-8B-Instruct} and \textit{Mistral-7B-Instruct-v0.2} models.
+
+\end{itemize}
+%\multicolumn{1}{c|}{\rotatebox[origin=c]{90}{narrativeqa}} &
+
+
+
+
+
+
+\section{Conclusion and Future Work}
+\label{conclusion}
+In this work, we presented an alternative approach to represent LLM tokens during inference. We showed that a compact representation paired with KVCrush compression algorithm leads to a substantial reduction in KV cache memory footprint. We demonstrated how we can use this method to achieve a memory-efficient LLM inference pipeline without compromising the quality of the generated tokens. In future work, we intend to investigate dynamic cache budget allocation and develop a more refined multi-anchoring approach.
+
+\bibliographystyle{splncs04}
+\bibliography{citations}
+\end{document}

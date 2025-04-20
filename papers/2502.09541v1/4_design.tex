@@ -1,0 +1,998 @@
+%\section{\THISWORK\ Design Details} \label{section:design}
+
+
+%Below, we explain the design of \THISWORK\ in detail.
+
+% \THISWORK\ includes three layers in its stack.
+% Our optimized IO primitive, \texttt{Exchange}, is at the bottom of the stack.
+% It enhances a single GPU's IO throughput with its neighbors' under-utilized SDMA engines and PCIe bandwidth (\S\ref{sec:Exchange-IO-primitive}).
+% The abundant IO throughput provided by \texttt{Exchange} allows us to design an IO-decoupled programming model as the middle layer of \THISWORK\ (\S\ref{sec:IO-decoupled-model}).
+% While maintaining efficiency, this programming model separates the concern of IO scheduling and on-GPU kernel design, and enables reusing code not designed for out-of-core GPU data processing. 
+% We implement 3 applications as the top layer of \THISWORK, all achieving state-of-the-art performance compared to baseline solutions.
+% We case study the design of two important kernels, sort (\S\ref{sec:design-sort}) and join (\S\ref{sec:design-join}), as examples for the proposed programming model.
+% In \S\ref{sec:design-ssb} we explain how to adapt the on-GPU query processing library, Crystal~\cite{crystal-sigmod-20}, to handle out-of-core query processing, and discuss how to use zero-copy together with \texttt{Exchange} to improve query processing performance further.
+
+\section{SDMA-based IO Primitive Design}
+\label{sec:Exchange-IO-primitive}
+
+% \subsubsection{The high-level Idea.}
+\begin{figure}
+\centering
+\begin{minipage}{.3\linewidth}
+    \includegraphics[width=\linewidth]{figures/high-level-io-primitive.pdf}
+    \caption{Multiple paths between GPU0 and CPU.}
+    \label{fig:io-primitive-flow}
+\end{minipage}
+\begin{minipage}{.66\linewidth}
+    \includegraphics[width=\linewidth]{figures/io-high-level.pdf}
+    \caption{Pipelining data forwarding.}
+    \label{fig:io-primitive-pipeline}
+\end{minipage}
+\end{figure}
+
+\subsection{\textbf{High-level Idea}} \label{sec:io-high-level}
+We use an example system with four GPUs to illustrate our high-level idea.
+As shown in Figure~\ref{fig:io-primitive-flow}, in multi-GPU systems, data can reach a specific GPU from the CPU-side DRAM through multiple paths. 
+In this example, GPU0 handles IO-intensive applications, such as data analytics, while the other three GPUs execute compute-intensive tasks like LLM inference.
+GPU0 can leverage the IO bandwidth of its neighboring GPUs through inter-GPU links:
+beyond its own PCIe links to the CPU, GPU0 can communicate with the CPU indirectly by using the SDMA engines on the other three GPUs as forwarders, utilizing a small fraction of their GPU memory as buffers. 
+These forwarding activities do not significantly affect the normal execution of the other three GPUs, as their SDMA engines and PCIe links are typically underutilized. 
+Consequently, this approach significantly enhances the IO capability of GPU0 with minimal impact on the performance of the other GPUs.
+
+Each forwarding GPU needs to first receive data from the source, either GPU0 or the CPU (depending on the direction of data transfer), into a buffer on its GPU memory and then forward the received data to the destination. 
+To fully utilize the PCIe bandwidth, the data transmission process needs to be packetized and pipelined.
+Figure~\ref{fig:io-primitive-pipeline}(a) illustrates a naive scheduling approach for this process. 
+In this approach, the forwarding GPU waits until all data has reached its memory before forwarding it to the destination, failing to take advantage of the full-duplex nature of PCIe links. 
+Moreover, a significant amount of memory must be allocated as buffers on the forwarding GPUs, which reduces the capacity available for the compute-intensive kernels.
+In contrast, Figure~\ref{fig:io-primitive-pipeline}(b) shows a pipelined schedule that overlaps IO in both directions. 
+This approach requires only a small buffer on the forwarding GPU capable of holding a single packet, optimizing bandwidth usage and minimizing memory overhead on the forwarding GPUs.
+
+%%%%%%%%%%%% OLD TEXT START %%%%%%%%%%%%
+\begin{comment}
+Data can reach a certain GPU from CPU-side DRAM through multiple paths in recent multi-GPU systems.
+We illustrate this idea at a high level in Figure~\ref{fig:io-primitive-flow}.
+In this example, GPU0 runs IO-intensive applications like query processing, while the other three process compute-intensive applications like LLM inference.
+GPU0 can borrow IO bandwidth from its neighbors through the inter-GPU links.
+In addition to its own PCIe links to the CPU, GPU0 can also communicate to the CPU indirectly by using the SDMA engines on the other three GPUs as forwarders, and a tiny fraction of their GPU memory as buffers.
+The forwarding activities do not significantly influence the normal execution of the rest of the three GPUs, as the SDMA engines and PCIe links are originally under-utilized.
+As a result, we can greatly improve the IO capability of GPU0 at little cost to others.
+
+Each forwarding GPU needs to first receive the data from the source, either GPU0 or the CPU, to a buffer on its GPU memory and then forward the received data to the destination. 
+To fully utilize the PCIe bandwidth, the data and the transmission process need to be packetized and pipelined.
+Figure~\ref{fig:io-primitive-pipeline} (a) depicts a naive schedule for this process. 
+The forwarding GPU waits until all data reaches its memory and then forwards the data to the destination, failing to exploit the full-duplex property of PCIe links.
+Plus, a significant amount of memory needs to be allocated as buffers on the forwarding GPUs, reducing the capacity available to the compute kernels.
+A pipelined schedule is shown in Figure~\ref{fig:io-primitive-pipeline} (b), which overlaps the IO in both directions and requires only a small buffer on the forwarding GPU that can hold a single packet.
+\end{comment}
+%%%%%%%%%%%% OLD TEXT END %%%%%%%%%%%%
+
+
+% \subsubsection{Challenges}
+% \label{sec:io-challenges}
+
+% \begin{figure}
+%     \centering
+%     \includegraphics[width=\linewidth]{figures/io-challenge.pdf}
+%     \caption{IO challenge. H2D: Host-to-Device Data Transfer. D2H: Device-to-Host Data Transfer. For simplicity, the inter-GPU IO activities are not shown.}
+%     \label{fig:io-challenge}
+% \end{figure}
+
+% \begin{figure}
+%     \centering
+%     \includegraphics[width=\linewidth]{figures/irregular-IO.pdf}
+%     \caption{The estimated mean IO bandwidth (GB/s) of H2D transfer on AMD MI100, when D2H transfer happens in the background. Code like \texttt{0011} on the x-axis means the first and second GPUs are conducting D2H transfer in the background. }
+%     \label{fig:io-irregular}
+% \end{figure}
+
+% \noindent
+\subsection{\textbf{Challenges}} \label{sec:io-challenges}
+Both NVIDIA's CUDA and AMD's HIP runtimes allow applications to submit a set of concurrent tasks on different \texttt{Streams} and specify dependencies among them through \texttt{Events}~\cite{cuda, hip}.
+A straightforward implementation of the idea presented above is to build a Directed Acyclic Graph (DAG) using these two APIs, allowing the runtime to manage data movement in a dataflow order.
+In this DAG, nodes represent data packet transfer commands between GPUs launched on different \texttt{Streams}, and edges represent \texttt{Events} that enforce the forwarding order.
+However, in practice, we find two challenges to achieve desired performance as listed below.
+% However, we encounter difficulties in achieving high IO throughput using this baseline strategy due to two main pitfalls.
+
+%%%%%%%%%%%% OLD TEXT START %%%%%%%%%%%%
+\begin{comment}
+Both Nvidia's cuda and AMD's HIP runtime allow applications to submit a set of concurrent tasks on different \texttt{Streams} and specify the dependency among them through \texttt{Events}~\cite{cuda, hip}.
+One straightforward implementation for the idea in \S\ref{sec:io-high-level} is to represent it as a Directed Acyclic Graph (DAG) using these two APIs and let the runtime take the responsibility to carry out the data movement in a dataflow order.
+The nodes are the data packet transfer commands between GPUs launched on different \texttt{Streams}, and the edges are the \texttt{Events} that enforce the forwarding order.
+However, we struggle to achieve high IO throughput following this baseline strategy due to two pitfalls.
+\end{comment}
+%%%%%%%%%%%% OLD TEXT END %%%%%%%%%%%%
+
+\noindent
+\textbf{Challenge \#1. Head-of-line blocking.} 
+% \textcolor{red}{While operations on different streams are intended to execute in parallel, this is not guaranteed by either the runtime or the hardware.}
+Although operations are submitted to different streams, they must traverse multiple layers of software queues before ultimately being enqueued into a limited set of hardware-managed queues~\cite{olmedo-rtas-2020, otterness-rtns-2021}. 
+The execution engines process operations from these queues in FIFO order. 
+This FIFO order can lead to head-of-line blocking between operations on different streams. 
+% Figure~\ref{fig:io-challenge}(a) is simplified from a profiling trace that illustrates this issue. 
+As a result, part of the Host-to-Device IO operations are unintentionally blocked by the runtime in our baseline solution.
+
+%%%%%%%%%%%% OLD TEXT START %%%%%%%%%%%%
+\begin{comment}
+While the operations on different streams are intended to be executed in parallel, it is not guaranteed by the runtime and hardware.
+While operations are submitted to different streams, they have to go through multiple layers of software queues and are finally enqueued into a common set of limited number of hardware-managed queues~\cite{olmedo-rtas-2020, otterness-rtns-2021}.
+The execution engines pop operations from these queues in FIFO order and carry out the popped operations.
+The FIFO order enforced by these queues may result in head-of-line blocking between operations on different streams.
+Figure~\ref{fig:io-challenge}(a) is simplified from a profiling trace that can manifest this issue.
+Part of the Host-to-Device IO operations are unintentionally blocked by the runtime in our baseline solution.
+\end{comment}
+%%%%%%%%%%%% OLD TEXT END %%%%%%%%%%%%
+
+\noindent 
+\textbf{Challenge \#2. Non-uniform IO bandwidth.}
+When both directions of all PCIe links are used simultaneously for data transfer, the combined IO bandwidth requirement exceeds the CPU-side memory controller's capacity, resulting in some PCIe links not achieving their maximum bandwidth. 
+% As shown in Figure~\ref{fig:io-irregular}, the bandwidth achieved by each link is highly dependent on the activity on other links and is difficult to predict statically.
+This leads to non-uniform bandwidth availability across different paths, and the bandwidth achieved by each link is highly dependent on the activity on other links.
+For example, when all GPUs perform H2D data transfer and GPU0, 1, and 2 transfer data in D2H, the achievable H2D bandwidth on GPU0 and 2 is only around 8GB/s, and around 20GB/s on GPU1.
+This is significantly less than the 28GB/s bandwidth when there is no D2H traffic.
+In our test machine with 4 AMD MI100s, data traffic in the D2H direction consistently outperforms H2D traffic when competing for bandwidth, making H2D links more susceptible to interference from other data transfers.
+% This issue causes load imbalance in data transfers, as depicted in Figure~\ref{fig:io-challenge}(b).
+This issue causes load imbalance in data transfers. 
+When transferring data in both directions using our baseline solution, all H2D paths are assigned the same number of equally-sized packets, yet they complete in significantly different times, leading to underutilized PCIe links at the end. 
+
+\noindent
+\textit{These challenges motivate the necessity of a more sophisticated solution to fully utilize the potential of PCIe links.}
+
+%%%%%%%%%%%% OLD TEXT START %%%%%%%%%%%%
+\begin{comment}
+When both directions of all PCIe links are simultaneously used for data transfer, the combined IO bandwidth requirement is larger than what the memory controller can achieve. 
+As a result, some directions on some PCIe links cannot achieve their maximum bandwidth.
+Because we strive to saturate CPU-side memory bandwidth, this fact means the bandwidth we can achieve through each path is non-uniform.
+Further, the amount of bandwidth each link can secure is irregular.
+As showcased by Figure~\ref{fig:io-irregular}, it turns out that the bandwidth achieved by each link is strongly related to the activities happening on other links and is hard to predict statically.
+Specifically, on our test machine with 4 MI100s, the data traffic in the D2H direction always wins the traffic in the H2D direction when competing for bandwidth.
+Thus, the bandwidth achievable by H2D links is usually lower and more susceptible to other data transfer activities.
+This issue can cause load imbalance for data transfer as shown in Figure~\ref{fig:io-challenge} (b).
+We simplify a profiling trace where we transfer 6.4 GB data from Device to Host, and 9.6 GB data from Host to Device using our baseline solution. 
+While all H2D paths are assigned 60 equally-sized packets, they use significantly different amounts of time to finish, leaving the PCIe links underutilized at the end of the transmission process. 
+These two pitfalls suggest a more involved solution is necessary to unleash the full potential of PCIe links. 
+\end{comment}
+%%%%%%%%%%%% OLD TEXT END %%%%%%%%%%%%
+
+\subsection{\textbf{Proposed Design}}
+We follow two design principles to address the challenges above.
+
+\begin{enumerate}[leftmargin=*]
+    \item \textit{Only submit requests that will be immediately executed by the GPU.}
+    By ensuring that, no task waits inside all queue levels, and we can eliminate unpredictable head-of-line blocking. 
+    \item \textit{Consider all concurrent data transfers and implement comprehensive flow control.} 
+    Given the irregular nature of IO bandwidth, a holistic flow control mechanism that accounts for traffic in both directions is essential to maintaining overall load balance.
+\end{enumerate}
+
+%%%%%%%%%%%% OLD TEXT START %%%%%%%%%%%%
+\begin{comment}
+\begin{enumerate}[leftmargin=*]
+    \item \textit{Only submit requests that will be immediately executed by GPU.}
+    Thus, no tasks wait inside all levels of queues, and we can get rid of the hard-to-predict head-of-line blocking.
+    However, any higher-level library can perform queuing that does not cause blocking internally.
+
+    \item \textit{Take all concurrent data transfers into account and perform flow control accordingly.}
+    Due to the irregularity of IO bandwidth, a holistic flow control mechanism that takes care of traffic in both directions is necessary to achieve overall load balance.
+\end{enumerate}
+\end{comment}
+%%%%%%%%%%%% OLD TEXT END %%%%%%%%%%%%
+
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{figures/exchange-high-level.pdf}
+    \caption{The interface of \texttt{Exchange} operation.}
+    \label{fig:io-primitive-interface}
+\end{figure}
+
+\noindent
+\textbf{Interface.}
+We introduce a key primitive, \texttt{Exchange}, based on the observations discussed, as illustrated in Figure~\ref{fig:io-primitive-interface}. 
+The \texttt{Exchange} operation asynchronously transfers data between the CPU and the target GPU while simultaneously managing data movement in both directions. 
+This transfer is pipelined at a specified packet size granularity. 
+By scheduling H2D and D2H data movements together, \texttt{Exchange} enables the underlying scheduler to manage both directions and perform flow control effectively.
+Unlike traditional \texttt{Memcpy} APIs, which require source and 
+destination memory to be contiguous, \texttt{Exchange} only mandates that the sizes of the source and destination be identical. 
+For example, it allows copying 4 chunks of 2 GB data from CPU DRAM to an 8 GB region in GPU memory.
+The design of \texttt{Exchange} elevates CPU-GPU data movement from basic runtime APIs to a more sophisticated library component. 
+This design philosophy mirrors practices in databases, which maintain their own buffer pools rather than relying on lower-level \texttt{mmap}~\cite{crotty2022you}, and aligns with the use of collective communication primitives like NVIDIA’s NCCL and AMD’s RCCL.
+
+%%%%%%%%%%%% OLD TEXT START %%%%%%%%%%%%
+\begin{comment}
+We abstract a key primitive, \texttt{Exchange}, based on the above observations, as illustrated in Figure~\ref{fig:io-primitive-interface}.
+An exchange operation asynchronously moves some CPU data to the target GPU and simultaneously downloads some data from the target GPU to the CPU, pipelined at a certain packet size granularity.
+This operation schedules H2D and D2H data movements together, making it possible for the underlying scheduler to bear both in mind and perform flow control.
+Unlike classic \texttt{Memcpy} APIs provided by runtimes, our interface does not require the destination and source to be a continuous chunk of memory, as long as their size is the same.
+The application can, for example, copy 4 chunks of 2 GB data from CPU DRAM to an 8 GB region on GPU memory.
+
+\texttt{Exchange} uplifts the job of CPU-GPU data movement from native runtime API to a library component.
+The rationale behind such design decisions is similar to why databases tend to maintain their own buffer pools instead of using lower-level \texttt{mmap}, and why collective communication primitives are maintained by both NVIDIA (NCCL) and AMD (RCCL) officially.
+\end{comment}
+%%%%%%%%%%%% OLD TEXT END %%%%%%%%%%%%
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.88\linewidth]{figures/exchange-detail.pdf}
+    \caption{The implementation details of \texttt{Exchange} operation.}
+    \label{fig:exchange-details}
+\end{figure}
+
+
+\noindent
+\textbf{Implementation details.}
+Our implementation of the \texttt{Exchange} operation includes both link-level workers for data packet transmission and a global scheduler to ensure balanced load distribution among links.
+Figure~\ref{fig:exchange-details} provides an example with GPU0 as the target GPU. 
+Each GPU initializes two link workers dedicated to H2D and D2H data transfers, respectively.
+The link worker on forwarding GPUs, referred to as the \textit{indirect link}, maintains two buffers sized to the packet granularity and alternates between them to enable pipelined packet forwarding.
+In contrast, the link worker on the target GPU, known as the \textit{direct link}, functions as a proxy to the underlying runtime memory copy API.
+
+The global scheduler manages two task queues for H2D and D2H packets, populated from the arguments to \texttt{Exchange}. 
+Flow control is enforced by a policy that dictates whether a link can dequeue a task from its respective queue. 
+Given that H2D traffic consistently suffers from bandwidth competition on our test machine, our policy ensures that the D2H queue does not drain faster than the H2D queue; otherwise, the links are restricted from popping tasks from the D2H queue.
+A more universal policy could involve maintaining a balanced number of tasks in each queue.
+Below, we provide a detailed walk-through of this process, illustrated in Figure~\ref{fig:exchange-details}.
+
+
+%%%%%%%%%%%% OLD TEXT START %%%%%%%%%%%%
+\begin{comment}
+Our implementation of the \texttt{Exchange} operation includes link-level workers that transmit data packets as well as a global scheduler that ensures load balance among links.
+
+An example is presented in Figure~\ref{fig:exchange-details}, where the target GPU is GPU0.
+Each GPU will initialize two link workers responsible for H2D and D2H data transfer separately.
+The link worker on the forwarding GPUs, named \textit{indirect link}, maintains two buffers at the size of packet granularity, and alternates between them to pipeline the packet forwarding.
+On the other hand, the link worker on the target GPU, named \textit{direct link}, is simply a proxy to the underlying runtime memory copy API.
+The global scheduler includes two task queues for H2D and D2H packets, which are populated from the arguments to \texttt{Exchange}.
+Flow control is achieved by a flow control policy, which determines whether a link can pop a task from the task queue.
+Noticing that the H2D traffic is always the victim of bandwidth competition on our test machine, our flow control policy is never to let the D2H queue drain faster than the H2D queue, otherwise forbid the links from popping the D2H queue.
+A potentially more universal policy is to never let any queue contain \texttt{N} tasks fewer than the other one.
+However, as we do not have access to other machines with different IO characteristics, we cannot verify its universality.
+Thus, we stick with the more specialized solution in this proof-of-concept work, and leave exploring the design space of different policies in future work.
+We now detail the entire process with a walk-through example shown in Figure~\ref{fig:exchange-details}.
+\end{comment}
+%%%%%%%%%%%% OLD TEXT END %%%%%%%%%%%%
+
+When \texttt{Exchange} is instantiated, it initializes a pair of links for each GPU and a global scheduler. 
+Upon invoking the \texttt{launch()} method, the global scheduler partitions the \texttt{dstH2D} and \texttt{srcH2D} data at the packet size granularity and populates the H2D queue (\circled{1}). 
+Similarly, it populates the D2H queue.
+All links are then activated and continuously pop tasks from their respective queues. 
+Each link follows a work cycle until the queue is empty. 
+In each cycle, the indirect link pushes any buffered packets from the previous cycle to the destination (\circled{2}) and attempts to dequeue a task from the queue (\circled{3}). 
+If permitted by the flow control policy, the link retrieves a task (\circled{4}) and then transfers a packet from the source to its buffer (\circled{5}).
+If the flow control policy rejects the pop request (\circled{6}), the link receives a stall signal (\circled{7}), waits for a short period (\circled{8}), and retries the task pop (\circled{9}). 
+The direct link operates similarly but moves data directly to the destination. 
+Empirically, we set the waiting period to 10us, which is a few percent of the packet transfer time.
+Each link is blocked at the end of each iteration until all IO operations issued by the link are completed. 
+This ensures that at the beginning of the next iteration, the execution units used by the link are idle, allowing any requests to be executed immediately rather than waiting in the queue, adhering to the design principle of immediate execution (1).
+
+%%%%%%%%%%%% OLD TEXT START %%%%%%%%%%%%
+\begin{comment}
+When \texttt{Exchange} is constructed, it initializes a pair of links for each GPU and a global scheduler.
+After the \texttt{launch()} method is invoked, the global scheduler partitions the \texttt{dstH2D} and \texttt{srcH2D} at the granularity of packet size, and populates the H2D queue (\circled{1}).
+It also populates the D2H queue similarly.
+Then, all links will be set active and keep popping tasks from the queues.
+All links loop a work cycle until the queue is empty.
+In each iteration, the indirect link pushes any packet buffered in the last cycle to the destination (\circled{2}) and tries to pop a task from the queue (\circled{3}).
+With the allowance of the flow control policy, it retrieves a task (\circled{4}) and then moves a packet from the source to its buffer (\circled{5}).
+When the pop request is rejected by the flow control policy (\circled{6}), the link receives a stall signal (\circled{7}).
+The link waits a short period (\circled{8}) and tries to pop a task again (\circled{9}).
+The direct link follows the same way to retrieve tasks but directly moves the data to the destination.
+Empirically, we set the waiting period to 10us, which is a few percent of the time to transfer a packet.
+Each link is blocked at the end of each iteration until all IO operations issued by the link are completed.
+This ensures that at the beginning of the next iteration, the execution units used by the link are idle.
+Any requests will be executed immediately instead of waiting in the queue, and thus we respect the design principle (1).
+\end{comment}
+%%%%%%%%%%%% OLD TEXT END %%%%%%%%%%%%
+
+% \subsubsection{Trade-off between selectivity}
+% \subsection{\textbf{Fine-grained Data Transfers}} \label{sec:tradeoff-selectivity}
+% Because \texttt{Exchange} utilizes SDMA engines for data forwarding, it is extremely inefficient at moving data at cache line granularity like zero-copy access. 
+% \texttt{Exchange} assumes that each \texttt{MemRef} in the source or destination \texttt{RefGroup} encompasses a few hundred megabytes and includes multiple packets.
+% As a result, while \texttt{Exchange} can enhance GPU bandwidth by leveraging IO resources from neighboring GPUs, operations with small data access granularity may see zero-copy access outperforming \texttt{Exchange}. 
+% Further details on this comparison are discussed in \S\ref{sec:ssb-selectivity}.
+
+%%%%%%%%%%%% OLD TEXT START %%%%%%%%%%%%
+\begin{comment}
+Because we only use SDMA engines for data forwarding to avoid occupying costly compute resources on the other GPUs, \texttt{Exchange} cannot move data at cache line granularity like zero-copy access.
+The assumption taken by \texttt{Exchange} is that each \texttt{MemRef} in the source or destination \texttt{RefGroup} sizes a few hundred MBs, containing multiple packets.
+Therefore, even if here we quadruple the bandwidth for a GPU by borrowing IO resources from neighbors, in some scenarios, like executing queries with low selectivity for certain columns, zero-copy access can outperform our \texttt{Exchange} operation.
+More details are discussed in \S\ref{sec:ssb-selectivity} when we are dealing with query processing.
+\end{comment}
+%%%%%%%%%%%% OLD TEXT END %%%%%%%%%%%%
+
+\section{IO-Decoupled Programming Model}
+\label{sec:IO-decoupled-model}
+
+\subsection{\textbf{High-level Idea}}
+With CPU-GPU data transfer bandwidth as a primary bottleneck, many prior works design a tightly coupled CPU-GPU IO schedule with compute kernels~\cite{triton-join, pump-up-volume, gowan-ipdpsw-2018, sioulas-icde-2019, rui-vldb2020}.
+While these approaches have achieved promising results, they complicate the design space by intertwining IO management with GPU kernel design, often leading to ad-hoc optimization techniques. 
+Furthermore, this strategy limits the reuse of optimized and validated kernels provided by GPU vendors, which are not designed for out-of-core processing.
+
+We propose that, given \texttt{Exchange}'s significant mitigation of the IO bottleneck, adopting a decoupled programming model that separates IO management from on-GPU computation is advantageous. 
+This model allows for a clear separation of concerns, facilitating code reuse while maintaining high performance.
+% {\color{red}
+% In this approach, GPU kernels do not need special modifications for handling data on the CPU. 
+% Programmers can develop GPU kernels with a traditional single-GPU model in mind, reusing code initially designed for GPU-memory-fitted data. 
+% Concurrently, the framework manages all IO orchestration, provided that programmers specify how to partition the data to fit into GPU memory.
+% }
+In this approach, programmers can develop \textit{data-parallel}~\cite{data-parallel} operations by using regular on-GPU kernels and specifying how to partition the data to fit into GPU memory, leaving the framework managing all IO orchestration.
+Programmers can develop GPU kernels with a traditional single-GPU model in mind, reusing code initially designed for GPU-memory-fitted data. 
+\THISWORK\ is designed for data analytics, thus cannot accelerate algorithms/data structures involving data access jumps exceeding the GPU memory size (i.e., tens of GBs).
+However, in the scope of data analytics, many operations are naturally data-parallel, like projection and aggregation, and others can be decomposed into steps of data-parallel sub-operations, as we will demonstrate for sort and join (\S\ref{sec:design-sort} and \S\ref{sec:design-join}).
+
+The right-hand side of Figure~\ref{fig:pipeline-high-level} illustrates the proposed programming model. 
+In this model, programmers extend their existing on-GPU kernels into \texttt{ExKernel}s, short for \texttt{\textbf{Ex}}tended \texttt{\textbf{Kernel}}.
+\texttt{ExKernel}s handle large datasets that exceed GPU memory by processing data stored in DRAM and then saving the results back to DRAM. 
+These \texttt{ExKernel}s are executed by a \texttt{Pipelined Executor}, which leverages \texttt{Exchange} to manage off-GPU IO. 
+This approach allows \texttt{ExKernel}s to efficiently process out-of-core data while fully utilizing PCIe bandwidth.
+
+%%%%%%%%%%%% OLD TEXT START %%%%%%%%%%%%
+\begin{comment}
+With the assumption that the bandwidth between CPU and GPU is the most significant bottleneck, many of the prior GPU data processing research that target datasets beyond GPU capacity co-design the CPU-GPU IO patterns and on-GPU compute kernels~\cite{triton-join, pump-up-volume, gowan-ipdpsw-2018, sioulas-icde-2019, rui-vldb2020}. 
+While achieving encouraging results, such a strategy couples the already complicated design space of IO management and GPU kernel design, further intricating the reasoning process and introducing ad-hoc GPU optimization techniques.
+Besides, it prevents the proposed solution from reusing many optimized and verified GPU kernels maintained by GPU vendors like NVidia and AMD, as they are not designed for out-of-core processing.
+
+We argue that because \texttt{Exchange} greatly relieves the IO bottleneck, we can adopt a decoupled programming model that considers IO activities and on-GPU kernels separately, instead of together.
+Such a programming model enforces the separation of concern and encourages code reuse, while still achieving satisfactory performance.
+The on-GPU code does not require special designs to process data on the CPU.
+Thus, the programmers can write GPU kernels with a classic single-GPU model in mind, and reuse the code originally designed only to process data fit in GPU memory.
+On the other hand, as long as programmers specify how the data should be partitioned to fit inside GPU memory, the framework under the programming models takes care of all the IO orchestration. 
+
+The right-hand side of Figure~\ref{fig:pipeline-high-level} overviews the proposed programming model.
+The programmers extend their on-GPU kernels to \texttt{ExKernel}s, an abbreviation for \texttt{\textbf{Ex}}tended \texttt{\textbf{Kernel}}. 
+\texttt{ExKernel}s process large input data only fit in the DRAM and save the result back to the DRAM.
+\texttt{ExKernel}s are executed by a \texttt{Pipelined Executor}, which uses \texttt{Exchange} to perform off-GPU IO.
+Implementing an \texttt{ExKernel} for an on-GPU kernel enables it to process out-of-core data, and naturally maximizes the utilization of all PCIe bandwidth.
+\end{comment}
+%%%%%%%%%%%% OLD TEXT END %%%%%%%%%%%%
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.95\linewidth]{figures/pipeline-high-level.pdf}
+    \caption{IO-decoupled Programming Model at a High Level, the interface for \texttt{ExKernel}, and examples of how \texttt{ExKernel} may partition its input or output. }
+    \label{fig:pipeline-high-level}
+\end{figure}
+
+\subsection{\textbf{Design Details of \texttt{ExKernel}}}
+The interface of \texttt{ExKernel} is depicted in Figure~\ref{fig:pipeline-high-level}.
+An \texttt{ExKernel} comprises two sets of methods.
+(1) \textit{Data Mapping}: this set of methods directs the executor on how to process the large dataset in chunks on the GPU using the on-GPU kernel.
+(2) \textit{Kernel Adaptation}: this set of methods defines how the on-GPU kernel interacts with the executor, specifying how to receive input and produce output.
+
+%%%%%%%%%%%% OLD TEXT START %%%%%%%%%%%%
+\begin{comment}
+The interface of \texttt{ExKernel} is shown in Figure~\ref{fig:pipeline-high-level}.
+An \texttt{ExKernel} includes two sets of methods. 
+One set of methods, \textit{Data Mapping}, tells the executor how to process the large data piece by piece on GPU using the on-GPU kernel, while another, \textit{Kernel Adaption}, specifies how the on-GPU kernel should get input from and dump output to the executor.
+\end{comment}
+%%%%%%%%%%%% OLD TEXT END %%%%%%%%%%%%
+
+% \textcolor{red}{A better term is needed, because the ``partition'' here does not move any data on the CPU side at all. It only establishes a mapping that marks some region as the first partition, some other regions as the second partition, etc}
+
+\noindent
+\textbf{Data Mapping.}
+Efficient processing of datasets larger than GPU memory requires chunk-wise handling, where each chunk fits into GPU memory. 
+The \texttt{ExKernel} \textit{maps} inputs and outputs into \textit{chunks} of size \texttt{chunkSz}, ensuring each chunk fits within the allocated memory. 
+The chunks are accessible through the \texttt{inputs()} and \texttt{outputs()} methods, while \texttt{size()} indicates the total number of chunks to process. 
+During this process, data in DRAM remains stationary; only a mapping table is created to associate data with its respective chunk. 
+A chunk can be either a contiguous memory region or a collection of regions. 
+Contiguous chunks are suitable for embarrassingly parallel operations, such as element-wise addition. 
+In contrast, non-contiguous chunks are used when processing outputs from other \texttt{ExKernel}s, as demonstrated in our sort (\S\ref{sec:design-sort}) and hash join (\S\ref{sec:design-join}) designs.
+
+%%%%%%%%%%%% OLD TEXT START %%%%%%%%%%%%
+\begin{comment}
+The only way to efficiently process a dataset larger than GPU memory is to do it chunk by chunk, each of which can fit in GPU memory.
+\texttt{ExKernel} \textit{maps} the inputs and outputs into \textit{chunks} and ensures that each chunk can fit within a piece of memory sized \texttt{chunkSz}.
+The chunks are exposed via \texttt{inputs()} and \texttt{outputs()} methods to the executor.
+\texttt{size()} returns how many chunks need to be processed in total.
+Note that data in DRAM is not moved during this process as we only establish a mapping table to tell which part of the data belongs to a certain chunk.
+A chunk can be either a consecutive memory region or a group of memory regions, as demonstrated at the bottom of Figure~\ref{fig:pipeline-high-level}.
+The former can be used when the operation is embarrassingly parallelizable, like adding 1 to all elements.
+The latter can be used when the input is the output of another \texttt{ExKernel}, whose examples can be found in our sort (\S\ref{sec:design-sort}) and hash join (\S\ref{sec:design-join}) design.
+\end{comment}
+%%%%%%%%%%%% OLD TEXT END %%%%%%%%%%%%
+
+\noindent \textbf{Kernel adaption.}
+The \texttt{kernel()} method wraps the on-GPU kernels designed solely for processing data within GPU memory. 
+It provides these kernels with
+(a) \texttt{mem}: a memory region containing both input and output data,
+(b) \texttt{type}: a code indicating the layout of \texttt{mem},
+(c) \texttt{it}: an index specifying the chunk of data currently being processed, and
+(d) \texttt{tmp}: a memory area for temporary storage during execution.
+The layout of \texttt{mem} is defined by the \texttt{inBuffer()} and \texttt{outBuffer()} methods. 
+These methods, given the \texttt{type} code and index \texttt{it}, return specific regions of \texttt{mem} for input and output.
+Upon completion, \texttt{kernel()} returns a \texttt{type} code that can be used with \texttt{outBuffer()} to locate the output and with \texttt{inBuffer()} to access the next input.
+
+\noindent
+\textbf{Output management.}
+\texttt{outputs()} can cover a smaller or larger range of memory than \texttt{inputs()} for operations with different input/output sizes.
+\texttt{kernel()} may populate \texttt{outputs()} during execution for operations with indefinite output size. 
+However, programmers need to be conservative on \texttt{inputs()} chunk size to avoid overflowing GPU memory buffers.
+More details are in our technical report.
+Developing a more versatile input/output management mechanism for indefinite-sized outputs is left as future work.
+
+%%%%%%%%%%%% OLD TEXT START %%%%%%%%%%%%
+\begin{comment}
+\texttt{kernel()} wraps the on-GPU kernels that are only designed to process data on GPU memory.
+It provides the wrapped kernels with a piece of \texttt{mem} memory holding input and output, a \texttt{type} code indicating \texttt{mem}'s layout, and an index \texttt{it} to the chunk of data currently being processed.
+A \texttt{tmp} memory is also provided to hold execution temporaries.
+The layout of \texttt{mem} is determined by methods \texttt{inBuffer()} and \texttt{outBuffer()}.
+Based on the \texttt{type} code and the index \texttt{it}, they return a part of \texttt{mem} to hold input and another for output.
+After \texttt{kernel()} finishes, it returns a \texttt{type} code that can be passed to \texttt{outBuffer()} to locate the output, as well as passed to \texttt{inBuffer()} to load next input.
+\end{comment}
+%%%%%%%%%%%% OLD TEXT END %%%%%%%%%%%%
+
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.75\linewidth]{figures/pipeline-details.pdf}
+    \caption{Implementation details of \texttt{ExKernel} execution.}
+    \label{fig:pipeline-details}
+\end{figure}
+
+\subsection{\textbf{Design Details of \texttt{Pipelined Executor}}}
+\label{sec:executor}
+We illustrate the execution of an \texttt{ExKernel} using the pipeline executor with an example in Figure~\ref{fig:pipeline-details}.
+The executor divides GPU memory into three sections: two memory buffers, \texttt{mem A} and \texttt{mem B}, each allocated 16 GB from the 32 GB available on the AMD MI100, and a \texttt{tmp} memory for temporary storage.
+The computation is performed in a software-pipelined manner~\cite{softpipe-pldi-1988}, running through multiple cycles. 
+During the $n$th pipeline cycle $C_n$:
+(1) The executor processes the $(n-1)$th chunk, which was previously loaded into \texttt{mem B}, by invoking \texttt{kernel(it=n-1)} (\circled{1}).
+(2) The kernel reads from and writes to \texttt{mem B} and \texttt{tmp}, leaving the output in \texttt{mem B} (\circled{2}).
+(3) The executor records the \texttt{type} code returned by \texttt{kernel()} to determine the input and output buffers for the next cycle (\circled{3}).
+(4) Concurrently, an \texttt{Exchange} operation is performed over \texttt{mem A}, with source and destination determined by the recorded \texttt{type} code from the previous cycle (\circled{4}).
+(5) The input for the $n$th chunk is loaded from the CPU, and the output of the $(n - 2)$th chunk is saved to the CPU (\circled{5}).
+% In the following sections, we detail how to implement sort and hash join, as well as a late materialization technique based on zero-copy memory access.
+
+%%%%%%%%%%%% OLD TEXT START %%%%%%%%%%%%
+\begin{comment}
+We explain how the executor carries out the \texttt{ExKernel} through an example presented in Figure~\ref{fig:pipeline-details}.
+The pipeline executor divides the GPU memory into three parts, which include a pair of memory buffers \texttt{mem A} and \texttt{mem B} as well as a piece of memory \texttt{tmp} to hold the temporaries for GPU kernels.
+The MI100 we use has 32GiB (GiB = $1024^3$B) memory, and we allocate 16GB (GB = $1^9$B) each for \texttt{mem A} and \texttt{mem B}.
+The remaining is allocated to \texttt{tmp}.
+The executor performs the computation in a software-pipelined manner~\cite{softpipe-pldi-1988}, which finishes in multiple cycles.
+During the $n$th pipeline cycle $C_n$, the executor operates \texttt{mem A} and \texttt{mem B} in parallel.
+The executor invokes the \texttt{kernel(it=n-1)}, to process the $(n-1)$th chunk loaded to \texttt{mem B} in the previous pipeline cycle (\circled{1}).
+The operator will read and write \texttt{mem B} as well as \texttt{tmp}, and leaves the output in \texttt{mem B} (\circled{2}).
+The executor records the returned \texttt{type} code by \texttt{kernel()} to locate the input buffer and output buffer in the next pipeline cycle (\circled{3}).
+Simultaneously, the executor performs an \texttt{Exchange} operation over \texttt{mem A}, setting the source and destination based on the \texttt{type} code recorded in the previous cycle (\circled{4}).
+The input for the $n$th chunk is loaded from the CPU and the output of the $(n - 2)$th chunk is saved to the CPU (\circled{5}).
+
+
+In the following sections, we explain how to implement sort, hash join, and queries in Star Schema Benchmark (SSB) with this programming model as case studies.
+\end{comment}
+%%%%%%%%%%%% OLD TEXT END %%%%%%%%%%%%
+
+\section{Tailored Query Execution}
+\label{sec:query-execution}
+In this section, we present the details of sort and hash join, as well as late materialization based on zero-copy memory access.
+
+% With our IO primitive and programming model, we leverage state-of-the-art on-core libraries AMD rocPRIM~\cite{rocprim} and Crystal~\cite{crystal-sigmod-20} to build a set of high-performance out-of-core query operators.
+% Although we only showcase how to apply our techniques to these libraries, the idea is generally applicable to other execution libraries.
+
+% \THISWORK's programming model abstracts away the IO orchestration, but query operators still need to specify their data partitioning strategy for out-of-core processing.
+% For certain operators, including selection, projection, and join with only one table larger than GPU memory, we can
+% trivially divide the out-of-core table into multiple chunks and then stream the data onto the GPU.
+
+% In this section, we illustrate how we implement query operators using the existing on-core GPU libraries with two complex operators that require tailored data partitioning strategy: sort (\S\ref{sec:design-sort}) and hash join with both tables larger than the GPU memory (\S\ref{sec:design-join}).
+% In \S\ref{sec:design-ssb}, we also introduce a late materialization technique utilizing zero-copy memory accesses as a complementary optimization.
+
+
+%We apply \THISWORK's IO primitive and programming model to Crystal~\cite{crystal-sigmod-20} and XXX GPU kernel to build a GPU-accelerated query engine. We choose these libraries because of their state-of-the-art performance, but our framework can also apply to other query execution libraries. Crystal assumes the GPU memory holds all the data. \THISWORK's programming model significantly simplifies the adaption of Crystal for out-of-core processing.
+
+%However, query operators still need to define their data partitioning strategies when the data size exceeds GPU memory. A simple partition strategy that sends data to GPU in chunks is sufficient for many operators, including select, project, and aggregate. We discuss two operators, sort and hash join, that require a tailored partitioning design. We also introduce an execution optimization based on late materialization and zero-copy memory access.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.75\linewidth]{figures/sort-flow.pdf}
+    \caption{The implementation details of sort operation upon the IO-decoupled programming model.}
+    \label{fig:sort-flow}
+\end{figure}
+
+\subsection{Case Study -- Sort}
+\label{sec:design-sort}
+In this section, we illustrate the design of the sort operator in the context of sorting a large array of 64-bit integers that exceeds GPU memory capacity, which adapts the classic external sort algorithm~\cite{external-sort}.
+Our approach, as shown in Figure~\ref{fig:sort-flow}, employs two \texttt{ExKernel}s. 
+The \texttt{SortExKernel} is responsible for partitioning the input array and sorting each chunk individually. 
+The sorted chunks are then stored in an intermediate buffer on the CPU. 
+Subsequently, the \texttt{MergeExKernel} merges these sorted chunks and writes the final output back to the original data location. 
+To highlight the code reuse capabilities of our programming model, we utilize existing GPU kernels provided by vendors, avoiding the need to develop custom GPU kernels.
+
+%%%%%%%%%%%% OLD TEXT START %%%%%%%%%%%%
+\begin{comment}
+In this section, we aim at sorting a big array of 64-bit integers that do not fit in GPU memory with a GPU.
+Our design, illustrated in Figure~\ref{fig:sort-flow}, includes two \texttt{ExKernel}s.
+The \texttt{SortExKernel} partitions the input array and sorts each chunk.
+The result is put into an intermediate buffer on the CPU.
+Then, the \texttt{MergeExKernel} merges these sorted chunks, and outputs back to where the input initially resides.
+To emphasize the code reuse capability of our programming model, we do not write any custom GPU kernels and only use the GPU kernels maintained by vendors.
+\end{comment}
+%%%%%%%%%%%% OLD TEXT END %%%%%%%%%%%%
+
+\subsubsection{\textbf{Integration with Vendor-maintained GPU Primitives.}}
+Both AMD and NVIDIA offer highly optimized parallel primitives for their GPUs through libraries like rocPRIM~\cite{rocprim} and CUB~\cite{cub}, respectively. 
+These libraries, extensively tested and continuously updated with cutting-edge techniques~\cite{onesweep-2022, mergepath-2012}, ensure optimal performance. 
+In our work, we utilize rocPRIM primitives due to our focus on AMD GPUs, noting that its interface closely mirrors that of NVIDIA's CUB.
+
+We briefly outline the rocPRIM primitives used and their input/output conventions.
+\textit{Double Buffer} consists of two memory regions, designated as \texttt{current} and \texttt{alternate}. 
+It is a standard construct in GPU sorting operations.
+\texttt{radix\_sort\_key()} operates on a double buffer where \texttt{current} contains the input array. 
+After sorting, \texttt{current} holds the sorted array, and the roles of \texttt{current} and \texttt{alternate} are swapped.
+\texttt{radix\_sort\_pair()} sorts pairs of keys and values using two double buffers. 
+It outputs the sorted keys and values into the \texttt{current} regions of each buffer.
+\texttt{merge()} merges two sorted arrays into a third output array, taking pointers to the input and output arrays as arguments.
+These primitives facilitate efficient data processing by leveraging optimized GPU operations and memory management.
+
+%%%%%%%%%%%% OLD TEXT START %%%%%%%%%%%%
+\begin{comment}
+AMD and Nvidia officially maintain highly optimized parallel primitives for their GPUs~\cite{rocprim, cub}.
+Besides being widely tested, these libraries keep integrating state-of-the-art techniques~\cite{onesweep-2022, mergepath-2012}, providing competitive performance.
+In this work, we use primitives from rocPRIM~\cite{rocprim} as we work on AMD GPUs, whose interface is similar to their counterparts in Nvidia CUB~\cite{cub}.
+We briefly discuss the primitives we used from rocPRIM and the input/output convention of these primitives. 
+
+A \textit{double buffer} is a pair of memory regions and one is marked as \texttt{current} while another as \texttt{alternate} by an integer. 
+It is the common data structure used by GPU sort primitives.
+\texttt{radix\_sort\_key()} takes a double buffer whose \texttt{current} holds the input array.
+After sorting, it changes the marker such that \texttt{current} holds the sorted array.
+\texttt{radix\_sort\_pair()} takes two double buffers for the pairs' key and value.
+Following a similar input/output convention, it outputs the sorted pairs' key and value in the \texttt{current} of each double buffer.
+Another primitive we use is \texttt{merge()}.
+It takes two pointers to two sorted arrays and another pointer to the output array.
+It merges the sorted arrays and fills the output array with the result.
+\end{comment}
+%%%%%%%%%%%% OLD TEXT END %%%%%%%%%%%%
+
+\subsubsection{\textbf{Design Details of \texttt{SortExKernel}}}
+\label{sec:SortExOperation}
+The goal is to sort the given array in multiple chunks, which are subsequently merged.
+
+\noindent
+\textbf{Data Mapping.}
+The input is divided into several contiguous chunks that fit within the on-GPU buffer, as illustrated in Figure~\ref{fig:sort-flow}. 
+The output on the CPU side is mapped similarly, with each chunk containing a sorted sub-array.
+% The input is divided into several contiguous chunks that fit within the on-GPU buffer, as illustrated in Figure~\ref{fig:sort-flow}. 
+% For example, when sorting 2 billion 8-byte integers using an MI100 GPU, and given that the memory buffer for input and output is 16GB, we can handle 8GB of data per operation. 
+% This corresponds to 500 million 8-byte integers per chunk, allowing us to process a total of 4 chunks. 
+% The output on the CPU side is mapped similarly, with each chunk containing a sorted sub-array.
+
+%%%%%%%%%%%% OLD TEXT START %%%%%%%%%%%%
+\begin{comment}
+The input is mapped into a few continuous chunks to fit inside the on-GPU buffer, as shown in Figure~\ref{fig:sort-flow}.
+Assume that we are sorting 2 billion 8-byte integers using MI100 in this example.
+As we described in \S\ref{sec:executor}, the size of the memory buffer that holds the input and output is 16GB.
+Thus, we can sort 8GB data at a time, which contains 500M 8-byte integers, and process 4 chunks.
+The output array on the CPU is mapped identically, and each chunk will be filled with a sorted sub-array.
+\end{comment}
+%%%%%%%%%%%% OLD TEXT END %%%%%%%%%%%%
+
+\noindent
+\textbf{Kernel Adaption.}
+We wrap \texttt{sort\_by\_key()} to handle the sorting operation on the GPU.
+To integrate the double buffer data structure with the executor, the buffer's marker is used as the \texttt{type} code. 
+The methods \texttt{inBuffer()} and \texttt{outBuffer()} interpret the provided \texttt{mem} as a double buffer, with the \texttt{current} buffer indicated by the \texttt{type} code. 
+They return this \texttt{current} buffer accordingly. 
+Similarly, the \texttt{kernel()} method reconstructs the double buffer based on the \texttt{type} code and invokes \texttt{sort\_by\_key()}. 
+After \texttt{sort\_by\_key()} completes the sorting and updates the buffer marker, \texttt{kernel()} returns the new marker as the updated \texttt{type} code.
+
+%%%%%%%%%%%% OLD TEXT START %%%%%%%%%%%%
+\begin{comment}
+We wrap \texttt{sort\_by\_key()} to sort data on GPU.
+To bridge the double buffer data structure to the executor, the marker of the double buffer will be used as the \texttt{type} code.
+Both \texttt{inBuffer()} and \texttt{outBuffer()} will interpret the given \texttt{mem} as a double buffer whose \texttt{current} is pointed by the \texttt{type} code, and return the \texttt{current}.
+Similar, \texttt{kernel()} reconstructs the double buffer by \texttt{type}, and invoke \texttt{sort\_by\_key()}.
+After \texttt{sort\_by\_key()} changes the marker of the provided double buffer, \texttt{kernel()} returns that changed marker as the new \texttt{type} code.
+\end{comment}
+%%%%%%%%%%%% OLD TEXT END %%%%%%%%%%%%
+
+
+\subsubsection{\textbf{Design Details of \texttt{MergeExKernel}}}
+This \texttt{ExKernel} merges multiple sorted chunks produced by the \texttt{SortExKernel} into a single, fully sorted array in a single pass.
+
+
+\noindent
+\textbf{Data Mapping.}
+The input to this operation consists of \( N \) sorted chunks, each with a size of \( C \). 
+The objective is to regroup these chunks into \( N \) new chunks \( P_i \) (\( 0 \leq i < N \)) such that \(\text{max}(P_i) \leq \text{min}(P_{i + 1})\) for all \(0 \leq i < N - 1\). 
+Each new chunk will contain \( N \) sorted segments, which can then be efficiently merged on the GPU.
+We devise an efficient algorithm based on binary search, the details of which can be found in our technical report~\cite{vortex-technical-report}.
+% For clarity, let us first assume that all elements in the input are unique and of type \( T \). 
+% By performing binary searches on each sorted chunk, we can determine the inclusive and exclusive percentiles for any value \( t \in T \) within the input. 
+% This allows us to identify \( N + 1 \) distinct pivot values \( p_i \in T \) (\( i = 0, \ldots, N \)), where \( p_i \) represents the \(\frac{i}{N}\)th percentile of the entire input data.
+% Each pivot \( p_i \) delineates the range where exactly \( C \) elements \( v \) satisfy \( p_i \leq v < p_{i + 1} \) (\(0 \leq i < N\)). 
+% We can efficiently locate these elements within the \( N \) input sorted chunks. 
+% By taking all elements between consecutive pivots from each sorted chunk, we can regroup the data into new chunks.
+% Figure~\ref{fig:sort-flow} illustrates this concept, where the white points on the \texttt{MergeExKernel}'s \texttt{inputs()} denote the locations of the pivots. 
+In Figure~\ref{fig:sort-flow}, the white points on \texttt{MergeExKernels}'s \texttt{inputs()} segment the input chunks and reorganize them into the desired partitions.
+% This approach can be adapted for cases where values are not unique by making slight adjustments to the partition boundaries to ensure that each new chunk contains exactly \( C \) elements. 
+The output is then partitioned to store the final sorted result.
+
+
+%%%%%%%%%%%% OLD TEXT START %%%%%%%%%%%%
+\begin{comment}
+The input to this operation is $N$ sorted chunks each with a size of $C$.
+The mapping step regroups those chunks in to $N$ new chunks $P_i\ (0 \leq i < N)$ such that max($P_i$) $\leq$ min($P_{i + 1}$) $\forall 0 \leq i < N - 1$.
+Each new chunk contains $N$ sorted segments which can be efficiently merged on GPU.
+For the convenience of explaining the idea, let us first assume all elements in the input are unique with a type $T$.
+By performing binary searches on each sorted chunk, we can efficiently know the inclusive/exclusive percentile of a certain value $t \in T$ within the input.
+This enables us to find, in a radix order, $N + 1$ different pivots $p_i \in T\ (i = 0, \ldots, N)$, where $p_i$ is the $\frac{i}{N}$th percentile of the entire input data. 
+There are exactly $C$ elements $v$ in the input that satisfies $p_i \leq v < p_{i + 1}\ (0 \leq i < N)$, which can be efficiently located in the $N$ input sorted chunks.
+Then, we can regroup a new chunk by taking all elements between two pivots from each sorted chunk.
+This idea is illustrated in Figure~\ref{fig:sort-flow}, where the white points on the \texttt{MergeExKernel}'s \texttt{inputs()} represent the location of pivots.
+These white dots separate the input chunks and then regroup them into 4 partitions.
+This idea can be easily extended to support the case where the values are not unique. 
+Slight adjustment to the partition boundary can be applied to ensure each chunk contains exactly $C$ elements.
+The output is partitioned accordingly to hold the final result.
+\end{comment}
+%%%%%%%%%%%% OLD TEXT END %%%%%%%%%%%%
+
+\noindent
+\textbf{Kernel Adaption.}
+The on-GPU kernels are tasked with merging the sorted segments within each partition. 
+This process is performed in a tree-like order, as depicted in Figure~\ref{fig:sort-flow}, using the \texttt{merge()} kernel from rocPRIM.
+We employ the double buffer layout described in the sorting step. 
+During each iteration, the kernel merges pairs of segments from the \texttt{current} buffer and writes the results to the \texttt{alternate} buffer. 
+After completing the merge operations in an iteration, the buffers are swapped. 
+The management of the \texttt{type} code, \texttt{inBuffers}, and \texttt{outBuffers} follows the same approach as detailed in \S\ref{sec:SortExOperation}.
+
+%%%%%%%%%%%% OLD TEXT START %%%%%%%%%%%%
+\begin{comment}
+The responsibility of the on-GPU kernels is to merge the sorted segments in each partition together.
+We iteratively merge the segments in a tree-like order as shown in Figure~\ref{fig:sort-flow}, using the \texttt{merge()} kernel from rocPRIM.
+We follow the double buffer data layout mentioned in the sort step.
+In each iteration, we merge the pairs of segments with \texttt{merge()} from \texttt{current} and output the result to \texttt{alternate}.
+At the end of each iteration, we swap the double buffer. 
+The \texttt{type} code, \texttt{inBuffers}, and \texttt{outBuffers} are managed in a similar way as \S\ref{sec:SortExOperation}.
+\end{comment}
+%%%%%%%%%%%% OLD TEXT END %%%%%%%%%%%%
+
+% \subsubsection{Memory usage and performance modeling}
+% To sort an array occupies $N$ bytes residing on the CPU, the sort operation needs to allocate $2N$ bytes on the CPU.
+% Each \texttt{ExOperation} reads and writes exactly $N$ bytes from and to DRAM. 
+% Thus, the ideal performance is
+% $$
+% \frac{4N}{BW_{exchange-1:1}} \gtrapprox \frac{4N}{BW_{DRAM}}
+% $$
+% Where $BW_{exchange-1:1}$ means the bandwidth \texttt{Exchange} achieved when 50\% of traffic is H2D and the rest D2H, which is slightly lower than the maximum achievable bandwidth of DRAM $BW_{DRAM}$.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.9\linewidth]{figures/radix-partition-flow.pdf}
+    \caption{Implementation details of \texttt{RadixPartitionExKer}. }
+    \label{fig:radix-partition-flow}
+\end{figure}
+
+\subsection{Case Study -- Hash Join}
+\label{sec:design-join}
+Next, we discuss the design of the hash join operator on an equality predicate where both tables exceed the GPU memory.
+We refer to the two tables as  \( A \) and \( B \) and the join predicate as \texttt{A.key == B.key}.
+%Our goal is to accelerate the following SQL query
+%\begin{verbatim}
+%SELECT SUM(A.val + B.val) FROM A, B WHERE A.key == B.key;
+%\end{verbatim}
+%with a GPU, given that both tables \( A \) and \( B \) exceed GPU memory capacity.
+Based on the classic idea of radix-partitioned hash join~\cite{partitioned-join-vldb99}, Triton join~\cite{triton-join} proposes a solution that surpasses CPU performance, relying heavily on a specialized high-bandwidth CPU-GPU NVLink configuration. 
+In contrast, we achieve even better results using our \texttt{Exchange} primitive and an IO-decoupled programming model, which utilizes standard PCIe links to access CPU-side memory.
+For this case study, we follow the problem setup outlined in~\cite{triton-join}. 
+Both tables \( A \) and \( B \) have equal sizes, with each row consisting of an 8-byte unsigned integer tuple \texttt{<key, val>}. 
+The \texttt{key} in table \( B \) contains foreign key referencing \texttt{A}, with the keys distributed uniformly.
+Following the idea of radix-partitioned hash join, our solution includes a \texttt{RadixPartitionExKer} to cluster tuples with identical hashes into \textit{groups} and a \texttt{HashJoinExKer} to join the \textit{groups} from both tables with the same hashes together.
+
+%%%%%%%%%%%% OLD TEXT START %%%%%%%%%%%%
+\begin{comment}
+Our goal is to accelerate the following query 
+\begin{verbatim}
+SELECT SUM(A.val + B.val) FROM A, B WHERE A.key == B.key;
+\end{verbatim}
+with GPU, when both tables A and B are larger than GPU memory capacity.
+Clemens et el.~\cite{triton-join} proposes a faster-than-CPU solution deeply dependent on a special version of high-bandwidth CPU-GPU NVlinks.
+We achieve even better results with our \texttt{Exchange} primitive and IO-decoupled programming model, which uses open standard PCIe links to access CPU-side memory. 
+In this case study, we follow the problem setup as~\cite{triton-join}.
+$|A| = |B|$, and each row of \texttt{A} and \texttt{B} is a tuple of 8-byte unsigned integers \texttt{<key, val>}.
+\texttt{B.key} contains foreign keys to \texttt{A}, following uniform distribution.
+
+Following the classic idea of radix-partitioned hash join~\cite{partitioned-join-vldb99}, our solution includes a \texttt{RadixPartitionExKer} to cluster tuples with identical hashes into \textit{groups} and a \texttt{HashJoinExKer} to join the \textit{groups} from both tables with the same hashes together. 
+% The \texttt{id} column in both table follow
+% As a proof-of-concept, we takes the assumption that \texttt{A.id}
+\end{comment}
+%%%%%%%%%%%% OLD TEXT END %%%%%%%%%%%%
+
+\subsubsection{\textbf{Design Details of \texttt{RadixPartitionExKer}}}
+Figure~\ref{fig:radix-partition-flow} illustrates the details of the \texttt{RadixPartitionExKer}. 
+This \texttt{ExKernel} maps the table into chunks and clusters tuples within each chunk using a hash function. 
+Following~\cite{triton-join}, it utilizes the 0 to 23 bits of the key as the hash value, partitioning the table into approximately 16.8 million groups.
+While a better hash function can be used to handle the skewed key distribution, this is out of the scope of our paper as we focus on IO optimization.
+Tuples in each group share a distinct hash value ranging from 0 to $2^{24} - 1$. 
+Groups with the same hash value can be joined independently in the subsequent phase.
+
+%%%%%%%%%%%% OLD TEXT START %%%%%%%%%%%%
+\begin{comment}
+Figure~\ref{fig:radix-parition-flow} presents the details of this \texttt{ExKernel}.
+At a high level, it maps the table into chunks and clusters the tuples inside each chunk based on a hash function.
+Similar to~\cite{triton-join}, we take the 0 to 23 bits from the key as the hash value, which means this operation clusters the table into 16.8 million groups.
+The hashes of groups start from 0 and end at $2^{24} - 1$.
+The groups with the same hashes can be joined, independently from other tuples, in the join phase.
+\end{comment}
+%%%%%%%%%%%% OLD TEXT END %%%%%%%%%%%%
+
+\noindent
+\textbf{Kernel Adaption.}
+We build the on-GPU clustering kernel by integrating the \texttt{radix\_sort\_pair()} primitive from rocPRIM with our custom \texttt{find\_boundary()} kernel, rather than developing it from scratch.
+The clustering kernel organizes tuples based on their hash values and generates a \texttt{boundary} array to demarcate group boundaries.
+As illustrated in the lower half of Figure~\ref{fig:radix-partition-flow}, consider an example with 3-bit unsigned integers where we use the lower two bits of the keys as hashes to cluster them into 4 groups. 
+
+(1) The executor loads a partition of 4 tuples from the CPU. The kernel uses \texttt{radix\_sort\_pair()} to sort these tuples by the lower two bits of their keys (\circled{1}).
+Although the tuples are now clustered, the exact boundaries between groups remain undetermined.
+(2) The \texttt{find\_boundary()} kernel generates a \texttt{boundary} array with $N + 1$ elements for $N$ groups, whose $i$th and $(i+1)$th elements tell the boundary of the group with a hash $i$.
+Initially, this array contains placeholder values (\textit{e.g.,} \texttt{N} for "Not Available"). 
+The kernel masks the keys with \texttt{0'b11} to obtain their hash values (\circled{2}). 
+It then performs parallel checks to identify transitions between different hashes.
+(3) If a hash $h$ at position $i$ differs from its previous hash, this signifies the start of a new group. 
+The position $i$ is recorded in the corresponding $h$th entry of the \texttt{boundary} array (\circled{3}). 
+In the example, the second entry remains 1 because the group with hash 1 is empty.
+(4) To complete the \texttt{boundary} array, we replace any remaining \texttt{N} entries with the subsequent valid boundary positions, effectively denoting empty groups (\circled{4}). 
+With the tuples now clustered and the \texttt{boundary} array populated, the results are stored back to the CPU for further processing.
+
+
+%%%%%%%%%%%% OLD TEXT START %%%%%%%%%%%%
+\begin{comment}
+We build the on-GPU clustering kernel by compositing the \texttt{radix\_sort\_pair()} from rocPRIM with our customized \texttt{find\_boundary()} kernel, instead of from scratch.
+Given a set of \texttt{<key, val>} tuples from the table, the clustering kernel forms the groups by sorting these tuples based on their hashes and produces another \texttt{boundary} array that marks the boundaries of groups.
+We illustrate this process with a simplified example, shown in the lower half of Figure~\ref{fig:radix-parition-flow}.
+In this example, we are processing 3-bit unsigned integers and use the lower two bits of the keys as the hashes to cluster them into 4 groups.
+The executor loads a partition of 4 tuples from the CPU, and the kernel first uses \texttt{radix\_sort\_pair()} to sort these 4 tuples by the lower two bits (\circled{1}).
+The data is now clustered but the boundary is still unknown.
+The \texttt{boundary} array generated by \texttt{find\_boundary()} contains $N + 1$ elements when there are $N$ different groups.
+The $i$th group's hash is $i$ and contains the tuples in the range of \texttt{[boundary[i], boundary[i+1])}.
+In this example, \texttt{boundary} contains 5 elements all initialized with empty tokens \texttt{N}.
+It first masks keys with \texttt{0b11} to get their hashes (\circled{2}).
+Then, it checks whether each hash equals the hash in front of it in parallel.
+The inconsistency detected for a hash $h$ at location $i$ indicates that the $h$th group starts at $i$, and $i$ is written to the $h$th entry of the \texttt{boundary} array (\circled{3}).
+In our example, the second element in \texttt{boundary} is still \texttt{N} because the group with a hash 1 is empty.
+We complete the \texttt{boundary} array by replacing \texttt{N} with the element next to it, which represents an empty group (\circled{4}).
+Now, we have the tuples clustered and a \texttt{boundary} array to locate each group, which then is stored back to the CPU.
+\end{comment}
+%%%%%%%%%%%% OLD TEXT END %%%%%%%%%%%%
+
+
+\noindent
+\textbf{Data Mapping.}
+The table's \texttt{key} and \texttt{val} columns are mapped into chunks.
+When the table is mapped into \texttt{N} chunks, the output will include \texttt{N} chunks of clustered \texttt{key} and \texttt{val}, as well as \texttt{N} chunks of \texttt{boundary} to indicate mark the boundaries for each chunk.
+
+% \begin{figure}[t]
+%     \centering
+%     \includegraphics[width=\linewidth]{figures/hash-join-flow.png}
+%     \caption{The implementation details of the \texttt{HashJoinExKer}. }
+%     \label{fig:hash-join-flow}
+% \end{figure}
+\subsubsection{\textbf{Design Details of \texttt{HashJoinExKer}}}
+After both tables are radix partitioned, the join phase processes groups with identical hash values from each table.
+
+\noindent
+\textbf{Data Mapping.}
+The goal of this step is to ensure that all groups with the same hash value are processed by the on-GPU kernel together. 
+We carefully partition the data by binary search over `boundary' chunks, and present more details in technical report~\cite{vortex-technical-report}.
+% When dealing with $2N$ chunks of clustered `key' and `val' from both tables, we consider $2N$ distinct groups, each from a chunk, for every hash value.
+% To ensure that all groups with the same hash value are processed by the on-GPU kernel together, we carefully partition the data. 
+% This partitioning is guided by the $2N$ `boundary' chunks from both tables.
+% The cumulative count of tuples up to a given hash, denoted as $N^i$, is derived from summing the `boundary[i]' values across all $2N$ chunks. 
+% We then employ binary search to identify a suitable hash threshold $i_0$ such that all tuples with hash values less than $i_0$ fit within the GPU buffer.
+% Following this, we iteratively determine subsequent thresholds $i_k\ (k > 0)$ using binary search, ensuring that the number of tuples between each $i_{k-1}$ and $i_k$ remains within the GPU buffer’s capacity. 
+% This process continues until $i_k$ reaches the maximum number of unique groups (e.g., $2^{24}$ in this case). 
+% Each partition thus accommodates all groups with hash values within a specific range, ensuring efficient processing.
+% Figure~\ref{fig:hash-join-flow} illustrates this process, where the `RadixPartitionExKer' segments both tables into 2 chunks each, and the `HashJoinExKer' subsequently reorganizes these into 4 distinct partitions. Each partition is then processed independently.
+
+
+%%%%%%%%%%%% OLD TEXT START %%%%%%%%%%%%
+\begin{comment}
+When there are $2N$ chunks of clustered \texttt{key} and \texttt{val} from both tables, there will be $2N$ groups having the same hash, each from a chunk.
+We ensure that all groups with the same hash, from both tables, are in the same \texttt{HashJoinExOp}'s partition, and the partition needs to fit the GPU buffer.
+To achieve this, we form the partitions based on the $2N$ \texttt{boundary} chunks from both tables.
+The sum of \texttt{boundary[i]} from all $2N$ \texttt{boundary} chunks is the number of tuples contained by all groups from 0 to $i$, denoted $N^i$.
+We can binary search for a suitable $i_0$ such that all tuples fit the GPU buffer.
+All groups with their hashes $h < i_0$ are placed in the first partition. 
+Then, we iteratively find $i_k\ (k > 0)$ by binary search $i_k$ such that $N^{i_k} - N^{i_{k-1}}$ is smaller than the GPU buffer size, until $i_k$ equals the maximum number of unique groups ($2^{24}$ in our setting).
+All groups with their hashes $i_{k-1} \leq h < i_k$ are placed in the $k$th partition.
+Each partition contains all segments of its groups' \texttt{key}, \texttt{val}, and \texttt{boundary} from all the $2N$ chunks.  
+Figure~\ref{fig:hash-join-flow} demonstrates an example where the \texttt{RadixPartitionExKer} divides both tables into 2 chunks, and \texttt{HashJoinExKer} regroups them into 4 partitions and processes each independently.
+\end{comment}
+%%%%%%%%%%%% OLD TEXT END %%%%%%%%%%%%
+
+\noindent
+\textbf{Kernel Adaption.}
+We fully customize the hash join kernel to leverage GPU shared memory for enhanced performance. 
+In the partitioning phase, the data is divided into 16.8 million groups that can be processed independently. 
+Even with a dataset of 16 billion rows, each group contains approximately 1000 tuples and occupies around 16KB, which fits comfortably within the 64KB shared memory available per GPU core.
+% Each thread block is assigned to handle a single group, and it uses `boundary' to locate the values in groups.
+As this paper focuses on out-of-core GPU processing, we leave the details of this on-GPU kernel for our technical report~\cite{vortex-technical-report}.
+% Initially, it retrieves the boundaries for the groups in table A from the `boundary' segments (\circled{1}) and then constructs a local hash table in shared memory using the `key` and `val` from table A (\circled{2}). 
+% Next, the thread block retrieves the boundaries for the groups in table B (\circled{3}). 
+% Each thread probes the hash table with the `key' from table B and accumulates the `val' in a local counter when it hits. 
+% Finally, the thread block aggregates the results from its threads and updates the global `Result' counter (\circled{4}). 
+% This approach maximizes the use of shared memory and minimizes global memory accesses, leading to efficient execution of the join operation.
+
+
+%%%%%%%%%%%% OLD TEXT START %%%%%%%%%%%%
+\begin{comment}
+We fully customize the hash join kernel to exploit the shared memory on GPUs. 
+In the partition step, the table is clustered into 16.8 million groups that can be processed independently. 
+Even if the table contains 16 billion rows, each group only contains around 1 thousand tuples and takes around 16KB, while each GPU core usually has at least 64KiB of shared memory per core.
+Each thread block is responsible for a group.
+It first fetches the boundary of the groups in table A from the \texttt{boundary} segments (\circled{1}) and then uses the corresponding \texttt{key} and \texttt{val} in table A to build a local hash table in shared memory (\circled{2}).
+Then it fetches the boundary of the groups in table B (\circled{3}) and probes the local hash table with the \texttt{key} and \texttt{val} in table B.
+Once hit, each thread accumulates the sum in its local counter.
+Finally, the thread block sums all values in its threads together and updates the global \texttt{Result} counter (\circled{4}).
+\end{comment}
+%%%%%%%%%%%% OLD TEXT END %%%%%%%%%%%%
+
+% \subsection{Case Study -- Query Processing on Star Schema}
+% \label{sec:design-ssb}
+% Star schema~\cite{star-schema-sigmod-02} is a popular way to organize a data warehouse.
+% It comprises a large \textit{fact table} and a few small \textit{dimension tables}.
+% The fact table contains the main data and foreign keys to dimension tables.
+% Queries on star schema commonly filter the dimension table, join them with the fact table, and aggregate the joined results. 
+% We take the Star Schema Benchmark (SSB) as a concert example.
+% Star Schema Benchmark (SSB) is an OLAP benchmark widely used by many prior database research~\cite{ydb-2013, crystal-sigmod-20, mordered-vldb-2022, kaibo-vldb-2014, hetexchange-vldb-2019}, simplified from the well-known TPC-H benchmark.
+% It is composed of 13 queries grouped in 4 query flights.
+% The queries join a fact table, \textit{lineorder}, with a few small dimension tables, \textit{date}, \textit{supplier}, \textit{customer}, and \textit{part}, to gain insights from the database.
+
+% \subsubsection{Processing Out-of-Core Star Schema Queries}
+% The dimension tables in databases organized in star schema are usually small.
+% For example, while the entire SSB database uses 600GB at a scale factor of 1000, its dimension tables only use a few hundred MB.
+% Therefore, we load the dimension table to GPU memory, build the hash table for them, and keep them inside GPU memory.
+% Then, we partition the fact table and process these partitions one by one using existing kernels that can process star schema queries on GPU.
+
+% \subsubsection{Exploit low selectivity with zero-copy memory access}
+% \label{sec:ssb-selectivity}
+% Not all elements in columns of the fact table involved in a query execution are needed~\cite{star-schema-sigmod-02}.
+% For example, SSB Q2.3 filters out a subset of \textit{part} and \textit{suppiler} table by their brands and region.
+% Then, it joins the \textit{lineorder} table with this subset of \textit{part} and \textit{supplier} table and aggregates the revenue from the rows in \textit{lineorder} which appears in the joined result.
+% In this query, only 0.02\% of the rows participate in aggregation at the end, aside from the fact that only part of the foreign keys to \textit{suppiler} in \textit{lineorder} is accessed in the multi-way join. 
+% Blindly transfer columns in entirety to GPU waste IO bandwidth on unused data.
+
+% We can exploit the low selectivity of a column in a query by only selectively transferring used elements in a column.
+% As we discussed in \S\ref{sec:tradeoff-selectivity}, our \texttt{Exchange} operation transfers data at large granularity.
+% The used elements are sparsely spread across a column.
+% They need to be picked up and sent to GPUs at fine granularity, which is not achievable by \texttt{Exchange}.
+
+% We propose to use both \texttt{Exchange} and zero-copy memory access to transfer the columns of fact tables.
+% Before we start to process the fact table, we can estimate the selectivity of each column by first filtering the dimension table.
+% Still taking SSB Q2.3 as an example, let us assume only $\frac{1}{1000}$ of the \textit{part} rows and $\frac{1}{5}$ of the \textit{supplier} rows are filtered to join with \textit{lineorder}.
+% We can join the most selective table \textit{part} first, then \textit{suppiler}, and use the selectivity of the dimension table we observed to estimate the selectivity of the columns in \textit{lineorder}.
+% In this case, the selectivity of the foreign keys column to \textit{suppiler} can be estimated as $\frac{1}{1000}$, and $\frac{1}{1000} \times \frac{1}{5} = \frac{1}{5000}$ for all other columns.
+% We only transfer the columns with selectivity lower than a threshold, $TH$, through the IO-decoupled programming model, which uses \texttt{Exchange} under the hood.
+% The highly selective columns are brought to the GPU on the fly during kernel execution by zero-copy memory access.
+% Because zero-copy happens at cache line granularity, we avoid bringing most of the unused data. 
+% The threshold $TH$ is determined by GPU LLC cache line size, $C_{l2}$, the size of the accessed element, $E$, as well as the number of GPUs \texttt{Exchange} uses, $N_{exchange}$.
+% $$
+% TH = \frac{E}{C_{l2} \times N_{exchange}}
+% $$
+% If the selectivity is higher than $TH$, the entire column is transferred to GPU on average, as zero-copy happens at cache line granularity.
+% On our test machine with 4 MI100 GPUs, whose LLC cache line size is 64 bytes, $TH = \frac{4}{64 \times 4} = \frac{1}{64}$, when we are accessing 4-byte integers.
+
+
+\subsection{Case Study -- Late Materialization}
+\label{sec:design-ssb}
+Late materialization is a common optimization for column-oriented databases, where only columns referenced by selection/join predicates and tuples not filtered out by selection/join predicates are fully materialized from disk to memory~\cite{abadi2006materialization}. 
+\THISWORK~utilizes this strategy to reduce the amount of data transferred from CPU memory to GPU memory. Consider a selection operator based on two predicates $\sigma_a$ and $\sigma_b$ for a table with two columns $a$ and $b$.
+If $\sigma_a$ is highly selective, the execution engine only needs to transfer column $a$ from CPU memory to GPU to apply $\sigma_a$ first. Then, it only transfers the values of column $b$ from the tuples that satisfy $\sigma_a$ to GPU to further evaluate $\sigma_b$. 
+The join predicates are optimized similarly.
+
+%Although only a tiny fraction of column $b$ will be examined when $\sigma_a$ is highly restrictive, the entire column $b$ will be loaded to GPU in our baseline strategy.
+%Ideally, only the used items in column $b$ should be selectively transferred to avoid wasting IO bandwidth.
+%In the context of classic database design, this observation motivates \textit{late materialization} for column storage.
+%Only used elements in each column are \textit{materialized} from slow disks with tuple-wise fine-grained control.
+%In the context of out-of-core GPU data processing, we also want to \textit{late materialize} columns from CPU memory through PCIe only for items needed.
+
+However, such a technique requires fine-grained CPU-GPU data access based on the predicate of each tuple, which is not achievable efficiently by SDMA-based IO primitives (\S\ref{sec:SDMA}).
+In contrast, although zero-copy memory access can operate at cache line granularity, it cannot enjoy the idle IO resource on other GPUs due to its need for compute units.
+We propose to late materialize a column $c$ with zero-copy access in an \texttt{ExKernel} based on a selectivity estimator $\hat{S_c}$ for that column, which is determined before that \texttt{Exkernel} happens.
+If $\hat{S_c}$ is less than an architectural-dependent threshold $TH$, the execution engine will not load column $c$ but let the on-core kernel use zero-copy memory access to retrieve data on demand. 
+Otherwise, it will still load $c$ through SDMA-based \texttt{Exchange}.
+The threshold $TH$ is determined by GPU LLC cache line size, $C_{l2}$, the size of the accessed element, $E$, as well as the number of GPUs \texttt{Exchange} uses, $N_{exchange}$.
+$$
+TH = \frac{E}{C_{l2} \times N_{exchange}}
+$$
+If the selectivity is higher than $TH$, the benefit of selective data access is less than plainly using neighboring GPUs' IO resources.
+On our test machine with 4 MI100 GPUs, whose LLC cache line size is 64 bytes, $TH = \frac{4}{64 \times 4} = \frac{1}{64}$, when we are accessing 4-byte integers.
+We validate our formula with the following micro-benchmark.
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{figures/zero-copy-vs-gpu-io.pdf}
+    \caption{Zero copy vs GPU IO.}
+    \label{fig:selectivity-perf}
+\end{figure}
+
+\begin{verbatim}
+for i in range(16e9)
+  sum += pred[i % 2e9] % SEL == 0 ? v[i] : 0
+\end{verbatim}
+The \texttt{pred} array resides in GPU memory, and \texttt{SEL} is a hyperparameter that is inversely related to selectivity. 
+We implement this micro-benchmark using both \texttt{Exchange} and zero-copy data transfer techniques, varying \texttt{SEL} from 1 to 128. 
+The results are presented in Figure~\ref{fig:selectivity-perf}. 
+Notably, when \texttt{SEL} \(> 64\), zero-copy becomes more efficient. 
+This aligns with the threshold \(TH = \frac{1}{64}\), validating the results derived from our formula.
+
+\subsection{Discussion}
+\THISWORK\ can be used to support data analytics engines with different processing models.
+In this work, we bind \THISWORK\ with Crystal~\cite{crystal-sigmod-20} that uses kernel fusion for query execution, but executing an operator at a time is also viable by chaining multiple \THISWORK\ extended GPU operators. 
+For example, libraries like cuDF~\cite{cudf} implement their operators
+based on on-GPU compute primitives in Thrust~\cite{Thrust} and CUB~\cite{cub}, which shares similar APIs as the rocPRIM~\cite{rocprim} we use. 
+One may take a similar approach described in \S\ref{sec:design-sort} and \S\ref{sec:design-join} to extend the operators with \THISWORK, and chain them for query execution.
+The CPU memory can hold the intermediate results.
+% We leave the investigation of the strategies to integrate \THISWORK\ with various libraries and processing models as future work.
+% \textcolor{red}{Section 6 should end here. Move the below SSB discussion into the evaluation right after introducing the SSB benchmark. There, you can talk about how we implement SSB queries using \THISWORK, including the operators and late materialization.}
+
+% \textcolor{blue}{Yichao: I think we still need the ``join in star schema query'' example to explain how to get a selectivity estimator (see my comment above). }
+
+% \subsubsection{\textbf{Optimizing Star Schema Queries with Late Materialization}}
+% \label{sec:ssb-specific-design}
+% Star schema~\cite{star-schema-sigmod-02} is a popular way to organize a data warehouse.
+% It comprises a large \textit{fact table} and a few small \textit{dimension tables}.
+% the fact table contains the main data and foreign keys to dimension tables.
+% Queries on star schema commonly filter the dimension table, join them with the fact table, and aggregate the joined results. 
+% To execute such queries, we load the dimension tables to GPU memory, filter and build the hash table for them, and keep them inside GPU memory.
+% Because the selectivity of each dimension table is known after their hash tables are built, we can use the selectivity of the dimension table as an accurate estimator for the selectivity of each column in the fact table.
+% Thus, we can optimize the star schema query by late materializing some columns in the fact table during query execution, as long as their selectivity estimator is less than $TH$.
+
+
+
+
+
+
+
+
+
+
+
+
+% \textcolor{red}{OLD TEXT PLEASE IGNORE!!!!! late materialization}
+% star schema~\cite{star-schema-sigmod-02} is a popular way to organize a data warehouse.
+% it comprises a large \textit{fact table} and a few small \textit{dimension tables}.
+% the fact table contains the main data and foreign keys to dimension tables.
+% queries on star schema commonly filter the dimension table, join them with the fact table, and aggregate the joined results. 
+% We take the Star Schema Benchmark (SSB) as a concert example.
+% Star Schema Benchmark (SSB) is an OLAP benchmark widely used by many prior database research~\cite{ydb-2013, crystal-sigmod-20, mordered-vldb-2022, kaibo-vldb-2014, hetexchange-vldb-2019}, simplified from the well-known TPC-H benchmark.
+% It is composed of 13 queries grouped in 4 query flights.
+% The queries join a fact table, \textit{lineorder}, with a few small dimension tables, \textit{date}, \textit{supplier}, \textit{customer}, and \textit{part}, to gain insights from the database.
+
+
+% \subsubsection{Strategy}
+% \subsubsection{Processing Out-of-Core Star Schema Queries}
+% The dimension tables in databases organized in star schema are usually small.
+% While the entire database uses 600GB in our setting, its dimension tables only use a few hundred MB.
+% For example, while the entire SSB database uses 600GB at a scale factor of 1000, its dimension tables only use a few hundred MB.
+% Therefore, we load the dimension table to GPU memory, build the hash table for them, and keep them inside GPU memory.
+% Then, we partition the fact table and process these partitions one by one using the kernels from Crystal.
+% Then, we partition the fact table and process these partitions one by one using existing kernels that can process star schema queries on GPU.
+
+% Crystal~\cite{crystal-sigmod-20} is an optimized implementation of Start Schema Benchmark (SSB) Queries on GPU. 
+% It exploits shared memory to reduce GPU memory traffic, but assuming that all data is held inside GPU memory.
+% In this section, we adapt Crystal to process data on CPU-side DRAM to show that our IO-decoupled programming model is not limited to standalone operators, but also end-to-end OLAP queries.
+% We adapt Crystal to process data on CPU-side DRAM in a way similar to \S\ref{sec:design-sort} and \S\ref{sec:design-join}, but further improve its performance by exploiting the low selectivity of columns.
+
+% \subsubsection{Exploit low selectivity with zero-copy memory access}
+% \label{sec:ssb-selectivity}
+% % Not all elements in the columns involved in a query execution are needed.
+% Not all elements in columns of the fact table involved in a query execution are needed~\cite{star-schema-sigmod-02}.
+% For example, SSB Q2.3 filters out a subset of \textit{part} and \textit{suppiler} table by their brands and region.
+% Then, it joins the \textit{lineorder} table with this subset of tables and aggregates the revenue from the rows in \textit{lineorder} which appears in the joined result.
+% In this query, only 0.02\% of the rows participate in aggregation at the end, aside from the fact that only part of the foreign keys to \textit{suppiler} in \textit{lineorder} is accessed in the multi-way join. 
+% Blindly transfer columns in entirety to GPU waste IO bandwidth on unused data.
+
+% We can exploit the low selectivity of a column in a query by only selectively transferring used elements in a column.
+% As we discussed in \S\ref{sec:tradeoff-selectivity}, our \texttt{Exchange} operation transfers data at large granularity.
+% The used elements are sparsely spread across a column.
+% They need to be picked up and sent to GPUs at fine granularity, which is not achievable by \texttt{Exchange}.
+
+% We propose to use both \texttt{Exchange} and zero-copy memory access to transfer the columns of fact tables.
+% Before we start to process the fact table, we can estimate the selectivity of each column by first filtering the dimension table.
+% Still taking SSB Q2.3 as an example, let us assume only $\frac{1}{1000}$ of the \textit{part} rows and $\frac{1}{5}$ of the \textit{supplier} rows are filtered to join with \textit{lineorder}.
+% We can join the most selective table \textit{part} first, then \textit{suppiler}, and use the selectivity of the dimension table we observed to estimate the selectivity of the columns in \textit{lineorder}.
+% In this case, the selectivity of the foreign keys column to \textit{suppiler} can be estimated as $\frac{1}{1000}$, and $\frac{1}{1000} \times \frac{1}{5} = \frac{1}{5000}$ for all other columns.
+% We only transfer the columns with selectivity lower than a threshold, $TH$, through the IO-decoupled programming model, which uses \texttt{Exchange} under the hood.
+% The highly selective columns are brought to the GPU on the fly during kernel execution by zero-copy memory access.
+% Because zero-copy happens at cache line granularity, we avoid bringing most of the unused data. 
+% The threshold $TH$ is determined by GPU LLC cache line size, $C_{l2}$, the size of the accessed element, $E$, as well as the number of GPUs \texttt{Exchange} uses, $N_{exchange}$.
+% $$
+% TH = \frac{E}{C_{l2} \times N_{exchange}}
+% $$
+% If the selectivity is higher than $TH$, the entire column is transferred to GPU on average, as zero-copy happens at cache line granularity.
+% On our test machine with 4 MI100 GPUs, whose LLC cache line size is 64 bytes, $TH = \frac{4}{64 \times 4} = \frac{1}{64}$, when we are accessing 4-byte integers.

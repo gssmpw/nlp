@@ -1,0 +1,159 @@
+\section{Motivation and \lmm{} Characterization}
+\label{sec:characterization}
+
+To further understand the limitations of monolithic deployments and explore unique characteristics that distinguish \lmm{} serving from text-centric LLM serving, we characterize open-source \lmms{} in the \emph{Image-Text-to-Text} category~\cite{ittt}.
+We evaluate the performance and resource characteristics of heterogeneous inference stages under varying image inputs and model configurations (\Cref{sec:characterization:open-source}).
+Moreover, to understand multimodal traffic patterns at scale, we analyze sample production traces from one production \lmm{} inference cluster in Azure (\Cref{sec:characterization:production}).
+
+\input{figs-tex/sharegpt}
+
+\input{figs-tex/latency-comparison}
+
+\myparagraph{Characterization Setup}
+The following is our setup:
+
+\myparagraphemph{Models}
+We use six representative open-source \lmms{} across two different architectures (DecOnly and CroAttn) as listed in \Cref{table:model-config}. We deploy the models on vLLM~\cite{vllm} in BF16.
+
+\myparagraphemph{Dataset}
+We use the open-source ShareGPT-4o dataset~\cite{chen2024far}, which includes 50K images of varying resolutions and text prompts from multimodal GPT-4o as shown in \Cref{fig:sharegpt}.
+
+
+\myparagraphemph{Hardware}
+Our setup features a DGX-A100 server with 8 NVIDIA A100 GPUs (80GB each) connected via NVLINK~\cite{a100azure}.
+It has 96 AMD Epyc™ 7V12 CPU cores and 1900 GiB DRAM.
+
+
+
+\subsection{Characterization on Open-Source \lmms}
+\label{sec:characterization:open-source}
+We characterize open-source \lmms{} to understand how different inference stages impact performance and resource efficiency.
+Additionally, we compare DecOnly and CroAttn models to highlight the need for model-specific optimization.
+
+\input{figs-tex/prep-encoder-characteristics}
+
+\myparagraph{Per-stage Latency Breakdown}
+\Cref{fig:latency_breakdown} plots the split-up of TTFT across the three stages that comprise it; image preprocessing, image encoding, and LLM prefill.
+There are three key takeaways.
+First, image preprocessing, which occurs on the CPU, contributes minimally to the overall TTFT, while image encoding time contributes to a major portion in TTFT (especially for CroAttn models).
+For instance, 79\% and 65\% of TTFT in Llama3.2-11B and Llama3.2-90B are from image encoding.
+For DecOnly models such as InternVL-26B and NVLM-D-72B, image encoding latency accounts for 25\% and 54\% of TTFT. Second, the image encoding time depends on the encoder model size. For instance, scaling from SigLIP-400M (in LLaVA-OV-7B) to InternViT-6B (in InternVL-26B), the median image encoding time increases by 10$\times$.
+Finally, prefill computation is more efficient in CroAttn models because image tokens are attended to only in the CroAttn layers, as previously discussed in \cref{sec:background:lmm}.
+
+\boxinsight{A major portion of the TTFT is spent on image encoding, particularly for CroAttn models, making image encoding optimization critical to meet TTFT SLOs.}
+\label{insight:1}
+
+\myparagraph{Compute Characteristics of \lmm{} Stages}
+Image preprocessing on CPU and image encoding on GPU are compute-intensive processes.
+\Cref{fig:vary-preprocessor-core} plots the impact of varying the number of CPU cores on preprocessing latency. Preprocessing is CPU-intensive and benefits from trivially parallelizing across cores.
+Both stages exhibit linear latency scaling with batch size, saturating compute without significant throughput gains from increased batching as shown in~\Cref{fig:vary-img-preprocessor-batch,fig:vary-encoder-batch-mllama}, respectively.
+\Cref{fig:sm-metrics} further plots the GPU utilization metrics for a request batch size of one during image preprocessing and image encoding.
+We observe a consistent SM core activity near 100\% during image encoding, with average DRAM utilization below 30\%.
+Image encoding is, therefore, typically compute-bound, resembling the language model's prefill phase~\cite{pod-attention}.
+Moreover, when a request has multiple images in the input prompt, there is no compute dependency between the images during image encoding; hence, image tiles can be parallelized across multiple encoders.
+
+\boxinsight{Image preprocessing and encoding are both compute-intensive similar to LLM prefill stage.
+The independence of image computations in a multimodal request enables parallelization of image preprocessing and encoding across multiple instances.}
+\label{insight:2}
+
+Compute characteristics of prefill and decode phases of the LLM backend have been well studied;
+the prefill phase is typically compute-bound, while the decode phase is memory-bound~\cite{patel2024splitwise,sarathi-serve,pod-attention}.
+However, \Cref{fig:latency_breakdown} shows that LLM prefill is more efficient in CroAttn models than inDecOnly models, resulting in reduced compute boundness and an interesting tradeoff we describe below.
+
+\myparagraph{Latency-Accuracy Profiles across \lmms{}}
+\Cref{fig:scatter-plot-lmms} shows the accuracy versus prefill/TTFT efficiency for different models.
+When comparing models with similar language model backend sizes across both architectures (\eg{}, Llama3.2-11B vs. LLaVA-OV-7B and Llama3.2-90B vs. LLaVA-OV-72B vs. NVLM-D-72B), we observe that CroAttn models typically have up to an order of magnitude lower LLM prefill time, leading to lower TTFT.
+However, the CroAttn models usually achieve 5 points lower accuracy compared to their DecOnly counterparts on the Open VLM leaderboard~\cite{vlm-leaderboard}.
+For example, Llama3.2-90B scores 63.4, while the similarly sized LLaVA-OV-72B scores 68, but with significantly higher prefill latency and TTFT than Llama3.2-90B.
+
+\input{figs-tex/accuracy-scatter}
+
+\boxinsight{DecOnly models exhibit 10$\times$ worse prefill latency than similar-sized CroAttn models, leading to less TTFT SLO headroom for the image encoding and thus necessitating higher scalability for image workloads.}
+\label{insight:3}
+
+\input{figs-tex/batch-size}
+
+\myparagraph{Impact of Batching}
+In today’s monolithic deployments, a single batch size is applied across all stages of the \lmm{} on the GPU, which does not strike a balance between latency and throughput given heterogeneous compute characteristics observed across different stages.
+\Cref{fig:batch-size} shows how the batch size affects the median latency of each \lmm{} stage across architectures.
+As the batch size increases, the latency grows at varying rates, reflecting each stage's differing sensitivity to batch size and compute intensity.
+
+Compute-intensive stages like image encoding and LLM prefill (in DecOnly models with longer image token inputs) show limited throughput gains and rising latency beyond small batch sizes.
+In contrast, the memory-bound decode stage benefits from linear throughput scaling.
+Due to their low text token count, CroAttn models uniquely gain from prefill batching, diverging from traditional LLM trends where prefill saturates compute even at a batch size of one.
+Notably, DecOnly model NVLM-D with fewer image tokens also exhibits certain benefits in batching.
+
+\boxinsight{The effectiveness of batching varies for each \lmm{} component and is model-specific.
+\lmm{} request batching should thus be tailored to each stage.
+}
+\label{insight:4}
+
+\input{figs-tex/vary-tp}
+
+\myparagraph{Impact of Parallelism}
+Monolith deployments also limit the flexibility of model sharding within a GPU server which is typically done through tensor parallelism (TP)~\cite{vllm-tp-pp}.
+\Cref{fig:model-parallelism} shows how increasing TP degrees affects latency across \lmm{} stages.
+In Llama3.2-11B, the lowest LLM prefill latency occurs at TP-8, image encoding at TP-4, and TBT at TP-1.
+At TP-8, encoding latency rises due to the tradeoff between compute intensity and inter-GPU communication, making it inefficient to split a small 630M encoder across eight GPUs.
+
+In contrast, NVLM-D-72B, with a larger 6B image encoder, sees a $1.3\times$ latency reduction when increasing TP from 4 to 8. However, this comes with diminishing returns relative to resource cost.
+To balance throughput and latency, operators can deploy two TP-4 encoders for higher throughput or one TP-8 encoder for lower latency, both using eight GPUs.
+
+\boxinsight{Treating the image encoder and LLM backend as a monolith limits parallelism flexibility and degrades performance.
+Decoupling them enables independent scaling and optimized efficiency through pipelining.}
+\label{insight:5}
+
+\subsection{Production \lmm{} Trace Analysis}
+\label{sec:characterization:production}
+Building on the insights from open-source \lmm{} characterization, we further analyze multimodal traffic patterns at scale, leveraging production traces from one of Azure's \lmm{} inference clusters.
+The traces capture a sample of multi-tenant traffic, including both text-only and image-text requests.
+Our study focuses on
+(1) temporal and burstiness patterns and
+(2) heterogeneity of multimodal requests.
+We plan to open-source these production traces.
+
+
+\input{figs-tex/prod-traces-timeseries}
+\myparagraph{Temporal Patterns and Burstiness}
+\Cref{fig:qpm-prod} shows the traffic of text-only and image-text requests separately to understand their dynamic behavior and overall impact on the system.
+The traces are collected over a span of one week. 
+To understand the traffic patterns, we report the timeline of prompt (input) token rate, output token rate, request arrival rate, and input image rate.
+Our analysis reveals two key characteristics in production \lmm{} inference:
+\begin{itemize}[nosep]
+\item \myparagraphemph{Diverse Arrival Patterns}
+Image-text requests show up to 5$\times$ higher prompt token rates than text-only requests.
+In addition, their peak and trough occurrences are largely independent, showing minimal correlation.
+\item \myparagraphemph{Image-Driven Bursts}
+Image-text requests experience significant burstiness, not only due to higher request arrival rates but also increased images per request (\eg{}, video workloads). As a result, existing LLM traffic prediction methods~\cite{stojkovic2024dynamollm} (which work well for workloads with diurnal patterns) have a high average error rate of 79\%.
+\end{itemize}
+
+\input{figs-tex/prod-traces-input-cdf}
+
+\myparagraph{Request Heterogeneity} 
+\Cref{fig:text-len-prod} shows that prompt lengths vary significantly across modalities.
+Both image-text and text-only requests follow a heavy-tailed power-law distribution ($\alpha$=4.4 and 2.9, respectively) where a higher $\alpha$ means a heavier tail with more extreme events occurring more frequently.
+In addition, image-text requests have longer median prompts due to image tokens but shorter tails than text-only requests.
+\Cref{fig:img-num-prod} shows that the number of images per request also varies significantly with a heavy tail.
+In addition, among the top three services issuing text-image requests, we observe high inter-service variability.
+Some services process 16$\times$ more images per request than others.
+
+Comparing the image dimension distribution in our production traces with that of ShareGPT-4o image dataset~\cite{chen2024far}, we observe similar distributions, with median image width and height around 500 pixels and P95 exceeding 1000 pixels.
+
+\boxinsight{Production \lmm{} image traffic exhibits bursty behavior independent of traffic patterns of text requests.
+Serving systems must dynamically scale resources to handle modality-specific bursts efficiently.}
+\label{insight:6}
+
+\myparagraph{Impact of Mixed Modality}
+Given \lmm{} requests' input heterogeneity, \Cref{fig:variation-ttft-mixed-tokens} shows how varying image token percentages within a single request affects TTFT and LLM prefill time in a CroAttn model Llama3.2-11B, with detailed latency breakdowns.
+DecOnly models have no prefill time variation with varying token ratios as image and text tokens are treated in the same manner.
+We fix the total context length of each request at 16K tokens while varying the percentage of image tokens by adjusting the number of images (0--10 images in each case with 1601 tokens per image).
+
+\input{figs-tex/variation-mixed-tokens}
+
+TTFT increases with the percentage of image tokens in a request due to the increased image encoding computation, resulting in a 1.5$\times$ TTFT degradation when transitioning from text-only to image-only inputs.
+However, this latency gain is significantly lower than DecOnly models because CroAttn models attend to image tokens only within the CroAttn layers, resulting in reduced LLM prefill time (shown in green) and partially offsetting the overhead from image encoding.
+The right figure further illustrates this by breaking down the layer-wise LLM prefill time, highlighting a reduction in self-attention compute (\ie{}, ``Attn Layer'' and ``MLP Layer'') as the proportion of image tokens increases.
+Although the cross-attention computation peaks at the 50\% image tokens (due to the dependency on both image and text tokens), it contributes much less than self-attention computation because there are only 4 CroAttn layers (out of 40 layers).
+
+\boxinsight{DecOnly models maintain consistent prefill times regardless of token modality, making total token count the key factor for request routing. In contrast, CroAttn models experience reduced prefill latency as the image token percentage increases, requiring a modality-aware routing strategy that balances both text and image token load.}
+\label{insight:7}

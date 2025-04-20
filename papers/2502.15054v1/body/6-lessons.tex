@@ -1,0 +1,84 @@
+In this section, we discuss lessons and opportunities informed by our experience with large-scale graph ML. We expect this guidance to help academic researchers as well as practitioners building out their own graph ML functions.
+
+\subsection{Lessons: Infrastructure}
+\label{sec:lesson-infra}
+
+\paragraph{Vertical vs. Horizontal Scaling.}  Our early explorations in GNN modeling at industry-scale occurred when modern GNN libraries were limited, and ``spatial GNNs'' were still emerging~\citep{hamilton2017inductive, ying2018graph}. To handle large graphs, we employed a vertical-scaling solution, leveraging the highest-memory cloud machines available at the time (GCP's \texttt{n1-highmem-96}, with 96 vCPU and 624GB RAM).  We stored graph topology in CSR format, node features as a large tensor, and used Ray \footnote{\url{https://github.com/ray-project/ray}} for both shared-memory and multiprocessing, enabling a producer-consumer setup across CPU workers and GPU trainers.  
+
+
+While this prototype powered our early applications, it soon faced challenges due to multiple scaling factors: 
+\emph{(i)} Snapchat's rapid user growth, increasing graph size, 
+\emph{(ii)} the pursuit of richer node and edge features, and 
+\emph{(iii)} the need of adopting more advanced newly-proposed GNN models. 
+The reliance on vertical-scaling handicapped our ability to deal with these factors, forcing compromises in model, feature and graph scale. 
+% Hence, we sought out a naturally horizontally-scaling approach, which led to  
+This led us to invest in horizontally scalable architectures as the next-gen GNN modeling solutions at Snapchat (discussed in \cref{sec:framework}). Today, although the ceiling of vertical-scaling has increased with larger machines, we opt for horizontal designs which offer greater elasticity at different scales.
+
+\paragraph{GNN Libraries vs. Hand-rolled Convolutions.} In our early efforts, libraries like PyG \cite{Fey2019pyg} and DGL \cite{wang2019dgl} were nascent, and not well-suited for large-scale industrial use. 
+% Hence, our modeling solution leveraged hand-rolled graph sampling, joining with node features, and basic convolutions like 
+Hence, we developed graph sampling and convolution operations in native PyTorch, using models like GraphSAGE \cite{hamilton2017inductive} and (neighbor-sampled) GCN \cite{kipf2016semi}.
+% , applied on the sampled adjacencies.  
+% The solution forced equal number of nodes at each layer (no ragged-tensor support) and using complex multi-dimensional tensors (e.g. {\small \texttt{(b\_size, n\_nodes, n\_nodes, n\_node\_feat)}} for 2-layer convolution), paired with complex reshaping and reduction for message passing.  
+This approach required managing complex multi-dimensional tensors\footnote{E.g., tensor with shape of \texttt{(batch\_size, n\_nodes, n\_nodes, n\_node\_feat)} for 2-layer convolution.} and intricate reshaping
+% and reduction 
+for message passing.
+While effective initially, these custom solutions were challenging to adapt to advanced GNN models. Hence, when re-architecting, we take advantage of advances in frameworks like PyG and DGL which abstract away low-level convolution details. GiGL now benefits from the continuous improvements contributed to these libraries, closing the gap between cutting-edge research and production applications.
+
+\paragraph{Tabularization vs. Real-time Graph Sampling.} 
+% GiGL is designed to support multiple strategies for GNN training, with the major categorization being \emph{tabularized}, or \emph{real-time sampled} subgraphs. The former aims to pre-compute mini-batched graph objects which can be utilized by training processes in a purely data-parallel setting without shared graph state, while the latter queries a shared graph state during training and inference.  
+GiGL is designed to support both \emph{tabularized} and \emph{real-time} subgraph sampling workflows. Tabularization enables:
+\emph{(i)} cost amortization for parameter tuning and multi-user workflows,
+\emph{(ii)} easy integration with traditional recommender data sources to enable co-trained GNNs, and
+\emph{(iii)} decoupling graph scaling from GNN modeling through translation layers.
+However, it introduces challenges such as \emph{(i)} storage footprint due to data duplication, \emph{(ii)} need for careful resource management of ETL jobs, and \emph{(iii)} careful balancing of I/O and GPU utilization. In contrast, real-time sampling allows:
+\emph{(i)} adaptive graph usage during training (e.g., \cite{han2022mlpinit, yoon2021performance}), and
+\emph{(ii)} flexibility in swapping graph engine or database backend.
+Its limitations include the need to \emph{(i)} repeat sampling for each forward iteration and \emph{(ii)} need for careful concurrency and availability management of backend~\cite{borisyuk2024lignn}. While many internal applications rely on tabularization, careful backend optimization can yield significant cost savings for these large-scale workflows on a per-run basis. These trade-offs may shift as ETL processes and amortization strategies evolve.
+% These modalities have various pros and cons. Tabularization enables \emph{(i)} amortization of training data generation and cost for hyperparameter optimization and re-use by multiple practitioners, \emph{(ii)} easy joining with traditional  recommender data sources to enable co-trained GNNs, and \emph{(iii)} separation of ``handling graph scale'' from modeling choices (e.g. PyG, DGL, or other) through translation layers.  The main cons are \emph{(i)} storage footprint due to data duplication, \emph{(ii)} need for careful resource management of ETL jobs, and \emph{(iii)} care to balance network-bound data-loading and GPU hydration.  The latter strategy enables \emph{(i)} adaptive graph usage during training, e.g.\cite{han2022mlpinit, yoon2021performance}, \emph{(ii)} flexibility in swapping graph engine or database backend.  The main cons are \emph{(i)} need to repeat sampling runs for each model iteration, and \emph{(ii)} need for careful concurrency and availability management of backend, as \cite{borisyuk2024lignn} notes. While many internal applications use tabularization, careful choices in graph backend can enable considerable compute cost savings for these large-scale workflows on a per-run basis.  Yet, this tradeoff may change in the future with optimizations in ETL job and underlying amortization needs.
+
+\subsection{Lessons: Modeling}
+\label{sec:lesson-model}
+
+\paragraph{Offline vs. Online Performance.} 
+% We echo the common knowledge from ML practitioners that 
+As with many ML applications,
+offline-online discrepancies are common.  
+% While internal applications of GiGL training and inference use common metrics like validation loss, NDCG, and HitRate to guide decisions, we find that improving offline test metrics is unhelpful to online settings after a point, given exogenous online factors. 
+While we use metrics like validation loss, NDCG, and HitRate to guide model development, we find that improving offline metrics has diminishing returns for online performance after a point, due to external factors. 
+Hence, we often employ post-processing logic to also monitor task-relevant (non-differentiable) surrogate metrics which can help prune unpromising offline candidates early.
+
+\paragraph{Graph Data Sensitivity.} While most GNN research focuses on improved modeling, we find that graph data definition is underlooked and can outweigh model iteration in impact.  
+In real-world applications, graphs can often be refined in various ways, as exemplified in \cref{sec:friending}.
+% Most prior works assume fixed graphs, but this constraint does not exist in real-world settings
+% : e.g. in the friend recommendations context, we have many options to define edges between users (using edge type A vs. B, using both, weighting them, etc.)  
+% These factors both affect topology (graph density, average degree, etc), as well as signal quality.
+In particular, while past work emphasizes graph densification \cite{zhao2021data, zhao2022graph, han2022g} to improve downstream GNN performance, 
+we found that signal quality is the key for better embeddings, resulting with \emph{sparser} graph in most cases.
+% we found that \emph{sparser} graphs can result in better embeddings, especially when sparsity is induced by improving signal quality.  
+Favorably, we can achieve better performance at reduced compute cost. Moreover, embedding quality for low-degree nodes can be improved with \emph{targeted} augmentation with signal quality guardrails \cite{wang2023topological, guo2024node}: notably, falling back to weaker-signal edges when strong-signal edges are too-sparse.
+
+\paragraph{Shallow Graph Embeddings (SGE) vs. GNNs.} Modern graph ML research mainly focuses on GNNs, and is predated by advancements in shallow graph embedding (SGE) methods like DeepWalk \cite{perozzi2014deepwalk} or LINE \cite{tang2015line}.  While academic evaluation often paints a picture in which GNN methods clearly outperform SGE methods, we observe in multiple internal applications that they are \emph{mutually} useful.  \citet{dongseesaw} points out this complementarity; in particular, SGEs can outperform GNNs in cases where we have limited node or edge-features (avoiding dimensional collapse), or heterophilic signals, where feature-similarity is less predictive.
+% where using feature-similarity as an inductive prior on target embeddings can be limiting.
+
+% \paragraph{Multi-Stage Ranking.} We find GNN embeddings to be especially powerful sources in retrieval phase of multi-stage ranking funnels across applications.  Yet, GNN embeddings can \emph{also} provide additive value in downstream rankers. \cite{sankar2021graph} observes similar phenomena: in particular, it is valuable for optimization goals for the two sets of embeddings to differ.
+
+\vspace{-0.05in}
+\subsection{Opportunities}
+
+\paragraph{New Advances in Link Prediction.} Standard message-passing neural networks (MPNNs) are not the final frontier for link prediction. More complex subgraph-GNN architectures \cite{zhang2018link, zhu2021neural, zhao2021stars} show superior link performance,
+% compared to such methods, 
+and newer work show strong effectiveness of joint usage of simple heuristic link prediction metrics with GNNs \cite{mao2024demystifying, mamixture}. Moreover, co-training of large language models with graphs to improve node embedding quality is an emerging area~\cite{chenllaga,ren2024survey}.  
+We see explorations in all these areas as avenues for the next-generation of GNNs at Snapchat.
+
+\paragraph{Broadening Applications.} 
+While our current applications mostly focus on link prediction for recommendation systems, significant potential exists in expanding into node-level classification and regression tasks, particularly for user modeling.
+% Internal applications are diverse, and although many of our existing applications share a link prediction focus given recommendation applications, we have significant opportunity and plans to explore further node-level classification and regression tasks which are more relevant to user modeling tasks. 
+Moreover, cross-domain graph modeling offers opportunities of knowledge transfer between high- and low-resource interaction domains, as well as social recommendation avenues which directly leverage social graph in the context of user-item recommendation tasks \cite{fan2019graph, zhu2021cross}.
+
+\paragraph{Evolving Technical Choices.} We discussed key elements of GiGL design in \cref{sec:framework}. These choices enable flexibility in GNN training and inference which rely on in-memory subgraph sampling, graph databases, and ETL jobs. 
+% Changes in underlying offerings and scaling properties can make one paradigm significantly more advantageous over others, especially for certain graph modeling problems.  Moreover, cloud-providers' offerings and cost-profiles can change this evaluation.
+However, shifts in infrastructure, cloud offerings, and cost models can influence which approach is most effective for specific graph modeling tasks. 
+We continue to explore these evolving opportunities to improve GiGL, and are eager to 
+% work with the academic community to foster them.
+collaborate with the academic community to advance the field.
+

@@ -1,0 +1,298 @@
+\section{Verde: Dispute resolution for neural networks}
+\label{sec:game}
+
+Consider a client delegating the same ML program (e.g. training, inference) to $k>1$ compute providers, whom we'll generically call `\servers'.
+Each \server responds with a claimed output (or a binding commitment to an output).
+If all \servers return the same output, then there is no need for dispute resolution.
+If the \servers disagree on the output, they'll engage in a dispute resolution protocol with a neutral referee (which could be the client themselves).
+For simplicity, we assume all $k$ \servers claims a different output. Any \servers claiming the same output can be merged into one.
+At the end of the protocol, the referee selects one of the $k$ outputs to accept. 
+
+The security guarantee of dispute resolution is as follows:
+If there is an honest \server, their output is guaranteed to be the one accepted.
+The referee will identify $k-1$ dishonest \servers, proving that they reported incorrect output.
+An important limitation is that if \emph{all} \servers are dishonest, the protocol will still identify $k-1$ dishonest providers, but the referee will also an incorrect output and not find proof of incorrectness for one dishonest provider.
+
+
+
+{\bf Program setup:} 
+The client specifies a neural network with initial weights, training data, and training metadata 
+  like the optimizer and global batch size. 
+The model is a topologically-sorted computational graph, 
+  consisting of operators (using standardized formats like \onnx\cite{onnx2017}). 
+A ``training step'' comprises a forward pass, backward pass, parameter updates 
+  and an optimizer state update. 
+
+For simplicity of presentation, we consider only the case of $k=2$ \servers.\footnote{Extending to $k>2$ \servers can be achieved trivially by repeating the 2-\server case iteratively or in a hierarchical tournament. More efficient combination is possible by combining some steps.}
+We assume bitwise reproducibility between the referee and all \servers, ensuring that honest execution 
+always produces the same output (Section~\ref{sec:repops} explains how \repops enables this 
+on different hardware setups).
+The referee has access to the computational graph defining the model, the initial parameters, and the training data. 
+However, they are assumed to be computationally limited, and unable to train the model themselves. 
+
+During dispute resolution, the referee interacts with the \servers, 
+analyzing commitments to their intermediate computation states to narrow down the 
+dispute to a smaller segment of the program.
+In adapting this to neural network training, we design 
+a protocol that proceeds in two phases.
+\begin{enumerate}
+  \item {\bf Phase 1} identifies the exact training step 
+    that the \trainers first diverged at.
+  \item {\bf Phase 2} identifies the first operator in the computational graph
+    defining the model where they diverge. 
+\end{enumerate}
+
+Sections \ref{sec:bisection-phase-1} and \ref{sec:bisection-phase-2} 
+describe the two phases, respectively.
+While we focus on training, our techniques immediately extend 
+to inference. 
+
+\subsection{Phase 1: Identifying the diverging training step.}
+\label{sec:bisection-phase-1}
+
+A training program specifies the neural network as a computational graph 
+with a training dataset and fixed training metadata. 
+We start by abstracting the training procedure as a state machine, where the 
+``state'' is the values of the learnable parameters and optimizer state 
+and the ``transition function'' is each training step 
+performing a forward pass, backward pass, and optimizer state update. 
+At each training step, we derive a ``checkpoint'' that includes the state and 
+can be \emph{committed} using a cryptographically binding commitment scheme. 
+We define a precise checkpoint and commitment format later, 
+but it suffices for now to assume that the checkpoint consists of just the aforementioned state 
+and is committed to using a standard collision-resistant hash function like SHA-256. 
+
+The training program transcript can thus be viewed as a sequence of checkpoints 
+$C_0 \rightarrow C_1 \rightarrow \ldots \rightarrow C_n$. 
+If two trainers start with $C_0$ 
+but produce different outputs after $n$ steps, $C_n$ and $C_n'$, 
+then there must be a training step $i$ where they first ``diverged'':
+that is, they claim different transitions 
+$C_i \rightarrow C_{i+1}$ and $C_i \rightarrow C_{i+1}'$, 
+respectively, at step $i$. 
+
+{\bf A first attempt.} 
+The naive way for the referee to identify this diverging step is to 
+receive from each \trainer the 
+hashes of all their checkpoints, and then find the diverging checkpoint with a linear search.
+The prohibitive issue here is that hashing 
+the model state after every single step can be very expensive for large models.
+For example, hashing the weights and Adam optimizer state~\cite{kingma14adam}
+(the optimizer state is double the size of the weights alone)
+in FP32 precision for 
+\distilbert (66 million parameters) takes under a second, 
+for \llama-1B takes around 2.5 seconds, and for \llama-8B around 15 seconds, 
+on a CPU with 128 GB RAM and the Apple M3 chip.
+
+\input{protocols/phase_1.tex}
+
+{\bf Optimization: multi-level checkpointing.}
+We identify the diverging step by narrowing down the interval it occurs in 
+through multiple rounds of interaction (see Algorithm~\ref{sec:bisection-phase-1})
+During training, the \trainers log checkpoints only at specified steps, instead of every step.
+Upon receiving these initial checkpoints sequences, 
+the referee identifies the first diverging checkpoint as before.\footnote{Note that we eschew the binary search of Canetti et al., as the number of checkpoint commitments is so low ($N<100$) it is more efficient in practice to send all of them in a single round.}
+Then, the parties recurse: they re-run the diverging segment of training and 
+log more granular checkpoints within.
+These are again sent to the referee 
+who identifies and shares the new diverging segment. 
+This repeats until the granularity of the checkpoints is a single training step.
+
+\textbf{Communication and storage costs.}
+As only short hashes are communicated at this stage (and not the checkpoints themselves), 
+the communication overhead is minimal for all parties. 
+There is a trade-off between the checkpointing frequency (and thus, the hashing and 
+storage requirements) during training and the amount of re-execution needed by the \trainers 
+after training during dispute resolution. 
+For example, if the trainers log $N$ initial checkpoints 
+at each level, 
+then the \trainers re-execute a $(\frac{1}{N} + \frac{1}{N^2} + \frac{1}{N^3} + \ldots)$ 
+fraction of the original training program. When $N=20$, this 
+comes to under $6\%$. 
+When considering just the learnable parameters of \llama-8B with precision FP32, 
+this requires a few hundred gigabytes of storage.
+With $N=100$, the amount of re-execution reduces to under $1.1\%$ but 
+the storage requirements reaches a few terabytes. 
+As mentioned earlier, the time taken to hash all of the checkpoints is 
+negligible compared to the training program itself (and can be done in parallel). 
+
+
+
+
+\subsection{Phase 2: Narrowing down the diverging operation.}
+\label{sec:bisection-phase-2}
+
+At the end of Phase 1, 
+the referee identifies the diverging training step, along with the 
+starting commitment of the step (common to \trainers) and the 
+two disputed ending commitments. 
+To decide which of the two \trainers' claims is dishonest, 
+the referee could re-run the entire training step themselves. 
+This requires them to receive the starting checkpoint state from either \trainer,
+perform the step, 
+and compare the hash of the output with that of the two \trainers.
+However, this incurs high communication and computation costs for the referee. 
+A checkpoint itself can be many gigabytes and 
+a training step requires a peak memory usage larger 
+than the checkpoint itself. 
+
+To improve on this, we observe that the work done by a training step function is defined as a computational graph.
+We can narrow down the dispute further to the 
+the first \emph{operator} in the graph 
+the two \trainers diverged at. 
+Resolving the output of just a single operator can reduce 
+the communication and compute requirements of the referee
+by two orders of magnitude. 
+For example, 
+the largest operator involved in most transformer-based models, 
+the key-query matrix multiplication in the self-attention layer, 
+can be represented as a series of 
+matrix-vector multiplication operators, each of which require 
+memory in the order of dozens of megabytes even for large sequence lengths. 
+
+\textbf{Computational graph and node representations.}
+We start with the representation of neural networks as a directed acyclic computational 
+graph and extend it to capture all the work done in a training step: 
+the forward pass, backward pass, and optimizer state updates.
+This extended graph can be implicitly derived 
+from the computational graph representing the 
+forward pass of the model, such as in a format like \onnx, 
+and automatic differentiation library like \autograd.
+An example of this expanded graph is shown in Figure \ref{fig:extended-graph}
+for a neural network with one operator. 
+Note that we topologically sort the graph to ensure a common order for all parties. 
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.35\textwidth]{figures/extended-graph.pdf}
+  \caption{Extended computational graph for a neural network with a single operator. 
+Yellow represents nodes that initialize tensor values from either the training data or the 
+a training checkpoint. 
+    Blue nodes are forward pass operators, and red ones are backward pass operators. 
+For clarity, we label the edge transferring context (also called ``saved tensors''' in autograd) 
+from the forward pass to the corresponding backward pass operator.
+  In the dispute resolution algorithm, these nodes are specified as \cgraphnode objects. 
+} 
+  \label{fig:extended-graph}
+\end{figure}
+
+We augment these nodes with information 
+allowing the referee to later resolve disputes without needing to 
+run other parts of the graph.
+On top of information about the node's connections (inputs nodes, output nodes), 
+the operation (operator and attribute details), 
+we add the hashes of all tensors sent into and emitted out of the node.
+
+\begin{tcolorbox}[colback=azure!5!white, colframe=azure!75!black, title={\cgraphnode}]
+\textbullet\ Input node pointers\\
+\textbullet\ Output node pointers\\
+\textbullet\ Operator and attributes\\
+\textbullet\ {\bf Input tensor hashes}: list of hashes of the tensors input to this node \\
+\textbullet\ {\bf Output tensor hashes}: list of hashes of the tensors output from this node 
+\end{tcolorbox}
+
+If the \trainers start with the same checkpoint 
+(which we know to be the case after Phase 1) at the start of a training step 
+but finish with different weights or optimizer state, then there must be a node 
+in the above computational graph that the \trainers start with the same inputs 
+but compute different outputs for. 
+Similar to Algorithm~\ref{alg:protocol_phase_1}, we can identify this 
+node by comparing the sequence of hashes of the nodes produced by each \trainer. 
+When performing a training step during dispute resolution,  
+the \trainers populate and hash these nodes, and send the sequence to the 
+referee. 
+Algorithm~\ref{alg:protocol_phase_2} shows the full protocol.
+
+\input{protocols/phase_2.tex}
+
+\paragraph{Checkpoint hash format.}
+
+We can now specify the precise checkpoint format used in Phase 1. 
+To ensure continuity between the \trainers claims in Phase 1 and 2, 
+the checkpoint after a given training step is the Merkle tree 
+with the leaves being the 
+\emph{hash of all the {\cgraphnode} nodes} 
+of the training step leading to the checkpoint, as shown in Figure~\ref{fig:checkpoint-merkle-tree}.  
+As these contain hashes of all updates performed in the step, they serve as a 
+commitment to the new training state. 
+Importantly, 
+they disallow a trainer from using inconsistent commitments between Phase 1 and Phase 2. 
+The referee ensures that the sequence of node hashes sent by the 
+\trainers in Phase 2 conform exactly to the 
+values of $\disphash$ obtained in Phase 1 
+(line \textred{7} in Algorithm~\ref{alg:protocol_phase_2}). 
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.4\textwidth]{figures/checkpoint_commitment.pdf}
+  \caption{The nodes of the computational graph of the latest training step 
+    serve as the checkpoint used in Phase 1. 
+    It's committed to using a Merkle (binary hash) tree 
+    and verified by the referee in Phase 2 (line {7}).   
+    Merkle trees provide efficient proofs of membership for its leaves,
+    facilitating efficient dispute resolution when \trainers disagree on the 
+    values from the weights, optimizer state, or training data. 
+  }
+  \label{fig:checkpoint-merkle-tree}
+\end{figure}
+
+
+
+\subsection{Referee's decision algorithm.}
+\label{sec:decision}
+
+Finally, we outline the algorithm used by the referee to determine the dishonest party 
+in the dispute.
+At the end of Phase 2, the referee contains objects $\node_0, \node_1$ representing 
+\cgraphnode nodes in the extended computational graph.
+As the node hashes are different, there must differ in at least one of the fields 
+specified in the \cgraphnode definition. 
+As we enforce deterministic execution and control for 
+randomness, at most one node can represent a valid execution.
+The referee compares the fields within the nodes and determines which of them 
+represents a valid execution. 
+
+Depending on how $\node_0$ and $\node_1$ differ, the referee resolves the 
+dispute. There are 3 main cases, depending on what differs between the nodes.
+\begin{enumerate}
+  \item {\bf Case 1:} Difference in graph structure: \texttt{inputs, outputs, operator}  
+  \item {\bf Case 2:} Difference in an input tensor hash.
+  \item {\bf Case 3:} Difference in an output tensor hash.
+\end{enumerate}
+
+We provide brief descriptions of how each case is handled. 
+{\bf Case 1} is the easiest 
+to resolve as it means one \trainer constructed the graph incorrectly.
+The referee, knowing the model specified by the client, can check which structure is correct. 
+
+{\bf Case 2} involves multiple sub-cases 
+depending on whether the input tensor corresponding to the differing hash 
+is from from (a) the starting checkpoint (such as a weight or 
+optimizer state value) or from (b) another node in the graph.
+If (a), then the referee requests a \emph{Merkle membership proof} 
+of the input hash in the checkpoint from the two \trainers. 
+This short and easy-to-check proof can only be produced by the honest \trainer.
+If (b), the referee asks for the 
+source node's opening from the trainers to check which of the disputed tensor hash 
+is present as an output tensor hash of that node.
+As nodes $\node_0, \node_1$ are the first diverging node, 
+    they agree on source node and in particular, the \texttt{emitted tensor hashes} in it. 
+    The disputed input tensor hash must be an emitted tensor hash in the other node. 
+
+{\bf Case 3} implies that the two trainers claim different emitted tensor values. 
+This is the only scenario where the referee needs to run the operator 
+and decide which \trainer is correct. 
+This can be done in multiple ways, depending on the operator and 
+compute capabilities of the referee. 
+The referee can recompute the operator themselves by receiving from the trainers 
+  the input tensors of the node. 
+We can also further decompose the operator into smaller operators and perform more phases 
+  to narrow down the dispute arbitrarily. 
+  
+
+
+
+
+
+
+

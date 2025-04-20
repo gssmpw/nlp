@@ -1,0 +1,445 @@
+\section{PyTorch Implementation}\label{sec:dynamic_checkpoint}
+
+We use Algorithm~\ref{alg:train-checkpoint} to estimate the memory usage and compare it with the result from PyTorch, a state-of-the-art deep learning platform that supports checkpoints. 
+However, the memory usage reported by PyTorch does not match the simulated results from Algorithm~\ref{alg:train-checkpoint}.
+After tracing the implementation of PyTorch, we realized the following.
+
+\begin{enumerate}
+\item First, PyTorch does {\em not} keep all checkpoints in memory all the time, as Equation~\ref{eq:cost} indicates.  
+We observe that PyTorch released the memory of $d_i$ (checkpoint or not) when it is no longer used.
+That is, it does not release the memory in batch, as algorithm~\ref{alg:train-checkpoint} suggests.
+\item Algorithm~\ref{alg:train-checkpoint} does not consider the memory of $r_i$ (Equation~\ref{eq:ri}).
+The size of this {\em output gradient} is the same as $d_i$, which is quite significant.
+In addition, PyTorch will allocate a data buffer to fit the maximum output gradient $d_i$ within a segment.
+As a result, the size of maximum $d_i$ should be counted {\em twice} for an accurate estimate of the memory requirement of PyTorch. 
+\end{enumerate}
+
+We now describe a more memory-saving checkpoint mechanism. 
+We conjectured that PyTorch uses this mechanism, instead of Algorithm~\ref{alg:train-checkpoint},
+and we verified this conjecture by experiments in Section~\ref{sec:experiment}.
+Therefore, this is a more accurate description of the PyTorch implementation.
+The pseudocode of this memory management algorithm is in Algorithm~\ref{alg:train-early-free}.
+
+\begin{algorithm}[h!t]
+\begin{algorithmic}
+\caption{Neural Network Training with Checkpoints as Done by PyTorch}
+\label{alg:train-early-free}
+%\Comment{Forward phase}
+\Require Weights $w_1, \ldots, w_n$, input $x$ ($d_0$), and the ground truth $G$.
+\Ensure Updated $w_1, \ldots, w_n$.\\
+
+\For{$i \gets 1$ to $n$}        \Comment{Forward Phase}     
+    \State {Allocate memory for $d_i$}  
+    \State {Compute $d_i$ with $d_{i-1}$ and $w_i$}
+    \If {$d_{i-1}$ is not a checkpoint}
+        \State {Free the memory of $d_{i-1}$} 
+    \EndIf
+\EndFor
+\For{$i \gets n$ to $1$}     \Comment{Backward Phase}
+    \If {$d_i$ is a checkpoint}
+        \State{Let $d_h$ be the previous checkpoint. Allocate and recompute $d_{h+1}, \ldots, d_{i-1}$}
+%        \State{Allocate and recompute $d_{h+1}, \ldots, d_{i-1}$}
+        \State{Release the buffer for the previous output gradients} 
+        \State{Allocate a new buffer $r$ of size  $\max(d_{h}, \ldots, d_{i-1})$} 
+        \Comment{output gradient}
+    \EndIf
+    \State {Compute $r_i$ (Equation \ref{eq:ri})}
+    \State {Compute $g_i$ (Equation~\ref{eq:gi})}
+    \State{Update $w_i$ with $g_i$} \Comment{Update the weight}
+    \State{Release the memory $d_i$} \Comment{as PyTorch implementation}
+\EndFor 
+\end{algorithmic}
+\end{algorithm}
+
+The new mechanism will release the memory of $d_i$ as soon as we do not need them.
+The forward phase is the same as the previous mechanism; we only keep checkpoints in memory.
+During the backward phase, we will have two cases for the index $i$ in Algorithm~\ref{alg:train-early-free}.
+
+\begin{itemize}
+\item If $d_i$ is a checkpoint, then we will first find the previous checkpoint $d_{h}$ and recompute all data in the segment between $d_{h+1}$ and $d_{i-1}$, where $d_h$ is the previous checkpoint.
+\item We then free the memory of the output gradient of the previous segment.
+\item We then allocate a new buffer for the output gradient of this segment, of size $\max(d_{h}, \ldots, d_{i-1})$.
+\item We then update the weight $w_i$ as in Algorithm~\ref{alg:train-checkpoint}.
+Finally, just as in the PyTorch implementation, we free the memory of $d_{i}$ since we no longer need it.
+\end{itemize}
+
+With these observations, we derive a more accurate memory consumption model and verify it with experiments in Section~\ref{sec:prediction}.
+Now we focus on the theoretical aspects of finding the set of checkpoints to minimize memory use for this new model.
+
+One can think of this new checkpoint mechanism as it shrinks the current segment until it reaches the next checkpoint, and then it recomputes the next segment and starts shrinking it. 
+Also, it always keeps a buffer of the size of the maximum among the current segment and its left checkpoint as the output gradient.
+Let $C$ be the set of checkpoints, $d_i \in C$, and $d_h$ is the checkpoint before $d_i$ in $C$. 
+The memory usage for the $i$-th backward phase $m(i)$ is in Equation~\ref{eq:memory}, where $C(i)$ is the set of checkpoints with an index no larger than $i$.
+Note that we only need to define $m(i)$ for those $i$'s where $d_i \in C$ to find the maximum memory usage since the memory usage from the $i$-th iteration to the $h-1$-th iteration always decreases, since Algorithm~\ref{alg:train-early-free} always free memory at the end of the iteration.  
+For example, if $d_{{i'}}$ is a data between $d_h$ and $d_i$,  i.e., $h < i' < i$, then memory usage $m(i')$ is in Equation~\ref{eq:iprime}.
+Note that PyTorch implementation (Algorithm~\ref{alg:train-early-free}) still maintains the output gradient buffer of size $\max_{h \leq k < i}(d_k)$ when the backward phase goes to $d_{i'}$.
+It is obvious that $m(i') < m(i)$, so we only need to define $m(i)$ for those $i$'s where $d_i \in C$ to find the maximum.
+
+\begin{eqnarray}
+m(i) & = & \sum_{d \in C(i)} d + \sum_{k = h+1}^{i-1} d_k + \max_{h \leq k < i}(d_k) \label{eq:memory} \\
+m(i') & = & \sum_{d \in C(h)} d + \sum_{k = h+1}^{i'} d_k + \max_{h \leq k < i}(d_k) \label{eq:iprime} 
+\end{eqnarray}
+
+For ease of notation, we define $s(h, i)$ as in Equation~\ref{eq:s}, so we can rewrite Equation~\ref{eq:memory} into \ref{eq:memory-simple}.
+
+\begin{eqnarray}
+s(h, i) & = & \sum_{k = h+1}^{i-1} d_k + \max_{h \leq k < i}(d_k) \label{eq:s} \\
+m(i) & = & \sum_{d \in C(i)} d + s(h, i) \label{eq:memory-simple}
+\end{eqnarray}
+
+Given the $d_i$ for $1 \leq i \leq n$, the goal is to find the set of checkpoints $C$ which minimizes the maximum among all $i$ for Equation~\ref{eq:memory-simple}, for all $d_i$ in $C$.
+We will use {\em dynamic checkpoint selection problem} to denote this optimization problem.
+%We will use {\em dynamic checkpoint selection} to denote this optimization problem.
+\subsection{Dynamic Programming}
+
+We again use dynamic programming to solve the dynamic checkpoint selection problem.
+
+Define a function $M(i)$, representing the minimum memory usage from layer $i$ to layer $n$, given that layer $i$ is the checkpoint.
+Here, the term $M(1)$ is the answer to the dynamic checkpoint selection problem.
+%We first define a memory usage function $M(i)$, which is the minimum memory usage {\em before} the step $i$ of the backward phase, considering data from $d_i$ to $d_n$, where $d_i$ is a checkpoint.
+%
+Now we derive the recursion of $M$.
+For each term $M(i)$, $1\leq i < n$, consider the next checkpoint: $d_j$, $i < j < n$.
+%Since $d_i$ is a checkpoint, we consider a possible next checkpoint, $d_j$, during the backward phase, for $i < j < n$.
+There are two possibilities for minimum memory usage:
+\begin{itemize}
+\item The memory usage peaks when the backpropagation updates the weights between layer $j$ and layer $n$.
+Therefore, the memory usage is $d_i + M(j)$.
+\item The memory usage peaks when the backpropagation updates the weights between layer $i$ and layer $j$.
+Therefore, the memory usage is $d_i + s(i, j) + d_j$.
+\end{itemize}
+%There are two possibilities for minimum memory usage during the backward phase.
+%The first possibility happens before the $j$ step, so the memory usage is $d_i + M(j)$.
+%That is, the memory usage peaks before the $j$-th iteration, so as far as $d_i$ to $d_n$ are concerned, the maximum is $d_i + M(j)$.
+%The second possibility happens at the beginning of the $j$-th iteration, so the memory usage is $d_i + s(i,j) + d_j$.
+As a result, we derive the recursion of $M$ as in Equation~\ref{eq:T-rec}.
+%Since we do not know which $j$ will minimize the memory usage for an $i$, we enumerate all $j$ between $i$ and $n$ and find the one that minimizes the larger values of the two possibilities.
+\begin{equation}
+M(i) = \min_{i < j < n}(\max(d_i + M(j),  d_i + s(i,j) + d_j)) \label{eq:T-rec}
+\end{equation}
+
+%We rewrite Equation~\ref{eq:T-rec} into Equation~\ref{eq:T-rec-simple}.
+%\begin{equation}
+%M(i) = d_i + \min_{i < j < n}(\max(M(j),  s(i,j) + d_j)) \label{eq:T-rec-simple}
+%\end{equation}
+
+Here we discuss the time complexity of this recursion.
+To find a single $M(i)$ using Equation~\ref{eq:T-rec}, we enumerate all $j$ between $i$ and $n$ and then find the one that minimizes the larger values between $d_i + M(j)$ and $d_i + s(i, j) + d_j$.
+%We need to enumerate all $j$ between $i$ and $n$, compute $\max(M(j),  s(i,j) + d_j)$, and find their minimum.
+A simple algorithm takes $O(n)$ time to compute each $M(i)$, and there are $n$ such $M(i)$ values to compute.
+Therefore, the time for computing all $M(i)$'s is $O(n^2)$, if we precompute all $s(i,j)$, which also takes $O(n^2)$ time.
+%A simple algorithm will take $O(n)$ time to compute a $M(i)$, and the total time for computing all $M(i)$'s will be $O(n^2)$ if we precompute all $s(i,j)$, which also takes $O(n^2)$ time.
+See Algorithm~\ref{alg:dynamic-checkpoint-selection-square-time} for the implementation details.
+
+\begin{algorithm}[h!tb]
+\begin{algorithmic}
+\caption{Dynamic Checkpoint Selection in $O(n^2)$ time}
+\label{alg:dynamic-checkpoint-selection-square-time}
+%\Comment{Forward phase}
+\Require data sizes $d_0, \ldots, d_n$.
+\Ensure The minimum cost of checkpoint selection
+\State{$M(n)=d_n$}
+\For{$i \gets n-1$ to $1$}
+\State{$M(i)=\infty$}
+\For{$j \gets i+1$ to $n$}
+    \State{$M(i) = \min(M(i), \max(d_i + M(j),  d_i + s(i,j) + d_j))$}        
+\EndFor
+\EndFor
+\State{return $M(1)$} \Comment{the answer}
+\end{algorithmic}
+\end{algorithm}
+
+\begin{theorem}
+\label{thm:dynamic-checkpoint-selection-square-time}
+The dynamic checkpoint selection problem is $O(n^2)$-time solvable, where $n$ is the number of neural network layers.
+%We can solve the dynamic checkpoint selection problem in $O(n^2)$ time, where $n$ is the number of layers.
+\end{theorem}
+
+%\comment{
+\subsection{Linear Time}
+
+%We now describe how to compute Equation~\ref{eq:T-rec-simple} in linear time of $n$.
+%The first observation is that building a prefix sum table on $d_i$ will take $O(n)$ time.
+%After we have the prefix sum table, we can compute any range sum of $d_i$, e.g., $\sum_{s=i+1}^{k} d_s$ of %Equation~\ref{eq:T-rec-simp}, in $O(1)$ time.
+%We first observe that $M(i)$ is a decreasing function of $i$.
+
+%\begin{lemma} \label{lm:T}
+%$M(i)$ is a decreasing function of $i$.
+%\end{lemma}
+%\begin{proof}
+%A direction observation from Equation~\ref{eq:T-rec-simple}, and the fact that $s(i,j) > s(i + 1,j)$.
+
+%\begin{eqnarray*}
+%\lefteqn{M(i)} \\
+%& = & d_i + \min_{i < j < n}(\max(M(j),  s(i,j) + d_j)) \\
+%& > & \min((\max(M(i+1), s(i, i+1) + d_{i+1}), \\ 
+%& & \min_{i + 1 < j < n}(\max(M(j),  s(i,j) + d_j)) \\
+%& > & \min(M(i+1), \min_{i + 1 < j < n}(\max(M(j),  s(i + 1,j) + d_j)) \\
+%& > & \min(M(i+1), M(i+1)) \\
+%& > & M(i+1)
+%\end{eqnarray*}
+%\end{proof}
+
+We now describe how to compute Equation~\ref{eq:T-rec} in linear time of $n$.
+First, we rewrite Equation~\ref{eq:T-rec} into Equation~\ref{eq:T-rec-simple}.
+\begin{equation}
+M(i) = d_i + \min_{i < j < n}(\max(M(j),  s(i,j) + d_j)) \label{eq:T-rec-simple}
+\end{equation}
+To ease the notation we define $U(i, j)$ as in Equation~\ref{eq:U} and simplify Equation~\ref{eq:T-rec-simple} into \ref{eq:TU}.
+
+\begin{eqnarray}
+U(i, j) & = & s(i,j) + d_j \label{eq:U} \\
+M(i) & = & d_i + \min_{i < j < n}(\max(M(j), U(i, j))) \label{eq:TU}
+\end{eqnarray}
+
+The linear-time algorithm is derived from two observations:
+\begin{itemize}
+    \item The computation of $M(i)$ using Equation~\ref{eq:TU} can be reduced to finding the minimum of the larger values between an increasing function and a decreasing queue.
+    \item The index that yields the minimum in Equation~\ref{eq:TU} when computing $M(i)$ is no greater than the index that yields the minimum in Equation~\ref{eq:TU} when computing $M(i + 1)$.
+\end{itemize}
+
+\subsubsection{The First Observation}
+The function $U(i, j)$ is monotonic of $j$ for a given $i$.
+%We observe that $U(i, j)$ is a monotonic function of $j$ for a given $i$.
+\begin{lemma} \label{lm:U}
+$U(i, j)$ is an increasing function of $j$ for a given $i$.
+\end{lemma}
+\begin{proof}
+\begin{eqnarray}
+\lefteqn{U(i, j + 1)} \\
+& = & s(i,j + 1) + d_{j+1} \\
+& = & (\sum_{k = i+1}^{j} d_k + \max_{i \leq k \leq j}(d_k)) + d_{j+1} \label{eq:U-(i,dot)}\\
+& > & d_j + \sum_{k = i+1}^{j-1} d_k + \max_{i \leq k \leq j}(d_k) \\
+& > & (\sum_{k = i+1}^{j-1} d_k + \max_{i \leq k < j}(d_k)) + d_j\\
+& = & U(i, j)
+\end{eqnarray}
+\end{proof}
+
+% We use a queue $Q$ to store the known $M(i)$ values.
+% Whenever a $M(i)$, where $0 \leq i < n$, is found, apply the following procedure on $Q$:
+% \begin{enumerate}
+%    \item Locate the last entry $M(i^\star)$ within $Q$, if one exists.
+%    \item If $M(i^\star) \leq M(i)$ or if $Q$ is empty, insert $M(i)$ into $Q$; otherwise, eliminate $M(i^\star)$ from $Q$ and call this procedure recursively.
+% \end{enumerate}
+
+We use a monotonic queue $Q$ to store a sorted subset of $M(i)$'s, for $i$ between $1$ and $n$.
+We compute $M(i)$ for $i$ from $n$ down to $1$.
+After computing $M(i)$, we remove those $M$'s from the head of $Q$ that are no less than $M(i)$, then add $M(i)$ to the head of $Q$.
+%After we compute $M(i)$, we remove those $M$'s at the beginnin of $Q$ that are no less than $M(i)$, then add $M(i)$ at the beginning of $Q$.
+As a result, we acquire Lemma~\ref{lm:monotonicQueue}.
+%As a result, $Q$ is a sequence of {\em decreasing} $M(i)$ values with increasing $i$ indices.
+%For ease of notation, we use $Q_i$ to denote the monotonic queue $Q$ after we added $M(i)$ to it.
+
+% Equation~\ref{eq:TU} shows that when computing $M(i)$, we should consider all $M(j)$ values, where $i < j < n$.
+% However, we observe that we only need to consider the $M(j)$ values in $Q$ during the computation of $M(i)$.
+
+\begin{lemma} \label{lm:monotonicQueue}
+$Q$ is a monotonically decreasing queue with respect to the index of function $M$.
+\end{lemma}
+\begin{proof}
+\comment{
+Assume for contradiction that $Q$ is not a monotonically decreasing queue with respect to the index of function $M$.
+Then there exist two adjacent entries $M(i)$ and $M(j)$ in $Q$ such that
+\begin{equation*}
+    i < j \hspace{1cm}\text{and}\hspace{1cm} M(i) < M(j)
+\end{equation*}
+However, according to the procedure for maintaining $Q$, $M(j)$ is removed prior to inserting $M(i)$.
+Thus, $M(j)$ is not in $Q$, a contradiction.}
+The lemma follows from the construction of $Q$.
+\end{proof}
+
+For ease of notation, we use $Q_i$ to denote the monotonic queue $Q$ after we added $M(i)$ to it.
+We observe that only those $M(j)$'s in $Q$ need to be considered when applying Equation~\ref{eq:TU} to compute $M(i)$.
+%The first key idea of the linear time proof is that we only need to consider those $M(j)$'s in $Q$ for Equation~\ref{eq:T-rec-simple} when we compute $M(i)$.
+Formally we have Equation~\ref{eq:T-rec-queue}.
+
+\begin{equation}
+M(i) = d_i + \min_{j \in Q_{i-1}}(\max(M(j), U(i, j))) = d_i + \min_{i < j < n}(\max(M(j), U(i, j))) \label{eq:T-rec-queue}
+\end{equation}
+%\begin{equation}
+%M(i) = \min_{j \in Q_{i-1}}(\max(M(j), U(i, j))) = \min_{i < j < n}(\max(M(j), U(i, j))) \label{eq:T-rec-queue}
+%\end{equation}
+
+\begin{lemma} \label{lm:Q}
+When we compute $M(i)$ with Equation~\ref{eq:TU}, we only need to consider those indices $j$'s in $Q_{i-1}$, i.e., we have Equation~\ref{eq:T-rec-queue}.
+%When we compute $M(i)$ with Equation~\ref{eq:T-rec-simple}, we only need to consider those indices $j$'s in $Q_{i-1}$, i.e., we have Equation~\ref{eq:T-rec-queue}.
+\end{lemma}
+\begin{proof}
+Consider $M(a)$ that removes $M(b)$ during the construction of $Q$.
+By the construction of $Q$, we have $M(a) \leq M(b)$.
+In addition, we have $a < b$ because we compute $M(i)$ for $i$ from $n$ to $1$.
+This implies that $U(i, a) < U(i, b)$ since Lemma~\ref{lm:U} states that $U(i, j)$ is increasing for a fixed $i$.
+%By the construction, we have $a < b$ because we compute $M(i)$ for $i$ from $n$ to $1$, so we have $M(a) \leq M(b)$.
+%In addition, $U(i, a) < U(i, b)$ from Lemma~\ref{lm:U} because $a < b$.
+The preceding two inequalities, $M(a) \leq M(b)$ and $U(i, a) < U(i, b)$, imply $\max(M(a), U(i, a)) \leq \max(M(b), U(i, b))$, which indicates that we can safely ignore the case $j=b$ when computing $M(i)$ using Equation~\ref{eq:TU}.
+Therefore, the Lemma follows and Equation~\ref{eq:T-rec-queue} is valid.
+%As a result, $\max(M(a), U(i, a)) \leq \max(M(b), U(i, b))$, and we can safely ignore $b$ in Equation~\ref{eq:TU}, thus the theorem follows and Equation~\ref{eq:T-rec-queue} is valid.
+\end{proof}
+
+\comment{
+\begin{lemma} \label{lm:Q}
+For each $x$ such that $0 \leq x < n$, if
+\begin{equation}
+i = \arg \min_{x < j < n}(\max(M(j), U(x, j)))
+\end{equation}
+then $M(i) \in Q$.
+\end{lemma}
+\begin{proof}
+We prove Lemma~\ref{lm:Q} by showing that for each $x$ such that $0 \leq x < n$, if there exists an $i^*$ such that $M(i^*) \notin Q$, then
+\begin{equation}
+i^* \neq \arg\min_{x < j < n}(\max(M(j), U(x, j)))
+\end{equation}
+
+According to the procedure for maintaining $Q$, if $M(i^*) \notin Q$, then there exists an $i$, where $x < i < i^*$, such that $M(i) < M(i^*)$, implying that
+\begin{equation} \label{eq:lmQTi}
+M(i) < \max(M(i^*), U(x, i^*))
+\end{equation}
+
+By Lemma~\ref{lm:U} and $x < i < i^*$, we have $U(x, i) < U(x, i^*)$, implying that
+\begin{equation} \label{eq:lmQUi}
+U(x, i) < \max(M(i^*), U(x, i^*))
+\end{equation}
+
+By combining Equation~\ref{eq:lmQTi} and Equation~\ref{eq:lmQUi}, we obtain the following inequality:
+\begin{equation}
+\max(M(i), U(x, i)) < \max(M(i^*), U(x, i^*))
+\end{equation}
+
+Thus,
+\begin{equation}
+i^* \neq \arg \min_{x < j < n}(\max(M(j), U(x, j)))
+\end{equation}
+\end{proof}
+}
+
+\comment{
+In addition, we observe that $Q$ is a monotonically decreasing queue with respect to the index of function $M$.
+}
+
+Combining Lemma~\ref{lm:U}, \ref{lm:monotonicQueue}, and \ref{lm:Q}, we obtain the first observation of our linear time algorithm: the value of $M(i)$ is the sum of $d_i$ and the minimum of the larger value between an increasing function $U(i,\cdot)$ and a decreasing queue $Q$ with respect to $j$, the index of $M$'s in $Q$.
+%Combining Lemma~\ref{lm:U}, \ref{lm:monotonicQueue}, and \ref{lm:Q}, we conclude that $M(i)$ is the sum of $d_i$ and the minimum of the larger value between an increasing function $U$ and a decreasing queue $Q$ of $j$, for $i < j < n$ and $M(j) \in Q$.
+
+To simplify the description, we use $j^*(i)$ to denote the $j$ that minimizes Equation~\ref{eq:TU}, as defined in Equation~\ref{eq:jstar}.
+%To simplify the description, we use $j^*(i)$ in Equation~\ref{eq:jstar} to denote the $j$ that minimizes Equation~\ref{eq:T-rec-simple}.
+This observation reduces the search for $j^*(i)$ in Equation~\ref{eq:TU} from considering each $U(i, j)$ and $M(j)$ for all $j$ between $i$ and $n$ to identifying the intersection of the increasing function $U$ and the decreasing queue $Q$ if they intersect.
+%$j^*(i)$ will be at the intersection of the function $U$ and the values in $Q$ if they do intersect.
+If the function values of $U$ and the values in $Q$ do not intersect, then the $j^*(i)$ will be $n$ or $i$.
+Figure~\ref{fig:compute_M(2)} illustrates this observation.
+
+\begin{equation}
+j^*(i) = \arg \min_{i < j < n}(\max(M(j), U(i, j))) \label{eq:jstar}
+\end{equation}
+
+\subsubsection{The Second Observation}
+%Next, we aim to establish a connection between the computation of $M(i)$ and that of $M(i - 1)$.
+We observe how $U(i, j)$ changes when $i$ decreases for a fixed $j$.
+
+\begin{eqnarray}
+\lefteqn{U(i - 1, j)}  \label{eq:Ui1} \\
+& = &  s(i - 1,j) + d_j \nonumber \\ 
+& = & \sum_{k = i}^{j-1} d_k + \max_{i-1 \leq k < j}(d_k) + d_j \label{eq:U-update}\\
+& = & (d_i + \sum_{k = i+1}^{j-1} d_k) + (\max(d_{i-1}, \max_{i \leq k < j}(d_k))) + d_j \nonumber\\
+& > & \sum_{k = i+1}^{j-1} d_k + \max_{i \leq k < j}(d_k) + d_j \\
+& = & s(i,j) + d_j \\
+& = & U(i,j)
+\end{eqnarray}
+
+The inequality $U(i - 1, j) > U(i, j)$ indicates that after we compute $M(i)$ by finding $j^*(i)$ that minimizes Equation~\ref{eq:TU}, we only need to consider those $j$'s that are no greater than $j^*(i)$ when we compute $M(i - 1)$ through minimizing Equation~\ref{eq:TU}.
+The dotted arrows in Figure~\ref{fig:compute_M(1)} illustrate the change from $U(2, j)$ to $U(1, j)$.
+%The inequality $U(i -1, j) > U(i, j)$ indicates that after we compute $M(i)$ by finding $j^*(i)$ that minimizes Equation~\ref{eq:T-rec-simple}, we only need to consider those $j$'s that are no greater than $j^*(i)$ to minimize Equation~\ref{eq:T-rec-simple} for $M(i-1)$.
+
+\input{tikz/linear_time_algorithm_Demo}
+
+\begin{lemma} \label{lm:jstar}
+$j^*$ is a increasing function of $i$, i.e., $j^*(i-1) \leq j^*(i)$.
+\end{lemma}
+\begin{proof}
+In Equation~\ref{eq:TU}, $M(j)$ is a function of $j$ only and not a function of $i$.
+However, for all $j$ from $i + 1$ to $n - 1$, $U(i - 1, j) > U(i, j)$, and $U(i - 1, j)$ is a increasing function of $j$.
+As a result, if a $M(j) \in Q$ and $U(i-1, j)$ intersect, they will intersect at a $j$ value that is no greater than $j^*(i)$.
+\end{proof}
+
+Lemma~\ref{lm:jstar} leads to the second observation: to find the $j^*(i - 1)$, the index that minimizes $M(i - 1)$ in Equation~\ref{eq:TU}, we only need to consider those $j$'s that are no greater than $j^*(i)$.
+%Lemma~\ref{lm:jstar} leads to the second observation: to find the $j$ that minimizes $M(i - 1)$, we only need to consider $j$'s that are no greater than $j^*(i)$.
+In other words, when computing all $M(i)$ for $i$ from $n$ to $1$, we only need to find the $j$ that minimizes $M(i)$ in the direction of decreasing $j$.
+%In other words, we will compute all $M(i)$ for $i$ from $n$ to $1$, and we only need to find the $j$ that minimizes $M(i)$ in the direction of decreasing $j$.
+
+Figure~\ref{fig:computation_Demo} illustrates the second observation.
+According to the first observation, the minimum is yielded at the intersection of the black stars and dots.
+With the transition from $U(2,\cdot)$ to $U(1,\cdot)$, as indicated by the dotted arrows in Figure~\ref{fig:compute_M(1)}, we observe that the index of the intersection between the black stars and dots when computing $M(2)$ is no less than the index of their intersection when computing $M(1)$.
+Therefore, we have $j^*(1) \leq j^*(2)$.
+
+%The computation of Equation~\ref{eq:U-update} takes $O(1)$ time since we can compute $U(i-1, j)$ from $U(i, j)$ from Equation~\ref{eq:U-update} by tracking $\sum_{k = i+1}^{j-1} d_k$ and $\max_{i \leq k < j}(d_k)$, so that we can easily compute $d_i + \sum_{k = i + 1}^{j - 1} d_k$ and $\max(d_i, \max_{i + 1 \leq k \leq j - 1}(d_k))$ for a fixed $j$ in Equation~\ref{eq:U-update}.
+% As a result, we can compute all $M(i)$'s with $O(n)$ time since we can compute every $M(i)$ in amortized $O(1)$ time.
+
+\subsubsection{The Linear Time Algorithm}
+We list the pseudo-code of the dynamic checkpoint selection problem in Algorithm~\ref{alg:dynamic-checkpoint-selection}.
+%We list the pseudo-code of the dynamic checkpoint selection in Algorithm~\ref{alg:dynamic-checkpoint-selection}.
+
+\begin{algorithm}[h!tb]
+\begin{algorithmic}[1]
+\caption{Dynamic Checkpoint Selection Problem in $O(n)$ time}
+\label{alg:dynamic-checkpoint-selection}
+\Require data sizes $d_1, \ldots, d_n$.
+\Ensure The minimum cost of the dynamic checkpoint selection problem.
+\State{$Q = \emptyset$}
+\State{$j^{*} = n$}
+\For{$i \gets n$ to $1$} \Comment{Compute $M(i)$ for $i$ from $n$ to $1$}
+    \State{ $j = j^{*}$} \LineLabel{alg_line:set_j_from_jstar}
+    \If{$i < n$}
+        \State{Compute $U(i, j)$ from $U(i + 1, j)$ using Equation~\ref{eq:U-update}} \LineLabel{alg_line:Uij_to_Ui-1j}
+    \EndIf
+    \While {$U(i, j) \geq M(j)$ and $M(j)$ is not the first element in $Q$} \label{alg_line:while_start}\Comment{repeat until a crossover}
+        \State {Set $j'$ to be the index of the previous element of $M(j)$ in $Q$}
+        \State {Compute $U(i, j')$ from $U(i, j)$ using Equation~\ref{eq:U-(i,dot)}} \LineLabel{alg_line:Uij_to_Uij'}
+        \State {$j = j'$} \LineLabel{alg_line:j_to_j'_inside_while}
+%        \State {Compute $U(i, j)$ from $U(i + 1, j)$, as in Equation~\ref{eq:U-update}}
+    \EndWhile \LineLabel{alg_line:while_end}
+    \State {Set $M(i)$ to $d_i + \min (\max (M(j), U(i, j)), \max (M(j+1), U(i, j+1)))$}
+    \State {Set $j^*$ to $j$ or $j + 1$ according to the minimum from the previous statement.}  \LineLabel{alg_line:set_j*}
+    \State {Remove those $M$'s at the beginning of $Q$ that are no less than $M(i)$}
+    \State {Add $M(i)$ at the beginning of $Q$}
+\EndFor
+\State{return $M(1)$} \Comment{the answer}
+\end{algorithmic}
+\end{algorithm}
+\newpage
+\begin{theorem}
+The dynamic checkpoint selection problem is $O(n)$-time solvable, where $n$ is the number of neural network layers.
+\begin{proof}
+To prove the correctness, we show that during the $i$-th iteration, Algorithm~\ref{alg:dynamic-checkpoint-selection} obtains the correct $M(i)$.
+According to Lemma~\ref{lm:jstar} in the second observation, the search for the $j^*(i)$ begins at $j^*(i + 1)$, which is implemented in line~\ref{alg_line:set_j_from_jstar}.
+The first observation indicates that $j^*(i)$ occurs at the intersection of $U(i,\cdot)$ and $Q$.
+The ``while'' loop from line~\ref{alg_line:while_start} to line~\ref{alg_line:while_end}, computing the first index $j$ before this intersection, implements this observation.
+This is achieved since the function $U(i,\cdot)$ and the maintenance of $Q$ are the same as described in the first observation.
+Subsequently, we assign $M(i)$ as the smaller value between $d_i + \max (M(j), U(i, j))$ and $d_i + \max (M(j + 1), U(i, j + 1))$ as indicated by Equation~\ref{eq:TU}.
+%The reason for considering both $j$ and $j + 1$ is that the minimum value may occur at the first index after the intersection or the first index before the intersection.
+The two subfigures of Figure~\ref{fig:computation_Demo} illustrate why both $j$, the first index before the intersection, and $j + 1$, the first index after the intersection, may be the index $j^*(i)$ that minimizes Equation~\ref{eq:TU}.
+%In Figure~\ref{fig:compute_M(2)}, the index that minimizes $M(2)$ occurs at the first index after the intersection, while in Figure~\ref{fig:compute_M(1)}, the index that minimizes $M(1)$ occurs at the first index before the intersection.
+We have thus proven the correctness of the algorithm~\ref{alg:dynamic-checkpoint-selection}.
+
+We will now prove that the time complexity of Algorithm~\ref{alg:dynamic-checkpoint-selection} is $O(n)$.
+The time complexity of Algorithm~\ref{alg:dynamic-checkpoint-selection} consists of the time to maintain $Q$ and to compute each $U(i, j)$ in line~\ref{alg_line:Uij_to_Ui-1j} and line~\ref{alg_line:Uij_to_Uij'}.
+
+Each $M(i)$ will enter and exit $Q$ once, from either its head or its tail.
+%From the construction of $Q$ we know that each $M(i)$ will enter and exit $Q$ once, from either its head or its tail.
+Therefore, the time complexity of maintaining $Q$ is $O(n)$.
+
+The computation of $U(i, j)$ at line~\ref{alg_line:Uij_to_Ui-1j} is performed $n - 1$ times.
+Each $U(i, j)$ is derived from $U(i + 1, j)$ using Equation~\ref{eq:U-update}.
+By maintaining $\displaystyle\sum_{k = i + 2}^{j - 1} d_k $ and $\displaystyle\max_{i + 1 \leq k < j}(d_k) $, the terms $\displaystyle\sum_{k = i + 1}^{j - 1} d_k $ and $\displaystyle\max_{i \leq k < j}(d_k) $ in Equation~\ref{eq:U-update} can be computed in $O(1)$ time.  
+As a result, the computation of $U(i, j)$ at line~\ref{alg_line:Uij_to_Ui-1j} across all iterations takes O(n) time.
+
+Each computation of $U(i, j')$ at line~\ref{alg_line:Uij_to_Uij'} takes $O(j - j')$ time by tracking $\displaystyle\sum_{k = i+1}^{j} d_k$ and $\displaystyle\max_{i \leq k \leq j}(d_k)$ in Equation~\ref{eq:U-(i,dot)}.
+Moreover, after the computation, the value of $j$ is decreased by $j - j'$ (line~\ref{alg_line:j_to_j'_inside_while}).
+The time complexity of the computation in line~\ref{alg_line:Uij_to_Uij'}, therefore, depends on the range by which $j$ is reduced.
+Initially, $j$ equals $n$.
+It remains positive throughout the computation, and in each iteration of the ``for'' loop, the value of $j$ can increase by at most $1$ (line~\ref{alg_line:set_j*}).
+Therefore, the range by which $j$ is reduced is bounded by $2n$, implying the $O(n)$ time complexity of the computation in line~\ref{alg_line:Uij_to_Uij'}.
+%From Lemma~\ref{lm:jstar} we only need to consider $j$ in decreasing order when we compute $M(i)$ in Equation~\ref{eq:TU} in decreasing $i$ order.
+%There are only $n$ possible $j$ values, and each update in Equation~\ref{eq:U-update} takes $O(1)$ time.
+
+As a result, the time complexity of Algorithm~\ref{alg:dynamic-checkpoint-selection} is $O(n)$.
+\end{proof}
+\end{theorem}
+%}

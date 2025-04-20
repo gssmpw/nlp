@@ -1,0 +1,137 @@
+\section{Implementation}
+\label{chap:implementation}
+
+This section presents the work done as a part of this study along with the details of the CutQC framework. This is necessary as this study uses the CutQC framework by modifying it to perform the required benchmarks. Section \ref{sec:impl/cutqc} describes how the CutQC framework is used in this study along with the modifications done to the framework. Section \ref{sec:impl/benchmarks} provides more information on the benchmarking scripts used.
+
+
+
+
+\subsection{CutQC Framework with updates}
+\label{sec:impl/cutqc}
+
+While Section \ref{sec:circuit-cutting} provides more information related to the math behind circuit cutting, this section aims to provide more insight into the CutQC framework from a programmatic perspective. The framework has three main modules i.e. \textit{Cutter}, \textit{Evaluator} and, \textit{Builder and Verifier}. To keep the benchmarks as close to the source material as possible, only the \textit{Evaluator} module is modified in this study to support evaluations on GPUs. In contrast, the other modules are kept the same except for changes required to support the most recent version of the tools in the quantum software environment, specifically Qiskit v1.0.2 vs v0.19.0 used in the original CutQC paper.
+
+
+
+\subsubsection{Cutter}
+
+As the name suggests, this module is used to identify suitable cut locations on a given quantum circuit and generate the subcircuit instances after the cuts have been made. The framework uses mixed-integer programming to automate the identification of cut locations to minimize the resulting classical postprocessing cost. This is done using the Gurobi optimizer \cite{gurobi}, a commercial optimizer solution (free to use for academic purposes).  
+
+% The input circuit is first converted to a DAG (directed acyclic graph) representation and stripped of all single qubit gates since they do not affect the process of finding cut locations for a quantum circuit along a qubit wire. This stripped circuit is then parsed to extract the necessary metadata including the topological order of the 2-qubit gates and the qubits on which these gates are applied. In the next step, this metadata is fed to the Gurobi Optimizer (the MIP model) to get the cut locations for the quantum circuit. Finally, using the cut locations, the subcircuits are generated (along with the single qubit gates) and passed on to the evaluator module.  
+
+As mentioned above, no change is made to the Cutter module as a part of this study. Only changes necessary to support the latest version of Qiskit were made in the form of small updates to the parts of the module using deprecated Qiskit functions and attributes. Listing \ref{listing:impl/example-update} shows an example of such changes. To preserve brevity, all such changes are not included in this report.
+
+\vspace{\baselineskip}
+\begin{lstlisting}[caption={ Example for changes made to ensure compatibility with the latest Qiskit version 1.0.2. The original line of code on Line 3 is commented and the updated line of code is shown on Line 5. The code checks if both vertices of an edge are ``Gate operations" and adds them to a list if \textit{true}. },
+label={listing:impl/example-update},
+language=Python,
+float]
+for u, v, _ in dag.edges():
+    # Commented original line of code
+    # if u.type == "op" and v.type == "op":
+    # Updated line of code
+    if "DAGOpNode" in str(type(u)) and "DAGOpNode" in str(type(v)):
+        u_id = vertex_ids[id(u)]
+        v_id = vertex_ids[id(v)]
+        edges.append((u_id, v_id))
+\end{lstlisting}
+
+
+\subsubsection{Evaluator}
+
+This module simulates the subcircuit instances generated after cutting the circuit. Each subcircuit has to be simulated multiple times depending on the number of cuts made to the original circuit. The module spawns multiple processes to simulate the required subcircuits in parallel. The number of processes spawned depends on the size of the subcircuits simulated and the total available RAM on the machine running the module.  
+
+Each subcircuit instance is first modified to add initialization gates/measurements depending on the combination of the Qubit Initializations and Qubit Measurements assigned to it. After this, the subcircuits are simulated using the Qiskit Aer simulator and the state probabilities are stored on disk by every process. Once all subcircuits have been evaluated and probabilities are stored on disk, the next step is executed i.e. the attribution of shots. This step adjusts the probability counts for subcircuits having qubits that do not contribute to the final uncut state. This is a crucial step required to reconstruct the probability distribution of the original uncut circuit.  
+
+This module has been updated to support circuit evaluations on GPU using the latest version of the Qiskit Aer simulator. Listing \ref{listing:impl/eval-cpu} shows a trimmed version of the original function used to simulate circuits on CPUs using the \textit{statevector\_simulator} and Listing \ref{listing:impl/eval-gpu} shows the updated function supporting evaluation on GPUs using the \textit{statevector\_simulator}. A `device' option is added to the function to enable selecting the target device at runtime. The GPU simulator in Qiskit Aer requires additional options to be set when running a job (\textit{blocking\_enable} and \textit{blocking\_qubits}). The \textit{blocking\_qubits} option is used to set the chunk size for each memory space and needs to be tuned depending on the amount of GPU memory available on the target machine. For NVIDIA A100 GPUs on Perlmutter, the value is set to 30.
+
+\vspace{\baselineskip}
+\begin{lstlisting}[caption={ Original function to evaluate circuits using the \textit{statevector\_simulator} method on CPUs. (Source: CutQC Framework \cite{cutqc}) },
+label={listing:impl/eval-cpu},
+language=Python,
+float]
+def evaluate_circ(circuit, backend):
+    circuit = copy.deepcopy(circuit)
+    if backend == "statevector_simulator":
+        simulator = aer.Aer.get_backend("statevector_simulator")
+        result = simulator.run(circuit).result()
+        statevector = result.get_statevector(circuit)
+        prob_vector = Statevector(statevector).probabilities()
+        return prob_vector
+    else:
+        raise NotImplementedError
+\end{lstlisting}
+
+\vspace{\baselineskip}
+\begin{lstlisting}[caption={ Updated function to evaluate circuits supporting evaluation on GPUs. The target device for simulation is selected based on the `device' argument passed to the function. },
+label={listing:impl/eval-gpu},
+language=Python,
+float]
+def evaluate_circ(circuit, backend, device):
+    if backend == "statevector_simulator":
+        circuit.save_statevector()
+        if device == "CPU":
+            aercpu = AerSimulator(method='statevector')
+            result = aercpu.run(circuit).result()
+        if device == "GPU":
+            aergpu = AerSimulator(method='statevector', device='GPU')
+            result = aergpu.run(circuit, blocking_enable=True, blocking_qubits=30).result()
+        
+        statevector = result.get_statevector(circuit)
+        prob_vector = Statevector(statevector).probabilities()
+
+        return prob_vector
+    else:
+        raise NotImplementedError
+\end{lstlisting}
+
+As this module is executed in parallel, a function calculates the ideal number of processes to spawn. This function is also updated to return the number of required processes depending on the target device where the job would be executed i.e. CPU or GPU. Listing \ref{listing:impl/num-workers} shows the updated function with the updated part highlighted using comments. The number of workers for the target device set to CPU is calculated based on three factors: the total number of jobs to be executed, the total available memory and the total number of CPU cores on the machine. On the other hand, calculating this for the target device set to GPUs is not so straightforward. Multiple `num\_workers' values were used to benchmark the runtime of jobs on GPUs and it was observed that setting it to 32 (half of the available CPU cores on Perlmutter nodes) gave the best results.
+
+\vspace{\baselineskip}
+\begin{lstlisting}[caption={ Updated function to calculate the ideal number of processes to spawn for parallel job execution. The number of workers for CPUs is calculated whereas the number of workers for GPUs is set to 32 after benchmarking for different values. },
+label={listing:impl/num-workers},
+language=Python,
+float]
+def get_num_workers(num_jobs, ram_required_per_worker, device):
+    if device == "CPU":
+        ram_avail = psutil.virtual_memory().available / 1024**3
+        ram_avail = ram_avail / 4 * 3
+        num_cpus = int(os.cpu_count() / 4 * 3)
+        num_workers = int(min(ram_avail / ram_required_per_worker, num_jobs, num_cpus))
+    # Updated part of the function.
+    # The device option is added to the original function.
+    if device == "GPU":
+        num_workers = 32
+
+    return num_workers
+\end{lstlisting}
+
+
+\subsubsection{Builder and Verifier}
+
+This module is responsible for reconstructing the probability distribution based on the subcircuit probabilities obtained from the Evaluator module and verifying (optional) whether the reconstructed probability lies within a certain error margin of the original probability distribution. This is where the CutQC framework calculates the Kronecker products for the subcircuit terms (refer to Figure \ref{fig:edge-decomposition}). To do this, the probability vectors are represented as `tensors' and the `Tensorflow' library is used to compute the Kronecker products of these `tensors'. The module also supports reconstructing the probability distribution of specified qubits in the scenario where storing the entire statevector is not feasible. There is no change made to this module as a part of this study.
+
+
+
+\subsection{Benchmarking}
+\label{sec:impl/benchmarks}
+
+This section provides more information about the benchmark scripts and how they were executed. Refer to Section \ref{sec:benchmarks} for more details about the circuits used for benchmarking the two simulation methods. All benchmarks were performed on the Perlmutter \cite{perlmutter} system at NERSC (National Energy Research Scientific Computing Center) in Lawrence Berkeley National Lab.  
+
+Since the benchmarks reported in this study were executed multiple times, saving as much time as possible for actual computations was essential. To do this, circuits used in the benchmark were generated and saved beforehand. Actual benchmarks would then load these circuits from the disk and perform the necessary benchmarks. Figure \ref{fig:impl/flow-save-circ} shows the process of generating and saving the circuits to disk. A Slurm \cite{slurm} (workload manager software used by Perlmutter) job is used to execute the python script responsible for generating and saving quantum circuits to disk. The python script calls the circuit generator code which generates the required quantum circuit based on the input provided. This quantum circuit is then saved to disk in binary format using the `qpy' module in Qiskit.
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[alt={Flow diagram representing how circuits are saved to disk using the QPY module in Qiskit.}, width=\linewidth]{figures/impl-flowchart-save-circuits.png}
+    \caption{ This figure represents how the circuits are generated and saved as QPY files to avoid re-generating circuits for every benchmark run. A Slurm job runs a Python script which executes the required circuit generator and saves the circuit to disk using the \textit{QPY} module in Qiskit. }
+    \label{fig:impl/flow-save-circ}
+\end{figure}
+
+The above process is repeated for all circuit combinations benchmarked (circuit type and number of qubits) in parallel. Benchmarks are executed once the quantum circuits are saved to disk. A Slurm job executes and manages the benchmark execution script for every circuit. Each circuit is passed on to the CutQC framework for evaluation using the circuit-cutting method. Finally, the circuit is simulated directly using the Qiskit Aer simulator and results for both simulation methods are saved to disk using the `pickle' module in Python.
+
+% \begin{figure}[htbp]
+%     \centering
+%     \includegraphics[alt={Flow diagram representing how circuit benchmarks are executed on Perlmutter using Slurm and Python scripts.}, width=\linewidth]{figures/impl-flowchart-benchmark.png}
+%     \caption{ This figure represents how the benchmark is run. A Slurm job runs a Python script which executes the CutQC framework on a given input circuit and the result metrics are stored as pickle files to disk. As can be observed, the CutQC framework has three major modules i.e. \textit{Cut}, \textit{Evaluate} (executes in parallel) and \textit{Build \& Verify}. }
+%     \label{fig:impl/flow-benchmark}
+% \end{figure}

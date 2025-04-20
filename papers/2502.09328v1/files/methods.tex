@@ -1,0 +1,145 @@
+\section{System Design}\label{sec:system}
+
+\systemName is a VSCode extension that provides users with pairs of inline code completions from various LLMs.
+In return, users provide their votes on which completion is better suited for their task.
+To avoid interrupting user workflows, voting is designed to be \emph{seamless}---users use keyboard shortcuts to quickly accept one of the two completions into their code, which we interpret as a vote in favor of the underlying model that produced it.
+Designed to allow for developer's day-to-day usage, the three core components of \systemName (Figure~\ref{fig:overview}) are 1) the User Interface, 2) Model Sampling, and 3) Model Prompting.
+
+
+
+
+\subsection{User Interface}\label{subsec:pairwise}
+
+Traditional code completion tools (e.g., GitHub Copilot~\citep{Copilot}) only show one completion at a time.
+However, showing two code completions simultaneously enables us to collect preference judgments on the same context~\cite{chiang2024chatbot,lu2024wildvision}. 
+We propose an interface that allows a user to view two completions in a head-to-head manner; to our knowledge, we are the first to introduce an interface that does so.
+We propose a design inspired by Git Diff---a well-established tool familiar to many developers---which displays code from the current commit and code from the incoming commit stacked vertically, one on top of the other.
+In a similar manner, given an existing code context, we also stack responses from two different model outputs.
+This allows users to examine both completions together (an example of how the completions are visualized is in Figure~\ref{fig:overview}).
+The user can accept the top suggestion using \texttt{tab} and the bottom suggestion using \texttt{shift+tab}, or decide neither is appropriate and continue typing.
+The only distinction between our system and conventional inline completion systems is the inclusion of a second suggestion, 
+resulting in a user experience that is familiar overall. 
+
+
+We make several other notable design decisions.
+First, we repeat the first line in the ghost text of the top completion so that both top and bottom completions are entirely ghost text.
+Not repeating the text---as is the case with a single completion---was an alternative we considered, but our initial pilot studies indicated that the discrepancy between top (partial ghost text) and bottom (full ghost text) completions was more likely to confuse users. 
+Second, we always wait for both completions to finish generating before showing them to the user to reduce the effects of latency on user preference,
+which we aim to study separately in  Section~\ref{sec:analysis}.
+Lastly, we randomize the ordering of the completions to remove top-bottom bias from our preference evaluation.
+We discuss additional design decisions in Appendix~\ref{sec:appendix-interface}.
+
+
+
+\subsection{Model Sampling}\label{subsec:sampling}
+
+A key challenge in building a realistic environment for coding assistance is providing responsive code completion.
+Developer expectations for low latencies impact not only user satisfaction and retention, but also directly affect their likelihood to provide preference data.
+The slower the completions are returned to the user, the \textit{less likely} users are to vote (i.e. users select neither completion) (Figure~\ref{fig:acceptance_rate}). 
+However, many model providers do not optimize their API endpoints for low-latency use cases, requiring us to explore a sampling strategy that improves our system-wide latency.
+
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.7\columnwidth]{figures/acceptance_rate.pdf}
+\vspace{-0.5cm}
+\caption{
+The likelihood of users accepting one of the two completions as a function of empirical pairwise latency (determined by the slower of the two models). 
+As latency increases, users are less likely to accept a completion.
+We devise a sampling strategy described in Section~\ref{subsec:sampling} which reduces pairwise latency by 33\% while also ensuring sufficient coverage of unique model pairs.}
+\label{fig:acceptance_rate}
+\end{figure}
+
+
+Since the \systemName interface shows two code completions together, the slowest completion determines the latency.
+Thus, given a set of $M$ models $\{1, \ldots, M\}$, we let $F_{\text{max}}(l; i, j)$ denote the cumulative density function (CDF) for the maximum latency between models $i$ and $j$.
+Because latencies tend to be long-tailed, we model $F_{\text{max}}(l; i, j)$ as a log-normal CDF with parameters estimated from our historical data.
+Our objective will then be to minimize the expected latency of the chosen model pair under the distribution induced by our observed data,
+\begin{equation}
+    \mathcal{L}(\theta) = \mathbb{E}_{(i, j) \sim p_\theta, L \sim F_{\text{max}}(l;i,j)} [L],
+    \label{eq:latency}
+\end{equation}
+where $p_\theta$ is a distribution over model pairs,
+\begin{equation}
+p_\theta(i, j) = \frac{\exp(\theta_{ij}/\tau)}{\sum_{k < l} \exp(\theta_{kl}/\tau)}.
+\end{equation}
+Above, $\tau$ is a temperature parameter that interpolates between a latency-optimized distribution and a uniform distribution, allowing us to trade off latency and coverage of unique model pairs.
+The parameters $\theta \in \mathbb{R}^{\binom{M}{2}}$ are optimized via gradient descent to minimize (Eq.~\ref{eq:latency}).
+In practice, we set $\tau$ to values between 5 and 10 to ensure sufficient coverage.
+By deploying our algorithm, we observed a decrease in median experienced latency by 33\% (from 1.61 to 1.07 seconds) compared to a uniform distribution.
+
+
+
+
+
+\subsection{Model Prompting}\label{sec:prompting}
+
+During real development processes, developers frequently modify or expand upon existing code which requires models to \emph{infill} between code segments.
+However, many popular coding models such as GPT-4o or Sonnet 3.5 are instruction-tuned~\citep{wei2022finetuned} and trained to output text left-to-right autoregressively, rather than to ``fill-in-the-middle'' (FiM)~\citep{fried2023incodergenerativemodelcode, gong2024evaluation}.
+In preliminary experiments, we observed poor, essentially unusable performance of instruction-tuned models on FiM tasks.
+Accordingly, we use offline datasets to improve chat models' infilling capabilities.
+We include full experimental details and results in Appendix~\ref{sec:appendix-prompt}.
+
+
+\textbf{Offline Evaluation Set-up.} 
+Our set-up uses the HumanEval-infilling dataset~\citep{bavarian2022efficient} which consists of 1640 examples where random spans in a completed portion of code are masked out to simulate FiM behavior.
+To incorporate prefix and suffix information, we began with several prompt templates from~\citet{gong2024evaluation} with modifications to align the prompts with chat models (e.g., initial instruction and few-shot examples).
+The templates capture different ways to encode information about the given code context. 
+For example, prefix-suffix-middle presents the code context in the order of prefix and then suffix, and the LLM is asked to output the middle.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.5\columnwidth]{figures/combined_plot.pdf}
+\caption{We evaluate the effectiveness of our prompting scheme by comparing LLM performance on infilling tasks (using pass@1) before and after applying it. We evaluate 9 different models of varying performance across 4 different prompt templates (i.e., ways of encoding the prefix and suffix in the prompt): each point represents one model and one prompt template pair. We observe that, across the board, the overwhelming majority of pairs 
+benefit from our prompting scheme (e.g., lie above the diagonal line).
+}
+\label{fig:prompt_results}
+\end{figure}
+
+\textbf{Vanilla performance on FiM tasks.} 
+We find that the success of standard prompt templates varies greatly between models (Table~\ref{tab:evaluation-results}).
+This is not necessarily an indication that models cannot code as clearly many state-of-the-art chat models are proficient coders~\citep{jain2024livecodebench, lin2024wildbench}.
+Instead, the vast majority of the errors result in formatting issues or duplicate code segments rather than logical errors, indicating that FiM performance is inhibited more by low-level formatting issues than high-level coding capabilities: see examples of these errors in Appendix~\ref{sec:format-errors}.
+
+% \textbf{Post-processing using Snip-It.} 
+\textbf{Our prompting scheme.}
+While it is not feasible to retrain these models because many of them offer API access only, we explore alternative approaches via prompting to improve chat models' abilities to complete FiM tasks.
+Specifically, we allow the model to generate code snippets, which is a more natural format, and then post-process the snippets into a FiM completion.
+Our approach is as follows:
+the model is prompted with the same prompts as above (e.g. prefix-suffix-middle) but with instructions to begin by repeating a portion of the prefix and similarly end by repeating a portion of the suffix. 
+Then, we remove any portion of the output code that already exists in the input, similar to recent agentic search-replace tools~\citep{searchreplace}.
+As shown in Figure~\ref{fig:prompt_results}, we found that, relative to the baseline, our prompting scheme provides robust performance gains for infilling: performance improved in $93$\% of the conditions.
+High-performing models improve substantially (e.g., Claude-3.5-Sonnet improves from 56.1\% to 73.0\%), while initially struggling models improve dramatically (e.g., Llama-3.1-70B from 7.4\% to 49\%).
+While offline evaluation is not a perfect metric, we find that these drastic improvements enable these models for FiM tasks.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

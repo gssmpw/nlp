@@ -1,0 +1,254 @@
+%%{-0.5em}
+
+\section{Methodology}
+\label{sec:method}
+
+
+We introduce ProxSparse, a learning-based pruning method guided by a mask selection regularizer that generates high-quality semi-structured masks for efficient LLM serving. ProxSparse enables mask exploration in a global perspective by leveraging the gradient-based method, taking into account cross-layer connections with end-to-end feedback, rather than relying on localized, heuristic-based approaches for abrupt pruning. In this work, we focus specifically on 2:4 sparsity, 
+and we discuss the extension to other sparsity patterns in Appendix~\ref{Discussion}.
+
+To address the challenges posed by the non-convex and non-differentiable nature of \eqref{eq:orig_problem}, our strategy for solving \eqref{eq:orig_problem} involves (a) designing a relaxation of the problem with hard constraints into a (Lagrange) regularized form (b) developing a principled optimization algorithm for solving the relaxed problem, thereby facilitating the learning process.
+
+
+\subsection{Relaxation and Structure-inducing regularization}
+We start by rewriting \eqref{eq:orig_problem} into an equivalent form:
+\begin{subequations}
+\begin{align}
+\min_{W}&\quad \mathcal{L}(W),\nonumber\\%\label{eq_weight} \\
+\text{s.t.}& \quad W \text{ is 2:4 sparse}, \label{eq:sparse} \\
+&\quad \text{Mask}_{W}\odot(W - W_0) = 0 \label{eq:frozen}, 
+\end{align}
+\end{subequations}
+
+where $\text{Mask}_{W}$ selects the non-zero elements of $W$, $W_{0}$ denotes the original pretrained parameter weights.
+
+This seemingly trivial reformulation changes the variables to optimize from a Boolean mask to a continuous weight vector which makes it more amenable to continuous optimization. 
+
+Next, we propose a relaxation of the two constraints \eqref{eq:sparse} and \eqref{eq:frozen} into a regularized form that gradually induces these structures:
+\begin{equation}\label{eq:reg}
+\begin{aligned}
+\min_{W}& \quad \mathcal{L}(W) + \lambda_1 \text{Reg}_{2:4}(W) + \lambda_2 \text{Reg}_{W_0}(W),
+\end{aligned}
+\end{equation}
+where $\text{Reg}_{2:4}(W)$ promotes the structured sparsity constraints and $\text{Reg}_{W_0}(W)$ penalizes the deviation away from the initial pretrained weight $W_0$.
+
+
+$\text{Reg}_{2:4}$ decomposes into every 4-parameter block, where we apply the following regularizer \cite{ann_paper} to enforce the sparse pattern.
+{\small
+\begin{equation}\label{eq_semi}
+\begin{aligned}
+\text{Reg}_{2:4, \, w \in \mathbb{R}^4}(w) =  & |w_1||w_2||w_3| + |w_2||w_3||w_4| \\
+  + & |w_3||w_4||w_1| + |w_4||w_1||w_2|.
+\end{aligned}
+\end{equation}
+}
+\begin{proposition}\label{prop:24}
+The following statements hold true.
+\begin{enumerate}
+    \item $\text{Reg}_{2:4, \, w \in \mathbb{R}^4}(w) = 0 $ if and only if $w$ is 2:4 sparse.
+    \item $\text{Reg}_{2:4, \, w \in \mathbb{R}^4}(w)$ is invariant to permutation of the coordinates.
+    \item $\text{Reg}_{2:4, \, w \in \mathbb{R}^4}(w)$ is differentiable when restricting to the ``active set'' $\{i\in[4]||w_i|>0\}$.
+\end{enumerate}
+\end{proposition}
+Observe that by the first property, if $\lambda_1 \rightarrow \infty$ the solution is guaranteed to be \eqref{eq:sparse}. The non-smoothness of \eqref{eq_semi} ensures that it enjoys a ``shrinkage'' property (analogous to $\ell_1$-regularization for sparsity) such that it induces \emph{exact} 2:4-sparsity even if $\lambda$ is not tending to $\infty$.
+
+To promote the locality constraint \eqref{eq:frozen}, we design the second regularizer as follows.
+$$\text{Reg}_{W_0}(W) = \left\|\frac{W}{W_0 + \epsilon \sign(W_0)} \odot (W - W_0)\right\|_F^2,$$
+where the division is coordinate-wise and $\sign(\cdot)$ outputs $1$ when $\cdot \geq 0$ and $0$ otherwise.
+
+
+This regularizer can be viewed as a special weight decay towards $W_0$, but it imposes a stronger penalty for coordinates of $W$ that are larger and nearly no penalty for those coordinates that are nearly $0$. $\epsilon \sign(W_0)$ is added to avoid the numerical instability associated with (near)-$0$ division. 
+\begin{proposition}\label{prop:locality}
+    \begin{enumerate}
+        \item $\text{Reg}_{W_0}(W) = 0$ if and only if $[W]_i=[W_0]_i$ for all coordinates $i$ s.t. $W_i\neq 0$.
+        \item  $\text{Reg}_{W_0}(W) = \text{Reg}_{W_0[W\neq 0]}(W[W\neq 0])$.
+        \item $\text{Reg}_{W_0}(W)$ is continuously differentiable. 
+    \end{enumerate}
+\end{proposition}
+Together with Proposition~\ref{prop:24}, we observe that the nullspace of the two regularizers together is the feasible region of the original problem, which allows us to optimize towards a solution that satisfies the original problem's constraints.
+\begin{corollary}
+$\text{Reg}_{W_0}(W) = 0$ and $\text{Reg}_{2:4}(W) = 0$ if and only if $W$ satisfies \eqref{eq:sparse} and \eqref{eq:frozen}. 
+\end{corollary}
+To say it differently, if $\lambda_1,\lambda_2\rightarrow \infty$, the relaxed problem \eqref{eq:reg} is identical to the original problem \eqref{eq:orig_problem}.
+We encode the rigid and non-differentiable mask selection constraints into the learning objectives, enabling a learnable optimization process.
+Another benefit of transitioning from hard constraints to soft  regularization is that it introduces ``wiggling room'', enabling flexibility during exploration. This allows the learning to make smoother, more informed pruning decisions with a larger exploration space, rather than making abrupt changes during optimization, which could cause early commitment to suboptimal state as we will show in experimental Section~\ref{sec:lambda1} later. The main challenge now lies in an effective solving algorithm for the regularizer with efficiency, which is crucial to facilitate end-to-end mask learning for LLMs with scale.
+
+\subsection{Proximal Gradient Descent for 2:4 Sparsity}
+
+To optimize \eqref{eq:reg},we propose to use the proximal gradient descent \citep{nesterov2013gradient} --- a popular method for solving composite optimization problems of the form $\min_x f(x) + h(x)$ where $f$ is differentiable but $h$ is not.
+
+Proximal gradient descent iteratively updates $x$ by alternating between a gradient descent step on $f$ and a proximal operator (a generalization of ``projection'') on $h$:
+\begin{subequations}
+\begin{align}
+    y &= x_t - \eta \nabla f(x_t), \\
+    x_{t+1} &= \argmin_{x} \frac{1}{2}\|x - y\|^2 + h(x).
+\end{align}
+\end{subequations}
+In our problem, $f:=\Ls + \lambda_2\text{Reg}_{W_0}$ and $h:=\lambda_1\text{Reg}_{2:4}$. Pseudocode of this algorithm is given in Algorithm~\ref{alg:ProxSparse}.
+\begin{algorithm}[!t]
+\caption{\textsf{ProxSparse}: Proximal Gradient Descent for End-to-End 2:4-Sparsity Pruning}\label{alg:ProxSparse}
+    \begin{algorithmic}[1]
+        \State \textbf{Input:} Initial pretrained weights $w_0$. Learning rate schedule $\eta_0,\eta_1,...$. Stochastic gradient oracle $\mathcal{G}$ that takes $w$ and outputs $g$ such that $\mathbb{E}[g] = \nabla \mathcal{L}(w)$.
+        \For{$k=0,1,2,...$ }
+        \State $g_k \leftarrow  \mathcal{G}(w_{k})$ \Comment{SGD (or Adam) update.}
+        \State $V \leftarrow W_{k} -\eta_k (g_k + \lambda_2\nabla \text{Reg}_{W_0}(W_k))$
+        \State $W_{k+1} \leftarrow \argmin_{W} \frac{1}{2}\|W - V\|^2 + \lambda_1\text{Reg}_{2:4}(W).$    
+        \EndFor
+        \State \textbf{Output:} $W_0 \odot \mathrm{Mask}_{ \mathrm{Proj}_{2:4}(W_k)}$.
+    \end{algorithmic}
+\end{algorithm}
+
+The main benefit of the proximal gradient approach is that it does not prematurely commit to a particular sparsity mask, or fix the weights at the initialization. Instead, the regularizers are soft constraints, allowing ample wiggling room around the rigid constraint set for the gradient descent-based algorithm to potentially jump out of a suboptimal local region, and thereby converge to a better qualifying solution. 
+
+One issue of not imposing the constraint is that the last iterate might not be feasible after the specified number of iterations. For those cases, we simply project the solution $W_k$ to a 2:4-sparse solution basing on magnitude and snap the surviving weights to $W_0$.
+%the feasible set and halt. 
+All our experimental results are based on solutions that are exactly 2:4 sparse with weights unchanged from initialization. %\textcolor{red}{behaivor of wk here}
+
+\subsection{Efficient Proximal Operator}
+\label{sec_effi_proximal}
+An efficient solver for the proximal operator is essential for enabling end-to-end learning at LLM scale. Since $\Ls$ and $\text{Reg}_{W_0}$ are both differentiable, the efficient implementation of ProxSparse
+boils down to solving the proximal operator associated with $\text{Reg}_{2:4}$.
+\begin{equation}\label{eq:prox}
+\small
+    w^* = \argmin_{w \in \mathbb{R}^4} \frac{1}{2} \|w - y\|^2 + \lambda \mathrm{Reg}_{2:4}(w)  
+% \begin{aligned}
+%     w^* &= \arg \min_{w \in \mathbb{R}^4} \left( \frac{1}{2} \|w - y\|^2 + \lambda \Big( |w_1||w_2||w_3| \right. \nonumber \\
+%     & \left. \quad + |w_2||w_3||w_4| + |w_3||w_4||w_1| + |w_4||w_1||w_2| \Big) \right)
+% \end{aligned}
+\end{equation}
+
+This is a non-convex optimization problem. \citet{ann_paper} showed that it can be solved with three convex subproblems. 
+% More details can be found in Appendix~\ref{theory_detail}. 
+\begin{theorem}[\cite{ann_paper}]\label{thm:split}
+To solve \eqref{eq:prox} for any $y\in\R^4$, it suffices to solve: 
+%$\Big( w_1 w_2 w_3 + w_2 w_3 w_4+ w_3 w_4 w_1 + w_4 w_1 w_2 \Big)$
+\begin{equation}\label{eq:prox_reformulate}
+\small
+\begin{aligned}
+    \min_{w \in \mathbb{R}_+^4} \frac{1}{2} \|w - z\|^2 + \lambda \mathrm{Reg}_{2:4}(w)
+\end{aligned}
+\end{equation}
+where $z = \mathrm{sorted}(|y|)$ is non-negative and sorted in descending order, i.e., $z_1\geq z_2\geq z_3 \geq z_4\geq 0$. Moreover, the optimal solution to \eqref{eq:prox_reformulate} must be one of the following three candidates:
+\begin{enumerate}
+%%{-0.5em}
+    \item ``2-sparse solution'' $[z_1,z_2, 0,0]$; 
+    \item ``3-sparse solution'', $[\dot{w}_1,\dot{w}_2,\dot{w}_3,0]$
+    \item ``dense solution'' $[\ddot{w}_1,\ddot{w}_2,\ddot{w}_3,\ddot{w}_4]$
+\end{enumerate}
+where $\dot{w} = \argmin_{w\in\mathbb{R}_+^3} \{g_3(w) \; \text{s.t.}\; \nabla^2 g_3(w) \succeq 0 \}$ with $$g_3(w) :=\frac{1}{2}\|w - z_{1:3}\|^2 + \lambda (w_1w_2 + w_2w_3 + w_3 w_1),$$
+% \begin{equation}\label{eq:3sparse_subprob}
+% \begin{aligned}
+%     &\dot{w} = \argmin_{w\in\mathbb{R}_+^3} \{g_3(w) \; \text{s.t.}\; \nabla^2 g_3(w) \succeq 0 \}\\
+%     &\text{with } g_3(w) :=\frac{1}{2}\|w - z_{1:3}\|^2 + \lambda w_1w_2 + w_2w_3 + w_3 w_1.
+%     \end{aligned}
+% \end{equation}
+and $\ddot{w} = \argmin_{w\in\mathbb{R}_+^4} \{g_4(w) \; \text{s.t.}\; \nabla^2 g_4(w) \succeq 0 \}$ with $g_4(w)$ being the objective function of \eqref{eq:prox_reformulate}. Meanwhile, $\{w | \nabla^2 g_3(w)\succeq 0 \}$ and  $\{ w | \nabla^2 g_4(w)\succeq 0 \}$ are \emph{convex sets}, making the corresponding optimization problems convex.
+
+\end{theorem}
+
+This result suggests that we can simply \emph{enumerate} the three candidate solutions and return the one with the smallest objective value. \citet{ann_paper} thus proposed to solve for the ``3-sparse'' and ``dense'' solutions using interior point method (IPM) with a log-determinant barrier function, leading to the \textsf{EnumIPM} algorithm, which optimally solves \eqref{eq:prox_reformulate}. However, \textsf{EnumIPM} incurs high computational cost (Table~\ref{tab:computation}). A faster heuristic, \textsf{EnumPGD}, was introduced to replace IPM with projected gradient descent without imposing semidefinite constraints. While \textsf{EnumPGD} improves efficiency, it sacrifices provably guarantees. 
+
+
+
+
+
+We propose a new method based on alternating minimization (ALM) with convergence guarantees. The resulting \textsf{EnumALM} is even more efficient than \textsf{EnumPGD} (see Table~\ref{tab:computation} for an numerical comparison). Moreover, in all 20,000 experiments in Table~\ref{tab:computation}, \textsf{EnumALM} provides more optimal solutions than those of \textsf{EnumIPM}. This enables us to scale up the proximal gradient method for handling LLMs with billions of parameters in practice. An example regularization paths is illustrated in Figure~\ref{fig:regularization_path} in Appendix~\ref{app:reg_path}.
+
+Pseudocode for \textsf{ALM} and \textsf{EnumALM} are given in Algorithm~\ref{alg:alm} and \ref{alg:enumALM} respectively. Algorithmically, ALM works by iterating over the coordinates of $w$ and minimizing $g_3$ or $g_4$ over the current coordinate while keeping other coordinates fixed. The solution of this one dimensional problem is soft-thresholding:
+\begin{fact}
+Assume $z\geq 0$, the optimal solution to $\min_{w\in \R_+}  \frac{1}{2}(w-z)^2 + \alpha w$ is
+$w = \max\{z-\alpha,0\}$.
+\end{fact}
+Observe that soft-thresholding is commonly used in L1-regularized optimization for inducing (unstructured) sparsity.  Our algorithm can thus be viewed as iterative soft-thresholding with adaptive chosen threshold that induces 2:4 structured sparsity rather than standard sparsity.
+
+\begin{algorithm}
+\caption{\textsf{ALM}: Alternating Minimization}\label{alg:alm}
+\begin{algorithmic}[1]
+\State \textbf{Input:} $z\in \R^4$ (sorted, nonnegative), parameter $\lambda$, tolerance $\epsilon$, desired sparsity-level $S=3 \text{ or } 4$.% maximum iterations $N_{\text{max}}$
+%\Ensure Thresholded vector $\mathbf{v}$
+\State Initialize $w'=0, w=0$, 
+\State $w_{1:S}  \leftarrow z_{1:S}$
+    %\For{$k = 0, 1, \dots$}%, iter\_num$}
+    \While{ $\|w'-w\|>\epsilon$}
+        \For{$i \in \{1,...,S\}$}
+            \State 
+            $w_i \leftarrow \max \left\{ z_i - \lambda \sum_{\substack{j,k\in[4]\backslash \{i\}\\j \neq k}} w_jw_k, 0 \right\}$ \\
+            \Comment{This is soft-thresholding operator}
+            %\Else
+            %\EndIf
+        \EndFor
+        \State $w' \leftarrow w$
+    %     \State \textbf{break}
+    % \EndIf
+    \EndWhile
+\State  \textbf{Output:} $w$
+\end{algorithmic}
+\end{algorithm}
+\begin{algorithm}
+\caption{\textsf{EnumALM} for solving \eqref{eq:prox}}\label{alg:enumALM}
+\begin{algorithmic}[1]
+    \State \textbf{Input:} $y\in \R^4$, parameter $\lambda$, tolerance $\epsilon$
+    \State $s \leftarrow \mathrm{sign}(y) $ \Comment{elementwise}
+    \State $z, \textrm{idx} \leftarrow  \mathrm{sort}(|y|,\text{`descending'})$  \Comment{idx is reverse index.}
+    \State $\tilde{w} \leftarrow [z_1,z_2, 0, 0]$ \Comment{2-sparse solution.}
+      \State $\dot{w} = \textsf{ALM}(z,\lambda,\epsilon, S=3)$ \Comment{3-sparse solution.}
+      \State $\ddot{w} = \textsf{ALM}(z,\lambda,\epsilon, S=4)$ \Comment{dense solution.}
+      \State $w \leftarrow \argmin_{w\in\{\tilde{w},\dot{w},\ddot{w}\}}\frac{1}{2}\|w-z\|^2 + \lambda \mathrm{Reg}_{2:4}(w)$
+    \State \textbf{Output:}  $s\odot w[\textrm{idx}]$ \Comment{$\odot$ is elementwise product} 
+    \end{algorithmic}
+\end{algorithm}
+
+
+
+\begin{table}[!t]
+    \centering
+    \resizebox{\linewidth}{!}{  
+    \begin{tabular}{cc c c}
+     \hline
+                & \textsf{EnumIPM} &\textsf{EnumPGD} & \textsf{EnumALM} (ours)\\
+                \hline
+      Total runtime (sec)   & 561.70 & 43.31& 8.52\\
+      Max suboptimality  &$10^{-13}$&$10^{-6}$& $<10^{-13}$\\
+       \hline
+    \end{tabular}
+    }
+    \caption{Comparison of the runtime and accuracy of solvers of \eqref{eq:prox} for solving 100 randomly generated problem instances, each with 200 different choices of $\lambda$. The second row shows the worst-case suboptimality. IPM is guaranteed to give the optimal solution up-to a tolerance parameter of $10^{-13}$. ALM achieves better objective value in all experiments than IPM, while GD occasionally gives solutions with slightly suboptimal objective values.}
+    \label{tab:computation}
+%%{-1em}
+\end{table}
+
+
+
+\subsection{Convergence guarantees}
+
+
+Next, we study the convergence theory of ProxSparse. We first prove that the inner-loop Algorithm~\ref{alg:alm} always converges to a critical point. Then we will argue that if Algorithm~\ref{alg:enumALM} returns the correct solution (they do in all our experiments!), then under mild assumptions on training loss $\mathcal{L}$ and boundedness of the parameters $W_k$, the outer-loop Algorithm~\ref{alg:ProxSparse} also converges to a stationary point. The proofs of both propositions below are deferred to Appendix~\ref{sec:proofs}.
+
+
+\begin{proposition}[Convergence of \textsf{ALM}]\label{prop:innerloop_convergence}
+When $\epsilon>0$, Algorithm~\ref{alg:alm} halts with no more than $3\lambda \|z\|^3/\epsilon^2$ iterations. Also, at the limit $\epsilon\rightarrow 0$, the output of Algorithm~\ref{alg:alm} converges to a critical point of $g_3$ when $S=3$ (or of $g_4$ when $S=4$).
+\end{proposition}
+
+
+
+\begin{proposition}[Convergence of \textsf{ProxSparse}]\label{prop:outerloop_convergence}
+    Assume $\mathcal{L}$ is continuously differentiable, and that there exists $B>0$ such that $\|W_t\| \leq B$ for all $t=1,2,3,...$. Then Algorithm~\ref{alg:ProxSparse} converges to a critical point in the sense of the limiting subdifferential of the regularized objective function of \eqref{eq:reg} (see \cite{RW1998}).
+\end{proposition}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
